@@ -104,6 +104,15 @@ class Win32WindowedAppContext final : public WindowedAppContext {
 
   HMODULE shcore_module_ = nullptr;
   HMODULE user32_module_ = nullptr;
+
+  // System timer resolution override (winmm). Loaded dynamically so the runtime
+  // gains no static winmm.lib link dependency. Raising the timer resolution to
+  // 1ms keeps guest sub-ms sleeps (KeDelayExecutionThread) from rounding up to
+  // the default ~15.6ms scheduler quantum, which is the source of frame judder.
+  HMODULE winmm_module_ = nullptr;
+  UINT (WINAPI* time_begin_period_)(UINT) = nullptr;
+  UINT (WINAPI* time_end_period_)(UINT) = nullptr;
+  UINT timer_period_set_ = 0;  // non-zero => timeBeginPeriod active, end in dtor
   PerMonitorDpiV1Api per_monitor_dpi_v1_api_ = {};
   PerMonitorDpiV2Api per_monitor_dpi_v2_api_ = {};
   bool per_monitor_dpi_v1_api_available_ = false;

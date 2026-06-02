@@ -23,6 +23,13 @@ Win32WindowedAppContext::~Win32WindowedAppContext() {
   if (pending_functions_hwnd_) {
     DestroyWindow(pending_functions_hwnd_);
   }
+  if (timer_period_set_ && time_end_period_) {
+    time_end_period_(timer_period_set_);
+    timer_period_set_ = 0;
+  }
+  if (winmm_module_) {
+    FreeLibrary(winmm_module_);
+  }
   if (user32_module_) {
     FreeLibrary(user32_module_);
   }
@@ -57,6 +64,26 @@ bool Win32WindowedAppContext::Initialize() {
     per_monitor_dpi_v2_api_available_ &=
         (*reinterpret_cast<void**>(&per_monitor_dpi_v2_api_.get_dpi_for_window) =
              GetProcAddress(user32_module_, "GetDpiForWindow")) != nullptr;
+  }
+
+  // Raise the system timer resolution to 1ms. Without this, guest sub-ms
+  // sleeps (KeDelayExecutionThread) round up to the default ~15.6ms scheduler
+  // quantum, which blows the per-frame budget and causes frame judder (and
+  // makes the SDL input-pump thread's SDL_Delay(1) actually sleep ~15ms).
+  // Loaded dynamically so we keep no static winmm.lib dependency. Released in
+  // the destructor via timeEndPeriod.
+  winmm_module_ = LoadLibraryW(L"winmm.dll");
+  if (winmm_module_) {
+    *reinterpret_cast<void**>(&time_begin_period_) =
+        GetProcAddress(winmm_module_, "timeBeginPeriod");
+    *reinterpret_cast<void**>(&time_end_period_) =
+        GetProcAddress(winmm_module_, "timeEndPeriod");
+    if (time_begin_period_ && time_end_period_) {
+      // 0 == TIMERR_NOERROR.
+      if (time_begin_period_(1) == 0) {
+        timer_period_set_ = 1;
+      }
+    }
   }
 
   // Create the message-only window for executing pending functions - using a

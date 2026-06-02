@@ -1099,6 +1099,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
+  // Pure presented-frame tally (real swaps only, no vblank pollution).
+  swap_counter_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 

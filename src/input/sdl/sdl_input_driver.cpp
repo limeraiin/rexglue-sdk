@@ -35,7 +35,12 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       controllers_mutex_(),
       keystroke_states_() {}
 
-SDLInputDriver::~SDLInputDriver() {}
+SDLInputDriver::~SDLInputDriver() {
+  // Safety net: ensure the pump thread is stopped even if OnClosing didn't run.
+  if (pump_thread_running_.exchange(false) && pump_thread_.joinable()) {
+    pump_thread_.join();
+  }
+}
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
@@ -108,11 +113,35 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       }
       REXLOG_INFO("SDL input driver initialized successfully");
     });
+
+    // Start the dedicated input pump thread now that SDL is initialized. It owns
+    // all SDL_PumpEvents() calls so the guest's GetState never blocks on a
+    // UI-thread round-trip (see InputPumpThreadMain / the header note).
+    if (SDL_Gamepad_initialized_ && !pump_thread_running_.exchange(true)) {
+      pump_thread_ = std::thread([this]() { InputPumpThreadMain(); });
+    }
+  }
+}
+
+void SDLInputDriver::InputPumpThreadMain() {
+  // Pump SDL at ~1ms cadence. SDL_PumpEvents drives device polling and fires the
+  // event watch (HandleEvent), which buffers events into pending_events_; the
+  // guest thread later drains them in DrainAndLock. No SDL_INIT_VIDEO is used by
+  // this driver (the window is Win32-native), so pumping off the UI thread is
+  // safe as long as it happens on exactly this one thread.
+  while (pump_thread_running_.load(std::memory_order_relaxed)) {
+    SDL_PumpEvents();
+    SDL_Delay(1);  // ~1ms → sub-frame input latency, zero main-thread stall
   }
 }
 
 void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
   if (attached_window_) {
+    // Stop the pump thread before tearing down SDL subsystems so no
+    // SDL_PumpEvents() runs after SDL_QuitSubSystem.
+    if (pump_thread_running_.exchange(false) && pump_thread_.joinable()) {
+      pump_thread_.join();
+    }
     attached_window_->RemoveListener(this);
     if (sdl_pumpevents_queued_) {
       attached_window_->app_context().CallInUIThreadSynchronous(
@@ -173,10 +202,9 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   auto is_active = this->is_active();
 
-  if (is_active) {
-    QueueControllerUpdate();
-  }
-
+  // No pump here: the dedicated input pump thread keeps pending_events_ fresh at
+  // ~1ms, so we just drain + read. (Previously PumpEventsSync() did a synchronous
+  // UI-thread round-trip that stalled this thread up to a vblank per call.)
   auto guard = DrainAndLock();
 
   auto controller = GetControllerState(user_index);
@@ -669,15 +697,14 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
-  // Pump SDL events to ensure controller state is up to date.
-  bool is_queued = false;
-  sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
-  if (!is_queued) {
-    attached_window_->app_context().CallInUIThread([this]() {
-      SDL_PumpEvents();
-      sdl_pumpevents_queued_ = false;
-    });
-  }
+  // No-op: the dedicated input pump thread (InputPumpThreadMain) now owns all
+  // SDL_PumpEvents() calls. Pumping from here too would race the pump thread
+  // (SDL_PumpEvents is not safe to call concurrently from multiple threads).
+}
+
+void SDLInputDriver::PumpEventsSync() {
+  // No-op: superseded by the dedicated pump thread. Kept so existing call sites
+  // compile; see InputPumpThreadMain and the header note for the rationale.
 }
 
 // Check if the analog inputs exceed their thresholds to become a button press

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include <rex/input/input_driver.h>
@@ -86,8 +87,24 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
+  // Synchronously pump SDL events (throttled) so a subsequent state read sees
+  // the freshest OS input, instead of last frame's (QueueControllerUpdate is
+  // async and leaves the guest reading the PREVIOUS pump's events ~1 frame old).
+  void PumpEventsSync();
+
+  // Dedicated input pump thread: calls SDL_PumpEvents() at ~1ms cadence so the
+  // event watch (HandleEvent) keeps pending_events_ fresh WITHOUT the guest
+  // thread doing a synchronous round-trip to the UI thread per GetState. The
+  // old PumpEventsSync round-trip blocked the main game loop up to a vblank per
+  // poll (~38ms/frame, capping in-game fps at ~23). GetState now only drains +
+  // reads cached state. SDL is pumped on exactly ONE thread (this one) to avoid
+  // concurrent-pump data races; QueueControllerUpdate/PumpEventsSync are no-ops.
+  void InputPumpThreadMain();
+  std::thread pump_thread_;
+  std::atomic<bool> pump_thread_running_{false};
 
   rex::ui::Window* attached_window_ = nullptr;
+  std::atomic<uint32_t> last_pump_ms_{0};
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
