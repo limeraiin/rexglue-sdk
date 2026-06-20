@@ -30,9 +30,11 @@ namespace {
 constexpr int IDC_RENDERER = 1001;
 constexpr int IDC_RES = 1002;
 constexpr int IDC_VSYNC = 1003;
-constexpr int IDC_FULLSCREEN = 1004;
+constexpr int IDC_DISPLAY_MODE = 1004;
 constexpr int IDC_DATA = 1005;
 constexpr int IDC_BROWSE = 1006;
+constexpr int IDC_INTERNAL_RES = 1007;
+constexpr int IDC_EXP_60FPS = 1008;
 
 struct GpuOption {
   const wchar_t* label;
@@ -55,13 +57,40 @@ const ResPreset kResPresets[] = {
     {3840, 2160, L"3840 x 2160 (4K)"},
 };
 
+// Internal render-resolution scale (Xenia draw_resolution_scale). The guest
+// renders at a fixed 720p; this supersamples its render targets by an integer
+// factor (2x -> 1440p, 3x -> 2160p), which is the only lever that changes the
+// actual rendered resolution. Maps to the `resolution_scale` cvar.
+struct InternalResOption {
+  int scale;
+  const wchar_t* label;
+};
+const InternalResOption kInternalResOptions[] = {
+    {1, L"Native (720p)"},
+    {2, L"1440p (2x supersampling)"},
+    {3, L"2160p / 4K (3x supersampling)"},
+};
+
+// Display mode. The runtime implements "fullscreen" as borderless fullscreen
+// (no DXGI exclusive mode); maps to the bool `fullscreen` cvar.
+struct DisplayModeOption {
+  bool fullscreen;
+  const wchar_t* label;
+};
+const DisplayModeOption kDisplayModes[] = {
+    {false, L"Windowed"},
+    {true, L"Borderless Fullscreen"},
+};
+
 struct DialogState {
   bool done = false;
   bool play = false;
   HWND combo_renderer = nullptr;
   HWND combo_res = nullptr;
+  HWND combo_internal_res = nullptr;
   HWND check_vsync = nullptr;
-  HWND check_fullscreen = nullptr;
+  HWND check_exp_60fps = nullptr;
+  HWND combo_display = nullptr;
   HWND edit_data = nullptr;
   HFONT font = nullptr;
 };
@@ -140,23 +169,35 @@ void BuildControls(HWND hwnd, DialogState* st) {
                                    CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 16, 260, 220,
                                    IDC_RENDERER, font);
 
-  MakeControl(hwnd, L"STATIC", L"Resolution:", SS_LEFT, 16, 52, 150, 20, -1, font);
+  MakeControl(hwnd, L"STATIC", L"Window resolution:", SS_LEFT, 16, 52, 150, 20, -1, font);
   st->combo_res = MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
                               172, 50, 260, 220, IDC_RES, font);
 
+  MakeControl(hwnd, L"STATIC", L"Internal resolution:", SS_LEFT, 16, 86, 150, 20, -1, font);
+  st->combo_internal_res =
+      MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 84,
+                  260, 220, IDC_INTERNAL_RES, font);
+
+  MakeControl(hwnd, L"STATIC", L"Display mode:", SS_LEFT, 16, 120, 150, 20, -1, font);
+  st->combo_display =
+      MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 118,
+                  260, 220, IDC_DISPLAY_MODE, font);
+
   st->check_vsync = MakeControl(hwnd, L"BUTTON", L"Vsync (fixes screen tearing)",
-                                BS_AUTOCHECKBOX | WS_TABSTOP, 172, 86, 260, 22, IDC_VSYNC, font);
-  st->check_fullscreen = MakeControl(hwnd, L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX | WS_TABSTOP,
-                                     172, 112, 260, 22, IDC_FULLSCREEN, font);
+                                BS_AUTOCHECKBOX | WS_TABSTOP, 172, 154, 260, 22, IDC_VSYNC, font);
 
-  MakeControl(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 146, 200, 20, -1, font);
+  st->check_exp_60fps =
+      MakeControl(hwnd, L"BUTTON", L"60 FPS overworld (EXPERIMENTAL)", BS_AUTOCHECKBOX | WS_TABSTOP,
+                  172, 180, 260, 22, IDC_EXP_60FPS, font);
+
+  MakeControl(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 222, 200, 20, -1, font);
   st->edit_data = MakeControl(hwnd, L"EDIT", nullptr,
-                              WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, 168, 330, 24, IDC_DATA,
+                              WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, 244, 330, 24, IDC_DATA,
                               font);
-  MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 167, 80, 26, IDC_BROWSE, font);
+  MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 243, 80, 26, IDC_BROWSE, font);
 
-  MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 236, 84, 30, IDOK, font);
-  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 236, 84, 30, IDCANCEL, font);
+  MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 298, 84, 30, IDOK, font);
+  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 298, 84, 30, IDCANCEL, font);
 
   // --- Populate from current cvar values ---
   std::string gpu = rex::cvar::GetFlagByName("gpu");
@@ -177,10 +218,31 @@ void BuildControls(HWND hwnd, DialogState* st) {
   }
   SendMessageW(st->combo_res, CB_SETCURSEL, res_sel, 0);
 
+  int cur_scale = std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str());
+  int internal_sel = 0;
+  for (int i = 0; i < int(std::size(kInternalResOptions)); ++i) {
+    SendMessageW(st->combo_internal_res, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(kInternalResOptions[i].label));
+    if (cur_scale == kInternalResOptions[i].scale) internal_sel = i;
+  }
+  SendMessageW(st->combo_internal_res, CB_SETCURSEL, internal_sel, 0);
+
   SendMessageW(st->check_vsync, BM_SETCHECK,
                rex::cvar::GetFlagByName("vsync") == "true" ? BST_CHECKED : BST_UNCHECKED, 0);
-  SendMessageW(st->check_fullscreen, BM_SETCHECK,
-               rex::cvar::GetFlagByName("fullscreen") == "true" ? BST_CHECKED : BST_UNCHECKED, 0);
+
+  SendMessageW(st->check_exp_60fps, BM_SETCHECK,
+               rex::cvar::GetFlagByName("experimental_60fps") == "true" ? BST_CHECKED
+                                                                        : BST_UNCHECKED,
+               0);
+
+  bool cur_fullscreen = rex::cvar::GetFlagByName("fullscreen") == "true";
+  int display_sel = 0;
+  for (int i = 0; i < int(std::size(kDisplayModes)); ++i) {
+    SendMessageW(st->combo_display, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(kDisplayModes[i].label));
+    if (cur_fullscreen == kDisplayModes[i].fullscreen) display_sel = i;
+  }
+  SendMessageW(st->combo_display, CB_SETCURSEL, display_sel, 0);
 
   std::wstring data_dir = Widen(rex::cvar::GetFlagByName("game_data_root"));
   SetWindowTextW(st->edit_data, data_dir.c_str());
@@ -214,12 +276,22 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
   rex::cvar::SetFlagByName("video_mode_width", std::to_string(kResPresets[res_sel].width));
   rex::cvar::SetFlagByName("video_mode_height", std::to_string(kResPresets[res_sel].height));
 
+  int internal_sel = int(SendMessageW(st->combo_internal_res, CB_GETCURSEL, 0, 0));
+  if (internal_sel < 0 || internal_sel >= int(std::size(kInternalResOptions))) internal_sel = 0;
+  rex::cvar::SetFlagByName("resolution_scale",
+                           std::to_string(kInternalResOptions[internal_sel].scale));
+
   rex::cvar::SetFlagByName(
       "vsync", SendMessageW(st->check_vsync, BM_GETCHECK, 0, 0) == BST_CHECKED ? "true" : "false");
-  rex::cvar::SetFlagByName("fullscreen", SendMessageW(st->check_fullscreen, BM_GETCHECK, 0, 0) ==
-                                                 BST_CHECKED
-                                             ? "true"
-                                             : "false");
+
+  rex::cvar::SetFlagByName("experimental_60fps",
+                           SendMessageW(st->check_exp_60fps, BM_GETCHECK, 0, 0) == BST_CHECKED
+                               ? "true"
+                               : "false");
+
+  int display_sel = int(SendMessageW(st->combo_display, CB_GETCURSEL, 0, 0));
+  if (display_sel < 0 || display_sel >= int(std::size(kDisplayModes))) display_sel = 0;
+  rex::cvar::SetFlagByName("fullscreen", kDisplayModes[display_sel].fullscreen ? "true" : "false");
   rex::cvar::SetFlagByName("game_data_root", Narrow(data));
 
   rex::cvar::SaveConfig(config_path);
@@ -308,9 +380,10 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
 
   g_config_path = &config_path;
 
-  // Client area 448 x 286; size the window to fit it.
+  // Client area 448 x 348; size the window to fit it (the extra 34px row is the
+  // EXPERIMENTAL 60fps checkbox added below vsync).
   const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-  RECT rc{0, 0, 448, 286};
+  RECT rc{0, 0, 448, 348};
   AdjustWindowRectEx(&rc, style, FALSE, 0);
   int win_w = rc.right - rc.left;
   int win_h = rc.bottom - rc.top;

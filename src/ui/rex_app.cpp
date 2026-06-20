@@ -156,6 +156,11 @@ bool ReXApp::OnInitialize() {
   return true;
 }
 
+std::string ReXApp::GetDisplayName() const {
+  // Default: app name + SDK build stamp. Apps override for a clean product name.
+  return std::string(GetName()) + " " + REXGLUE_BUILD_TITLE;
+}
+
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
@@ -170,7 +175,7 @@ bool ReXApp::SetupEnvironment() {
       rex::cvar::LoadConfig(startup_config);
     }
     if (!REXCVAR_GET(skip_config_dialog)) {
-      if (!rex::ui::ShowStartupConfigDialog(GetName(), startup_config)) {
+      if (!rex::ui::ShowStartupConfigDialog(GetDisplayName(), startup_config)) {
         return false;
       }
     }
@@ -382,9 +387,9 @@ bool ReXApp::SetupPresentation() {
     return false;
   }
 
-  // Set window title with SDK build stamp
-  std::string title = std::string(GetName()) + " " + REXGLUE_BUILD_TITLE;
-  window_->SetTitle(title);
+  // Window caption: the app's display name (clean product name if overridden,
+  // else the build-stamped app name).
+  window_->SetTitle(GetDisplayName());
 
   window_->AddListener(this);
   window_->AddInputListener(this, 0);

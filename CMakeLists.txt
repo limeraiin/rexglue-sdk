@@ -197,6 +197,20 @@ add_compile_options(
     -Wextra
 )
 
+# Target the x86-64-v3 microarch level (AVX2 + FMA + BMI2 + MOVBE) for FIRST-PARTY
+# SDK code only (placed AFTER add_subdirectory(thirdparty) so vendored libs —
+# FFmpeg/libavcodec, Tracy, etc. — keep their own baseline ISA; forcing v3 on them
+# breaks their feature-detected builds). The software command processor is
+# byte-swap bound: it churns ~2.6M big-endian PM4 packets/sec (register/constant
+# writes + ~7k draws/frame), every read a BE load. MOVBE fuses load+bswap across
+# that loop (WriteRegister / ReadAndSwap / ExecutePacket); AVX2/FMA speed the rest.
+# Matches the recompiled-game ISA (cmake/rexglue_helpers.cmake). Quality-neutral
+# (-ffp-model=strict disables FMA contraction). Requires an AVX2 CPU (standard on
+# the RTX 3060-class target).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+    add_compile_options(-march=x86-64-v3)
+endif()
+
 include_directories(${REXGLUE_ROOT}/include)
 
 add_subdirectory(src/core)

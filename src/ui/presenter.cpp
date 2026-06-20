@@ -1598,11 +1598,27 @@ void Presenter::WaitForUITickFromUIThread() {
       return;
     }
     if (dxgi_ui_tick_last_vblank_ > dxgi_ui_tick_last_draw_) {
-      // If there have been multiple vblanks during the wait for some reason,
-      // next time draw the UI immediately.
-      dxgi_ui_tick_last_draw_ =
-          std::min(last_vblank_before_wait + uint64_t(1), dxgi_ui_tick_last_vblank_);
-      return;
+      // While guest output is actively presenting, each guest frame forces a UI
+      // tick (handled by the dxgi_ui_tick_force_requested_ branch above), so
+      // pace the UI to those forced ticks instead of returning on every monitor
+      // vblank. This keeps the host present rate equal to the guest frame rate
+      // (e.g. a 60 fps guest on a 120 Hz monitor is presented at 60 Hz, not
+      // 120 Hz). Only fall back to vblank-driven UI ticks once the guest has
+      // been idle longer than kGuestActiveUITickIdleTimeout, so the UI keeps
+      // animating on static screens (menus, paused guest output, etc.).
+      // The vblank thread keeps signaling every vblank, so a guest frame that
+      // forces a tick while we wait here is still picked up promptly.
+      constexpr std::chrono::milliseconds kGuestActiveUITickIdleTimeout{100};
+      bool guest_recently_presented =
+          (std::chrono::steady_clock::now() - dxgi_ui_tick_last_force_time_) <
+          kGuestActiveUITickIdleTimeout;
+      if (!guest_recently_presented) {
+        // If there have been multiple vblanks during the wait for some reason,
+        // next time draw the UI immediately.
+        dxgi_ui_tick_last_draw_ =
+            std::min(last_vblank_before_wait + uint64_t(1), dxgi_ui_tick_last_vblank_);
+        return;
+      }
     }
     dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
   }
@@ -1613,6 +1629,9 @@ void Presenter::ForceUIThreadPaintTick() {
 #if REX_PLATFORM_WIN32
   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   dxgi_ui_tick_force_requested_ = true;
+  // Remember when the guest output last forced a tick so WaitForUITick can pace
+  // the UI to the guest frame rate while the guest is actively presenting.
+  dxgi_ui_tick_last_force_time_ = std::chrono::steady_clock::now();
 #endif  // XE_PLATFORM
 }
 

@@ -156,6 +156,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Use for cleanup that depends on runtime resources.
   virtual void OnGuestThreadExit(system::XThread* thread) { (void)thread; }
 
+  /// Human-facing name shown in the main window caption and the pre-launch
+  /// dialog title. Defaults to the build-stamped app name (GetName() + version);
+  /// override to present a clean product name instead. Does NOT affect GetName()
+  /// (still used for config/log/path keys).
+  virtual std::string GetDisplayName() const;
+
   // --- Init phase methods (called in order from OnInitialize) ---
 
   /// Resolve path defaults, load config TOML, initialize logging.

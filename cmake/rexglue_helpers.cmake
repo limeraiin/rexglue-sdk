@@ -30,7 +30,14 @@ function(rexglue_apply_target_settings target_name)
 
     if(NOT MSVC)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-            target_compile_options(${target_name} PRIVATE -msse4.1)
+            # Target the x86-64-v3 microarch level (AVX2 + FMA + BMI2 + MOVBE,
+            # superset of SSE4.1). The recompiled guest is CPU-bound, and every
+            # guest memory access is a byte-swapped load/store: MOVBE fuses the
+            # load+bswap into one instruction, while AVX2/FMA/VEX speed up the
+            # scalar-FP and simde (VMX) math the hot worker spends its time in.
+            # Quality-neutral; requires an AVX2 CPU (standard on RTX 3060-class
+            # target hardware). See CLAUDE.md Chapter 9.
+            target_compile_options(${target_name} PRIVATE -march=x86-64-v3)
         endif()
     endif()
 endfunction()

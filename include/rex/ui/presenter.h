@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -1011,6 +1012,14 @@ class Presenter {
 
   std::mutex dxgi_ui_tick_mutex_;
   uint64_t dxgi_ui_tick_last_vblank_ = 1;
+  // steady_clock time of the last guest-output-forced UI tick
+  // (ForceUIThreadPaintTick). While guest output is actively presenting it
+  // forces a tick per guest frame, so the UI present is paced to the guest
+  // frame rate (matching the host present rate to the guest frame rate) rather
+  // than to the monitor refresh rate. When the guest goes idle for longer than
+  // kGuestActiveUITickIdleTimeout, vblank-driven UI ticks resume so the UI
+  // still animates on static screens. Protected by dxgi_ui_tick_mutex_.
+  std::chrono::steady_clock::time_point dxgi_ui_tick_last_force_time_{};
   // If output is null or shutdown is true, the signal may not be sent, either
   // don't limit the frame rate in this case (an exceptional situation, such as
   // a failure to find the output in DXGI), or don't draw at all if the window

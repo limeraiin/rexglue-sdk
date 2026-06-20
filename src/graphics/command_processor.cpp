@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -44,6 +45,11 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_worker_profile, false, "GPU",
+                    "Diagnostic: log a ~1s breakdown of the command-processor "
+                    "thread's wall time (starvation-spin vs real ExecutePrimaryBuffer "
+                    "work). For perf triage on Release builds (no Tracy). Off by default.");
 
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
@@ -271,11 +277,42 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
   CallInThread([this, swap_post_effect]() { swap_post_effect_actual_ = swap_post_effect; });
 }
 
+namespace {
+// [GPU-EXEC-PROFILE] Per-category timing, broken out of gpu_worker_profile's total
+// ExecutePrimaryBuffer time, to find WHERE the cmd-proc thread's 100% goes:
+// register/state writes (type0) vs type3 (draws+constants) vs the IssueDraw host
+// call specifically. Only the worker thread runs ExecutePacket/IssueDraw, so
+// thread_local is correct + lock-free. Gate set from WorkerThreadMain; ~0 cost off.
+bool g_exec_prof = false;
+thread_local uint64_t g_exec_type_ns[4] = {0, 0, 0, 0};
+thread_local uint64_t g_exec_type_cnt[4] = {0, 0, 0, 0};
+thread_local uint64_t g_issuedraw_ns = 0;
+thread_local uint64_t g_draw_cnt = 0;
+}  // namespace
+
 void CommandProcessor::WorkerThreadMain() {
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
+
+  // [GPU-WORKER-PROFILE] Opt-in (gpu_worker_profile cvar) breakdown of where this
+  // single command-processor thread's wall time actually goes: the starvation
+  // spin (waiting on the guest producer) vs real ExecutePrimaryBuffer work.
+  // Resolves the spin-vs-compute question on Release builds, which have no Tracy
+  // zones. ~zero cost when the cvar is off (one bool test per frame region).
+  // Only this thread touches these counters, so plain locals — no atomics.
+  const bool kProfile = REXCVAR_GET(gpu_worker_profile);
+  g_exec_prof = kProfile;
+  using prof_clock = std::chrono::steady_clock;
+  uint64_t prof_spin_ns = 0, prof_exec_ns = 0;
+  uint64_t prof_spin_loops = 0, prof_event_waits = 0, prof_exec_calls = 0,
+           prof_starves = 0;
+  uint64_t last_spin_ns = 0, last_exec_ns = 0, last_spin_loops = 0,
+           last_event_waits = 0, last_exec_calls = 0, last_starves = 0;
+  uint64_t last_type_ns[4] = {0, 0, 0, 0}, last_type_cnt[4] = {0, 0, 0, 0};
+  uint64_t last_issuedraw_ns = 0, last_draw_cnt = 0;
+  auto prof_last_report = prof_clock::now();
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
@@ -290,22 +327,38 @@ void CommandProcessor::WorkerThreadMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
+      auto spin_t0 = kProfile ? prof_clock::now() : prof_clock::time_point{};
+      if (kProfile) prof_starves++;
       PrepareForWait();
       uint32_t loop_count = 0;
       do {
-        // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
+        // Block on the write-pointer event once a short spin fails to find
+        // work. The event is Set() the instant the guest submits commands
+        // (UpdateWritePointer), so this wakes immediately on new work — the
+        // OS wakeup latency (sub-ms with timeBeginPeriod(1)) is negligible vs
+        // the frame and is absorbed because the guest is the bottleneck, not
+        // this consumer. The old 500-iteration busy-spin pegged a full core
+        // (the guest feeds work at sub-ms cadence, so it spun continuously)
+        // — wasteful heat that throttles real-work cores on a laptop.
+        constexpr uint32_t kStarvedSpinYields = 64;
+        if (loop_count > kStarvedSpinYields) {
           const int wait_time_ms = 5;
+          if (kProfile) prof_event_waits++;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
         }
 
         rex::thread::MaybeYield();
         loop_count++;
+        if (kProfile) prof_spin_loops++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+      if (kProfile) {
+        prof_spin_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            prof_clock::now() - spin_t0).count();
+      }
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -313,13 +366,61 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    {
+      auto exec_t0 = kProfile ? prof_clock::now() : prof_clock::time_point{};
+      read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+      if (kProfile) {
+        prof_exec_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            prof_clock::now() - exec_t0).count();
+        prof_exec_calls++;
+      }
+    }
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
+    }
+
+    // [GPU-WORKER-PROFILE] ~1s wall-time split report.
+    if (kProfile) {
+      auto now = prof_clock::now();
+      uint64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             now - prof_last_report).count();
+      if (wall_ns >= 1000000000ull) {
+        double wall_ms = wall_ns / 1e6;
+        double spin_ms = (prof_spin_ns - last_spin_ns) / 1e6;
+        double exec_ms = (prof_exec_ns - last_exec_ns) / 1e6;
+        REXGPU_INFO(
+            "[gpu-instr] wall={:.0f}ms spin={:.1f}ms({:.0f}%) exec={:.1f}ms({:.0f}%) "
+            "exec_calls={} starves={} spin_loops={} event_waits={}",
+            wall_ms, spin_ms, 100.0 * spin_ms / wall_ms, exec_ms,
+            100.0 * exec_ms / wall_ms, prof_exec_calls - last_exec_calls,
+            prof_starves - last_starves, prof_spin_loops - last_spin_loops,
+            prof_event_waits - last_event_waits);
+        REXGPU_INFO(
+            "[gpu-exec] reg(t0)={:.1f}ms/{} t3={:.1f}ms/{} of-which-issuedraw={:.1f}ms/{} "
+            "t1={:.1f}ms t2={:.1f}ms",
+            (g_exec_type_ns[0] - last_type_ns[0]) / 1e6, g_exec_type_cnt[0] - last_type_cnt[0],
+            (g_exec_type_ns[3] - last_type_ns[3]) / 1e6, g_exec_type_cnt[3] - last_type_cnt[3],
+            (g_issuedraw_ns - last_issuedraw_ns) / 1e6, g_draw_cnt - last_draw_cnt,
+            (g_exec_type_ns[1] - last_type_ns[1]) / 1e6,
+            (g_exec_type_ns[2] - last_type_ns[2]) / 1e6);
+        prof_last_report = now;
+        last_spin_ns = prof_spin_ns;
+        last_exec_ns = prof_exec_ns;
+        last_spin_loops = prof_spin_loops;
+        last_event_waits = prof_event_waits;
+        last_exec_calls = prof_exec_calls;
+        last_starves = prof_starves;
+        for (int i = 0; i < 4; i++) {
+          last_type_ns[i] = g_exec_type_ns[i];
+          last_type_cnt[i] = g_exec_type_cnt[i];
+        }
+        last_issuedraw_ns = g_issuedraw_ns;
+        last_draw_cnt = g_draw_cnt;
+      }
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -776,19 +877,45 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
   }
 
+  if (!g_exec_prof) {
+    switch (packet_type) {
+      case 0x00:
+        return ExecutePacketType0(reader, packet);
+      case 0x01:
+        return ExecutePacketType1(reader, packet);
+      case 0x02:
+        return ExecutePacketType2(reader, packet);
+      case 0x03:
+        return ExecutePacketType3(reader, packet);
+      default:
+        assert_unhandled_case(packet_type);
+        return false;
+    }
+  }
+  // [GPU-EXEC-PROFILE] timed dispatch (accumulate per packet type).
+  const auto exec_t0 = std::chrono::steady_clock::now();
+  bool r;
   switch (packet_type) {
     case 0x00:
-      return ExecutePacketType0(reader, packet);
+      r = ExecutePacketType0(reader, packet);
+      break;
     case 0x01:
-      return ExecutePacketType1(reader, packet);
+      r = ExecutePacketType1(reader, packet);
+      break;
     case 0x02:
-      return ExecutePacketType2(reader, packet);
+      r = ExecutePacketType2(reader, packet);
+      break;
     case 0x03:
-      return ExecutePacketType3(reader, packet);
+      r = ExecutePacketType3(reader, packet);
+      break;
     default:
       assert_unhandled_case(packet_type);
       return false;
   }
+  g_exec_type_ns[packet_type] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - exec_t0).count();
+  g_exec_type_cnt[packet_type]++;
+  return r;
 }
 
 bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
@@ -1525,8 +1652,16 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      // [GPU-EXEC-PROFILE] time the host backend draw recording specifically.
+      const auto draw_t0 = g_exec_prof ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      if (g_exec_prof) {
+        g_issuedraw_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - draw_t0).count();
+        g_draw_cnt++;
+      }
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
