@@ -36,16 +36,98 @@
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/startup_config_dialog.h>
 #include <rex/version.h>
 
 #include <fmt/format.h>
 #include <imgui.h>
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
+#include <memory>
+#include <string>
 #include <string_view>
 
+// Graphics backend selection. Every cvar is also a launch flag, so this is
+// selectable at startup as e.g. `--gpu vulkan`.
+//   any    - auto-pick (prefers D3D12 on Windows, falls back to Vulkan)
+//   d3d12  - force the Direct3D 12 backend
+//   vulkan - force the Vulkan backend
+// If the requested backend is unavailable or was not compiled into this build,
+// the runtime falls back to the other one. kInitOnly: the backend is chosen
+// once during startup and cannot change at runtime.
+REXCVAR_DEFINE_STRING(gpu, "any", "GPU", "Graphics backend: any, d3d12, vulkan")
+    .allowed({"any", "d3d12", "vulkan"})
+    .lifecycle(::rex::cvar::Lifecycle::kInitOnly);
+
+// Skip the native pre-launch configuration dialog and start the game directly
+// using the current cvar/config/CLI values. Set true for automated/headless
+// launches (e.g. --skip_config_dialog true).
+REXCVAR_DEFINE_BOOL(skip_config_dialog, false, "UI",
+                    "Skip the pre-launch configuration dialog and start immediately");
+
 namespace rex {
+
+namespace {
+
+// Builds the graphics backend chosen by the `gpu` cvar. Lives here (rather than
+// the old compile-time #if/#elif) so a single binary built with both backends
+// can switch between them at launch.
+std::unique_ptr<system::IGraphicsSystem> CreateConfiguredGraphicsBackend() {
+  std::string backend = REXCVAR_GET(gpu);
+  std::transform(backend.begin(), backend.end(), backend.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+#if REX_HAS_D3D12 && REX_HAS_VULKAN
+  const bool d3d12_ok = graphics::d3d12::D3D12GraphicsSystem::IsAvailable();
+  const bool vulkan_ok = graphics::vulkan::VulkanGraphicsSystem::IsAvailable();
+
+  if (backend == "vulkan") {
+    if (vulkan_ok) {
+      REXLOG_INFO("Graphics backend: Vulkan (requested via --gpu)");
+      return std::make_unique<graphics::vulkan::VulkanGraphicsSystem>();
+    }
+    REXLOG_WARN("Vulkan backend requested but unavailable; falling back to D3D12");
+    return std::make_unique<graphics::d3d12::D3D12GraphicsSystem>();
+  }
+  if (backend == "d3d12") {
+    if (d3d12_ok) {
+      REXLOG_INFO("Graphics backend: D3D12 (requested via --gpu)");
+      return std::make_unique<graphics::d3d12::D3D12GraphicsSystem>();
+    }
+    REXLOG_WARN("D3D12 backend requested but unavailable; falling back to Vulkan");
+    return std::make_unique<graphics::vulkan::VulkanGraphicsSystem>();
+  }
+  // "any" (default) or anything unrecognized: prefer D3D12 on Windows, then Vulkan.
+  if (backend != "any") {
+    REXLOG_WARN("Unknown gpu backend '{}'; using auto-selection", backend);
+  }
+  if (d3d12_ok) {
+    REXLOG_INFO("Graphics backend: D3D12 (auto)");
+    return std::make_unique<graphics::d3d12::D3D12GraphicsSystem>();
+  }
+  REXLOG_INFO("Graphics backend: Vulkan (auto)");
+  return std::make_unique<graphics::vulkan::VulkanGraphicsSystem>();
+#elif REX_HAS_D3D12
+  if (backend == "vulkan") {
+    REXLOG_WARN("Vulkan backend requested but not compiled into this build; using D3D12");
+  }
+  REXLOG_INFO("Graphics backend: D3D12 (only backend compiled in)");
+  return std::make_unique<graphics::d3d12::D3D12GraphicsSystem>();
+#elif REX_HAS_VULKAN
+  if (backend == "d3d12") {
+    REXLOG_WARN("D3D12 backend requested but not compiled into this build; using Vulkan");
+  }
+  REXLOG_INFO("Graphics backend: Vulkan (only backend compiled in)");
+  return std::make_unique<graphics::vulkan::VulkanGraphicsSystem>();
+#else
+  REXLOG_ERROR("No graphics backend was compiled into this build");
+  return nullptr;
+#endif
+}
+
+}  // namespace
 
 // --- ReXApp ---
 
@@ -76,6 +158,23 @@ bool ReXApp::OnInitialize() {
 
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
+
+  // Native pre-launch configuration dialog (graphics backend, vsync, resolution,
+  // fullscreen, game data folder). Load any persisted config first so the dialog
+  // shows the user's previous choices, then let it override the cvars and save
+  // them. Returning false here (Quit) exits the app before any window/graphics
+  // are created. Skipped with --skip_config_dialog true (automated launches).
+  {
+    std::filesystem::path startup_config = exe_dir / (std::string(GetName()) + ".toml");
+    if (std::filesystem::exists(startup_config)) {
+      rex::cvar::LoadConfig(startup_config);
+    }
+    if (!REXCVAR_GET(skip_config_dialog)) {
+      if (!rex::ui::ShowStartupConfigDialog(GetName(), startup_config)) {
+        return false;
+      }
+    }
+  }
 
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
@@ -261,11 +360,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 }
 
 bool ReXApp::SetupPresentation() {
-#if REX_HAS_D3D12
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
-#elif REX_HAS_VULKAN
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
-#endif
+  config_.graphics = CreateConfiguredGraphicsBackend();
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;

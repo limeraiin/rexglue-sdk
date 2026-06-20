@@ -419,13 +419,36 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
+// Escapes a string value for a TOML basic ("...") string. Without this,
+// Windows paths like `D:\naruto-extracted` round-trip incorrectly: `\n`/`\t`/...
+// are TOML escape sequences, so the path would reload mangled (e.g.
+// `D:<newline>aruto-extracted`). Escaping the backslash (and quotes/controls)
+// makes SaveConfig -> LoadConfig lossless.
+static std::string TomlEscapeBasicString(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
 std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = \"" + TomlEscapeBasicString(entry.getter()) + "\"\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
@@ -440,7 +463,7 @@ std::string SerializeToTOML(std::string_view category) {
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.category == category && entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = \"" + TomlEscapeBasicString(entry.getter()) + "\"\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }

@@ -1347,26 +1347,34 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  //
+  // When the global `vsync` cvar is enabled, force FIFO (true vsync) — it's the
+  // only mode guaranteed tear-free and frame-paced to the display. The
+  // immediate/mailbox/fifo-relaxed fast paths (lower latency, but immediate and
+  // fifo-relaxed can tear) are only considered with vsync off. This is what
+  // makes the startup dialog's "Vsync" toggle actually stop tearing.
+  const bool vsync = ::rex::cvar::Query<bool>("vsync");
+  if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
     // (though on Windows with borderless fullscreen, GDI copying is used
     // instead of independent flip, so it's not supported there).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
+  } else if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
              std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
                  present_modes.cend()) {
     // Allowing dropping frames to reduce latency, but no tearing.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
+  } else if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
              std::find(present_modes.cbegin(), present_modes.cend(),
                        VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
     // Limiting the frame rate, but lets too long frames cause tearing not to
     // make the latency even worse.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
   } else {
-    // Highest latency (but always guaranteed to be available).
+    // Highest latency (but always guaranteed to be available). Tear-free,
+    // display-paced — the vsync-on path.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
   }
   swapchain_create_info.clipped = VK_TRUE;

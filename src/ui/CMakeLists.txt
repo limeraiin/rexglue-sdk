@@ -60,12 +60,14 @@ if(WIN32)
         surface_win.cpp
         window_win.cpp
         windowed_app_context_win.cpp
+        startup_config_dialog_win.cpp
     )
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
         window_gtk.cpp
         windowed_app_context_gtk.cpp
+        startup_config_dialog_stub.cpp
     )
 endif()
 
@@ -135,6 +137,8 @@ if(WIN32)
     target_link_libraries(rexui PUBLIC
         dwmapi
         Shcore
+        Shell32   # SHBrowseForFolderW / SHGetPathFromIDListW (startup config dialog)
+        ole32     # CoTaskMemFree (startup config dialog)
     )
 else()
     find_package(PkgConfig REQUIRED)

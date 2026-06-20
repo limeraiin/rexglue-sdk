@@ -1148,17 +1148,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ui_submission_tracker_.NextSubmission();
   }
   paint_context_.paint_submission_tracker.NextSubmission();
-  // Present as soon as possible, without waiting for vsync (the host refresh
-  // rate may be something like 144 Hz, which is not a multiple of the common
-  // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
-  // frames for lower latency. Also, if possible, allowing tearing to use
-  // variable refresh rate in borderless fullscreen (note that if DXGI
-  // fullscreen is ever used in, the allow tearing flag must not be passed in
-  // fullscreen, but DXGI fullscreen is largely unneeded with the flip
-  // presentation model used in Direct3D 12).
-  HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+  // Honor the global `vsync` cvar:
+  //  - vsync on  -> sync interval 1 (block for vblank, tear-free, display-paced).
+  //  - vsync off -> sync interval 0 (present as soon as possible for lowest
+  //    latency) and allow tearing where the swapchain supports it, so variable
+  //    refresh rate may be used in borderless fullscreen. The host refresh rate
+  //    may be something like 144 Hz, which is not a multiple of the common
+  //    30/60 Hz guest refresh rate. (ALLOW_TEARING is only valid with sync
+  //    interval 0 and a tearing-capable swapchain; DXGI fullscreen is largely
+  //    unneeded with the D3D12 flip model so it's not used here.)
+  // This is what makes the startup dialog's "Vsync" toggle actually stop
+  // tearing on D3D12.
+  const bool vsync = ::rex::cvar::Query<bool>("vsync");
+  const UINT sync_interval = vsync ? 1u : 0u;
+  UINT present_flags = DXGI_PRESENT_RESTART;
+  if (!vsync && paint_context_.swap_chain_allows_tearing) {
+    present_flags |= DXGI_PRESENT_ALLOW_TEARING;
+  }
+  HRESULT present_result = paint_context_.swap_chain->Present(sync_interval, present_flags);
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
