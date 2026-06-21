@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -47,7 +48,25 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_dedupe_constants, false, "GPU/D3D12",
+                    "Skip shader-constant register writes whose value is unchanged, "
+                    "avoiding needless constant-buffer re-uploads on the command-"
+                    "processor thread. Experimental perf lever (Ch.9); default off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
+
+namespace {
+// [PERF/CONST-DEDUPE] Cached once per frame from the gpu_dedupe_constants cvar.
+// Only the command-processor thread reads/writes these, so plain globals (no
+// atomics). The hot WriteRegister path reads this bool instead of the cvar
+// accessor (which carries a static-local guard check per call).
+bool g_dedupe_constants = false;
+// Instrumentation: count of dedupe-eligible constant writes and how many were
+// redundant. Reported ~1/s from IssueSwap when gpu_worker_profile is on.
+uint64_t g_const_writes_total = 0;
+uint64_t g_const_writes_skipped = 0;
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1793,6 +1812,25 @@ void D3D12CommandProcessor::ShutdownContext() {
 }
 
 void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // [PERF/CONST-DEDUPE] A redundant shader-constant write (value unchanged)
+  // leaves the GPU-side constant buffer already correct, so the only effect of
+  // proceeding is marking the binding dirty -> a wasted full cbuffer re-upload
+  // in UpdateBindings. Skip it for the pure constant ranges only (float and
+  // bool/loop). Deliberately NOT applied to fetch constants (texture-cache /
+  // vertex-residency invalidation is correctness-sensitive) or any non-constant
+  // register (scratch writeback, COHER dirty bit, DC_LUT state machine).
+  if (g_dedupe_constants &&
+      ((index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+        index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+       (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+        index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
+    ++g_const_writes_total;
+    if (register_file_->values[index] == value) {
+      ++g_const_writes_skipped;
+      return;
+    }
+  }
+
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -1860,6 +1898,24 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    // [PERF/CONST-DEDUPE] If the whole incoming block matches the register file,
+    // the copy is a no-op and the cbuffer is already correct -> skip both the
+    // copy and the invalidation. base[] is guest-endian, so swap-compare.
+    if (g_dedupe_constants) {
+      g_const_writes_total += num_registers;
+      const uint32_t* cur = register_file_->values + start_index;
+      bool changed = false;
+      for (uint32_t i = 0; i < num_registers; ++i) {
+        if (memory::load_and_swap<uint32_t>(base + i) != cur[i]) {
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) {
+        g_const_writes_skipped += num_registers;
+        return;
+      }
+    }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     if (frame_open_) {
       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
@@ -1886,6 +1942,22 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    // [PERF/CONST-DEDUPE] See float-range note above.
+    if (g_dedupe_constants) {
+      g_const_writes_total += num_registers;
+      const uint32_t* cur = register_file_->values + start_index;
+      bool changed = false;
+      for (uint32_t i = 0; i < num_registers; ++i) {
+        if (memory::load_and_swap<uint32_t>(base + i) != cur[i]) {
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) {
+        g_const_writes_skipped += num_registers;
+        return;
+      }
+    }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     cbuffer_binding_bool_loop_.up_to_date = false;
     return;
@@ -1918,6 +1990,25 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+
+  // [PERF/CONST-DEDUPE] Refresh the cached enable flag once per frame (cmd-proc
+  // thread only), and when profiling is on emit the redundant-write rate.
+  g_dedupe_constants = REXCVAR_GET(gpu_dedupe_constants);
+  if (REXCVAR_GET(gpu_worker_profile)) {
+    static uint64_t s_last_total = 0, s_last_skipped = 0;
+    static auto s_last_report = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_last_report >= std::chrono::seconds(1)) {
+      uint64_t dt_total = g_const_writes_total - s_last_total;
+      uint64_t dt_skip = g_const_writes_skipped - s_last_skipped;
+      REXGPU_INFO("[gpu-dedupe] const_writes={} skipped={} ({:.0f}%)", dt_total, dt_skip,
+                  dt_total ? 100.0 * double(dt_skip) / double(dt_total) : 0.0);
+      s_last_report = now;
+      s_last_total = g_const_writes_total;
+      s_last_skipped = g_const_writes_skipped;
+    }
+  }
+
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
