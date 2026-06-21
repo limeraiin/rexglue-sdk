@@ -530,7 +530,13 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  // [PERF] GetRegisterInfo() is a ~20k-case switch, and WriteRegister sits on
+  // the command-processor hot path (~1-2M calls/sec). Its only use here is to
+  // gate an unknown-register DEBUG log that is off during normal play, so only
+  // run the lookup when GPU debug logging is actually enabled. Short-circuits
+  // to a cheap logger load + level compare in retail.
+  if (auto* gpu_log = ::rex::GetLoggerRaw(::rex::log::gpu());
+      gpu_log && gpu_log->should_log(spdlog::level::debug) && !regs.GetRegisterInfo(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 

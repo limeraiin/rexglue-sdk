@@ -36,8 +36,18 @@ class TraceWriter {
   void WritePrimaryBufferEnd();
   void WriteIndirectBufferStart(uint32_t base_ptr, uint32_t count);
   void WriteIndirectBufferEnd();
-  void WritePacketStart(uint32_t base_ptr, uint32_t count);
-  void WritePacketEnd();
+
+  // [PERF] These two run for every PM4 packet (~millions/sec on the command-
+  // processor thread). When no trace is being captured (the common case) the
+  // inlined file_ check lets the call be elided entirely instead of paying a
+  // function call + ret per packet. The actual write work lives in the
+  // out-of-line *Traced() bodies, only reached while a trace is open.
+  void WritePacketStart(uint32_t base_ptr, uint32_t count) {
+    if (file_) WritePacketStartTraced(base_ptr, count);
+  }
+  void WritePacketEnd() {
+    if (file_) WritePacketEndTraced();
+  }
   void WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr);
   void WriteMemoryReadCached(uint32_t base_ptr, size_t length);
   void WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length);
@@ -51,6 +61,10 @@ class TraceWriter {
                       uint32_t gamma_ramp_rw_component);
 
  private:
+  // Out-of-line bodies for the per-packet hot path; only called when file_ != nullptr.
+  void WritePacketStartTraced(uint32_t base_ptr, uint32_t count);
+  void WritePacketEndTraced();
+
   void WriteMemoryCommand(TraceCommandType type, uint32_t base_ptr, size_t length,
                           const void* host_ptr = nullptr);
 

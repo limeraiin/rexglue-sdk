@@ -128,10 +128,8 @@ void TraceWriter::WriteIndirectBufferEnd() {
   fwrite(&cmd, 1, sizeof(cmd), file_);
 }
 
-void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
-  if (!file_) {
-    return;
-  }
+// file_ != nullptr guaranteed by the inline WritePacketStart() wrapper.
+void TraceWriter::WritePacketStartTraced(uint32_t base_ptr, uint32_t count) {
   PacketStartCommand cmd = {
       TraceCommandType::kPacketStart,
       base_ptr,
@@ -141,10 +139,8 @@ void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
   fwrite(membase_ + base_ptr, 4, count, file_);
 }
 
-void TraceWriter::WritePacketEnd() {
-  if (!file_) {
-    return;
-  }
+// file_ != nullptr guaranteed by the inline WritePacketEnd() wrapper.
+void TraceWriter::WritePacketEndTraced() {
   PacketEndCommand cmd = {
       TraceCommandType::kPacketEnd,
   };
