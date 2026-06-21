@@ -37,8 +37,12 @@ REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, false, "GPU",
 REXCVAR_DEFINE_BOOL(force_convert_triangle_fans_to_lists, false, "GPU",
                     "Force convert triangle fans to lists");
 
-REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
-                     "Minimum indices for primitive processor cache")
+REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 4096, "GPU",
+                     "Minimum guest index count to store a converted/reset-replaced index "
+                     "buffer in the per-frame cache. Below this, re-convert each draw instead "
+                     "(cache insertion needs global-critical-region locking + page protection, "
+                     "which makes caching small IBs a net loss). Matches upstream Xenia; was 0 "
+                     "here, which cached every converted draw and stalled the cmd-proc thread.")
     .range(0, 1000000);
 
 // All these overrides are always safe to use as all backends are expected to
