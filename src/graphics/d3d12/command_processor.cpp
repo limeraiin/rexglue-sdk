@@ -54,6 +54,12 @@ REXCVAR_DEFINE_BOOL(gpu_dedupe_constants, false, "GPU/D3D12",
                     "processor thread. Experimental perf lever (Ch.9); default off.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU/D3D12",
+                    "Diagnostic: per-second breakdown of where IssueDraw's CPU time goes "
+                    "(prim-process / RT-update / pipeline / textures / bindings vs total), "
+                    "timed per-draw (cheap, ~a few %). Off by default. Ch.9 cmd-proc triage.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -66,6 +72,19 @@ bool g_dedupe_constants = false;
 // redundant. Reported ~1/s from IssueSwap when gpu_worker_profile is on.
 uint64_t g_const_writes_total = 0;
 uint64_t g_const_writes_skipped = 0;
+
+// [PERF/DRAW-PROFILE] Per-draw phase timing (cmd-proc thread only -> plain
+// globals). Refreshed once/frame in IssueSwap; reported there when on.
+// Index: 0=prim 1=rt-update 2=pipeline 3=textures 4=bindings 5=total IssueDraw
+//        6=BeginSubmission 7=draw-tail(residency+barriers+draw) 8=fixed-fn+sysconst.
+bool g_draw_prof = false;
+uint64_t g_draw_ns[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+uint64_t g_draw_count = 0;
+inline uint64_t prof_ns_since(std::chrono::steady_clock::time_point t0) {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count());
+}
 }  // namespace
 
 // Generated with `xb buildshaders`.
@@ -2009,6 +2028,28 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
   }
 
+  // [PERF/DRAW-PROFILE] Refresh the per-draw timing flag once per frame; report
+  // a per-second breakdown of where IssueDraw's CPU time goes.
+  g_draw_prof = REXCVAR_GET(gpu_draw_profile);
+  if (g_draw_prof) {
+    static uint64_t s_last[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, s_last_cnt = 0;
+    static auto s_last_report = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_last_report >= std::chrono::seconds(1)) {
+      double d[9];
+      for (int i = 0; i < 9; ++i) d[i] = (g_draw_ns[i] - s_last[i]) / 1e6;
+      uint64_t dc = g_draw_count - s_last_cnt;
+      REXGPU_INFO(
+          "[gpu-draw] draws={} total={:.1f}ms | begin={:.1f} prim={:.1f} rt={:.1f} pso={:.1f} "
+          "tex={:.1f} ff+sc={:.1f} bind={:.1f} tail={:.1f} other={:.1f}ms",
+          dc, d[5], d[6], d[0], d[1], d[2], d[3], d[8], d[4], d[7],
+          d[5] - (d[0] + d[1] + d[2] + d[3] + d[4] + d[6] + d[7] + d[8]));
+      s_last_report = now;
+      for (int i = 0; i < 9; ++i) s_last[i] = g_draw_ns[i];
+      s_last_cnt = g_draw_count;
+    }
+  }
+
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2397,6 +2438,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  // [PERF/DRAW-PROFILE] Time the whole IssueDraw (all return paths) + count it.
+  struct DrawProfTotal {
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    DrawProfTotal() : on(g_draw_prof) {
+      if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~DrawProfTotal() {
+      if (on) {
+        g_draw_ns[5] += prof_ns_since(t0);
+        ++g_draw_count;
+      }
+    }
+  } _dp_total;
+
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
 
@@ -2449,13 +2505,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
-  if (!BeginSubmission(true)) {
+  auto _dp_bs0 = g_draw_prof ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+  bool _dp_bs_ok = BeginSubmission(true);
+  if (g_draw_prof) g_draw_ns[6] += prof_ns_since(_dp_bs0);
+  if (!_dp_bs_ok) {
     return false;
   }
 
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
-  if (!primitive_processor_->Process(primitive_processing_result)) {
+  auto _dp_prim0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+  bool _dp_prim_ok = primitive_processor_->Process(primitive_processing_result);
+  if (g_draw_prof) g_draw_ns[0] += prof_ns_since(_dp_prim0);
+  if (!_dp_prim_ok) {
     return false;
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
@@ -2486,8 +2550,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+  auto _dp_rt0 = g_draw_prof ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+  bool _dp_rt_ok = render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                                normalized_color_mask, *vertex_shader);
+  if (g_draw_prof) g_draw_ns[1] += prof_ns_since(_dp_rt0);
+  if (!_dp_rt_ok) {
     return false;
   }
 
@@ -2514,10 +2582,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
-  if (!pipeline_cache_->ConfigurePipeline(
-          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
-          normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
+  auto _dp_pso0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+  bool _dp_pso_ok = pipeline_cache_->ConfigurePipeline(
+      vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+      normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
+      bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature);
+  if (g_draw_prof) g_draw_ns[2] += prof_ns_since(_dp_pso0);
+  if (!_dp_pso_ok) {
     return false;
   }
   if (REXCVAR_GET(async_shader_compilation) &&
@@ -2529,7 +2601,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  auto _dp_tex0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   texture_cache_->RequestTextures(used_texture_mask);
+  if (g_draw_prof) g_draw_ns[3] += prof_ns_since(_dp_tex0);
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2581,6 +2656,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
 
+  auto _dp_ff0 = g_draw_prof ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
@@ -2590,12 +2667,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
+  if (g_draw_prof) g_draw_ns[8] += prof_ns_since(_dp_ff0);
 
   // Update constant buffers, descriptors and root parameters.
-  if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+  auto _dp_bind0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+  bool _dp_bind_ok = UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used);
+  if (g_draw_prof) g_draw_ns[4] += prof_ns_since(_dp_bind0);
+  if (!_dp_bind_ok) {
     return false;
   }
   // Must not call anything that can change the descriptor heap from now on!
+  auto _dp_tail0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
 
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
@@ -2849,6 +2933,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  if (g_draw_prof) g_draw_ns[7] += prof_ns_since(_dp_tail0);
   return true;
 }
 
