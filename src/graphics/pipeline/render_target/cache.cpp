@@ -37,6 +37,10 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
 REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
                     "Use full range for SNORM16 render targets");
 
+REXCVAR_DEFINE_BOOL(gpu_skip_unchanged_rt_update, true, "GPU",
+                    "Skip RenderTargetCache::Update when no input register, argument, or "
+                    "EDRAM ownership state has changed since the previous draw (Ch.9 perf)");
+
 REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -341,6 +345,7 @@ void RenderTargetCache::InitializeCommon() {
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
+  ++ownership_generation_;  // [PERF/RT-GUARD] invalidate Update fingerprint
   ownership_ranges_.clear();
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
@@ -402,6 +407,51 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+
+  // [PERF/RT-GUARD] Entry guard: skip the whole body when nothing that affects
+  // this function's output or side effects changed since the last successful
+  // Update. Restricted to the host render-target path, and disabled when the
+  // height estimate may run the vertex shader on the CPU (then the result
+  // depends on guest memory, not captured by the register fingerprint).
+  bool fingerprint_eligible =
+      REXCVAR_GET(gpu_skip_unchanged_rt_update) && !interlock_barrier_only &&
+      !REXCVAR_GET(execute_unclipped_draw_vs_on_cpu);
+  RtUpdateFingerprint fingerprint;
+  if (fingerprint_eligible) {
+    fingerprint.is_rasterization_done = uint32_t(is_rasterization_done);
+    fingerprint.normalized_depth_control = normalized_depth_control.value;
+    fingerprint.normalized_color_mask = normalized_color_mask;
+    fingerprint.path = uint32_t(GetPath());
+    fingerprint.ownership_generation = ownership_generation_;
+    fingerprint.regs[0] = regs[XE_GPU_REG_RB_SURFACE_INFO];
+    fingerprint.regs[1] = regs[XE_GPU_REG_RB_DEPTH_INFO];
+    fingerprint.regs[2] = regs[XE_GPU_REG_RB_COLOR_INFO];
+    fingerprint.regs[3] = regs[XE_GPU_REG_RB_COLOR1_INFO];
+    fingerprint.regs[4] = regs[XE_GPU_REG_RB_COLOR2_INFO];
+    fingerprint.regs[5] = regs[XE_GPU_REG_RB_COLOR3_INFO];
+    fingerprint.regs[6] = regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+    fingerprint.regs[7] = regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
+    fingerprint.regs[8] = regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+    fingerprint.regs[9] = regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR];
+    fingerprint.regs[10] = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
+    fingerprint.regs[11] = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
+    fingerprint.regs[12] = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+    fingerprint.regs[13] = regs[XE_GPU_REG_PA_SU_VTX_CNTL];
+    fingerprint.regs[14] = regs[XE_GPU_REG_PA_CL_VPORT_YSCALE];
+    fingerprint.regs[15] = regs[XE_GPU_REG_PA_CL_VPORT_YOFFSET];
+    if (rt_update_fingerprint_valid_ &&
+        std::memcmp(&fingerprint, &rt_update_fingerprint_, sizeof(fingerprint)) == 0) {
+      // Inputs unchanged: a real re-run would re-own already-owned ranges,
+      // yielding empty transfers - reproduce that so the per-RT transfer pass is
+      // a no-op. last_update_used_/accumulated_ + are_accumulated_..._valid_ are
+      // already correct. Per-submission RT (re)binding is the subclass override's
+      // job (keyed off its own flags, reset on BeginSubmission), never skipped.
+      for (size_t i = 0; i < rex::countof(last_update_transfers_); ++i) {
+        last_update_transfers_[i].clear();
+      }
+      return true;
+    }
+  }
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -560,6 +610,11 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     if (!are_accumulated_render_targets_valid_) {
       std::memset(last_update_accumulated_render_targets_, 0,
                   sizeof(last_update_accumulated_render_targets_));
+    }
+    if (fingerprint_eligible) {
+      fingerprint.ownership_generation = ownership_generation_;
+      rt_update_fingerprint_ = fingerprint;
+      rt_update_fingerprint_valid_ = true;
     }
     return true;
   }
@@ -756,6 +811,14 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     std::memcpy(last_update_accumulated_render_targets_, last_update_used_render_targets_,
                 sizeof(last_update_accumulated_render_targets_));
     are_accumulated_render_targets_valid_ = true;
+  }
+
+  if (fingerprint_eligible) {
+    // Re-read the generation: this run's own ChangeOwnership calls bumped it;
+    // record the post-run value so an input-identical next draw compares equal.
+    fingerprint.ownership_generation = ownership_generation_;
+    rt_update_fingerprint_ = fingerprint;
+    rt_update_fingerprint_valid_ = true;
   }
 
   return true;
@@ -1155,6 +1218,7 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
   }
   // Change ownership, but don't transfer the contents - they will be replaced
   // anyway.
+  ++ownership_generation_;  // [PERF/RT-GUARD] invalidate Update fingerprint
   ownership_ranges_.clear();
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, render_target_key,
@@ -1164,6 +1228,7 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
 
 void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   assert_true(GetPath() == Path::kPixelShaderInterlock);
+  ++ownership_generation_;  // [PERF/RT-GUARD] invalidate Update fingerprint
   // Clear ownership - any overlap of data written before the barrier is safe.
   OwnershipRange empty_range(xenos::kEdramTileCount, RenderTargetKey(), RenderTargetKey(),
                              RenderTargetKey());
@@ -1286,6 +1351,9 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   if (length_tiles == 0) {
     return;
   }
+  // [PERF/RT-GUARD] Any ownership_ranges_ change invalidates the Update entry-
+  // guard fingerprint (resolves route their clears through here too).
+  ++ownership_generation_;
   uint32_t dest_pitch_tiles = dest.GetPitchTiles();
   bool dest_is_64bpp = dest.Is64bpp();
   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&

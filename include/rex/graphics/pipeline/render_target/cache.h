@@ -488,7 +488,10 @@ class RenderTargetCache {
   // false).
   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
 
-  void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
+  void ResetAccumulatedRenderTargets() {
+    are_accumulated_render_targets_valid_ = false;
+    rt_update_fingerprint_valid_ = false;
+  }
   RenderTarget* const* last_update_accumulated_render_targets() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_accumulated_render_targets_;
@@ -690,6 +693,27 @@ class RenderTargetCache {
   // last_update_accumulated_render_targets_ - it's not beneficial or even
   // incorrect to keep the previously bound render targets.
   bool are_accumulated_render_targets_valid_ = false;
+
+  // [PERF/RT-GUARD] Entry-guard (gpu_skip_unchanged_rt_update) for Update(): a
+  // fingerprint of everything that determines Update's output and side effects on
+  // the host render-target path. Lets Update skip its body (~285k calls/s in
+  // heavy scenes) when nothing relevant changed since the last successful update.
+  struct RtUpdateFingerprint {
+    uint32_t is_rasterization_done;
+    uint32_t normalized_depth_control;
+    uint32_t normalized_color_mask;
+    uint32_t path;
+    // Bumped on every ownership_ranges_ mutation (incl. resolves) so a
+    // between-draw resolve forces a full re-run.
+    uint64_t ownership_generation;
+    // RB_SURFACE_INFO, RB_DEPTH_INFO, RB_COLOR[0-3]_INFO, then the registers read
+    // by DrawExtentEstimator::EstimateMaxY (scissor / viewport state).
+    uint32_t regs[16];
+  };
+  RtUpdateFingerprint rt_update_fingerprint_ = {};
+  bool rt_update_fingerprint_valid_ = false;
+  // Monotonic counter incremented whenever ownership_ranges_ is mutated.
+  uint64_t ownership_generation_ = 0;
   // After an update (for simplicity, even an unsuccessful update invalidates
   // this), contains needed ownership transfer sources for each of the current
   // render targets. They are reordered so for one source, all transfers are
