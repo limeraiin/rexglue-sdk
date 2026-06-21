@@ -93,6 +93,7 @@ struct DialogState {
   HWND combo_display = nullptr;
   HWND edit_data = nullptr;
   HFONT font = nullptr;
+  HFONT font_small = nullptr;  // smaller font for the bottom-left credits line
 };
 
 std::wstring Widen(const std::string& s) {
@@ -198,6 +199,13 @@ void BuildControls(HWND hwnd, DialogState* st) {
 
   MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 298, 84, 30, IDOK, font);
   MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 298, 84, 30, IDCANCEL, font);
+
+  // Bottom-left credits line, drawn in a smaller font. Spans the full client
+  // width so it can wrap to a second line if the system font is large.
+  MakeControl(hwnd, L"STATIC",
+              L"Special thanks to ctrlalt3l1t3, GUARD, Vexil Megga and Hailnate13x for their "
+              L"Patreon support.",
+              SS_LEFT, 16, 342, 416, 36, -1, st->font_small ? st->font_small : font);
 
   // --- Populate from current cvar values ---
   std::string gpu = rex::cvar::GetFlagByName("gpu");
@@ -376,14 +384,21 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
   ncm.cbSize = sizeof(ncm);
   if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
     state.font = CreateFontIndirectW(&ncm.lfMessageFont);
+    // A slightly smaller flavour of the message font for the credits line.
+    // NB: can't name this `small` — <rpcndr.h> does `#define small char`.
+    LOGFONTW small_lf = ncm.lfMessageFont;
+    LONG h = small_lf.lfHeight < 0 ? -small_lf.lfHeight : small_lf.lfHeight;
+    h = (h * 5) / 6;  // ~83% of the message-font size
+    small_lf.lfHeight = small_lf.lfHeight < 0 ? -h : h;
+    state.font_small = CreateFontIndirectW(&small_lf);
   }
 
   g_config_path = &config_path;
 
-  // Client area 448 x 348; size the window to fit it (the extra 34px row is the
-  // EXPERIMENTAL 60fps checkbox added below vsync).
+  // Client area 448 x 384; size the window to fit it (the extra bottom strip
+  // below the buttons holds the smaller-font credits line).
   const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-  RECT rc{0, 0, 448, 348};
+  RECT rc{0, 0, 448, 384};
   AdjustWindowRectEx(&rc, style, FALSE, 0);
   int win_w = rc.right - rc.left;
   int win_h = rc.bottom - rc.top;
@@ -396,6 +411,7 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
                               nullptr, hinstance, &state);
   if (!hwnd) {
     if (state.font) DeleteObject(state.font);
+    if (state.font_small) DeleteObject(state.font_small);
     g_config_path = nullptr;
     return true;  // Don't block launch if the dialog can't be created.
   }
@@ -418,6 +434,7 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
   }
 
   if (state.font) DeleteObject(state.font);
+  if (state.font_small) DeleteObject(state.font_small);
   g_config_path = nullptr;
   return state.play;
 }
