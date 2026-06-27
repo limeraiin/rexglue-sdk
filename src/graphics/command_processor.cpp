@@ -51,6 +51,13 @@ REXCVAR_DEFINE_BOOL(gpu_worker_profile, false, "GPU",
                     "thread's wall time (starvation-spin vs real ExecutePrimaryBuffer "
                     "work). For perf triage on Release builds (no Tracy). Off by default.");
 
+REXCVAR_DEFINE_BOOL(gpu_split_profile, false, "GPU",
+                    "Diagnostic [GPU-SPLIT]: clean (no per-packet timing) ~1s split of "
+                    "ExecutePrimaryBuffer time into draw work (IssueDraw) vs the type-0 "
+                    "register/constant-write firehose vs other. Decides whether "
+                    "parallelizing draws can help heavy-forest fps. Launch-time only "
+                    "(read once at worker start, like gpu_worker_profile). Off by default.");
+
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"
@@ -288,6 +295,12 @@ thread_local uint64_t g_exec_type_ns[4] = {0, 0, 0, 0};
 thread_local uint64_t g_exec_type_cnt[4] = {0, 0, 0, 0};
 thread_local uint64_t g_issuedraw_ns = 0;
 thread_local uint64_t g_draw_cnt = 0;
+// [GPU-SPLIT] Clean draw-vs-firehose split (gpu_split_profile). Reuses the clean
+// g_issuedraw_ns/g_draw_cnt brackets (330k/s, ~1.6% self-inflation) and adds a
+// whole-call ExecutePacketType0 timer (the register/constant-write firehose).
+// Does NOT enable the per-packet g_exec_prof timing, so it stays ~clean.
+bool g_split_prof = false;
+thread_local uint64_t g_type0_split_ns = 0;
 }  // namespace
 
 void CommandProcessor::WorkerThreadMain() {
@@ -304,6 +317,10 @@ void CommandProcessor::WorkerThreadMain() {
   // Only this thread touches these counters, so plain locals — no atomics.
   const bool kProfile = REXCVAR_GET(gpu_worker_profile);
   g_exec_prof = kProfile;
+  // [GPU-SPLIT] independent clean split mode (no per-packet timing).
+  const bool kSplit = REXCVAR_GET(gpu_split_profile);
+  g_split_prof = kSplit;
+  const bool kTimeExec = kProfile || kSplit;  // bracket ExecutePrimaryBuffer when either is on
   using prof_clock = std::chrono::steady_clock;
   uint64_t prof_spin_ns = 0, prof_exec_ns = 0;
   uint64_t prof_spin_loops = 0, prof_event_waits = 0, prof_exec_calls = 0,
@@ -312,6 +329,7 @@ void CommandProcessor::WorkerThreadMain() {
            last_event_waits = 0, last_exec_calls = 0, last_starves = 0;
   uint64_t last_type_ns[4] = {0, 0, 0, 0}, last_type_cnt[4] = {0, 0, 0, 0};
   uint64_t last_issuedraw_ns = 0, last_draw_cnt = 0;
+  uint64_t last_type0_split_ns = 0;
   auto prof_last_report = prof_clock::now();
 
   while (worker_running_) {
@@ -367,9 +385,9 @@ void CommandProcessor::WorkerThreadMain() {
 
     // Execute. Note that we handle wraparound transparently.
     {
-      auto exec_t0 = kProfile ? prof_clock::now() : prof_clock::time_point{};
+      auto exec_t0 = kTimeExec ? prof_clock::now() : prof_clock::time_point{};
       read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
-      if (kProfile) {
+      if (kTimeExec) {
         prof_exec_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                             prof_clock::now() - exec_t0).count();
         prof_exec_calls++;
@@ -383,8 +401,8 @@ void CommandProcessor::WorkerThreadMain() {
                                        read_ptr_index_);
     }
 
-    // [GPU-WORKER-PROFILE] ~1s wall-time split report.
-    if (kProfile) {
+    // [GPU-WORKER-PROFILE] / [GPU-SPLIT] ~1s wall-time report (either profile on).
+    if (kProfile || kSplit) {
       auto now = prof_clock::now();
       uint64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              now - prof_last_report).count();
@@ -392,22 +410,41 @@ void CommandProcessor::WorkerThreadMain() {
         double wall_ms = wall_ns / 1e6;
         double spin_ms = (prof_spin_ns - last_spin_ns) / 1e6;
         double exec_ms = (prof_exec_ns - last_exec_ns) / 1e6;
-        REXGPU_INFO(
-            "[gpu-instr] wall={:.0f}ms spin={:.1f}ms({:.0f}%) exec={:.1f}ms({:.0f}%) "
-            "exec_calls={} starves={} spin_loops={} event_waits={}",
-            wall_ms, spin_ms, 100.0 * spin_ms / wall_ms, exec_ms,
-            100.0 * exec_ms / wall_ms, prof_exec_calls - last_exec_calls,
-            prof_starves - last_starves, prof_spin_loops - last_spin_loops,
-            prof_event_waits - last_event_waits);
-        REXGPU_INFO(
-            "[gpu-exec] reg(t0)={:.1f}ms/{} t3={:.1f}ms/{} of-which-issuedraw={:.1f}ms/{} "
-            "t1={:.1f}ms t2={:.1f}ms",
-            (g_exec_type_ns[0] - last_type_ns[0]) / 1e6, g_exec_type_cnt[0] - last_type_cnt[0],
-            (g_exec_type_ns[3] - last_type_ns[3]) / 1e6, g_exec_type_cnt[3] - last_type_cnt[3],
-            (g_issuedraw_ns - last_issuedraw_ns) / 1e6, g_draw_cnt - last_draw_cnt,
-            (g_exec_type_ns[1] - last_type_ns[1]) / 1e6,
-            (g_exec_type_ns[2] - last_type_ns[2]) / 1e6);
+        if (kProfile) {
+          REXGPU_INFO(
+              "[gpu-instr] wall={:.0f}ms spin={:.1f}ms({:.0f}%) exec={:.1f}ms({:.0f}%) "
+              "exec_calls={} starves={} spin_loops={} event_waits={}",
+              wall_ms, spin_ms, 100.0 * spin_ms / wall_ms, exec_ms,
+              100.0 * exec_ms / wall_ms, prof_exec_calls - last_exec_calls,
+              prof_starves - last_starves, prof_spin_loops - last_spin_loops,
+              prof_event_waits - last_event_waits);
+          REXGPU_INFO(
+              "[gpu-exec] reg(t0)={:.1f}ms/{} t3={:.1f}ms/{} of-which-issuedraw={:.1f}ms/{} "
+              "t1={:.1f}ms t2={:.1f}ms",
+              (g_exec_type_ns[0] - last_type_ns[0]) / 1e6, g_exec_type_cnt[0] - last_type_cnt[0],
+              (g_exec_type_ns[3] - last_type_ns[3]) / 1e6, g_exec_type_cnt[3] - last_type_cnt[3],
+              (g_issuedraw_ns - last_issuedraw_ns) / 1e6, g_draw_cnt - last_draw_cnt,
+              (g_exec_type_ns[1] - last_type_ns[1]) / 1e6,
+              (g_exec_type_ns[2] - last_type_ns[2]) / 1e6);
+        }
+        if (kSplit && exec_ms > 0.0) {
+          // Clean split of exec time: draw work (IssueDraw) vs type-0 register/
+          // constant-write firehose vs other (non-draw type3: constant-loads,
+          // indirect-buffer, waits, parse). draw+exec are ~clean; type0 carries
+          // ~3-8% self-inflation from its own 1.6M/s brackets, so other% is the
+          // floor for non-draw cost. Decides: parallelize draws vs cut firehose.
+          double draw_ms = (g_issuedraw_ns - last_issuedraw_ns) / 1e6;
+          double type0_ms = (g_type0_split_ns - last_type0_split_ns) / 1e6;
+          double other_ms = exec_ms - draw_ms - type0_ms;
+          REXGPU_INFO(
+              "[gpu-split] exec={:.1f}ms  draw={:.1f}ms({:.0f}%)  type0/regwrite={:.1f}ms({:.0f}%)  "
+              "other={:.1f}ms({:.0f}%)  draws={} (type0 ~self-inflated; draw+exec clean)",
+              exec_ms, draw_ms, 100.0 * draw_ms / exec_ms, type0_ms,
+              100.0 * type0_ms / exec_ms, other_ms, 100.0 * other_ms / exec_ms,
+              g_draw_cnt - last_draw_cnt);
+        }
         prof_last_report = now;
+        last_type0_split_ns = g_type0_split_ns;
         last_spin_ns = prof_spin_ns;
         last_exec_ns = prof_exec_ns;
         last_spin_loops = prof_spin_loops;
@@ -928,6 +965,9 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   // Type-0 packet.
   // Write count registers in sequence to the registers starting at
   // (base_index << 2).
+  // [GPU-SPLIT] whole-call timer = the register/constant-write firehose bucket.
+  const auto t0_split = g_split_prof ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
 
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   if (reader->read_count() < count * sizeof(uint32_t)) {
@@ -947,6 +987,10 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   }
 
   trace_writer_.WritePacketEnd();
+  if (g_split_prof) {
+    g_type0_split_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0_split).count();
+  }
   return true;
 }
 
@@ -1658,12 +1702,14 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      // [GPU-EXEC-PROFILE] time the host backend draw recording specifically.
-      const auto draw_t0 = g_exec_prof ? std::chrono::steady_clock::now()
-                                       : std::chrono::steady_clock::time_point{};
+      // [GPU-EXEC-PROFILE]/[GPU-SPLIT] time the host backend draw recording
+      // specifically (clean: ~330k brackets/s). Fires for either profile.
+      const bool kTimeDraw = g_exec_prof || g_split_prof;
+      const auto draw_t0 = kTimeDraw ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
-      if (g_exec_prof) {
+      if (kTimeDraw) {
         g_issuedraw_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now() - draw_t0).count();
         g_draw_cnt++;

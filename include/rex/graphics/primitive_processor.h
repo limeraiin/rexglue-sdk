@@ -198,10 +198,19 @@ class PrimitiveProcessor {
 
   PrimitiveProcessor(const RegisterFile& register_file, memory::Memory& memory,
                      TraceWriter& trace_writer, SharedMemory& shared_memory)
-      : register_file_(register_file),
+      : register_file_(&register_file),
         memory_(memory),
         trace_writer_(trace_writer),
         shared_memory_(shared_memory) {}
+
+ public:
+  // [GPU-PRECORD] Phase 1b-1: repoint the register file the draw path reads (a
+  // worker points this at its per-segment local copy during segment replay).
+  // Public: the owning D3D12CommandProcessor (not a subclass) repoints it for
+  // off-thread segment replay (Phase 1b-1b).
+  void SetRegisterFile(const RegisterFile* register_file) { register_file_ = register_file; }
+
+ protected:
 
   // Call from the backend-specific initialization function.
   // - full_32bit_vertex_indices_supported:
@@ -627,7 +636,7 @@ class PrimitiveProcessor {
     }
   }
 
-  const RegisterFile& register_file_;
+  const RegisterFile* register_file_;
   memory::Memory& memory_;
   TraceWriter& trace_writer_;
   SharedMemory& shared_memory_;

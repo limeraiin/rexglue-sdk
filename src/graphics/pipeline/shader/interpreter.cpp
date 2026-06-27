@@ -27,7 +27,7 @@ void ShaderInterpreter::Execute() {
   // For more consistency between invocations in case of a malformed shader.
   state_.Reset();
 
-  const uint32_t* bool_constants = &register_file_[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
+  const uint32_t* bool_constants = &(*register_file_)[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
 
   bool exec_ended = false;
   uint32_t cf_index_next = 1;
@@ -125,7 +125,7 @@ void ShaderInterpreter::Execute() {
           cf_index_next = cf_loop_start.address();
           continue;
         }
-        auto loop_constant = register_file_.Get<xenos::LoopConstant>(
+        auto loop_constant = register_file_->Get<xenos::LoopConstant>(
             XE_GPU_REG_SHADER_CONSTANT_LOOP_00 + cf_loop_start.loop_id());
         state_.loop_constants[state_.loop_stack_depth] = loop_constant;
         uint32_t& loop_iterator_ref = state_.loop_iterators[state_.loop_stack_depth];
@@ -154,7 +154,7 @@ void ShaderInterpreter::Execute() {
         xenos::LoopConstant loop_constant = state_.loop_constants[state_.loop_stack_depth - 1];
         assert_zero(
             std::memcmp(&loop_constant,
-                        &register_file_[XE_GPU_REG_SHADER_CONSTANT_LOOP_00 + cf_loop_end.loop_id()],
+                        &(*register_file_)[XE_GPU_REG_SHADER_CONSTANT_LOOP_00 + cf_loop_end.loop_id()],
                         sizeof(loop_constant)));
         uint32_t loop_iterator = ++state_.loop_iterators[state_.loop_stack_depth - 1];
         if (loop_iterator < loop_constant.count &&
@@ -243,7 +243,7 @@ const std::array<float, 4> ShaderInterpreter::GetFloatConstant(uint32_t address,
   if (index < 0) {
     return std::array<float, 4>();
   }
-  auto base_and_size_minus_1 = register_file_.Get<reg::SQ_VS_CONST>(
+  auto base_and_size_minus_1 = register_file_->Get<reg::SQ_VS_CONST>(
       shader_type_ == xenos::ShaderType::kVertex ? XE_GPU_REG_SQ_VS_CONST : XE_GPU_REG_SQ_PS_CONST);
   if (uint32_t(index) > base_and_size_minus_1.size) {
     return std::array<float, 4>();
@@ -253,7 +253,7 @@ const std::array<float, 4> ShaderInterpreter::GetFloatConstant(uint32_t address,
     return std::array<float, 4>();
   }
   std::array<float, 4> value;
-  std::memcpy(value.data(), &register_file_[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * index],
+  std::memcpy(value.data(), &(*register_file_)[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * index],
               sizeof(float) * 4);
   return value;
 }
@@ -926,7 +926,7 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
   }
 
   xenos::xe_gpu_vertex_fetch_t fetch_constant =
-      register_file_.GetVertexFetch(state_.vfetch_full_last.fetch_constant_index());
+      register_file_->GetVertexFetch(state_.vfetch_full_last.fetch_constant_index());
 
   if (!instr.is_mini_fetch()) {
     // Get the part of the address that depends on vfetch_full data.

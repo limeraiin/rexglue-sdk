@@ -14,16 +14,20 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/register_file.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
@@ -71,6 +75,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   DeferredCommandList& GetDeferredCommandList() {
     assert_true(submission_open_);
     return deferred_command_list_;
+  }
+
+  // [GPU-PRECORD] Phase 1b-1: the register file the DRAW PATH should read. Normally
+  // the shared parse-thread register file; a worker replaying a captured segment
+  // points this at its own per-segment local register file so the draw path (and,
+  // once they are decoupled, the subsystems) read that segment's state instead of
+  // the parse thread's run-ahead state. nullptr (default) ⇒ the shared file, so
+  // this is a true no-op until a worker sets it.
+  const rex::graphics::RegisterFile& GetActiveDrawRegisterFile() const {
+    return active_draw_register_file_ ? *active_draw_register_file_ : *register_file_;
   }
 
   uint64_t GetCurrentSubmission() const { return submission_current_; }
@@ -328,6 +342,43 @@ class D3D12CommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
+  // [GPU-PRECORD] Phase 1a: force the next draw to re-emit ALL command-list state
+  // (PSO, root sig, cbuffer bindings, descriptor heaps, topology, fixed-function)
+  // by resetting the same cached/dirty state BeginSubmission resets for a fresh
+  // list. Models a parallel-segment boundary where a new command list has nothing
+  // bound. Body is copied verbatim from BeginSubmission's reset block.
+  void ForceFullDrawStateReemit();
+
+  // [GPU-PRECORD] Phase 1b-0: the real IssueDraw body. IssueDraw() is a thin
+  // capture wrapper that, when gpu_precord_capture is on, defers a draw into the
+  // current segment's event log instead of recording it; PrecordFlush() replays
+  // the log (rewinding the register file to the segment snapshot) by calling this.
+  bool IssueDrawImpl(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                     IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
+  // Replay the pending captured segment into the current deferred command list,
+  // in original write/draw order, then clear it. No-op if no segment is open or
+  // already replaying (reentrancy guard). Dispatches to the shared-rewind (1b-0),
+  // local-register-file (1b-1b), or worker-thread (1b-1b Model C) path per cvar.
+  void PrecordFlush();
+  // [GPU-PRECORD] Phase 1b-1b: the event/draw replay loop, shared by every replay
+  // mode. Replays precord_events_ in order via WriteRegister/FromMem + IssueDrawImpl.
+  // Assumes the register file is already rewound/built and the draw-state cache reset.
+  void PrecordReplayEvents();
+  // [GPU-PRECORD] Phase 1b-1b: replay the captured segment against a PRIVATE local
+  // register file (precord_local_regfile_) with every draw-path holder repointed to
+  // it (SetRegisterFile), then restored. Exercises the 1b-1a decoupling: the draws
+  // read the segment's own state from a separate file, not the shared parse-thread
+  // file. Runs inline (gpu_precord_localrf) or on the worker (gpu_precord_thread).
+  void PrecordReplayLocal();
+  // [GPU-PRECORD] Phase 1b-1b worker (Model C): lazily start the replay worker;
+  // post the open segment and BLOCK until it has replayed (no parse/worker overlap
+  // yet — correctness/plumbing first); join at shutdown.
+  void PrecordWorkerEnsureStarted();
+  void PrecordWorkerMain();
+  void PrecordWorkerShutdown();
+  // Drop the pending segment's buffers without replaying (used after a flush, and
+  // defensively at submission boundaries).
+  void PrecordResetSegment();
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
   // as when there are unfinished graphics pipeline creation requests that would
@@ -466,6 +517,73 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  // [GPU-PRECORD] Phase 1a per-submission draw counter; every N draws a forced
+  // full-state re-emit models a segment boundary (correctness probe).
+  uint64_t parallel_record_counter_ = 0;
+  // [GPU-PRECORD] Phase 1a-ii: completed segment command streams for this
+  // submission, replayed in order before the final (current) deferred list at
+  // EndSubmission. Empty when gpu_parallel_record is off (zero overhead).
+  std::vector<std::vector<uintmax_t>> precord_segments_;
+
+  // [GPU-PRECORD] Phase 1b-0: deferred draw capture/replay (single-thread
+  // foundation for off-thread segment recording). When gpu_precord_capture is on,
+  // each draw is deferred into a per-segment event log instead of recorded inline;
+  // at a flush boundary the log is replayed against the register file rewound to a
+  // snapshot taken at the segment's first draw -> byte-identical deferred stream.
+  struct PrecordDraw {
+    xenos::PrimitiveType primitive_type;
+    uint32_t index_count;
+    bool has_index_buffer_info;
+    IndexBufferInfo index_buffer_info;  // deep copy (the source is transient)
+    bool major_mode_explicit;
+    // [GPU-PRECORD] The active vertex/pixel shaders are CP-member state set by PM4
+    // shader-load packets during parse (NOT in the register file), so the parse
+    // thread runs AHEAD of the deferred draws and active_*_shader_ holds the LATEST
+    // loaded shader by replay time. They must be captured per draw and restored
+    // before replay, or every replayed draw uses the wrong shader -> wrong
+    // vertex-fetch bitmap -> spurious "invalid fetch" aborts (the black-screen bug).
+    Shader* active_vs;
+    Shader* active_ps;
+  };
+  struct PrecordEvent {
+    enum class Kind : uint8_t { kWriteSingle, kWriteFromMem, kDraw } kind;
+    // kWriteSingle: a=reg index, b=value.
+    // kWriteFromMem: a=start index, b=num registers, c=offset into frommem data.
+    // kDraw: a=index into precord_draws_.
+    uint32_t a;
+    uint32_t b;
+    uint32_t c;
+  };
+  // The full register-file snapshot taken at the segment's first draw.
+  std::vector<uint32_t> precord_snapshot_;
+  std::vector<PrecordEvent> precord_events_;
+  std::vector<PrecordDraw> precord_draws_;
+  std::vector<uint32_t> precord_frommem_data_;  // raw guest dwords for kWriteFromMem
+  bool precord_segment_open_ = false;           // gates the write-log hot path
+  bool precord_replaying_ = false;              // true while PrecordFlush replays
+  uint32_t precord_draws_in_segment_ = 0;
+  // [GPU-PRECORD] Phase 1b-1: see GetActiveDrawRegisterFile(). nullptr ⇒ the shared
+  // register_file_ (default; no behavior change). A worker points this at its
+  // per-segment local register file while replaying that segment's draws.
+  const RegisterFile* active_draw_register_file_ = nullptr;
+
+  // [GPU-PRECORD] Phase 1b-1b: private register file the local-regfile replay path
+  // builds from the segment snapshot (all draw-path holders repointed to it during
+  // replay, then restored to the shared file). Lazily allocated (~80 KB). Only the
+  // active replayer (parse thread for localrf, worker for thread mode, never both at
+  // once) touches it, so no synchronization is needed on the buffer itself.
+  std::unique_ptr<RegisterFile> precord_local_regfile_;
+  // [GPU-PRECORD] Phase 1b-1b worker (Model C). The parse thread posts the captured
+  // segment and blocks until the worker has replayed it (no overlap yet), so while
+  // the worker runs PrecordReplayLocal the parse thread is idle ⇒ the precord_*
+  // buffers and the shared D3D12 subsystems are the worker's exclusively.
+  std::thread precord_worker_thread_;
+  std::mutex precord_worker_mutex_;
+  std::condition_variable precord_worker_cv_;
+  bool precord_worker_started_ = false;
+  bool precord_worker_shutdown_ = false;
+  bool precord_worker_job_pending_ = false;
 
   bool debug_markers_enabled_ = false;
 
@@ -720,6 +838,52 @@ class D3D12CommandProcessor : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_fetch_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;
+
+  // [GPU-INST] Consecutive-draw instancing coalescer. A batch is "open" after a
+  // draw is deferred (its pipeline/bindings/index buffer are already recorded in
+  // the command list, only the DrawIndexedInstanced is held back). Subsequent
+  // draws that are identical except for their vertex float constants append their
+  // per-instance constant block; on the first mismatch (or swap/copy/submission
+  // end) the batch is flushed as one instanced draw. Cmd-proc thread only.
+  struct InstancedBatch {
+    bool active = false;
+    bool indexed = false;
+    // Identity used to match subsequent draws (everything not covered by the
+    // "only vertex float constants changed" register-dirty signal).
+    Shader* vs = nullptr;
+    Shader* ps = nullptr;
+    xenos::PrimitiveType prim = xenos::PrimitiveType(0);
+    uint32_t index_count = 0;
+    bool has_ib = false;
+    uint32_t ib_base = 0;
+    uint32_t ib_count = 0;
+    xenos::IndexFormat ib_format = xenos::IndexFormat(0);
+    xenos::Endian ib_endian = xenos::Endian(0);
+    // Deferred draw parameters.
+    uint32_t host_draw_vertex_count = 0;
+    // Per-instance vertex float constants: float_count vec4s per instance, packed
+    // in the same order as the float-constants cbuffer.
+    uint32_t float_count = 0;
+    uint64_t float_bitmap[4] = {0, 0, 0, 0};
+    uint32_t count = 0;
+    uint32_t max_instances = 0;
+    std::vector<float> data;
+  };
+  InstancedBatch instanced_batch_;
+
+  // [GPU-INST] Append the current draw's vertex float constants as one instance.
+  void InstancedBatchAppend(const RegisterFile& regs);
+  // [GPU-INST] Begin a deferred instanced batch from the current draw.
+  void StartInstancedBatch(const RegisterFile& regs, Shader* vertex_shader, Shader* pixel_shader,
+                           xenos::PrimitiveType primitive_type, uint32_t index_count,
+                           const IndexBufferInfo* index_buffer_info,
+                           uint32_t host_draw_vertex_count, bool indexed);
+  // [GPU-INST] Whether the current draw can extend the open batch.
+  bool InstancedBatchCanMerge(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                              const IndexBufferInfo* index_buffer_info, Shader* vertex_shader,
+                              Shader* pixel_shader) const;
+  // [GPU-INST] Emit the open batch (if any) as a single instanced draw.
+  void FlushInstancedBatch();
 
   // Whether the latest shared memory and EDRAM buffer binding contains the
   // shared memory UAV rather than the SRV.

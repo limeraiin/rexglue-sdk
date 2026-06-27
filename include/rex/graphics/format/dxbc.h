@@ -451,6 +451,7 @@ enum class Name : uint32_t {
   kClipDistance = 2,
   kCullDistance = 3,
   kVertexID = 6,
+  kInstanceID = 8,
   kIsFrontFace = 9,
   kSampleIndex = 10,
   kFinalQuadEdgeTessFactor = 11,

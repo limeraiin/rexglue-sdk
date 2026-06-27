@@ -66,6 +66,10 @@ class PipelineCache {
   void EndSubmission();
   bool IsCreatingPipelines();
 
+  // [GPU-PRECORD] Phase 1b-1: repoint the register file the draw path reads (a
+  // worker points this at its per-segment local copy during segment replay).
+  void SetRegisterFile(const RegisterFile* register_file) { register_file_ = register_file; }
+
   D3D12Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count);
   // Analyze shader microcode on the translator thread.
@@ -73,9 +77,11 @@ class PipelineCache {
 
   // Retrieves the shader modification for the current state. The shader must
   // have microcode analyzed.
+  // [GPU-INST] When instanced is true, returns the GPU-instancing variant of
+  // the vertex shader (reads per-instance float constants via SV_InstanceID).
   DxbcShaderTranslator::Modification GetCurrentVertexShaderModification(
       const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
-      uint32_t interpolator_mask) const;
+      uint32_t interpolator_mask, bool instanced = false) const;
   DxbcShaderTranslator::Modification GetCurrentPixelShaderModification(
       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
       reg::RB_DEPTHCONTROL normalized_depth_control) const;
@@ -295,7 +301,7 @@ class PipelineCache {
                                                   PipelineRuntimeDescription& runtime_description);
 
   D3D12CommandProcessor& command_processor_;
-  const RegisterFile& register_file_;
+  const RegisterFile* register_file_;
   const D3D12RenderTargetCache& render_target_cache_;
   bool bindless_resources_used_;
 

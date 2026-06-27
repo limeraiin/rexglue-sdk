@@ -28,7 +28,11 @@ namespace rex::graphics {
 class ShaderInterpreter {
  public:
   ShaderInterpreter(const RegisterFile& register_file, const memory::Memory& memory)
-      : register_file_(register_file), memory_(memory) {}
+      : register_file_(&register_file), memory_(memory) {}
+
+  // [GPU-PRECORD] Phase 1b-1: repoint the register file the interpreter reads (a
+  // worker points this at its per-segment local copy during segment replay).
+  void SetRegisterFile(const RegisterFile* register_file) { register_file_ = register_file; }
 
   class ExportSink {
    public:
@@ -121,7 +125,7 @@ class ShaderInterpreter {
   void StoreFetchResult(uint32_t dest, bool is_dest_relative, uint32_t swizzle, const float* value);
   void ExecuteVertexFetchInstruction(ucode::VertexFetchInstruction instr);
 
-  const RegisterFile& register_file_;
+  const RegisterFile* register_file_;
   const memory::Memory& memory_;
 
   TraceWriter* trace_writer_ = nullptr;

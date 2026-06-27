@@ -35,6 +35,20 @@ class DeferredCommandList {
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
 
+  // [GPU-PRECORD] Phase 1a-ii: move the recorded command stream out (leaving this
+  // list empty, ready to record the next segment) for later ordered replay.
+  std::vector<uintmax_t> TakeStream() {
+    std::vector<uintmax_t> out = std::move(command_stream_);
+    command_stream_ = std::vector<uintmax_t>();
+    return out;
+  }
+  // Replay a previously-taken segment stream into the real command list, in order,
+  // without disturbing the stream currently being recorded.
+  void ExecuteStream(const std::vector<uintmax_t>& stream, ID3D12GraphicsCommandList* command_list,
+                     ID3D12GraphicsCommandList1* command_list_1) {
+    ExecuteRange(stream.data(), stream.size(), command_list, command_list_1);
+  }
+
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
                                                   UINT8 stencil, UINT num_rects) {
@@ -639,6 +653,12 @@ class DeferredCommandList {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+
+  // [GPU-PRECORD] Core replay over an arbitrary stream range; Execute/ExecuteStream
+  // both delegate here so segment replay and full-list replay share one code path.
+  void ExecuteRange(const uintmax_t* stream_data, size_t stream_size,
+                    ID3D12GraphicsCommandList* command_list,
+                    ID3D12GraphicsCommandList1* command_list_1);
 
   const D3D12CommandProcessor& command_processor_;
 

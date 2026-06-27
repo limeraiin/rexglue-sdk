@@ -184,7 +184,7 @@ class RenderTargetCache {
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
                     TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
                     uint32_t draw_resolution_scale_y)
-      : register_file_(register_file),
+      : register_file_(&register_file),
         draw_extent_estimator_(register_file, memory, trace_writer),
         draw_resolution_scale_x_(draw_resolution_scale_x),
         draw_resolution_scale_y_(draw_resolution_scale_y) {
@@ -192,7 +192,20 @@ class RenderTargetCache {
     assert_not_zero(draw_resolution_scale_y);
   }
 
-  const RegisterFile& register_file() const { return register_file_; }
+  const RegisterFile& register_file() const { return *register_file_; }
+
+ public:
+  // [GPU-PRECORD] Phase 1b-1: repoint the register file the draw path reads,
+  // cascading to the draw-extent estimator. A worker points this at its
+  // per-segment local copy during segment replay. Public: the owning
+  // D3D12CommandProcessor (not a subclass) repoints it for off-thread segment
+  // replay (Phase 1b-1b).
+  void SetRegisterFile(const RegisterFile* register_file) {
+    register_file_ = register_file;
+    draw_extent_estimator_.SetRegisterFile(register_file);
+  }
+
+ protected:
 
   virtual bool IsGammaFormatHostStorageSeparate() const = 0;
 
@@ -563,7 +576,7 @@ class RenderTargetCache {
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
  private:
-  const RegisterFile& register_file_;
+  const RegisterFile* register_file_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
 

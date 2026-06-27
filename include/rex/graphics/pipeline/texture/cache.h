@@ -473,7 +473,15 @@ class TextureCache {
   explicit TextureCache(const RegisterFile& register_file, SharedMemory& shared_memory,
                         uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y);
 
-  const RegisterFile& register_file() const { return register_file_; }
+  const RegisterFile& register_file() const { return *register_file_; }
+ public:
+  // [GPU-PRECORD] Phase 1b-1: repoint the register file the draw path reads (a
+  // worker points this at its per-segment local copy during segment replay).
+  // Public: the owning D3D12CommandProcessor (not a subclass) repoints it for
+  // off-thread segment replay (Phase 1b-1b).
+  void SetRegisterFile(const RegisterFile* register_file) { register_file_ = register_file; }
+
+ protected:
   SharedMemory& shared_memory() const { return shared_memory_; }
 
   // May be called for purposes like clearing the cache, as well as in the
@@ -578,7 +586,7 @@ class TextureCache {
                                         uint32_t address_first, uint32_t address_last,
                                         bool invalidated_by_gpu);
 
-  const RegisterFile& register_file_;
+  const RegisterFile* register_file_;
   SharedMemory& shared_memory_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;

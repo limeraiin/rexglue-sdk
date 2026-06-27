@@ -14,7 +14,9 @@
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -60,6 +62,80 @@ REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU/D3D12",
                     "timed per-draw (cheap, ~a few %). Off by default. Ch.9 cmd-proc triage.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_parallel_record, false, "GPU/D3D12",
+                    "[GPU-PRECORD] Phase 1a correctness probe (Ch.9 cmd-proc parallel-record "
+                    "track): every N draws, force a full command-list state re-emit into the "
+                    "single deferred list, modelling a parallel-segment boundary. Output MUST "
+                    "stay pixel-identical (worst case: redundant commands, slightly slower). "
+                    "Off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_precord_capture, false, "GPU/D3D12",
+                    "[GPU-PRECORD] Phase 1b-0 capture/replay correctness probe (Ch.9 cmd-proc "
+                    "parallel-record track): defer each draw's recording into a per-segment "
+                    "{register snapshot + ordered write/draw log}, then replay the log on the "
+                    "same thread (rewinding the register file to the snapshot) into the deferred "
+                    "command list at each flush boundary. Output MUST stay pixel-identical. "
+                    "Foundation for moving segment recording off-thread. Use alone (do not "
+                    "combine with gpu_parallel_record/gpu_instance). Off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_precord_localrf, false, "GPU/D3D12",
+                    "[GPU-PRECORD] Phase 1b-1b correctness probe (requires gpu_precord_capture): "
+                    "replay each captured segment against a PRIVATE local register file (all "
+                    "draw-path holders repointed to it) instead of rewinding the shared one. "
+                    "Exercises the 1b-1a register-file decoupling on the same thread. Output MUST "
+                    "stay pixel-identical to gpu_precord_capture. Off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_precord_thread, false, "GPU/D3D12",
+                    "[GPU-PRECORD] Phase 1b-1b worker (requires gpu_precord_capture; implies "
+                    "gpu_precord_localrf): run each segment's local-register-file replay on a "
+                    "dedicated worker thread while the parse thread blocks until it finishes "
+                    "(Model C: correctness/plumbing first, no parse/worker overlap yet). Output "
+                    "MUST stay pixel-identical. Off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [GPU-DRAW-DUMP] Native-renderer R&D (Ch.9 path B): dump the per-draw "draw
+// stream" -- VB/IB guest addresses + sizes, VS/PS ucode hashes, primitive type,
+// vertex/index counts -- for the first ~12k draws after enabling, then auto-stops
+// so log volume stays bounded (~one heavy frame). This is the data model a native
+// renderer would replay: IssueDraw is the ONE seam that sees every world draw
+// (the guest scene-graph traversal only covers the HUD). Logs '[gpu-drawdump]'.
+REXCVAR_DEFINE_BOOL(gpu_draw_dump, false, "GPU/D3D12",
+                    "Native-renderer R&D: dump the per-draw geometry/shader stream "
+                    "(VB/IB guest addrs, VS/PS hashes, prim+counts) for the first ~12k "
+                    "draws after enabling, then auto-stops. Off by default; '[gpu-drawdump]'.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [INST-PROBE] Instancing feasibility spike (Ch.9, optimize-Xenia route): the
+// gpu_draw_dump capture proved one heavy frame's ~12k draws collapse to ~884
+// distinct {geometry+shader} batch keys (92.6% redundant) -- the top 3 foliage
+// meshes alone are drawn ~5,862x. To turn that into GPU instancing we must confirm
+// that across a run of identical-key draws ONLY a per-instance transform constant
+// block differs (and which register holds it). When on, for the first ~12k draws
+// after enabling this groups draws by batch key and tracks which float constant
+// registers ever differ from the first draw of that key, then dumps a per-key
+// report ('[inst-probe]'). Arm it IN the heavy scene (console: 'gpu_instance_probe
+// true'), same as gpu_draw_dump. Read-only + auto-bounded; cmd-proc thread only.
+REXCVAR_DEFINE_BOOL(gpu_instance_probe, false, "GPU/D3D12",
+                    "Instancing R&D: group draws by {geometry+shader} batch key and "
+                    "report which float constant registers vary per-instance, for the "
+                    "first ~12k draws after enabling, then auto-stops. Off by default; "
+                    "'[inst-probe]'.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [GPU-INST] Consecutive-draw GPU instancing (Ch.9 draw-volume optimization).
+// When on, a run of back-to-back draws that are identical except for their
+// vertex float constants (the per-instance transform) is coalesced into a
+// single DrawIndexedInstanced; the vertex shader reads each instance's float
+// constants via SV_InstanceID. Default OFF (experimental); '[gpu-inst]'.
+REXCVAR_DEFINE_BOOL(gpu_instance, false, "GPU/D3D12",
+                    "Coalesce consecutive identical-except-transform draws into one "
+                    "instanced draw (vertex-shader SV_InstanceID per-instance constants). "
+                    "Off by default (experimental); reports '[gpu-inst]'.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -80,6 +156,227 @@ uint64_t g_const_writes_skipped = 0;
 bool g_draw_prof = false;
 uint64_t g_draw_ns[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 uint64_t g_draw_count = 0;
+// [GPU-PRECORD] Phase 1a: cached once/frame in IssueSwap. Segment size = draws
+// between forced full-state re-emits (correctness probe; tunable cvar comes in Phase 3).
+bool g_parallel_record = false;
+static constexpr uint32_t kParallelRecordSegmentDraws = 256;
+// [GPU-PRECORD] Phase 1b-0: cached once/frame in IssueSwap. When on, draws are
+// deferred into a per-segment event log and replayed at flush boundaries (segment
+// size reuses kParallelRecordSegmentDraws).
+bool g_precord_capture = false;
+// [GPU-PRECORD] Phase 1b-1b: cached once/frame in IssueSwap. localrf ⇒ replay
+// against a private local register file; thread ⇒ run that replay on the worker
+// (implies localrf). Read on the parse thread (dispatch) only; the worker reads
+// these via the parse thread's happens-before. Plain bools (cmd-proc thread).
+bool g_precord_localrf = false;
+bool g_precord_thread = false;
+// [GPU-DRAW-DUMP] Cached once/frame; counter auto-stops the dump after the cap so
+// log volume stays bounded. Worker-thread-only, so plain globals (no atomics).
+bool g_draw_dump = false;
+uint64_t g_draw_dump_count = 0;
+constexpr uint64_t kDrawDumpCap = 12000;
+
+// [INST-PROBE] Instancing feasibility spike state. Cmd-proc(worker)-thread only =>
+// plain globals, no atomics. Bounded: stops accumulating after kDrawDumpCap draws,
+// then dumps a per-batch-key report exactly once.
+bool g_inst_probe = false;
+uint64_t g_inst_draw_count = 0;
+bool g_inst_dumped = false;
+
+// [GPU-INST] Cached gpu_instance enable (refreshed once/frame, cmd-proc thread
+// only). g_instance_dirty tracks whether any register OUTSIDE the vertex
+// float-constant range [SHADER_CONSTANT_000_X, SHADER_CONSTANT_256_X) has
+// changed value since the last draw -- if not, the next draw differs only in
+// its per-instance transform and can be merged. Stats count coalesced guest
+// draws (in) vs emitted instanced draws (out).
+bool g_instance = false;
+bool g_instance_dirty = true;
+uint64_t g_instance_draws_in = 0;
+uint64_t g_instance_draws_out = 0;
+
+// Per-{geometry+shader} batch key: how many draws share it, and which float
+// constant registers ever differ across those draws (= the per-instance data a
+// GPU-instanced draw would have to stream). A clean instancing candidate has a
+// small CONTIGUOUS vertex-const delta (a transform matrix) and NO pixel delta.
+struct InstKeyInfo {
+  uint64_t count = 0;
+  bool have_first = false;
+  uint32_t prim = 0, idx = 0, vtx = 0, ib_base = 0, ib_cnt = 0, vb0 = 0;
+  int ib_fmt = 0;
+  uint64_t vs_hash = 0, ps_hash = 0;
+  // Used-constant bitmaps copied from the shaders (only diff what's actually read).
+  uint64_t vs_used[4] = {0, 0, 0, 0};
+  uint64_t ps_used[4] = {0, 0, 0, 0};
+  // First-draw snapshot of each used vec4 (256 vertex + 256 pixel float consts).
+  float vs_first[256][4];
+  float ps_first[256][4];
+  // Which vec4 consts ever differed (bit-exact) from the first draw of this key.
+  uint64_t vs_diff[4] = {0, 0, 0, 0};
+  uint64_t ps_diff[4] = {0, 0, 0, 0};
+};
+std::unordered_map<uint64_t, InstKeyInfo> g_inst_keys;
+constexpr size_t kInstMaxKeys = 8192;  // safety cap on distinct keys tracked
+
+inline uint64_t inst_mix(uint64_t h, uint64_t v) {
+  h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+  return h;
+}
+
+// Decode a 256-bit (4x uint64) "varying vec4" mask into a compact list, collapsing
+// contiguous runs to "c<lo>..c<hi>" so a 4-row transform reads as one range.
+std::string inst_decode_mask(const uint64_t mask[4]) {
+  std::vector<uint32_t> idxs;
+  for (uint32_t w = 0; w < 4; ++w) {
+    uint64_t bits = mask[w];
+    uint32_t b;
+    while (rex::bit_scan_forward(bits, &b)) {
+      bits &= ~(1ull << b);
+      idxs.push_back(w * 64 + b);
+    }
+  }
+  if (idxs.empty()) return "(none)";
+  std::string out;
+  size_t i = 0;
+  while (i < idxs.size()) {
+    size_t j = i;
+    while (j + 1 < idxs.size() && idxs[j + 1] == idxs[j] + 1) ++j;
+    if (!out.empty()) out += ",";
+    out += "c" + std::to_string(idxs[i]);
+    if (j > i) out += ".." + ("c" + std::to_string(idxs[j]));
+    i = j + 1;
+  }
+  return out;
+}
+
+// Per-draw accumulation: compute this draw's batch key, snapshot/diff its used
+// float constants against the first draw seen for that key.
+void InstanceProbeDraw(const RegisterFile& regs, const Shader* vs, const Shader* ps,
+                       uint32_t prim, uint32_t index_count, uint32_t host_vtx,
+                       uint32_t ib_base, int ib_fmt, uint32_t ib_cnt) {
+  if (vs == nullptr) return;
+  const Shader::ConstantRegisterMap& vcm = vs->constant_register_map();
+  // Stable hash over the bound vertex buffers (+ a label VB addr).
+  uint64_t vbhash = 0;
+  uint32_t vb0 = 0;
+  for (uint32_t i = 0; i < rex::countof(vcm.vertex_fetch_bitmap); ++i) {
+    uint32_t bits = vcm.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (rex::bit_scan_forward(bits, &j)) {
+      bits &= ~(uint32_t(1) << j);
+      const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(i * 32 + j);
+      const uint32_t addr = uint32_t(vf.address) << 2;
+      if (vb0 == 0) vb0 = addr;
+      vbhash = inst_mix(vbhash, (uint64_t(addr) << 32) | (uint32_t(vf.size) << 2));
+    }
+  }
+  const uint64_t vs_hash = vs->ucode_data_hash();
+  const uint64_t ps_hash = ps ? ps->ucode_data_hash() : 0;
+  uint64_t key = 0;
+  key = inst_mix(key, prim);
+  key = inst_mix(key, index_count);
+  key = inst_mix(key, host_vtx);
+  key = inst_mix(key, vs_hash);
+  key = inst_mix(key, ps_hash);
+  key = inst_mix(key, (uint64_t(ib_base) << 32) ^ (uint64_t(uint32_t(ib_fmt)) << 16) ^ ib_cnt);
+  key = inst_mix(key, vbhash);
+
+  auto it = g_inst_keys.find(key);
+  if (it == g_inst_keys.end()) {
+    if (g_inst_keys.size() >= kInstMaxKeys) return;
+    it = g_inst_keys.emplace(key, InstKeyInfo{}).first;
+  }
+  InstKeyInfo& ki = it->second;
+  ki.count++;
+  if (!ki.have_first) {
+    ki.have_first = true;
+    ki.prim = prim; ki.idx = index_count; ki.vtx = host_vtx;
+    ki.ib_base = ib_base; ki.ib_fmt = ib_fmt; ki.ib_cnt = ib_cnt; ki.vb0 = vb0;
+    ki.vs_hash = vs_hash; ki.ps_hash = ps_hash;
+    std::memcpy(ki.vs_used, vcm.float_bitmap, sizeof(ki.vs_used));
+    if (ps) {
+      std::memcpy(ki.ps_used, ps->constant_register_map().float_bitmap, sizeof(ki.ps_used));
+    }
+    for (uint32_t w = 0; w < 4; ++w) {
+      uint64_t e = ki.vs_used[w];
+      uint32_t b;
+      while (rex::bit_scan_forward(e, &b)) {
+        e &= ~(1ull << b);
+        std::memcpy(ki.vs_first[w * 64 + b],
+                    &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (w << 8) + (b << 2)],
+                    4 * sizeof(float));
+      }
+    }
+    for (uint32_t w = 0; w < 4; ++w) {
+      uint64_t e = ki.ps_used[w];
+      uint32_t b;
+      while (rex::bit_scan_forward(e, &b)) {
+        e &= ~(1ull << b);
+        std::memcpy(ki.ps_first[w * 64 + b],
+                    &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (w << 8) + (b << 2)],
+                    4 * sizeof(float));
+      }
+    }
+    return;
+  }
+  for (uint32_t w = 0; w < 4; ++w) {
+    uint64_t e = ki.vs_used[w];
+    uint32_t b;
+    while (rex::bit_scan_forward(e, &b)) {
+      e &= ~(1ull << b);
+      if (std::memcmp(ki.vs_first[w * 64 + b],
+                      &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (w << 8) + (b << 2)],
+                      4 * sizeof(float)) != 0) {
+        ki.vs_diff[w] |= (1ull << b);
+      }
+    }
+  }
+  for (uint32_t w = 0; w < 4; ++w) {
+    uint64_t e = ki.ps_used[w];
+    uint32_t b;
+    while (rex::bit_scan_forward(e, &b)) {
+      e &= ~(1ull << b);
+      if (std::memcmp(ki.ps_first[w * 64 + b],
+                      &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (w << 8) + (b << 2)],
+                      4 * sizeof(float)) != 0) {
+        ki.ps_diff[w] |= (1ull << b);
+      }
+    }
+  }
+}
+
+// Emit the per-key instancing report once, sorted by draw count.
+void InstanceProbeDump() {
+  std::vector<const InstKeyInfo*> v;
+  v.reserve(g_inst_keys.size());
+  for (auto& kv : g_inst_keys) v.push_back(&kv.second);
+  std::sort(v.begin(), v.end(),
+            [](const InstKeyInfo* a, const InstKeyInfo* b) { return a->count > b->count; });
+  uint64_t total = 0;
+  uint32_t clean = 0;  // keys with NO per-draw pixel/material delta (clean instancing)
+  for (auto* k : v) {
+    total += k->count;
+    if (!(k->ps_diff[0] | k->ps_diff[1] | k->ps_diff[2] | k->ps_diff[3])) ++clean;
+  }
+  REXGPU_INFO(
+      "[inst-probe] === {} draws over {} distinct batch keys; {} keys have NO pixel-const "
+      "delta (clean instancing candidates) ===",
+      total, v.size(), clean);
+  const size_t report = v.size() < 60 ? v.size() : 60;
+  for (size_t i = 0; i < report; ++i) {
+    const InstKeyInfo* k = v[i];
+    uint32_t vs_used_n = 0, ps_used_n = 0;
+    for (uint32_t w = 0; w < 4; ++w) {
+      vs_used_n += rex::bit_count(k->vs_used[w]);
+      ps_used_n += rex::bit_count(k->ps_used[w]);
+    }
+    REXGPU_INFO(
+        "[inst-probe] x{:5} prim{} idx{} vtx{} vs={:016X} ps={:016X} ib={:08X}:cnt{} vb={:08X} "
+        "| vs_vary={} ({} used) ps_vary={} ({} used)",
+        k->count, k->prim, k->idx, k->vtx, k->vs_hash, k->ps_hash, k->ib_base, k->ib_cnt, k->vb0,
+        inst_decode_mask(k->vs_diff), vs_used_n, inst_decode_mask(k->ps_diff), ps_used_n);
+  }
+}
+
 inline uint64_t prof_ns_since(std::chrono::steady_clock::time_point t0) {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now() - t0)
@@ -103,7 +400,12 @@ D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_syste
     : CommandProcessor(graphics_system, kernel_state), deferred_command_list_(*this) {
   legacy_readback_memexport_cvar_name_ = "d3d12_readback_memexport";
 }
-D3D12CommandProcessor::~D3D12CommandProcessor() = default;
+D3D12CommandProcessor::~D3D12CommandProcessor() {
+  // [GPU-PRECORD] Phase 1b-1b: ShutdownContext normally joins the replay worker;
+  // join defensively here too so a joinable std::thread never reaches its
+  // destructor (which would std::terminate). Idempotent.
+  PrecordWorkerShutdown();
+}
 
 void D3D12CommandProcessor::UpdateDebugMarkersEnabled() {
   debug_markers_enabled_ = IsGpuDebugMarkersEnabled();
@@ -118,6 +420,7 @@ void D3D12CommandProcessor::PushDebugMarker(const char* format, ...) {
   va_start(args, format);
   vsnprintf(label, sizeof(label), format, args);
   va_end(args);
+  PrecordFlush();  // [GPU-PRECORD] keep the marker ordered after pending draws
   deferred_command_list_.BeginDebugMarker(label);
 }
 
@@ -125,6 +428,7 @@ void D3D12CommandProcessor::PopDebugMarker() {
   if (!debug_markers_enabled_) {
     return;
   }
+  PrecordFlush();  // [GPU-PRECORD] keep the marker ordered after pending draws
   deferred_command_list_.EndDebugMarker();
 }
 
@@ -137,6 +441,7 @@ void D3D12CommandProcessor::InsertDebugMarker(const char* format, ...) {
   va_start(args, format);
   vsnprintf(label, sizeof(label), format, args);
   va_end(args);
+  PrecordFlush();  // [GPU-PRECORD] keep the marker ordered after pending draws
   deferred_command_list_.InsertDebugMarker(label);
 }
 
@@ -1689,6 +1994,10 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  // [GPU-PRECORD] Phase 1b-1b: stop the replay worker before tearing down the
+  // subsystems it records into. No replay is in flight here (the worker only runs
+  // while the parse thread is blocked inside PrecordFlush).
+  PrecordWorkerShutdown();
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
@@ -1830,7 +2139,51 @@ void D3D12CommandProcessor::ShutdownContext() {
   CommandProcessor::ShutdownContext();
 }
 
+// [GPU-PRECORD] Phase 1b-0: registers whose base WriteRegister has a
+// non-idempotent side effect — a stateful sequence (the DC_LUT gamma-ramp write
+// index/component machine) or a guest-memory / coherency effect (scratch
+// writeback, COHER dirty bit). These must apply exactly once, live; deferring one
+// into a replayed segment would double-apply it. (Same set the constant-dedupe
+// path refuses to skip.) A write to one of these flushes the pending segment
+// instead of being logged. Near-absent mid-frame in steady gameplay.
+static inline bool PrecordRangeMustNotDefer(uint32_t start_index, uint32_t end_index) {
+  auto overlaps = [&](uint32_t lo, uint32_t hi) { return start_index <= hi && end_index >= lo; };
+  return overlaps(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7) ||
+         overlaps(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST) ||
+         overlaps(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_RW_INDEX) ||
+         overlaps(XE_GPU_REG_DC_LUT_SEQ_COLOR, XE_GPU_REG_DC_LUT_SEQ_COLOR) ||
+         overlaps(XE_GPU_REG_DC_LUT_PWL_DATA, XE_GPU_REG_DC_LUT_PWL_DATA) ||
+         overlaps(XE_GPU_REG_DC_LUT_30_COLOR, XE_GPU_REG_DC_LUT_30_COLOR);
+}
+
 void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // [GPU-PRECORD] Phase 1b-0: while a deferred-draw segment is open, log this
+  // write so PrecordFlush can replay it in order with the draws against the
+  // rewound register file (reproducing the D3D12 cbuffer/texture invalidations).
+  // A stateful register instead flushes the segment so it applies once, live.
+  if (precord_segment_open_ && !precord_replaying_) {
+    if (PrecordRangeMustNotDefer(index, index)) {
+      PrecordFlush();
+    } else {
+      PrecordEvent ev;
+      ev.kind = PrecordEvent::Kind::kWriteSingle;
+      ev.a = index;
+      ev.b = value;
+      ev.c = 0;
+      precord_events_.push_back(ev);
+    }
+  }
+
+  // [GPU-INST] Track whether anything other than the vertex float constants
+  // changes between draws. A value-changing write to any register outside the
+  // vertex float-constant range breaks the "only the per-instance transform
+  // differs" invariant, so the next draw must not merge into the open batch.
+  if (g_instance && !g_instance_dirty &&
+      (index < XE_GPU_REG_SHADER_CONSTANT_000_X || index >= XE_GPU_REG_SHADER_CONSTANT_256_X) &&
+      register_file_->values[index] != value) {
+    g_instance_dirty = true;
+  }
+
   // [PERF/CONST-DEDUPE] A redundant shader-constant write (value unchanged)
   // leaves the GPU-side constant buffer already correct, so the only effect of
   // proceeding is marking the binding dirty -> a wasted full cbuffer re-upload
@@ -1887,7 +2240,49 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   if (!num_registers) {
     return;
   }
+  // [GPU-PRECORD] Phase 1b-0: log the bulk write (raw guest dwords) for replay.
+  // See WriteRegister; offset into precord_frommem_data_ is stored, not a pointer,
+  // so the side buffer may grow without invalidating earlier events. A range that
+  // touches a stateful register flushes the segment so it applies once, live.
+  if (precord_segment_open_ && !precord_replaying_) {
+    if (PrecordRangeMustNotDefer(start_index, start_index + num_registers - 1)) {
+      PrecordFlush();
+    } else {
+      PrecordEvent ev;
+      ev.kind = PrecordEvent::Kind::kWriteFromMem;
+      ev.a = start_index;
+      ev.b = num_registers;
+      ev.c = uint32_t(precord_frommem_data_.size());
+      precord_frommem_data_.insert(precord_frommem_data_.end(), base, base + num_registers);
+      precord_events_.push_back(ev);
+    }
+  }
   uint32_t end_index = start_index + num_registers - 1;
+
+  // [GPU-INST] See WriteRegister: mark the open batch un-mergeable if a
+  // value-changing write touches any register outside the vertex float-constant
+  // range [SHADER_CONSTANT_000_X, SHADER_CONSTANT_256_X). Bulk constant uploads
+  // confined to that range (the per-instance transform) are ignored.
+  if (g_instance && !g_instance_dirty) {
+    constexpr uint32_t kVsFloatLo = XE_GPU_REG_SHADER_CONSTANT_000_X;
+    constexpr uint32_t kVsFloatHi = XE_GPU_REG_SHADER_CONSTANT_256_X;  // exclusive
+    auto range_value_changed = [&](uint32_t lo, uint32_t hi) -> bool {
+      for (uint32_t idx = lo; idx <= hi; ++idx) {
+        if (memory::load_and_swap<uint32_t>(base + (idx - start_index)) !=
+            register_file_->values[idx]) {
+          return true;
+        }
+      }
+      return false;
+    };
+    if (start_index < kVsFloatLo &&
+        range_value_changed(start_index, std::min(end_index, kVsFloatLo - 1))) {
+      g_instance_dirty = true;
+    } else if (end_index >= kVsFloatHi &&
+               range_value_changed(std::max(start_index, kVsFloatHi), end_index)) {
+      g_instance_dirty = true;
+    }
+  }
 
   auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
                                          uint32_t last_constant) -> bool {
@@ -2031,6 +2426,49 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // [PERF/DRAW-PROFILE] Refresh the per-draw timing flag once per frame; report
   // a per-second breakdown of where IssueDraw's CPU time goes.
   g_draw_prof = REXCVAR_GET(gpu_draw_profile);
+  // [GPU-DRAW-DUMP] Refresh the draw-stream dump flag once per frame too.
+  g_draw_dump = REXCVAR_GET(gpu_draw_dump);
+  // [GPU-PRECORD] Phase 1a correctness-probe flag (forced segment-boundary re-emit).
+  g_parallel_record = REXCVAR_GET(gpu_parallel_record);
+  // [GPU-PRECORD] Phase 1b-0 capture/replay correctness-probe flag.
+  g_precord_capture = REXCVAR_GET(gpu_precord_capture);
+  // [GPU-PRECORD] Phase 1b-1b: local-register-file replay + worker (thread ⇒ localrf).
+  g_precord_localrf = REXCVAR_GET(gpu_precord_localrf);
+  g_precord_thread = REXCVAR_GET(gpu_precord_thread);
+  // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
+  {
+    const bool inst_now = REXCVAR_GET(gpu_instance_probe);
+    if (inst_now && !g_inst_probe) {
+      g_inst_keys.clear();
+      g_inst_draw_count = 0;
+      g_inst_dumped = false;
+    }
+    g_inst_probe = inst_now;
+  }
+  // [GPU-INST] Refresh the instancing enable once/frame; report the coalescing
+  // ratio per second when it is on. Any open batch from the previous frame is
+  // flushed below before the present.
+  g_instance = REXCVAR_GET(gpu_instance);
+  if (g_instance) {
+    static uint64_t s_last_in = 0, s_last_out = 0;
+    static auto s_last_report = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_last_report >= std::chrono::seconds(1)) {
+      uint64_t din = g_instance_draws_in - s_last_in;
+      uint64_t dout = g_instance_draws_out - s_last_out;
+      REXGPU_INFO("[gpu-inst] coalesced {} draws -> {} instanced draws (saved {})", din, dout,
+                  din >= dout ? din - dout : 0);
+      s_last_report = now;
+      s_last_in = g_instance_draws_in;
+      s_last_out = g_instance_draws_out;
+    }
+  }
+  // [GPU-PRECORD] Phase 1b-0: record the frame's pending captured draws before the
+  // present commands so they keep their stream position.
+  PrecordFlush();
+  // [GPU-INST] Emit any draw still held in the open instanced batch before the
+  // frame is presented.
+  FlushInstancedBatch();
   if (g_draw_prof) {
     static uint64_t s_last[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, s_last_cnt = 0;
     static auto s_last_report = std::chrono::steady_clock::now();
@@ -2432,8 +2870,56 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
 }
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
-                                      IndexBufferInfo* index_buffer_info,
-                                      bool major_mode_explicit) {
+                                      IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
+  // [GPU-PRECORD] Phase 1b-0 capture wrapper. When capturing (and not already
+  // replaying a captured segment), defer this draw into the current segment's
+  // event log instead of recording it now; PrecordFlush replays the log later.
+  if (!g_precord_capture || precord_replaying_) {
+    return IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  }
+  // A copy-mode "draw" records resolve commands (a non-draw recording op), so it
+  // must order after the pending captured draws: flush them, then run it inline.
+  if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+    PrecordFlush();
+    return IssueCopy();
+  }
+  // Open a segment on its first draw, snapshotting the register file now (it
+  // already holds every write that set this draw up). Later writes are logged and
+  // replayed in order so each draw sees exactly its own register state.
+  if (!precord_segment_open_) {
+    precord_snapshot_.assign(register_file_->values,
+                             register_file_->values + RegisterFile::kRegisterCount);
+    precord_segment_open_ = true;
+    precord_draws_in_segment_ = 0;
+  }
+  PrecordEvent ev;
+  ev.kind = PrecordEvent::Kind::kDraw;
+  ev.a = uint32_t(precord_draws_.size());
+  ev.b = 0;
+  ev.c = 0;
+  precord_events_.push_back(ev);
+  PrecordDraw draw;
+  draw.primitive_type = primitive_type;
+  draw.index_count = index_count;
+  draw.has_index_buffer_info = index_buffer_info != nullptr;
+  if (index_buffer_info) {
+    draw.index_buffer_info = *index_buffer_info;
+  }
+  draw.major_mode_explicit = major_mode_explicit;
+  // [GPU-PRECORD] capture the per-draw active shaders (parse-time CP state, not in
+  // the register file) so replay can restore each draw's own shaders.
+  draw.active_vs = active_vertex_shader_;
+  draw.active_ps = active_pixel_shader_;
+  precord_draws_.push_back(draw);
+  if (++precord_draws_in_segment_ >= kParallelRecordSegmentDraws) {
+    PrecordFlush();
+  }
+  return true;
+}
+
+bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                                          IndexBufferInfo* index_buffer_info,
+                                          bool major_mode_explicit) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -2454,7 +2940,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   } _dp_total;
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
-  const RegisterFile& regs = *register_file_;
+  const RegisterFile& regs = GetActiveDrawRegisterFile();
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -2470,6 +2956,24 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Always need a vertex shader.
     return false;
   }
+
+  // [GPU-INST] If an instanced batch is open, either extend it with this draw
+  // (identical except the per-instance transform) or flush it before processing
+  // this draw normally. The merge path skips all per-draw setup -- that skipped
+  // work is the win. Safe because g_instance_dirty is false only when nothing
+  // but the vertex float constants changed since the batch's last draw, and the
+  // shader/primitive/index-buffer identity is checked explicitly.
+  if (g_instance && instanced_batch_.active) {
+    if (InstancedBatchCanMerge(primitive_type, index_count, index_buffer_info,
+                               active_vertex_shader(), active_pixel_shader())) {
+      InstancedBatchAppend(regs);
+      ++g_instance_draws_in;
+      g_instance_dirty = false;
+      return true;
+    }
+    FlushInstancedBatch();
+  }
+
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
@@ -2513,6 +3017,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
 
+  // [GPU-PRECORD] Phase 1a: at each segment boundary, force the following draws to
+  // re-emit ALL command-list state (models a fresh per-segment command list). This
+  // runs BEFORE any of this draw's state setup (Process/Configure/UpdateBindings),
+  // so the re-emit lands in the current deferred list. Sequential single-list probe:
+  // output MUST stay pixel-identical (the extra emits are redundant, not wrong).
+  // counter==0 on a submission's first draw (BeginSubmission already did a full
+  // reset), so the guard avoids a double reset there.
+  if (g_parallel_record) {
+    if (parallel_record_counter_ != 0 &&
+        (parallel_record_counter_ % kParallelRecordSegmentDraws) == 0) {
+      // [GPU-PRECORD] Phase 1a-ii: close the just-finished segment (move its stream
+      // aside for ordered replay at EndSubmission), then force the new segment's
+      // first draw to re-emit all state into the now-empty deferred list. Replaying
+      // the saved segments in order, then the final list, reproduces the exact same
+      // command sequence as the single-list path -> pixel-identical.
+      precord_segments_.push_back(deferred_command_list_.TakeStream());
+      ForceFullDrawStateReemit();
+    }
+    ++parallel_record_counter_;
+  }
+
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   auto _dp_prim0 = g_draw_prof ? std::chrono::steady_clock::now()
@@ -2529,6 +3054,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
 
+  // [GPU-INST] Decide whether this draw starts a new instanced batch. Only plain
+  // (non-tessellated, kVertex) color/depth draws whose vertex shader uses purely
+  // absolute float-constant addressing are eligible. Any open batch was already
+  // flushed by the merge step above.
+  bool start_instanced =
+      g_instance && !memexport_used && is_rasterization_done &&
+      edram_mode == xenos::EdramMode::kColorDepth &&
+      !primitive_processing_result.IsTessellated() &&
+      primitive_processing_result.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kVertex &&
+      vertex_shader->constant_register_map().float_count != 0 &&
+      !vertex_shader->constant_register_map().float_dynamic_addressing;
+
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
@@ -2539,7 +3077,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                    : 0;
   DxbcShaderTranslator::Modification vertex_shader_modification =
       pipeline_cache_->GetCurrentVertexShaderModification(
-          *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask);
+          *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
+          start_instanced);
   DxbcShaderTranslator::Modification pixel_shader_modification =
       pixel_shader
           ? pipeline_cache_->GetCurrentPixelShaderModification(
@@ -2730,6 +3269,55 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // [GPU-DRAW-DUMP] Native-renderer R&D (Ch.9 path B): emit this draw's full
+  // geometry/shader stream. IssueDraw is the ONE seam that sees every world draw
+  // (the guest scene-graph traversal only covers the HUD), so this is the data
+  // model a native renderer replays. Header line + one line per bound vertex
+  // buffer (same vfetch iteration as the residency loop above). Auto-bounded.
+  if (g_draw_dump && g_draw_dump_count < kDrawDumpCap) {
+    const uint64_t dn = g_draw_dump_count++;
+    const uint32_t ib_base = index_buffer_info ? index_buffer_info->guest_base : 0u;
+    const uint32_t ib_count = index_buffer_info ? index_buffer_info->count : 0u;
+    const int ib_fmt = index_buffer_info ? static_cast<int>(index_buffer_info->format) : -1;
+    REXGPU_INFO(
+        "[gpu-drawdump] #{} prim={} idx={} vtx={} vs={:016X}/{} ps={:016X}/{} ib={:08X}:fmt{}:cnt{}",
+        dn, static_cast<uint32_t>(primitive_type), index_count,
+        primitive_processing_result.host_draw_vertex_count, vertex_shader->ucode_data_hash(),
+        static_cast<uint64_t>(vertex_shader->ucode_dword_count()),
+        pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0),
+        pixel_shader ? static_cast<uint64_t>(pixel_shader->ucode_dword_count()) : uint64_t(0),
+        ib_base, ib_fmt, ib_count);
+    const Shader::ConstantRegisterMap& cm_dump = vertex_shader->constant_register_map();
+    for (uint32_t i = 0; i < rex::countof(cm_dump.vertex_fetch_bitmap); ++i) {
+      uint32_t bits = cm_dump.vertex_fetch_bitmap[i];
+      uint32_t j;
+      while (rex::bit_scan_forward(bits, &j)) {
+        bits &= ~(uint32_t(1) << j);
+        const uint32_t vfi = i * 32 + j;
+        const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(vfi);
+        REXGPU_INFO("[gpu-drawdump-vb] #{} slot={} addr={:08X} size={} type={}", dn, vfi,
+                    static_cast<uint32_t>(vf.address) << 2, static_cast<uint32_t>(vf.size) << 2,
+                    static_cast<uint32_t>(vf.type));
+      }
+    }
+  }
+
+  // [INST-PROBE] Instancing feasibility spike: accumulate which float constants vary
+  // per-instance within each batch key, then dump the report once the cap is hit.
+  if (g_inst_probe && !g_inst_dumped && g_inst_draw_count < kDrawDumpCap) {
+    const uint32_t ip_ib_base = index_buffer_info ? index_buffer_info->guest_base : 0u;
+    const uint32_t ip_ib_count = index_buffer_info ? index_buffer_info->count : 0u;
+    const int ip_ib_fmt = index_buffer_info ? static_cast<int>(index_buffer_info->format) : -1;
+    InstanceProbeDraw(regs, vertex_shader, pixel_shader,
+                      static_cast<uint32_t>(primitive_type), index_count,
+                      primitive_processing_result.host_draw_vertex_count, ip_ib_base, ip_ib_fmt,
+                      ip_ib_count);
+    if (++g_inst_draw_count >= kDrawDumpCap) {
+      InstanceProbeDump();
+      g_inst_dumped = true;
+    }
+  }
+
   // Gather memexport ranges and ensure the heaps for them are resident, and
   // also load the data surrounding the export and to fill the regions that
   // won't be modified by the shaders.
@@ -2834,8 +3422,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
-    deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
-                                            0, 0);
+    // [GPU-INST] Defer the draw to coalesce following identical-except-transform
+    // draws; the pipeline/bindings/barriers above are recorded once for the run.
+    if (start_instanced) {
+      StartInstancedBatch(regs, active_vertex_shader(), active_pixel_shader(), primitive_type,
+                          index_count, index_buffer_info,
+                          primitive_processing_result.host_draw_vertex_count, /*indexed=*/false);
+    } else {
+      deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
+                                              0, 0);
+    }
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
     index_buffer_view.SizeInBytes = primitive_processing_result.host_draw_vertex_count;
@@ -2893,8 +3489,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
-    deferred_command_list_.D3DDrawIndexedInstanced(
-        primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    // [GPU-INST] Defer the draw to coalesce the run (memexport draws are never
+    // instanced, so scratch_index_buffer is always null on this path).
+    if (start_instanced) {
+      StartInstancedBatch(regs, active_vertex_shader(), active_pixel_shader(), primitive_type,
+                          index_count, index_buffer_info,
+                          primitive_processing_result.host_draw_vertex_count, /*indexed=*/true);
+    } else {
+      deferred_command_list_.D3DDrawIndexedInstanced(
+          primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    }
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
@@ -2935,6 +3539,141 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   if (g_draw_prof) g_draw_ns[7] += prof_ns_since(_dp_tail0);
   return true;
+}
+
+// [GPU-INST] Append the current draw's used vertex float constants as one
+// instance, packed in the same order as the float-constants cbuffer so the
+// instanced shader reads instance i at cb[i * float_count + packed_index].
+void D3D12CommandProcessor::InstancedBatchAppend(const RegisterFile& regs) {
+  InstancedBatch& b = instanced_batch_;
+  if (b.count >= b.max_instances) {
+    return;
+  }
+  size_t base = b.data.size();
+  b.data.resize(base + size_t(b.float_count) * 4);
+  float* dst = b.data.data() + base;
+  for (uint32_t word = 0; word < 4; ++word) {
+    uint64_t entry = b.float_bitmap[word];
+    uint32_t fc_index;
+    while (rex::bit_scan_forward(entry, &fc_index)) {
+      entry &= ~(uint64_t(1) << fc_index);
+      std::memcpy(dst, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (word << 8) + (fc_index << 2)],
+                  4 * sizeof(float));
+      dst += 4;
+    }
+  }
+  ++b.count;
+}
+
+// [GPU-INST] Begin a deferred instanced batch from the current (already set up)
+// draw. The pipeline/bindings/index buffer/barriers are already recorded in the
+// command list; only the draw call itself is held back until the batch closes.
+void D3D12CommandProcessor::StartInstancedBatch(const RegisterFile& regs, Shader* vertex_shader,
+                                                Shader* pixel_shader,
+                                                xenos::PrimitiveType primitive_type,
+                                                uint32_t index_count,
+                                                const IndexBufferInfo* index_buffer_info,
+                                                uint32_t host_draw_vertex_count, bool indexed) {
+  InstancedBatch& b = instanced_batch_;
+  b.active = true;
+  b.indexed = indexed;
+  b.vs = vertex_shader;
+  b.ps = pixel_shader;
+  b.prim = primitive_type;
+  b.index_count = index_count;
+  b.has_ib = index_buffer_info != nullptr;
+  if (b.has_ib) {
+    b.ib_base = index_buffer_info->guest_base;
+    b.ib_count = index_buffer_info->count;
+    b.ib_format = index_buffer_info->format;
+    b.ib_endian = index_buffer_info->endianness;
+  }
+  b.host_draw_vertex_count = host_draw_vertex_count;
+  const Shader::ConstantRegisterMap& constant_map = vertex_shader->constant_register_map();
+  b.float_count = constant_map.float_count;
+  std::memcpy(b.float_bitmap, constant_map.float_bitmap, sizeof(b.float_bitmap));
+  b.max_instances =
+      b.float_count
+          ? std::max(1u, DxbcShaderTranslator::kInstancedFloatConstantsVec4Capacity / b.float_count)
+          : 1u;
+  b.count = 0;
+  b.data.clear();
+  InstancedBatchAppend(regs);
+  ++g_instance_draws_in;
+  g_instance_dirty = false;
+}
+
+// [GPU-INST] Whether the current draw can extend the open batch: nothing but the
+// vertex float constants changed since the batch's last draw (g_instance_dirty),
+// the same shaders/primitive/index buffer, and capacity remains.
+bool D3D12CommandProcessor::InstancedBatchCanMerge(xenos::PrimitiveType primitive_type,
+                                                   uint32_t index_count,
+                                                   const IndexBufferInfo* index_buffer_info,
+                                                   Shader* vertex_shader,
+                                                   Shader* pixel_shader) const {
+  const InstancedBatch& b = instanced_batch_;
+  if (!b.active || g_instance_dirty) {
+    return false;
+  }
+  if (vertex_shader != b.vs || pixel_shader != b.ps) {
+    return false;
+  }
+  if (primitive_type != b.prim || index_count != b.index_count) {
+    return false;
+  }
+  bool has_ib = index_buffer_info != nullptr;
+  if (has_ib != b.has_ib) {
+    return false;
+  }
+  if (has_ib &&
+      (index_buffer_info->guest_base != b.ib_base || index_buffer_info->count != b.ib_count ||
+       index_buffer_info->format != b.ib_format || index_buffer_info->endianness != b.ib_endian)) {
+    return false;
+  }
+  return b.count < b.max_instances;
+}
+
+// [GPU-INST] Emit the open batch (if any) as a single DrawIndexedInstanced:
+// upload the per-instance vertex float constants and point the vertex float CBV
+// at them, then draw count instances. Pipeline/bindings/IB/topology/barriers
+// were recorded once at the batch's start.
+void D3D12CommandProcessor::FlushInstancedBatch() {
+  InstancedBatch& b = instanced_batch_;
+  if (!b.active) {
+    return;
+  }
+  b.active = false;
+  if (b.count == 0 || b.float_count == 0 || !submission_open_) {
+    b.data.clear();
+    return;
+  }
+  const uint32_t total_floats = b.count * b.float_count * 4;
+  D3D12_GPU_VIRTUAL_ADDRESS instance_cbv_address;
+  uint8_t* mapping = constant_buffer_pool_->Request(
+      frame_current_, sizeof(float) * total_floats, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+      nullptr, nullptr, &instance_cbv_address);
+  if (mapping == nullptr) {
+    REXGPU_ERROR("[gpu-inst] Failed to allocate a {}-instance constant buffer; dropping the batch",
+                 b.count);
+    b.data.clear();
+    return;
+  }
+  std::memcpy(mapping, b.data.data(), sizeof(float) * total_floats);
+  uint32_t root_parameter_float_constants_vertex =
+      bindless_resources_used_ ? kRootParameter_Bindless_FloatConstantsVertex
+                               : kRootParameter_Bindful_FloatConstantsVertex;
+  deferred_command_list_.D3DSetGraphicsRootConstantBufferView(root_parameter_float_constants_vertex,
+                                                              instance_cbv_address);
+  if (b.indexed) {
+    deferred_command_list_.D3DDrawIndexedInstanced(b.host_draw_vertex_count, b.count, 0, 0, 0);
+  } else {
+    deferred_command_list_.D3DDrawInstanced(b.host_draw_vertex_count, b.count, 0, 0);
+  }
+  // The vertex float CBV now points at the instance buffer; force the next
+  // normal draw to re-upload and re-bind its single-draw constants.
+  cbuffer_binding_float_vertex_.up_to_date = false;
+  ++g_instance_draws_out;
+  b.data.clear();
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
@@ -3101,6 +3840,13 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  // [GPU-PRECORD] Phase 1b-0: a resolve/copy must observe all prior draws, so
+  // record the pending captured segment before it (no-op when not capturing, and
+  // already done when reached via the IssueDraw copy-mode path).
+  PrecordFlush();
+  // [GPU-INST] A resolve/copy must observe all prior draws, so flush the open
+  // instanced batch first.
+  FlushInstancedBatch();
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -3474,6 +4220,250 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   }
 }
 
+void D3D12CommandProcessor::ForceFullDrawStateReemit() {
+  // [GPU-PRECORD] Phase 1a. Reset the SAME cached/dirty state BeginSubmission resets
+  // for a fresh command list, so the next draw re-emits everything into the current
+  // deferred list. Body mirrors BeginSubmission's two reset blocks verbatim; the
+  // binding-state half (normally only run on frame-open) is included unconditionally
+  // because a segment's fresh list has nothing bound. Emits nothing itself except the
+  // bindless SetDescriptorHeaps (matching BeginSubmission).
+  ff_viewport_update_needed_ = true;
+  ff_scissor_update_needed_ = true;
+  ff_blend_factor_update_needed_ = true;
+  ff_stencil_ref_update_needed_ = true;
+  viewport_cache_valid_ = false;
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  if (bindless_resources_used_) {
+    deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_, sampler_bindless_heap_current_);
+  } else {
+    view_bindful_heap_current_ = nullptr;
+    sampler_bindful_heap_current_ = nullptr;
+  }
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+
+  std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
+  std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
+  cbuffer_binding_system_.up_to_date = false;
+  cbuffer_binding_float_vertex_.up_to_date = false;
+  cbuffer_binding_float_pixel_.up_to_date = false;
+  cbuffer_binding_bool_loop_.up_to_date = false;
+  cbuffer_binding_fetch_.up_to_date = false;
+  current_shared_memory_binding_is_uav_.reset();
+  if (bindless_resources_used_) {
+    cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+    cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+  } else {
+    draw_view_bindful_heap_index_ = ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
+    draw_sampler_bindful_heap_index_ = ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
+    bindful_textures_written_vertex_ = false;
+    bindful_textures_written_pixel_ = false;
+    bindful_samplers_written_vertex_ = false;
+    bindful_samplers_written_pixel_ = false;
+  }
+}
+
+void D3D12CommandProcessor::PrecordResetSegment() {
+  precord_events_.clear();
+  precord_draws_.clear();
+  precord_frommem_data_.clear();
+  precord_segment_open_ = false;
+  precord_draws_in_segment_ = 0;
+}
+
+void D3D12CommandProcessor::PrecordReplayEvents() {
+  // The event/draw replay loop, shared by every replay mode. The register file is
+  // already rewound/built and the draw-state cache reset; replay re-applies every
+  // logged write (so the file ends at the segment-end state) interleaved with the
+  // draws, each draw seeing exactly its own register state. Caller sets
+  // precord_replaying_ + forces the other draw-path probes off.
+  for (const PrecordEvent& ev : precord_events_) {
+    switch (ev.kind) {
+      case PrecordEvent::Kind::kWriteSingle:
+        WriteRegister(ev.a, ev.b);
+        break;
+      case PrecordEvent::Kind::kWriteFromMem:
+        WriteRegistersFromMem(ev.a, precord_frommem_data_.data() + ev.c, ev.b);
+        break;
+      case PrecordEvent::Kind::kDraw: {
+        const PrecordDraw& draw = precord_draws_[ev.a];
+        // [GPU-PRECORD] restore this draw's own active shaders (parse-time CP state
+        // not carried by the register file) before replaying it.
+        active_vertex_shader_ = draw.active_vs;
+        active_pixel_shader_ = draw.active_ps;
+        IndexBufferInfo ibi;
+        IndexBufferInfo* ibi_ptr = nullptr;
+        if (draw.has_index_buffer_info) {
+          ibi = draw.index_buffer_info;
+          ibi_ptr = &ibi;
+        }
+        IssueDrawImpl(draw.primitive_type, draw.index_count, ibi_ptr, draw.major_mode_explicit);
+        break;
+      }
+    }
+  }
+}
+
+void D3D12CommandProcessor::PrecordReplayLocal() {
+  // [GPU-PRECORD] Phase 1b-1b: replay the captured segment against a PRIVATE local
+  // register file built from the segment snapshot, with every draw-path holder
+  // repointed to it for the duration. This exercises the 1b-1a decoupling: the
+  // draws read the segment's own state from a file other than the shared
+  // parse-thread file. Equivalent to the shared-rewind path because nothing but the
+  // draw path reads the register file while we replay (the parse thread is the
+  // caller here for localrf, or blocked waiting on us for thread mode).
+  if (!precord_local_regfile_) {
+    precord_local_regfile_ = std::make_unique<RegisterFile>();
+  }
+  RegisterFile* local = precord_local_regfile_.get();
+  std::memcpy(local->values, precord_snapshot_.data(),
+              RegisterFile::kRegisterCount * sizeof(uint32_t));
+
+  // Repoint all draw-path register-file holders to the local file. register_file_
+  // (the base member) must move too: replay's WriteRegister writes through it, and
+  // IssueDrawImpl's GetActiveDrawRegisterFile() falls back to it. RenderTargetCache
+  // cascades to its DrawExtentEstimator -> ShaderInterpreter.
+  RegisterFile* shared = register_file_;
+  register_file_ = local;
+  active_draw_register_file_ = local;
+  primitive_processor_->SetRegisterFile(local);
+  render_target_cache_->SetRegisterFile(local);
+  texture_cache_->SetRegisterFile(local);
+  pipeline_cache_->SetRegisterFile(local);
+
+  ForceFullDrawStateReemit();
+
+  bool saved_instance = g_instance;
+  bool saved_parallel = g_parallel_record;
+  g_instance = false;
+  g_parallel_record = false;
+  precord_replaying_ = true;
+
+  PrecordReplayEvents();
+
+  precord_replaying_ = false;
+  g_instance = saved_instance;
+  g_parallel_record = saved_parallel;
+
+  // Restore every holder to the shared file. The shared file was never touched, so
+  // it still holds the segment-end state (the parse thread advanced it during
+  // capture) -- consistent with the shared-rewind path's post-replay state.
+  register_file_ = shared;
+  active_draw_register_file_ = nullptr;
+  primitive_processor_->SetRegisterFile(shared);
+  render_target_cache_->SetRegisterFile(shared);
+  texture_cache_->SetRegisterFile(shared);
+  pipeline_cache_->SetRegisterFile(shared);
+
+  PrecordResetSegment();
+  ForceFullDrawStateReemit();
+}
+
+void D3D12CommandProcessor::PrecordWorkerEnsureStarted() {
+  if (precord_worker_started_) {
+    return;
+  }
+  precord_worker_shutdown_ = false;
+  precord_worker_job_pending_ = false;
+  precord_worker_thread_ = std::thread([this] { PrecordWorkerMain(); });
+  precord_worker_started_ = true;
+}
+
+void D3D12CommandProcessor::PrecordWorkerMain() {
+  std::unique_lock<std::mutex> lock(precord_worker_mutex_);
+  for (;;) {
+    precord_worker_cv_.wait(
+        lock, [this] { return precord_worker_job_pending_ || precord_worker_shutdown_; });
+    if (precord_worker_shutdown_) {
+      break;
+    }
+    // The parse thread is blocked in PrecordFlush waiting for us, so the precord_*
+    // buffers and the shared D3D12 subsystems are ours exclusively -- run the
+    // replay with the lock released (Model C: no parse/worker overlap yet).
+    lock.unlock();
+    PrecordReplayLocal();
+    lock.lock();
+    precord_worker_job_pending_ = false;
+    precord_worker_cv_.notify_all();
+  }
+}
+
+void D3D12CommandProcessor::PrecordWorkerShutdown() {
+  if (!precord_worker_started_) {
+    return;
+  }
+  {
+    std::unique_lock<std::mutex> lock(precord_worker_mutex_);
+    precord_worker_shutdown_ = true;
+    precord_worker_cv_.notify_all();
+  }
+  if (precord_worker_thread_.joinable()) {
+    precord_worker_thread_.join();
+  }
+  precord_worker_started_ = false;
+}
+
+void D3D12CommandProcessor::PrecordFlush() {
+  // Reentrancy guard: a replayed copy-mode op can re-enter via IssueCopy's flush.
+  if (precord_replaying_) {
+    return;
+  }
+  if (!precord_segment_open_) {
+    PrecordResetSegment();
+    return;
+  }
+
+  // [GPU-PRECORD] Phase 1b-1b: thread implies localrf. When localrf is selected,
+  // replay against a private local register file (optionally on the worker);
+  // otherwise take the 1b-0 shared-rewind path below.
+  if (g_precord_localrf || g_precord_thread) {
+    if (g_precord_thread) {
+      // Model C: hand the open segment to the worker and BLOCK until it has
+      // replayed it. No overlap yet -- this proves the off-thread replay plumbing
+      // and the local-regfile decoupling produce pixel-identical output.
+      PrecordWorkerEnsureStarted();
+      std::unique_lock<std::mutex> lock(precord_worker_mutex_);
+      precord_worker_job_pending_ = true;
+      precord_worker_cv_.notify_all();
+      precord_worker_cv_.wait(lock, [this] { return !precord_worker_job_pending_; });
+    } else {
+      PrecordReplayLocal();
+    }
+    return;
+  }
+
+  // [GPU-PRECORD] Phase 1b-0 shared-rewind path. Rewind the live register file to
+  // the snapshot taken at the segment's first draw, and reset the command-list
+  // cache so the segment re-emits all state (it is being recorded as if into a
+  // fresh list). All draw-path readers read this one register file, so rewinding it
+  // is sufficient for single-thread replay.
+  std::memcpy(register_file_->values, precord_snapshot_.data(),
+              RegisterFile::kRegisterCount * sizeof(uint32_t));
+  ForceFullDrawStateReemit();
+
+  // Replay must be deterministic and not branch on the other draw-path probes;
+  // force them off for the duration (they never affect which writes apply).
+  bool saved_instance = g_instance;
+  bool saved_parallel = g_parallel_record;
+  g_instance = false;
+  g_parallel_record = false;
+  precord_replaying_ = true;
+
+  PrecordReplayEvents();
+
+  precord_replaying_ = false;
+  g_instance = saved_instance;
+  g_parallel_record = saved_parallel;
+
+  // The register file now again holds the segment-end state (replay re-applied
+  // every logged write). Reset the segment and the draw caches so the following
+  // op / next segment records cleanly.
+  PrecordResetSegment();
+  ForceFullDrawStateReemit();
+}
+
 bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -3529,6 +4519,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    // [GPU-PRECORD] Phase 1a: count draws per submission (segment boundaries);
+    // clear any segment streams (defensive — EndSubmission already drains them).
+    parallel_record_counter_ = 0;
+    precord_segments_.clear();
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3607,6 +4601,14 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 }
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+  // [GPU-PRECORD] Phase 1b-0: record any pending captured draws before the
+  // submission closes, otherwise they would be lost.
+  PrecordFlush();
+  // [GPU-INST] A deferred instanced draw must be emitted into this submission
+  // before it closes, otherwise its recorded setup is orphaned and the draw is
+  // lost. Flush while the submission is still open.
+  FlushInstancedBatch();
+
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
 
   // Make sure there is a command allocator to write commands to.
@@ -3660,6 +4662,14 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
+    // [GPU-PRECORD] Phase 1a-ii: replay completed segment streams in submission
+    // order first, then the final (still-current) deferred list. Concatenated they
+    // are the exact command sequence the single-list path would have produced.
+    // Empty (no-op) when gpu_parallel_record is off.
+    for (auto& segment_stream : precord_segments_) {
+      deferred_command_list_.ExecuteStream(segment_stream, command_list_, command_list_1_);
+    }
+    precord_segments_.clear();
     deferred_command_list_.Execute(command_list_, command_list_1_);
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
@@ -3786,7 +4796,7 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   SetScissorRect(scissor_rect);
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
-    const RegisterFile& regs = *register_file_;
+    const RegisterFile& regs = GetActiveDrawRegisterFile();
 
     // Blend factor.
     float blend_factor[] = {
@@ -3834,7 +4844,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  const RegisterFile& regs = *register_file_;
+  const RegisterFile& regs = GetActiveDrawRegisterFile();
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
@@ -4252,7 +5262,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                                            bool shared_memory_is_uav) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
-  const RegisterFile& regs = *register_file_;
+  const RegisterFile& regs = GetActiveDrawRegisterFile();
 
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");

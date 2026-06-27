@@ -87,7 +87,7 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
                              const D3D12RenderTargetCache& render_target_cache,
                              bool bindless_resources_used)
     : command_processor_(command_processor),
-      register_file_(register_file),
+      register_file_(&register_file),
       render_target_cache_(render_target_cache),
       bindless_resources_used_(bindless_resources_used) {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
@@ -816,10 +816,10 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
 
 DxbcShaderTranslator::Modification PipelineCache::GetCurrentVertexShaderModification(
     const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
-    uint32_t interpolator_mask) const {
+    uint32_t interpolator_mask, bool instanced) const {
   assert_true(shader.type() == xenos::ShaderType::kVertex);
   assert_true(shader.is_ucode_analyzed());
-  const auto& regs = register_file_;
+  const auto& regs = *register_file_;
 
   DxbcShaderTranslator::Modification modification(
       shader_translator_->GetDefaultVertexShaderModification(
@@ -827,6 +827,8 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentVertexShaderModifica
           host_vertex_shader_type));
 
   modification.vertex.interpolator_mask = interpolator_mask;
+  // [GPU-INST] Select the instancing variant when requested by the coalescer.
+  modification.vertex.instanced = instanced ? 1 : 0;
 
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   uint32_t user_clip_planes = pa_cl_clip_cntl.clip_disable ? 0 : pa_cl_clip_cntl.ucp_ena;
@@ -849,7 +851,7 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
     reg::RB_DEPTHCONTROL normalized_depth_control) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
-  const auto& regs = register_file_;
+  const auto& regs = *register_file_;
 
   DxbcShaderTranslator::Modification modification(
       shader_translator_->GetDefaultPixelShaderModification(
@@ -914,11 +916,11 @@ bool PipelineCache::ConfigurePipeline(
 
   // Ensure shaders are translated - needed now for GetCurrentStateDescription.
   // Edge flags are not supported yet (because polygon primitives are not).
-  assert_true(register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
+  assert_true(register_file_->Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
                   xenos::VertexShaderExportMode::kPosition2VectorsEdge &&
-              register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
+              register_file_->Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
-  assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
+  assert_false(register_file_->Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
   // Ucode analysis is always needed on the main thread (for modification and
   // hash computation). Translation can be deferred to background threads when
   // async compilation is enabled.
@@ -1248,7 +1250,7 @@ bool PipelineCache::GetCurrentStateDescription(
 
   PipelineDescription& description_out = runtime_description_out.description;
 
-  const auto& regs = register_file_;
+  const auto& regs = *register_file_;
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
 
   // Initialize all unused fields to zero for comparison/hashing.

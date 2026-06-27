@@ -25,11 +25,19 @@ class DrawExtentEstimator {
  public:
   DrawExtentEstimator(const RegisterFile& register_file, const memory::Memory& memory,
                       TraceWriter* trace_writer)
-      : register_file_(register_file),
+      : register_file_(&register_file),
         memory_(memory),
         trace_writer_(trace_writer),
         shader_interpreter_(register_file, memory) {
     shader_interpreter_.SetTraceWriter(trace_writer);
+  }
+
+  // [GPU-PRECORD] Phase 1b-1: repoint the register file (cascades to the shader
+  // interpreter used for CPU vertex-Y estimation). A worker points this at its
+  // per-segment local copy during segment replay.
+  void SetRegisterFile(const RegisterFile* register_file) {
+    register_file_ = register_file;
+    shader_interpreter_.SetRegisterFile(register_file);
   }
 
   // The shader must have its ucode analyzed.
@@ -61,7 +69,7 @@ class DrawExtentEstimator {
     std::optional<uint32_t> vertex_kill_;
   };
 
-  const RegisterFile& register_file_;
+  const RegisterFile* register_file_;
   const memory::Memory& memory_;
   TraceWriter* trace_writer_;
 

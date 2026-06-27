@@ -202,7 +202,7 @@ const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCo
 
 TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shared_memory,
                            uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
-    : register_file_(register_file),
+    : register_file_(&register_file),
       shared_memory_(shared_memory),
       draw_resolution_scale_x_(draw_resolution_scale_x),
       draw_resolution_scale_y_(draw_resolution_scale_y) {

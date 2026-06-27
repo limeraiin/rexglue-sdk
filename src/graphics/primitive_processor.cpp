@@ -284,7 +284,7 @@ void PrimitiveProcessor::ClearPerFrameCache() {
 bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
   SCOPE_profile_cpu_f("gpu");
 
-  const RegisterFile& regs = register_file_;
+  const RegisterFile& regs = *register_file_;
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
   // Parse the primitive type and the tessellation state (VGT_OUTPUT_PATH_CNTL

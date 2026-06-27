@@ -433,6 +433,16 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
     a_.OpMov(dxbc::Dest::O(out_reg_vs_interpolators_ + i), dxbc::Src::LF(0.0f));
   }
 
+  // [GPU-INST] Compute the per-instance base index into the float-constants
+  // cbuffer: instance_base.x = SV_InstanceID * float_count. Every absolute
+  // float-constant load is then redirected to cb[instance_base.x + index].
+  if (system_temp_instance_base_ != UINT32_MAX) {
+    uint32_t instanced_float_count = current_shader().constant_register_map().float_count;
+    a_.OpUMul(dxbc::Dest::Null(), dxbc::Dest::R(system_temp_instance_base_, 0b0001),
+              dxbc::Src::V1D(kInRegisterVSInstanceID, dxbc::Src::kXXXX),
+              dxbc::Src::LU(instanced_float_count));
+  }
+
   // Remember that x# are only accessible via mov load or store - use a
   // temporary variable if need to do any computations!
   Shader::HostVertexShaderType host_vertex_shader_type =
@@ -818,6 +828,8 @@ void DxbcShaderTranslator::StartTranslation() {
 
   // Allocate global system temporary registers that may also be used in the
   // epilogue.
+  // [GPU-INST] Default: not the instancing variant.
+  system_temp_instance_base_ = UINT32_MAX;
   if (is_vertex_shader()) {
     system_temp_position_ = PushSystemTemp(0b1111);
     system_temp_point_size_edge_flag_kill_vertex_ = PushSystemTemp(0b0100);
@@ -826,6 +838,11 @@ void DxbcShaderTranslator::StartTranslation() {
     // override it.
     a_.OpMov(dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_, 0b0001),
              dxbc::Src::LF(-1.0f));
+    // [GPU-INST] Per-instance base index into the float-constants cbuffer.
+    // Allocated just above point_size; released in CompleteShaderCode.
+    if (IsVertexShaderInstanced()) {
+      system_temp_instance_base_ = PushSystemTemp(0b0001);
+    }
   } else if (is_pixel_shader()) {
     if (edram_rov_used_) {
       // Will be initialized unconditionally.
@@ -1057,6 +1074,13 @@ void DxbcShaderTranslator::CompleteShaderCode() {
     // - system_temp_memexport_address_.
     // - system_temps_memexport_data_.
     PopSystemTemp(rex::bit_count(uint32_t(memexport_eM_written)) + 2);
+  }
+
+  // [GPU-INST] Release system_temp_instance_base_ (allocated just above
+  // system_temp_point_size_edge_flag_kill_vertex_ in the instancing variant, so
+  // it is the top of the persistent stack at this point). UINT32_MAX otherwise.
+  if (system_temp_instance_base_ != UINT32_MAX) {
+    PopSystemTemp();
   }
 
   // Write stage-specific epilogue.
@@ -1343,7 +1367,15 @@ dxbc::Src DxbcShaderTranslator::LoadOperand(const InstructionOperand& operand,
         if (float_constant_index == UINT32_MAX) {
           return dxbc::Src::LF(0.0f);
         }
-        index.index_ = float_constant_index;
+        // [GPU-INST] In the instancing variant, redirect to this instance's
+        // block: cb[instance_base.x + packed_index]. instance_base is only set
+        // when float addressing is purely absolute, so this branch covers every
+        // constant load in an instanced shader.
+        if (system_temp_instance_base_ != UINT32_MAX) {
+          index = dxbc::Index(system_temp_instance_base_, 0, float_constant_index);
+        } else {
+          index.index_ = float_constant_index;
+        }
       } else {
         assert_true(constant_register_map.float_dynamic_addressing);
       }
@@ -2543,6 +2575,24 @@ void DxbcShaderTranslator::WriteInputSignature() {
       vertex_id.always_reads_mask = (register_count() >= 1) ? 0b0001 : 0b0000;
     }
 
+    // [GPU-INST] SV_InstanceID parameter for the instancing variant. The
+    // parameter records must stay contiguous (before the semantic strings), so
+    // allocate it here, right after SV_VertexID.
+    bool vs_instanced = IsVertexShaderInstanced();
+    size_t instance_id_position = 0;
+    if (vs_instanced) {
+      instance_id_position = shader_object_.size();
+      shader_object_.resize(shader_object_.size() + kParameterDwords);
+      ++parameter_count;
+      auto& instance_id = *reinterpret_cast<dxbc::SignatureParameter*>(shader_object_.data() +
+                                                                       instance_id_position);
+      instance_id.system_value = dxbc::Name::kInstanceID;
+      instance_id.component_type = dxbc::SignatureRegisterComponentType::kUInt32;
+      instance_id.register_index = kInRegisterVSInstanceID;
+      instance_id.mask = 0b0001;
+      instance_id.always_reads_mask = 0b0001;
+    }
+
     // Semantic names.
     uint32_t semantic_offset = uint32_t((shader_object_.size() - blob_position) * sizeof(uint32_t));
     {
@@ -2551,6 +2601,12 @@ void DxbcShaderTranslator::WriteInputSignature() {
       vertex_id.semantic_name_ptr = semantic_offset;
     }
     semantic_offset += dxbc::AppendAlignedString(shader_object_, "SV_VertexID");
+    if (vs_instanced) {
+      auto& instance_id = *reinterpret_cast<dxbc::SignatureParameter*>(shader_object_.data() +
+                                                                       instance_id_position);
+      instance_id.semantic_name_ptr = semantic_offset;
+      semantic_offset += dxbc::AppendAlignedString(shader_object_, "SV_InstanceID");
+    }
   } else if (IsDxbcDomainShader()) {
     // Control point indices, byte-swapped, biased according to the base index
     // and converted to float by the host vertex and hull shaders
@@ -3125,13 +3181,22 @@ void DxbcShaderTranslator::WriteShaderCode() {
     const Shader::ConstantRegisterMap& constant_register_map =
         current_shader().constant_register_map();
     assert_not_zero(constant_register_map.float_count);
+    // [GPU-INST] The instancing variant indexes the cbuffer dynamically by
+    // instance_base.x + index, so it must be declared large enough to cover the
+    // largest per-instance block range and as dynamically indexed.
+    uint32_t float_cbuffer_vec4_count = constant_register_map.float_count;
+    dxbc::ConstantBufferAccessPattern float_cbuffer_access =
+        constant_register_map.float_dynamic_addressing
+            ? dxbc::ConstantBufferAccessPattern::kDynamicIndexed
+            : dxbc::ConstantBufferAccessPattern::kImmediateIndexed;
+    if (IsVertexShaderInstanced()) {
+      float_cbuffer_vec4_count = kInstancedFloatConstantsVec4Capacity;
+      float_cbuffer_access = dxbc::ConstantBufferAccessPattern::kDynamicIndexed;
+    }
     ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_float_constants_,
                                           uint32_t(CbufferRegister::kFloatConstants),
                                           uint32_t(CbufferRegister::kFloatConstants)),
-                            constant_register_map.float_count,
-                            constant_register_map.float_dynamic_addressing
-                                ? dxbc::ConstantBufferAccessPattern::kDynamicIndexed
-                                : dxbc::ConstantBufferAccessPattern::kImmediateIndexed);
+                            float_cbuffer_vec4_count, float_cbuffer_access);
   }
   if (cbuffer_index_system_constants_ != kBindingIndexUnallocated) {
     ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_system_constants_,
@@ -3269,6 +3334,11 @@ void DxbcShaderTranslator::WriteShaderCode() {
       if (register_count()) {
         // Unswapped vertex index input (only X component).
         ao_.OpDclInputSGV(dxbc::Dest::V1D(kInRegisterVSVertexIndex, 0b0001), dxbc::Name::kVertexID);
+      }
+      // [GPU-INST] SV_InstanceID input for the instancing variant.
+      if (IsVertexShaderInstanced()) {
+        ao_.OpDclInputSGV(dxbc::Dest::V1D(kInRegisterVSInstanceID, 0b0001),
+                          dxbc::Name::kInstanceID);
       }
     }
     // Interpolator output.

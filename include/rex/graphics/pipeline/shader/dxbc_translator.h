@@ -158,6 +158,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // uint32_t 1.
       // Pipeline stage and input configuration.
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
+      // [GPU-INST] When set, this is the GPU-instancing variant of the vertex
+      // shader: it reads SV_InstanceID, computes a per-instance base offset into
+      // the float-constants cbuffer (= SV_InstanceID * float_count), and every
+      // absolute float-constant load is redirected to that per-instance block
+      // instead of the single shared block. Only emitted when the shader has
+      // float constants and does NOT use dynamic float addressing.
+      uint32_t instanced : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -461,6 +468,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kBindfulTexturesStart,
   };
 
+  // [GPU-INST] Declared vec4 capacity of the float-constants cbuffer in the
+  // instancing vertex-shader variant (must cover SV_InstanceID * float_count +
+  // index for the largest instance count). A D3D12 CBV is at most 65536 bytes =
+  // 4096 vec4; the command processor caps instances/draw so access stays in
+  // bounds. Public so the command processor can derive that per-draw cap.
+  static constexpr uint32_t kInstancedFloatConstantsVec4Capacity = 4096;
+
   // 192 textures at most because there are 32 fetch constants, and textures can
   // be 2D array, 3D or cube, and also signed and unsigned.
   static constexpr uint32_t kMaxTextureBindingIndexBits = 8;
@@ -602,7 +616,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // IF ANY OF THESE ARE CHANGED, WriteInputSignature and WriteOutputSignature
   // MUST BE UPDATED!
   static constexpr uint32_t kInRegisterVSVertexIndex = 0;
+  // [GPU-INST] SV_InstanceID input register for the instancing variant.
+  static constexpr uint32_t kInRegisterVSInstanceID = 1;
   static constexpr uint32_t kInRegisterDSControlPointIndex = 0;
+
+  // [GPU-INST] True when the current translation is the instancing variant of a
+  // vertex shader that actually has instanceable float constants (has float
+  // constants and does not use dynamic float addressing). Drives SV_InstanceID
+  // declaration, the per-instance base computation, and the cbuffer redirect.
+  bool IsVertexShaderInstanced() {
+    return is_vertex_shader() && GetDxbcShaderModification().vertex.instanced &&
+           current_shader().constant_register_map().float_count != 0 &&
+           !current_shader().constant_register_map().float_dynamic_addressing;
+  }
 
   // GetSystemConstantSrc + MarkSystemConstantUsed is for special cases of
   // building the source unconditionally - in general, LoadSystemConstant must
@@ -1033,6 +1059,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Total maximum number of temporary registers ever used during this
   // translation (for the declaration).
   uint32_t system_temp_count_max_;
+
+  // [GPU-INST] In the instancing vertex-shader variant, .x holds the per-instance
+  // base index into the float-constants cbuffer (SV_InstanceID * float_count).
+  // UINT32_MAX when not an instancing variant.
+  uint32_t system_temp_instance_base_;
 
   // Position in vertex shaders (because viewport and W transformations can be
   // applied in the end of the shader).

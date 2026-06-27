@@ -81,7 +81,7 @@ void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister expo
 uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   SCOPE_profile_cpu_f("gpu");
 
-  const RegisterFile& regs = register_file_;
+  const RegisterFile& regs = *register_file_;
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
   if (!vgt_draw_initiator.num_indices) {
@@ -264,7 +264,7 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
                                            const Shader& vertex_shader) {
   SCOPE_profile_cpu_f("gpu");
 
-  const RegisterFile& regs = register_file_;
+  const RegisterFile& regs = *register_file_;
 
   auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
   int32_t window_y_offset = pa_sc_window_offset.window_y_offset;
