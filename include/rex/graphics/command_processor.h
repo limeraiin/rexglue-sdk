@@ -93,8 +93,23 @@ class CommandProcessor {
   // GraphicsSystem::MarkVblank(). Use this to measure the true game frame rate.
   uint32_t swap_counter() const { return swap_counter_.load(std::memory_order_relaxed); }
 
-  Shader* active_vertex_shader() const { return active_vertex_shader_; }
-  Shader* active_pixel_shader() const { return active_pixel_shader_; }
+  // [GPU-PRECORD] Phase 1b-1c Inc 2: while a captured segment is being replayed, each
+  // replayed draw's own active shaders come from the per-draw replay fields (set in
+  // D3D12CommandProcessor::PrecordReplayEvents) instead of the shared active_*_shader_
+  // members, which the parse thread advances to the LATEST loaded shader as it runs
+  // ahead under Phase 1c overlap. (nullptr is a valid shader value, so a bool gates
+  // this, not a null sentinel.) Only the draw path (IssueDrawImpl) reads these
+  // accessors, and it runs only during replay or a normal non-precord draw -- never on
+  // the parse thread mid-capture (draws are deferred) -- so the replay fields are
+  // touched by a single thread.
+  Shader* active_vertex_shader() const {
+    return precord_replay_shaders_active_ ? precord_replay_active_vertex_shader_
+                                          : active_vertex_shader_;
+  }
+  Shader* active_pixel_shader() const {
+    return precord_replay_shaders_active_ ? precord_replay_active_pixel_shader_
+                                          : active_pixel_shader_;
+  }
 
   virtual bool Initialize();
   virtual void Shutdown();
@@ -297,6 +312,13 @@ class CommandProcessor {
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
+  // [GPU-PRECORD] Phase 1b-1c Inc 2: per-replayed-draw active shaders + the gate the
+  // active_vertex_shader()/active_pixel_shader() accessors consult. Set around a
+  // segment replay (alongside D3D12's precord_replaying_); the shared active_*_shader_
+  // members above are left holding their capture-end value, untouched by replay.
+  bool precord_replay_shaders_active_ = false;
+  Shader* precord_replay_active_vertex_shader_ = nullptr;
+  Shader* precord_replay_active_pixel_shader_ = nullptr;
 
   bool paused_ = false;
 

@@ -360,10 +360,26 @@ class D3D12CommandProcessor : public CommandProcessor {
   // already replaying (reentrancy guard). Dispatches to the shared-rewind (1b-0),
   // local-register-file (1b-1b), or worker-thread (1b-1b Model C) path per cvar.
   void PrecordFlush();
-  // [GPU-PRECORD] Phase 1b-1b: the event/draw replay loop, shared by every replay
-  // mode. Replays precord_events_ in order via WriteRegister/FromMem + IssueDrawImpl.
-  // Assumes the register file is already rewound/built and the draw-state cache reset.
-  void PrecordReplayEvents();
+  // [GPU-PRECORD] Phase 1b-1b/1c: the event/draw replay loop, shared by every replay
+  // mode. Replays precord_events_ in order interleaved with IssueDrawImpl. Assumes the
+  // register file is already rewound/built and the draw-state cache reset.
+  //   local_target == nullptr ⇒ 1b-0 shared-rewind mode: apply logged writes via the
+  //     normal WriteRegister/WriteRegistersFromMem against the (rewound) shared file.
+  //   local_target != nullptr ⇒ 1b-1b/1c local-regfile mode: apply logged writes via
+  //     PrecordApplyWrite* against the private local file, never touching register_file_.
+  void PrecordReplayEvents(RegisterFile* local_target);
+  // [GPU-PRECORD] Phase 1b-1c Inc 1: replay-time equivalents of WriteRegister /
+  // WriteRegistersFromMem that apply a DEFERRABLE register write against `file` (the
+  // per-segment local register file) instead of the shared register_file_ member, so a
+  // replaying worker never mutates the file the parse thread owns -- the write-side
+  // analogue of the 1b-1a read decoupling, and the invariant Phase 1c overlap needs.
+  // They mirror the deferrable-register subset of WriteRegister's effect (dedupe skip,
+  // value store, D3D12 cbuffer/texture/vertex-residency invalidation); the stateful
+  // registers are flush-gated (PrecordRangeMustNotDefer) so they never reach replay.
+  // Keep in sync with WriteRegister / WriteRegistersFromMem.
+  void PrecordApplyWrite(RegisterFile* file, uint32_t index, uint32_t value);
+  void PrecordApplyWriteFromMem(RegisterFile* file, uint32_t start_index, uint32_t* base,
+                                uint32_t num_registers);
   // [GPU-PRECORD] Phase 1b-1b: replay the captured segment against a PRIVATE local
   // register file (precord_local_regfile_) with every draw-path holder repointed to
   // it (SetRegisterFile), then restored. Exercises the 1b-1a decoupling: the draws

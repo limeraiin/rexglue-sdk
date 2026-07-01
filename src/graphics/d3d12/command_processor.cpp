@@ -4273,26 +4273,40 @@ void D3D12CommandProcessor::PrecordResetSegment() {
   precord_draws_in_segment_ = 0;
 }
 
-void D3D12CommandProcessor::PrecordReplayEvents() {
+void D3D12CommandProcessor::PrecordReplayEvents(RegisterFile* local_target) {
   // The event/draw replay loop, shared by every replay mode. The register file is
   // already rewound/built and the draw-state cache reset; replay re-applies every
   // logged write (so the file ends at the segment-end state) interleaved with the
   // draws, each draw seeing exactly its own register state. Caller sets
   // precord_replaying_ + forces the other draw-path probes off.
+  //   local_target == nullptr ⇒ 1b-0 shared-rewind mode: writes go through the normal
+  //     WriteRegister/WriteRegistersFromMem against the (already rewound) shared file.
+  //   local_target != nullptr ⇒ local-regfile mode: writes go to `local_target` via
+  //     PrecordApplyWrite*, leaving the shared register_file_ member untouched.
   for (const PrecordEvent& ev : precord_events_) {
     switch (ev.kind) {
       case PrecordEvent::Kind::kWriteSingle:
-        WriteRegister(ev.a, ev.b);
+        if (local_target) {
+          PrecordApplyWrite(local_target, ev.a, ev.b);
+        } else {
+          WriteRegister(ev.a, ev.b);
+        }
         break;
       case PrecordEvent::Kind::kWriteFromMem:
-        WriteRegistersFromMem(ev.a, precord_frommem_data_.data() + ev.c, ev.b);
+        if (local_target) {
+          PrecordApplyWriteFromMem(local_target, ev.a, precord_frommem_data_.data() + ev.c, ev.b);
+        } else {
+          WriteRegistersFromMem(ev.a, precord_frommem_data_.data() + ev.c, ev.b);
+        }
         break;
       case PrecordEvent::Kind::kDraw: {
         const PrecordDraw& draw = precord_draws_[ev.a];
-        // [GPU-PRECORD] restore this draw's own active shaders (parse-time CP state
-        // not carried by the register file) before replaying it.
-        active_vertex_shader_ = draw.active_vs;
-        active_pixel_shader_ = draw.active_ps;
+        // [GPU-PRECORD] Phase 1b-1c Inc 2: this draw's own active shaders (parse-time CP
+        // state not carried by the register file) go to the replay-scoped fields the
+        // accessors read, NOT the shared active_*_shader_ members the parse thread owns
+        // (it advances them to the latest loaded shader as it runs ahead under overlap).
+        precord_replay_active_vertex_shader_ = draw.active_vs;
+        precord_replay_active_pixel_shader_ = draw.active_ps;
         IndexBufferInfo ibi;
         IndexBufferInfo* ibi_ptr = nullptr;
         if (draw.has_index_buffer_info) {
@@ -4303,6 +4317,199 @@ void D3D12CommandProcessor::PrecordReplayEvents() {
         break;
       }
     }
+  }
+}
+
+void D3D12CommandProcessor::PrecordApplyWrite(RegisterFile* file, uint32_t index, uint32_t value) {
+  // [GPU-PRECORD] Phase 1b-1c Inc 1: the replay-time equivalent of a single
+  // WriteRegister for a DEFERRABLE register, applied against `file` (the per-segment
+  // local register file) instead of the shared register_file_ member. Mirrors the
+  // deferrable subset of D3D12CommandProcessor::WriteRegister + its base: the constant
+  // dedupe, the value store, and the D3D12 cbuffer/texture/vertex-residency
+  // invalidation. The stateful registers (scratch/COHER/DC_LUT) are flush-gated
+  // (PrecordRangeMustNotDefer) so they never reach replay -- intentionally omitted.
+  // During replay g_instance/g_parallel_record are forced off, so their branches in
+  // WriteRegister are dead here too. Keep in sync with WriteRegister (this override +
+  // the CommandProcessor base).
+
+  // [PERF/CONST-DEDUPE] mirror WriteRegister's constant dedupe, against `file`.
+  if (g_dedupe_constants &&
+      ((index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+        index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+       (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+        index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
+    ++g_const_writes_total;
+    if (file->values[index] == value) {
+      ++g_const_writes_skipped;
+      return;
+    }
+  }
+
+  // Value store (base CommandProcessor::WriteRegister, deferrable subset). Extended
+  // (out-of-bounds) registers live in the shared side map, not the file -- delegate to
+  // the base so the exact insert_or_assign + warn-once behavior is reproduced. (This
+  // is a shared-member touch; extended registers are near-absent in this title and a
+  // known Phase 1c overlap edge -- see the design doc's open investigations.)
+  if (index >= RegisterFile::kRegisterCount) {
+    CommandProcessor::WriteRegister(index, value);
+    return;
+  }
+  file->values[index] = value;
+
+  // D3D12 cbuffer / texture / vertex-residency invalidation (WriteRegister tail).
+  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    if (frame_open_) {
+      uint32_t float_constant_index = (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      if (float_constant_index >= 256) {
+        float_constant_index -= 256;
+        if (current_float_constant_map_pixel_[float_constant_index >> 6] &
+            (1ull << (float_constant_index & 63))) {
+          cbuffer_binding_float_pixel_.up_to_date = false;
+        }
+      } else {
+        if (current_float_constant_map_vertex_[float_constant_index >> 6] &
+            (1ull << (float_constant_index & 63))) {
+          cbuffer_binding_float_vertex_.up_to_date = false;
+        }
+      }
+    }
+  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+             index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    cbuffer_binding_bool_loop_.up_to_date = false;
+  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+             index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    cbuffer_binding_fetch_.up_to_date = false;
+    if (texture_cache_ != nullptr) {
+      texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
+                                                  6);
+    }
+    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
+  }
+}
+
+void D3D12CommandProcessor::PrecordApplyWriteFromMem(RegisterFile* file, uint32_t start_index,
+                                                     uint32_t* base, uint32_t num_registers) {
+  // [GPU-PRECORD] Phase 1b-1c Inc 1: replay-time equivalent of
+  // D3D12CommandProcessor::WriteRegistersFromMem, applying the bulk write against
+  // `file` instead of the shared register_file_ member. Mirrors the deferrable
+  // constant fast-paths + the generic per-register fallback; stateful ranges are
+  // flush-gated and never reach replay. Keep in sync with WriteRegistersFromMem.
+  if (!num_registers) {
+    return;
+  }
+  uint32_t end_index = start_index + num_registers - 1;
+
+  // Duplicated from WriteRegistersFromMem's local lambda (kept local to leave the hot
+  // parse path byte-for-byte untouched). Keep in sync.
+  auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
+                                         uint32_t last_constant) -> bool {
+    if (first_constant > last_constant) {
+      return false;
+    }
+    uint32_t first_word = first_constant >> 6;
+    uint32_t last_word = last_constant >> 6;
+    uint32_t first_bit = first_constant & 63;
+    uint32_t last_bit = last_constant & 63;
+    if (first_word == last_word) {
+      uint32_t bit_count = last_bit - first_bit + 1;
+      uint64_t mask = bit_count == 64 ? UINT64_MAX : ((UINT64_C(1) << bit_count) - 1) << first_bit;
+      return (usage_map[first_word] & mask) != 0;
+    }
+    if (usage_map[first_word] & (UINT64_MAX << first_bit)) {
+      return true;
+    }
+    for (uint32_t word = first_word + 1; word < last_word; ++word) {
+      if (usage_map[word]) {
+        return true;
+      }
+    }
+    uint64_t last_mask = last_bit == 63 ? UINT64_MAX : ((UINT64_C(1) << (last_bit + 1)) - 1);
+    return (usage_map[last_word] & last_mask) != 0;
+  };
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    if (g_dedupe_constants) {
+      g_const_writes_total += num_registers;
+      const uint32_t* cur = file->values + start_index;
+      bool changed = false;
+      for (uint32_t i = 0; i < num_registers; ++i) {
+        if (memory::load_and_swap<uint32_t>(base + i) != cur[i]) {
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) {
+        g_const_writes_skipped += num_registers;
+        return;
+      }
+    }
+    memory::copy_and_swap(file->values + start_index, base, num_registers);
+    if (frame_open_) {
+      uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      if (first_float_constant < 256) {
+        uint32_t last_vertex_constant = std::min(last_float_constant, 255u);
+        if (range_has_any_constant_usage(current_float_constant_map_vertex_, first_float_constant,
+                                         last_vertex_constant)) {
+          cbuffer_binding_float_vertex_.up_to_date = false;
+        }
+      }
+      if (last_float_constant >= 256) {
+        uint32_t first_pixel_constant =
+            first_float_constant >= 256 ? first_float_constant - 256 : 0;
+        uint32_t last_pixel_constant = last_float_constant - 256;
+        if (range_has_any_constant_usage(current_float_constant_map_pixel_, first_pixel_constant,
+                                         last_pixel_constant)) {
+          cbuffer_binding_float_pixel_.up_to_date = false;
+        }
+      }
+    }
+    return;
+  }
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    if (g_dedupe_constants) {
+      g_const_writes_total += num_registers;
+      const uint32_t* cur = file->values + start_index;
+      bool changed = false;
+      for (uint32_t i = 0; i < num_registers; ++i) {
+        if (memory::load_and_swap<uint32_t>(base + i) != cur[i]) {
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) {
+        g_const_writes_skipped += num_registers;
+        return;
+      }
+    }
+    memory::copy_and_swap(file->values + start_index, base, num_registers);
+    cbuffer_binding_bool_loop_.up_to_date = false;
+    return;
+  }
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    memory::copy_and_swap(file->values + start_index, base, num_registers);
+    cbuffer_binding_fetch_.up_to_date = false;
+    uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    if (texture_cache_) {
+      texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+    }
+    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+    return;
+  }
+
+  // Generic fallback. WriteRegistersFromMem defers to CommandProcessor::
+  // WriteRegistersFromMem, which loops the virtual WriteRegister per register; during
+  // replay that reduces to the deferrable subset -> PrecordApplyWrite per register
+  // (which also reproduces the per-register invalidation for any constant register in
+  // a mixed range).
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    PrecordApplyWrite(file, start_index + i, memory::load_and_swap<uint32_t>(base + i));
   }
 }
 
@@ -4321,12 +4528,15 @@ void D3D12CommandProcessor::PrecordReplayLocal() {
   std::memcpy(local->values, precord_snapshot_.data(),
               RegisterFile::kRegisterCount * sizeof(uint32_t));
 
-  // Repoint all draw-path register-file holders to the local file. register_file_
-  // (the base member) must move too: replay's WriteRegister writes through it, and
-  // IssueDrawImpl's GetActiveDrawRegisterFile() falls back to it. RenderTargetCache
-  // cascades to its DrawExtentEstimator -> ShaderInterpreter.
+  // Repoint the draw-path READ holders to the local file (the 1b-1a decoupling).
+  // RenderTargetCache cascades to its DrawExtentEstimator -> ShaderInterpreter.
+  // [GPU-PRECORD] Phase 1b-1c Inc 1: register_file_ (the base member) is deliberately
+  // NOT repointed anymore. Replay's register WRITES go to `local` via PrecordApplyWrite*
+  // (PrecordReplayEvents(local)); the shared file the parse thread owns is never mutated
+  // by replay -- the write-side analogue of the read decoupling above, and the invariant
+  // Phase 1c overlap depends on. IssueDrawImpl reads `local` via active_draw_register_file_
+  // (GetActiveDrawRegisterFile no longer relies on the register_file_ fallback here).
   RegisterFile* shared = register_file_;
-  register_file_ = local;
   active_draw_register_file_ = local;
   primitive_processor_->SetRegisterFile(local);
   render_target_cache_->SetRegisterFile(local);
@@ -4340,17 +4550,18 @@ void D3D12CommandProcessor::PrecordReplayLocal() {
   g_instance = false;
   g_parallel_record = false;
   precord_replaying_ = true;
+  precord_replay_shaders_active_ = true;  // [1b-1c Inc 2] accessors read the replay fields
 
-  PrecordReplayEvents();
+  PrecordReplayEvents(local);
 
   precord_replaying_ = false;
+  precord_replay_shaders_active_ = false;
   g_instance = saved_instance;
   g_parallel_record = saved_parallel;
 
-  // Restore every holder to the shared file. The shared file was never touched, so
-  // it still holds the segment-end state (the parse thread advanced it during
+  // Restore the READ holders to the shared file. The shared file was never touched by
+  // replay, so it still holds the segment-end state (the parse thread advanced it during
   // capture) -- consistent with the shared-rewind path's post-replay state.
-  register_file_ = shared;
   active_draw_register_file_ = nullptr;
   primitive_processor_->SetRegisterFile(shared);
   render_target_cache_->SetRegisterFile(shared);
@@ -4450,10 +4661,14 @@ void D3D12CommandProcessor::PrecordFlush() {
   g_instance = false;
   g_parallel_record = false;
   precord_replaying_ = true;
+  precord_replay_shaders_active_ = true;  // [1b-1c Inc 2] accessors read the replay fields
 
-  PrecordReplayEvents();
+  // nullptr ⇒ shared-rewind mode: writes go through WriteRegister against the file we
+  // just rewound above (this is the 1b-0 reference path, deliberately unchanged).
+  PrecordReplayEvents(nullptr);
 
   precord_replaying_ = false;
+  precord_replay_shaders_active_ = false;
   g_instance = saved_instance;
   g_parallel_record = saved_parallel;
 
