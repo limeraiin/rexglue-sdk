@@ -2867,6 +2867,14 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
 
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                           const uint32_t* host_address, uint32_t dword_count) {
+  // [GPU-PRECORD] Phase 1b-1c Inc 4 (H1): the parse thread mutates the shared shaders_
+  // map here (emplace). Serialize against the replay worker's pipeline-cache access under
+  // the coarse pipeline lock -- but only in worker (thread) mode, so precord-off / 1b-0 /
+  // localrf-inline keep their exact single-threaded behavior with no lock at all.
+  if (g_precord_thread) {
+    std::lock_guard<std::mutex> pipeline_lock(precord_pipeline_mutex_);
+    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+  }
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
@@ -2974,6 +2982,18 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       return true;
     }
     FlushInstancedBatch();
+  }
+
+  // [GPU-PRECORD] Phase 1b-1c Inc 4 (H1/H2): hold the coarse pipeline lock across the
+  // shader-analysis / translation / ConfigurePipeline span so the replay worker's
+  // pipeline-cache mutations (AnalyzeShaderUcode, GetOrCreateTranslation, ConfigurePipeline,
+  // the pipeline-handle lookup) serialize against the parse thread's LoadShader. Gated on
+  // worker (thread) mode via defer_lock: a no-op for precord-off / 1b-0 / localrf-inline,
+  // and it is the single outer lock this thread holds -> deadlock-free. Released right after
+  // the pipeline is configured; an early return in this span auto-releases it (RAII).
+  std::unique_lock<std::mutex> pipeline_lock(precord_pipeline_mutex_, std::defer_lock);
+  if (g_precord_thread) {
+    pipeline_lock.lock();
   }
 
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -3136,6 +3156,13 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     return true;
+  }
+
+  // [GPU-PRECORD] Phase 1b-1c Inc 4: pipeline configured -> release the pipeline lock
+  // before the texture-request / binding / draw-record tail (which touches no shared
+  // pipeline-cache state). No-op when the lock was never taken.
+  if (pipeline_lock.owns_lock()) {
+    pipeline_lock.unlock();
   }
 
   // Update the textures - this may bind pipelines.

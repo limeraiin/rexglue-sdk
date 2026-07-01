@@ -614,6 +614,18 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool precord_worker_shutdown_ = false;
   bool precord_worker_job_pending_ = false;
 
+  // [GPU-PRECORD] Phase 1b-1c Inc 4: coarse lock serializing pipeline-cache access
+  // between the parse thread and the replay worker (H1/H2). The PARSE thread holds it
+  // around PipelineCache::LoadShader (the shaders_ map emplace) in D3D12CommandProcessor::
+  // LoadShader; the WORKER holds it across the shader-analysis/translation/ConfigurePipeline
+  // span of IssueDrawImpl (AnalyzeShaderUcode + GetOrCreateTranslation + ConfigurePipeline +
+  // the pipeline-handle lookup), which also covers H2 (shader-pointee mutation). Both sites
+  // are gated on g_precord_thread, so the lock is inert (never taken) unless the worker is
+  // running -- zero overhead for precord off / 1b-0 / localrf-inline. It is the SINGLE outer
+  // lock each thread takes (holding nothing else), so it cannot deadlock. Uncontended under
+  // Model C (parse blocked while the worker replays); it is Inc 5 overlap that makes it bite.
+  std::mutex precord_pipeline_mutex_;
+
   bool debug_markers_enabled_ = false;
 
   // Viewport info caching - avoids redundant GetHostViewportInfo recalculation
