@@ -2170,7 +2170,7 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       ev.a = index;
       ev.b = value;
       ev.c = 0;
-      precord_events_.push_back(ev);
+      precord_slots_[precord_capture_slot_].events.push_back(ev);
     }
   }
 
@@ -2241,7 +2241,7 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     return;
   }
   // [GPU-PRECORD] Phase 1b-0: log the bulk write (raw guest dwords) for replay.
-  // See WriteRegister; offset into precord_frommem_data_ is stored, not a pointer,
+  // See WriteRegister; offset into the segment's frommem_data is stored, not a pointer,
   // so the side buffer may grow without invalidating earlier events. A range that
   // touches a stateful register flushes the segment so it applies once, live.
   if (precord_segment_open_ && !precord_replaying_) {
@@ -2252,9 +2252,10 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
       ev.kind = PrecordEvent::Kind::kWriteFromMem;
       ev.a = start_index;
       ev.b = num_registers;
-      ev.c = uint32_t(precord_frommem_data_.size());
-      precord_frommem_data_.insert(precord_frommem_data_.end(), base, base + num_registers);
-      precord_events_.push_back(ev);
+      PrecordSegment& seg = precord_slots_[precord_capture_slot_];
+      ev.c = uint32_t(seg.frommem_data.size());
+      seg.frommem_data.insert(seg.frommem_data.end(), base, base + num_registers);
+      seg.events.push_back(ev);
     }
   }
   uint32_t end_index = start_index + num_registers - 1;
@@ -2887,17 +2888,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // already holds every write that set this draw up). Later writes are logged and
   // replayed in order so each draw sees exactly its own register state.
   if (!precord_segment_open_) {
-    precord_snapshot_.assign(register_file_->values,
-                             register_file_->values + RegisterFile::kRegisterCount);
+    precord_slots_[precord_capture_slot_].snapshot.assign(
+        register_file_->values, register_file_->values + RegisterFile::kRegisterCount);
     precord_segment_open_ = true;
     precord_draws_in_segment_ = 0;
   }
+  PrecordSegment& seg = precord_slots_[precord_capture_slot_];
   PrecordEvent ev;
   ev.kind = PrecordEvent::Kind::kDraw;
-  ev.a = uint32_t(precord_draws_.size());
+  ev.a = uint32_t(seg.draws.size());
   ev.b = 0;
   ev.c = 0;
-  precord_events_.push_back(ev);
+  seg.events.push_back(ev);
   PrecordDraw draw;
   draw.primitive_type = primitive_type;
   draw.index_count = index_count;
@@ -2910,7 +2912,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // the register file) so replay can restore each draw's own shaders.
   draw.active_vs = active_vertex_shader_;
   draw.active_ps = active_pixel_shader_;
-  precord_draws_.push_back(draw);
+  seg.draws.push_back(draw);
   if (++precord_draws_in_segment_ >= kParallelRecordSegmentDraws) {
     PrecordFlush();
   }
@@ -4265,12 +4267,16 @@ void D3D12CommandProcessor::ForceFullDrawStateReemit() {
   }
 }
 
-void D3D12CommandProcessor::PrecordResetSegment() {
-  precord_events_.clear();
-  precord_draws_.clear();
-  precord_frommem_data_.clear();
-  precord_segment_open_ = false;
-  precord_draws_in_segment_ = 0;
+void D3D12CommandProcessor::PrecordResetSlot(uint32_t slot) {
+  // [GPU-PRECORD] Phase 1b-1c Inc 3: drop one slot's captured log. The snapshot is
+  // overwritten (assign) at the next segment open and local_regfile is rebuilt from the
+  // snapshot at replay, so both allocations are kept for reuse. The capture-side flags
+  // (precord_segment_open_ / precord_draws_in_segment_) are managed by PrecordFlush's
+  // slot swap, not here -- a slot has no standalone "open" state.
+  PrecordSegment& seg = precord_slots_[slot];
+  seg.events.clear();
+  seg.draws.clear();
+  seg.frommem_data.clear();
 }
 
 void D3D12CommandProcessor::PrecordReplayEvents(RegisterFile* local_target) {
@@ -4283,7 +4289,11 @@ void D3D12CommandProcessor::PrecordReplayEvents(RegisterFile* local_target) {
   //     WriteRegister/WriteRegistersFromMem against the (already rewound) shared file.
   //   local_target != nullptr ⇒ local-regfile mode: writes go to `local_target` via
   //     PrecordApplyWrite*, leaving the shared register_file_ member untouched.
-  for (const PrecordEvent& ev : precord_events_) {
+  // [GPU-PRECORD] Phase 1b-1c Inc 3: the log lives in the replay slot (set by the flush
+  // that handed this segment off); the capture slot is a different buffer the parse
+  // thread owns.
+  PrecordSegment& seg = precord_slots_[precord_replay_slot_];
+  for (const PrecordEvent& ev : seg.events) {
     switch (ev.kind) {
       case PrecordEvent::Kind::kWriteSingle:
         if (local_target) {
@@ -4294,13 +4304,13 @@ void D3D12CommandProcessor::PrecordReplayEvents(RegisterFile* local_target) {
         break;
       case PrecordEvent::Kind::kWriteFromMem:
         if (local_target) {
-          PrecordApplyWriteFromMem(local_target, ev.a, precord_frommem_data_.data() + ev.c, ev.b);
+          PrecordApplyWriteFromMem(local_target, ev.a, seg.frommem_data.data() + ev.c, ev.b);
         } else {
-          WriteRegistersFromMem(ev.a, precord_frommem_data_.data() + ev.c, ev.b);
+          WriteRegistersFromMem(ev.a, seg.frommem_data.data() + ev.c, ev.b);
         }
         break;
       case PrecordEvent::Kind::kDraw: {
-        const PrecordDraw& draw = precord_draws_[ev.a];
+        const PrecordDraw& draw = seg.draws[ev.a];
         // [GPU-PRECORD] Phase 1b-1c Inc 2: this draw's own active shaders (parse-time CP
         // state not carried by the register file) go to the replay-scoped fields the
         // accessors read, NOT the shared active_*_shader_ members the parse thread owns
@@ -4521,11 +4531,14 @@ void D3D12CommandProcessor::PrecordReplayLocal() {
   // parse-thread file. Equivalent to the shared-rewind path because nothing but the
   // draw path reads the register file while we replay (the parse thread is the
   // caller here for localrf, or blocked waiting on us for thread mode).
-  if (!precord_local_regfile_) {
-    precord_local_regfile_ = std::make_unique<RegisterFile>();
+  // [GPU-PRECORD] Phase 1b-1c Inc 3: replay the REPLAY slot (handed off by PrecordFlush),
+  // building its own local register file from that slot's snapshot.
+  PrecordSegment& seg = precord_slots_[precord_replay_slot_];
+  if (!seg.local_regfile) {
+    seg.local_regfile = std::make_unique<RegisterFile>();
   }
-  RegisterFile* local = precord_local_regfile_.get();
-  std::memcpy(local->values, precord_snapshot_.data(),
+  RegisterFile* local = seg.local_regfile.get();
+  std::memcpy(local->values, seg.snapshot.data(),
               RegisterFile::kRegisterCount * sizeof(uint32_t));
 
   // Repoint the draw-path READ holders to the local file (the 1b-1a decoupling).
@@ -4568,7 +4581,7 @@ void D3D12CommandProcessor::PrecordReplayLocal() {
   texture_cache_->SetRegisterFile(shared);
   pipeline_cache_->SetRegisterFile(shared);
 
-  PrecordResetSegment();
+  PrecordResetSlot(precord_replay_slot_);
   ForceFullDrawStateReemit();
 }
 
@@ -4622,9 +4635,23 @@ void D3D12CommandProcessor::PrecordFlush() {
     return;
   }
   if (!precord_segment_open_) {
-    PrecordResetSegment();
+    // Nothing captured; keep the capture slot clean and bail (no handoff).
+    PrecordResetSlot(precord_capture_slot_);
+    precord_draws_in_segment_ = 0;
     return;
   }
+
+  // [GPU-PRECORD] Phase 1b-1c Inc 3: hand the just-filled capture slot to the replayer
+  // as the replay slot, and open a fresh capture slot for what follows. In Model C the
+  // replay below runs to completion before this function returns (inline, or the worker
+  // is waited on), so the "other" slot is always already drained -> byte-identical with
+  // the old single buffer. Under overlap (Inc 5) the parse thread keeps capturing into
+  // the new slot while the worker drains this one. The write to precord_replay_slot_
+  // precedes the worker-mutex acquire below, so it is visible to the worker.
+  precord_replay_slot_ = precord_capture_slot_;
+  precord_capture_slot_ ^= 1u;
+  precord_segment_open_ = false;
+  precord_draws_in_segment_ = 0;
 
   // [GPU-PRECORD] Phase 1b-1b: thread implies localrf. When localrf is selected,
   // replay against a private local register file (optionally on the worker);
@@ -4646,11 +4673,11 @@ void D3D12CommandProcessor::PrecordFlush() {
   }
 
   // [GPU-PRECORD] Phase 1b-0 shared-rewind path. Rewind the live register file to
-  // the snapshot taken at the segment's first draw, and reset the command-list
-  // cache so the segment re-emits all state (it is being recorded as if into a
-  // fresh list). All draw-path readers read this one register file, so rewinding it
-  // is sufficient for single-thread replay.
-  std::memcpy(register_file_->values, precord_snapshot_.data(),
+  // the replay slot's snapshot (taken at the segment's first draw), and reset the
+  // command-list cache so the segment re-emits all state (it is being recorded as if
+  // into a fresh list). All draw-path readers read this one register file, so rewinding
+  // it is sufficient for single-thread replay.
+  std::memcpy(register_file_->values, precord_slots_[precord_replay_slot_].snapshot.data(),
               RegisterFile::kRegisterCount * sizeof(uint32_t));
   ForceFullDrawStateReemit();
 
@@ -4673,9 +4700,9 @@ void D3D12CommandProcessor::PrecordFlush() {
   g_parallel_record = saved_parallel;
 
   // The register file now again holds the segment-end state (replay re-applied
-  // every logged write). Reset the segment and the draw caches so the following
+  // every logged write). Reset the replay slot and the draw caches so the following
   // op / next segment records cleanly.
-  PrecordResetSegment();
+  PrecordResetSlot(precord_replay_slot_);
   ForceFullDrawStateReemit();
 }
 

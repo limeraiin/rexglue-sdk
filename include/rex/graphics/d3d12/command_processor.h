@@ -361,7 +361,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   // local-register-file (1b-1b), or worker-thread (1b-1b Model C) path per cvar.
   void PrecordFlush();
   // [GPU-PRECORD] Phase 1b-1b/1c: the event/draw replay loop, shared by every replay
-  // mode. Replays precord_events_ in order interleaved with IssueDrawImpl. Assumes the
+  // mode. Replays the replay slot's events in order interleaved with IssueDrawImpl. Assumes the
   // register file is already rewound/built and the draw-state cache reset.
   //   local_target == nullptr ⇒ 1b-0 shared-rewind mode: apply logged writes via the
   //     normal WriteRegister/WriteRegistersFromMem against the (rewound) shared file.
@@ -381,7 +381,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void PrecordApplyWriteFromMem(RegisterFile* file, uint32_t start_index, uint32_t* base,
                                 uint32_t num_registers);
   // [GPU-PRECORD] Phase 1b-1b: replay the captured segment against a PRIVATE local
-  // register file (precord_local_regfile_) with every draw-path holder repointed to
+  // register file (the replay slot's local_regfile) with every draw-path holder repointed to
   // it (SetRegisterFile), then restored. Exercises the 1b-1a decoupling: the draws
   // read the segment's own state from a separate file, not the shared parse-thread
   // file. Runs inline (gpu_precord_localrf) or on the worker (gpu_precord_thread).
@@ -392,9 +392,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   void PrecordWorkerEnsureStarted();
   void PrecordWorkerMain();
   void PrecordWorkerShutdown();
-  // Drop the pending segment's buffers without replaying (used after a flush, and
-  // defensively at submission boundaries).
-  void PrecordResetSegment();
+  // [GPU-PRECORD] Phase 1b-1c Inc 3: drop a slot's captured buffers (events/draws/
+  // frommem_data) without replaying, so it can capture or replay a fresh segment. Keeps
+  // the snapshot/local_regfile allocations for reuse. Used after a flush replays a slot,
+  // and defensively at submission boundaries.
+  void PrecordResetSlot(uint32_t slot);
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
   // as when there are unfinished graphics pipeline creation requests that would
@@ -566,30 +568,41 @@ class D3D12CommandProcessor : public CommandProcessor {
     enum class Kind : uint8_t { kWriteSingle, kWriteFromMem, kDraw } kind;
     // kWriteSingle: a=reg index, b=value.
     // kWriteFromMem: a=start index, b=num registers, c=offset into frommem data.
-    // kDraw: a=index into precord_draws_.
+    // kDraw: a=index into the segment's draws.
     uint32_t a;
     uint32_t b;
     uint32_t c;
   };
-  // The full register-file snapshot taken at the segment's first draw.
-  std::vector<uint32_t> precord_snapshot_;
-  std::vector<PrecordEvent> precord_events_;
-  std::vector<PrecordDraw> precord_draws_;
-  std::vector<uint32_t> precord_frommem_data_;  // raw guest dwords for kWriteFromMem
-  bool precord_segment_open_ = false;           // gates the write-log hot path
-  bool precord_replaying_ = false;              // true while PrecordFlush replays
-  uint32_t precord_draws_in_segment_ = 0;
+  // [GPU-PRECORD] Phase 1b-1c Inc 3: the per-segment capture buffers, DOUBLE-BUFFERED
+  // into two slots so the parse thread can capture the next segment (into the capture
+  // slot) while the replayer drains the previous one (the replay slot). In Model C the
+  // replayer always drains the replay slot before the parse thread reuses it, so the two
+  // slots behave exactly like the old single buffer (pixel-identical); the 2-slot
+  // structure is what Phase 1c overlap (Inc 5) needs. Per slot:
+  //   snapshot      - full register-file snapshot taken at the segment's first draw.
+  //   events/draws/frommem_data - the ordered write/draw log (frommem_data holds the raw
+  //                   guest dwords for kWriteFromMem; events store offsets into it).
+  //   local_regfile - private file the local-regfile replay path builds from the snapshot
+  //                   (lazily allocated ~80 KB, reused). Only the active replayer touches
+  //                   a replay slot, so no per-buffer synchronization is needed (the slot
+  //                   handoff rides the worker mutex/CV).
+  struct PrecordSegment {
+    std::vector<uint32_t> snapshot;
+    std::vector<PrecordEvent> events;
+    std::vector<PrecordDraw> draws;
+    std::vector<uint32_t> frommem_data;
+    std::unique_ptr<RegisterFile> local_regfile;
+  };
+  PrecordSegment precord_slots_[2];
+  uint32_t precord_capture_slot_ = 0;  // parse thread captures the open segment here
+  uint32_t precord_replay_slot_ = 0;   // the replayer (inline or worker) drains this
+  bool precord_segment_open_ = false;  // capture-side: gates the write-log hot path
+  bool precord_replaying_ = false;     // true while a replay is in progress
+  uint32_t precord_draws_in_segment_ = 0;  // capture-side draw count -> flush at 256
   // [GPU-PRECORD] Phase 1b-1: see GetActiveDrawRegisterFile(). nullptr ⇒ the shared
   // register_file_ (default; no behavior change). A worker points this at its
   // per-segment local register file while replaying that segment's draws.
   const RegisterFile* active_draw_register_file_ = nullptr;
-
-  // [GPU-PRECORD] Phase 1b-1b: private register file the local-regfile replay path
-  // builds from the segment snapshot (all draw-path holders repointed to it during
-  // replay, then restored to the shared file). Lazily allocated (~80 KB). Only the
-  // active replayer (parse thread for localrf, worker for thread mode, never both at
-  // once) touches it, so no synchronization is needed on the buffer itself.
-  std::unique_ptr<RegisterFile> precord_local_regfile_;
   // [GPU-PRECORD] Phase 1b-1b worker (Model C). The parse thread posts the captured
   // segment and blocks until the worker has replayed it (no overlap yet), so while
   // the worker runs PrecordReplayLocal the parse thread is idle ⇒ the precord_*
