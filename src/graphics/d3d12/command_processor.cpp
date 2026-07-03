@@ -96,6 +96,29 @@ REXCVAR_DEFINE_BOOL(gpu_precord_thread, false, "GPU/D3D12",
                     "MUST stay pixel-identical. Off by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_precord_overlap, false, "GPU/D3D12",
+                    "[GPU-PRECORD] Phase 1b-1c Inc 5 overlap (requires gpu_precord_thread): "
+                    "let the parse thread run AHEAD of the replay worker -- at a 256-draw "
+                    "segment boundary the captured slot is POSTed to the worker and the parse "
+                    "thread keeps capturing the next segment into the other slot instead of "
+                    "blocking (Model C). Backpressure bounds the lead to 1 segment (2 slots); "
+                    "true flush points (swap/copy/end-submission/markers/stateful writes) still "
+                    "drain the worker for ordering. This is the first parse/worker overlap -> "
+                    "the first fps signal. Output MUST stay pixel-identical. Off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [GPU-PRECORD H3-PROBE] Phase 1b-1c Inc 6 overlap correctness probe (diagnostic only,
+// no behavior change). For each replayed draw, re-hash the guest index buffer and
+// compare to the hash captured at parse time; count mismatches (= the guest overwrote
+// the IB in the parse->replay lead window). Reports '[gpu-h3]' checked/mismatch/rate
+// once/sec. Run it under +thread (Model C, expect ~0) vs +overlap (expect elevated) to
+// confirm + quantify the H3 hazard and pick the fix. See naruto-recomp/H3-ROOT-CAUSE.md.
+REXCVAR_DEFINE_BOOL(gpu_precord_h3_probe, false, "GPU/D3D12",
+                    "[GPU-PRECORD] Phase 1b-1c Inc 6 H3 diagnostic: count replayed draws "
+                    "whose guest index buffer was overwritten between capture and replay. "
+                    "Off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // [GPU-DRAW-DUMP] Native-renderer R&D (Ch.9 path B): dump the per-draw "draw
 // stream" -- VB/IB guest addresses + sizes, VS/PS ucode hashes, primitive type,
 // vertex/index counts -- for the first ~12k draws after enabling, then auto-stops
@@ -170,6 +193,28 @@ bool g_precord_capture = false;
 // these via the parse thread's happens-before. Plain bools (cmd-proc thread).
 bool g_precord_localrf = false;
 bool g_precord_thread = false;
+// [GPU-PRECORD] Phase 1b-1c Inc 5: overlap (parse runs ahead of the worker). Only
+// meaningful with g_precord_thread; gates every Inc 5 behavioral change so
+// gpu_precord_thread (Model C) stays the pixel-identical A/B reference. Read on the
+// parse thread; the worker never consults it. Cached once/frame in IssueSwap.
+bool g_precord_overlap = false;
+// [GPU-PRECORD H3-PROBE] Phase 1b-1c Inc 6 overlap correctness probe (default OFF,
+// cvar gpu_precord_h3_probe). For each replayed draw it re-hashes the guest index
+// buffer and compares to the hash captured at parse time; a mismatch means the guest
+// overwrote that IB in the parse->replay lead window (the H3 hazard). Counters are read
+// once/sec in IssueSwap (parse thread) but bumped at replay on the worker thread under
+// overlap, so they are atomic. The mismatch RATE decides the H3 fix: near-0 under
+// +thread (Model C baseline) but elevated under +overlap == H3 confirmed + quantified,
+// and a high rate means fences are frequent relative to draws (Option C would
+// over-serialize -> favor Option A'). See naruto-recomp/H3-ROOT-CAUSE.md.
+bool g_h3_probe = false;
+std::atomic<uint64_t> g_h3_ib_checked{0};
+std::atomic<uint64_t> g_h3_ib_mismatch{0};
+// [GPU-PRECORD H3-PROBE] Inc 6: the vertex-buffer counterpart. The IB probe measured
+// 0.0% overwrites in the heavy forest while foliage flickered, so the H3 corruption is
+// the VERTEX buffer (or a texture); these quantify the VB hazard the same way.
+std::atomic<uint64_t> g_h3_vb_checked{0};
+std::atomic<uint64_t> g_h3_vb_mismatch{0};
 // [GPU-DRAW-DUMP] Cached once/frame; counter auto-stops the dump after the cap so
 // log volume stays bounded. Worker-thread-only, so plain globals (no atomics).
 bool g_draw_dump = false;
@@ -394,6 +439,11 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
 }  // namespace shaders
+
+// [GPU-PRECORD] Phase 1b-1c Inc 5: per-thread replay flag (see the header). Each thread
+// that runs a replay (the parse thread for inline modes, the worker for thread/overlap)
+// gets its own copy, so the parse thread capturing under overlap always reads false.
+thread_local bool D3D12CommandProcessor::precord_replaying_ = false;
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
@@ -2161,7 +2211,15 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // write so PrecordFlush can replay it in order with the draws against the
   // rewound register file (reproducing the D3D12 cbuffer/texture invalidations).
   // A stateful register instead flushes the segment so it applies once, live.
-  if (precord_segment_open_ && !precord_replaying_) {
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: gate on precord_segment_open_ ALONE (not also
+  // !precord_replaying_) -- segment_open is false during every inline replay, so this
+  // stays behavior-identical, but it keeps the now-thread_local replay flag off the hot
+  // path AND ensures the parse thread's "should I defer?" test never reads the worker's
+  // replay state under overlap. precord_deferred records that this write went into the
+  // segment log, so the D3D12 side effects below can be skipped during pure overlap
+  // capture (the worker reproduces them at replay via PrecordApplyWrite).
+  bool precord_deferred = false;
+  if (precord_segment_open_) {
     if (PrecordRangeMustNotDefer(index, index)) {
       PrecordFlush();
     } else {
@@ -2171,6 +2229,7 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       ev.b = value;
       ev.c = 0;
       precord_slots_[precord_capture_slot_].events.push_back(ev);
+      precord_deferred = true;
     }
   }
 
@@ -2203,35 +2262,47 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     }
   }
 
+  // Value store into the shared register file (always -- the next segment's snapshot
+  // must see it). Under overlap this is the ONLY thing pure capture does; the D3D12
+  // side effects below belong to the worker at replay.
   CommandProcessor::WriteRegister(index, value);
 
-  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    if (frame_open_) {
-      uint32_t float_constant_index = (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
-      if (float_constant_index >= 256) {
-        float_constant_index -= 256;
-        if (current_float_constant_map_pixel_[float_constant_index >> 6] &
-            (1ull << (float_constant_index & 63))) {
-          cbuffer_binding_float_pixel_.up_to_date = false;
-        }
-      } else {
-        if (current_float_constant_map_vertex_[float_constant_index >> 6] &
-            (1ull << (float_constant_index & 63))) {
-          cbuffer_binding_float_vertex_.up_to_date = false;
+  // [GPU-PRECORD] Phase 1b-1c Inc 5 (the crux): during overlap, a DEFERRED write's
+  // D3D12 cbuffer/texture/vertex-residency invalidations must NOT run here on the parse
+  // thread -- they touch shared subsystems (texture_cache_, the cbuffer bindings,
+  // current_float_constant_map_) the worker owns while replaying an older segment.
+  // They are reproduced against the repointed subsystems by PrecordApplyWrite at replay
+  // time, so skipping them here keeps capture pure (H4/H5) with no lost effect. In every
+  // non-overlap mode precord_deferred is treated as false below, so this is a no-op.
+  if (!(g_precord_overlap && precord_deferred)) {
+    if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+      if (frame_open_) {
+        uint32_t float_constant_index = (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+        if (float_constant_index >= 256) {
+          float_constant_index -= 256;
+          if (current_float_constant_map_pixel_[float_constant_index >> 6] &
+              (1ull << (float_constant_index & 63))) {
+            cbuffer_binding_float_pixel_.up_to_date = false;
+          }
+        } else {
+          if (current_float_constant_map_vertex_[float_constant_index >> 6] &
+              (1ull << (float_constant_index & 63))) {
+            cbuffer_binding_float_vertex_.up_to_date = false;
+          }
         }
       }
+    } else if (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+               index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+      cbuffer_binding_bool_loop_.up_to_date = false;
+    } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+               index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+      cbuffer_binding_fetch_.up_to_date = false;
+      if (texture_cache_ != nullptr) {
+        texture_cache_->TextureFetchConstantWritten(
+            (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
+      }
+      InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
     }
-  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
-             index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    cbuffer_binding_bool_loop_.up_to_date = false;
-  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
-             index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
-    cbuffer_binding_fetch_.up_to_date = false;
-    if (texture_cache_ != nullptr) {
-      texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
-                                                  6);
-    }
-    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
 
@@ -2244,7 +2315,11 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   // See WriteRegister; offset into the segment's frommem_data is stored, not a pointer,
   // so the side buffer may grow without invalidating earlier events. A range that
   // touches a stateful register flushes the segment so it applies once, live.
-  if (precord_segment_open_ && !precord_replaying_) {
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: gate on precord_segment_open_ alone + track
+  // precord_deferred (see WriteRegister) so overlap capture skips the per-range D3D12
+  // invalidations below (worker reproduces them via PrecordApplyWriteFromMem at replay).
+  bool precord_deferred = false;
+  if (precord_segment_open_) {
     if (PrecordRangeMustNotDefer(start_index, start_index + num_registers - 1)) {
       PrecordFlush();
     } else {
@@ -2256,9 +2331,14 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
       ev.c = uint32_t(seg.frommem_data.size());
       seg.frommem_data.insert(seg.frommem_data.end(), base, base + num_registers);
       seg.events.push_back(ev);
+      precord_deferred = true;
     }
   }
   uint32_t end_index = start_index + num_registers - 1;
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: skip the D3D12 binding/texture/residency
+  // invalidations during pure overlap capture (the value copy_and_swap below still
+  // runs -- the next segment's snapshot must see it). False in every non-overlap mode.
+  const bool precord_skip_side_effects = g_precord_overlap && precord_deferred;
 
   // [GPU-INST] See WriteRegister: mark the open batch un-mergeable if a
   // value-changing write touches any register outside the vertex float-constant
@@ -2332,7 +2412,7 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
       }
     }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    if (frame_open_) {
+    if (frame_open_ && !precord_skip_side_effects) {
       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       if (first_float_constant < 256) {
@@ -2374,20 +2454,24 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
       }
     }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    cbuffer_binding_bool_loop_.up_to_date = false;
+    if (!precord_skip_side_effects) {
+      cbuffer_binding_bool_loop_.up_to_date = false;
+    }
     return;
   }
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    cbuffer_binding_fetch_.up_to_date = false;
-    uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    if (texture_cache_) {
-      texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+    if (!precord_skip_side_effects) {
+      cbuffer_binding_fetch_.up_to_date = false;
+      uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+      uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+      if (texture_cache_) {
+        texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+      }
+      InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     }
-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
   }
 
@@ -2436,6 +2520,40 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // [GPU-PRECORD] Phase 1b-1b: local-register-file replay + worker (thread ⇒ localrf).
   g_precord_localrf = REXCVAR_GET(gpu_precord_localrf);
   g_precord_thread = REXCVAR_GET(gpu_precord_thread);
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: overlap flip (parse runs ahead of the worker).
+  g_precord_overlap = REXCVAR_GET(gpu_precord_overlap);
+  // [GPU-PRECORD H3-PROBE] Phase 1b-1c Inc 6: refresh the H3 diagnostic flag and, when
+  // on, report the IB-overwrite rate once/sec (checked = replayed indexed draws with a
+  // captured hash; mismatch = those whose guest IB changed before replay = H3 firing).
+  g_h3_probe = REXCVAR_GET(gpu_precord_h3_probe);
+  if (g_h3_probe) {
+    static uint64_t s_h3_last_checked = 0, s_h3_last_mismatch = 0;
+    static auto s_h3_last_report = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_h3_last_report >= std::chrono::seconds(1)) {
+      static uint64_t s_h3_last_vb_checked = 0, s_h3_last_vb_mismatch = 0;
+      uint64_t checked = g_h3_ib_checked.load(std::memory_order_relaxed);
+      uint64_t mismatch = g_h3_ib_mismatch.load(std::memory_order_relaxed);
+      uint64_t vb_checked = g_h3_vb_checked.load(std::memory_order_relaxed);
+      uint64_t vb_mismatch = g_h3_vb_mismatch.load(std::memory_order_relaxed);
+      uint64_t dt_checked = checked - s_h3_last_checked;
+      uint64_t dt_mismatch = mismatch - s_h3_last_mismatch;
+      uint64_t dt_vb_checked = vb_checked - s_h3_last_vb_checked;
+      uint64_t dt_vb_mismatch = vb_mismatch - s_h3_last_vb_mismatch;
+      REXGPU_INFO(
+          "[gpu-h3] ib_checked={} ib_overwritten={} ({:.1f}%) | vb_checked={} "
+          "vb_overwritten={} ({:.1f}%)",
+          dt_checked, dt_mismatch,
+          dt_checked ? 100.0 * double(dt_mismatch) / double(dt_checked) : 0.0, dt_vb_checked,
+          dt_vb_mismatch,
+          dt_vb_checked ? 100.0 * double(dt_vb_mismatch) / double(dt_vb_checked) : 0.0);
+      s_h3_last_report = now;
+      s_h3_last_checked = checked;
+      s_h3_last_mismatch = mismatch;
+      s_h3_last_vb_checked = vb_checked;
+      s_h3_last_vb_mismatch = vb_mismatch;
+    }
+  }
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);
@@ -2896,10 +3014,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // already holds every write that set this draw up). Later writes are logged and
   // replayed in order so each draw sees exactly its own register state.
   if (!precord_segment_open_) {
-    precord_slots_[precord_capture_slot_].snapshot.assign(
-        register_file_->values, register_file_->values + RegisterFile::kRegisterCount);
-    precord_segment_open_ = true;
-    precord_draws_in_segment_ = 0;
+    PrecordOpenSegment();
   }
   PrecordSegment& seg = precord_slots_[precord_capture_slot_];
   PrecordEvent ev;
@@ -2920,9 +3035,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // the register file) so replay can restore each draw's own shaders.
   draw.active_vs = active_vertex_shader_;
   draw.active_ps = active_pixel_shader_;
+  // [GPU-PRECORD H3-PROBE] Inc 6: snapshot a hash of the guest index + vertex buffers
+  // NOW (parse time). Replay re-hashes the same ranges; a change means the guest
+  // recycled the source memory before the worker replayed this draw. Fields default to
+  // 0 (no check) when off / when the shader has no analyzed vertex fetches yet.
+  if (g_h3_probe) {
+    if (index_buffer_info && index_buffer_info->count) {
+      draw.h3_ib_hash =
+          PrecordH3HashIndexBuffer(*index_buffer_info, index_count, &draw.h3_ib_len);
+    }
+    draw.h3_vb_hash = PrecordH3CaptureVertexBuffers(
+        draw.active_vs, kH3MaxVbRanges, draw.h3_vb_range_addr, draw.h3_vb_range_size,
+        &draw.h3_vb_range_count, &draw.h3_vb_len);
+  }
   seg.draws.push_back(draw);
   if (++precord_draws_in_segment_ >= kParallelRecordSegmentDraws) {
-    PrecordFlush();
+    // [GPU-PRECORD] Phase 1b-1c Inc 5: the segment boundary -- under overlap this POSTs
+    // to the worker and keeps capturing (does not block). Every other PrecordFlush caller
+    // is a true flush point (default drain).
+    PrecordFlush(/*from_segment_boundary=*/true);
   }
   return true;
 }
@@ -4294,6 +4425,19 @@ void D3D12CommandProcessor::ForceFullDrawStateReemit() {
   }
 }
 
+void D3D12CommandProcessor::PrecordOpenSegment() {
+  // [GPU-PRECORD] Phase 1b-1c Inc 6 (H3 fix, Option A). Snapshot the shared register file
+  // into the current capture slot (it holds every write that set up the draws so far) and
+  // mark the segment open so subsequent register writes are logged + deferred. The caller
+  // guarantees the capture slot is free (lazy: first draw after a drain; eager: the
+  // just-reset slot at an overlap boundary). Reads register_file_ (shared, parse-owned)
+  // only -- safe while the worker replays against its private local file.
+  precord_slots_[precord_capture_slot_].snapshot.assign(
+      register_file_->values, register_file_->values + RegisterFile::kRegisterCount);
+  precord_segment_open_ = true;
+  precord_draws_in_segment_ = 0;
+}
+
 void D3D12CommandProcessor::PrecordResetSlot(uint32_t slot) {
   // [GPU-PRECORD] Phase 1b-1c Inc 3: drop one slot's captured log. The snapshot is
   // overwritten (assign) at the next segment open and local_regfile is rebuilt from the
@@ -4304,6 +4448,140 @@ void D3D12CommandProcessor::PrecordResetSlot(uint32_t slot) {
   seg.events.clear();
   seg.draws.clear();
   seg.frommem_data.clear();
+}
+
+uint32_t D3D12CommandProcessor::PrecordH3HashIndexBuffer(const IndexBufferInfo& ibi,
+                                                         uint32_t index_count,
+                                                         uint32_t* out_len) {
+  // [GPU-PRECORD H3-PROBE] Inc 6. Same computation at capture and replay, so any hash
+  // difference isolates a change to the guest index bytes (a recycle/overwrite), not to
+  // the inputs. Bounded + range-checked so it can never stall or fault the caller.
+  if (out_len) {
+    *out_len = 0;
+  }
+  const uint32_t index_size = (ibi.format == xenos::IndexFormat::kInt32) ? 4u : 2u;
+  uint64_t bytes64 = uint64_t(index_count) * index_size;
+  // A recycled scratch buffer changes broadly, so a bounded prefix hash still catches
+  // the overwrite while keeping the parse-thread cost small for huge index buffers.
+  uint32_t bytes = uint32_t(bytes64 > 65536u ? 65536u : bytes64);
+  if (!bytes || ibi.guest_base == 0 || ibi.guest_base >= SharedMemory::kBufferSize ||
+      SharedMemory::kBufferSize - ibi.guest_base < bytes) {
+    return 0;
+  }
+  const uint8_t* p = memory_->TranslatePhysical<const uint8_t*>(ibi.guest_base);
+  if (!p) {
+    return 0;
+  }
+  uint32_t h = 2166136261u;  // FNV-1a over the (bounded) index bytes.
+  for (uint32_t i = 0; i < bytes; ++i) {
+    h ^= p[i];
+    h *= 16777619u;
+  }
+  if (out_len) {
+    *out_len = bytes;
+  }
+  return h ^ bytes;
+}
+
+uint32_t D3D12CommandProcessor::PrecordH3HashCapturedVbRanges(const uint32_t* addr,
+                                                              const uint32_t* size,
+                                                              uint32_t count,
+                                                              uint32_t* out_len) {
+  // [GPU-PRECORD H3-PROBE] Inc 6. FNV-1a over the PINNED (addr,size) VB ranges in order,
+  // folding in each range's position so a buffer moving between slots still differs.
+  // Capture and replay both funnel through here over the same pinned ranges, so the
+  // hash matches iff the guest bytes are unchanged (no register state involved).
+  // Range-checked; a range that has since become unmapped contributes nothing, which
+  // the len comparison catches as a change.
+  if (out_len) {
+    *out_len = 0;
+  }
+  uint32_t h = 2166136261u;
+  uint32_t total = 0;
+  for (uint32_t r = 0; r < count; ++r) {
+    uint32_t a = addr[r];
+    uint32_t s = size[r];
+    if (!s || a == 0 || a >= SharedMemory::kBufferSize || SharedMemory::kBufferSize - a < s) {
+      continue;
+    }
+    const uint8_t* p = memory_->TranslatePhysical<const uint8_t*>(a);
+    if (!p) {
+      continue;
+    }
+    h ^= r;  // fold the range position
+    h *= 16777619u;
+    for (uint32_t k = 0; k < s; ++k) {
+      h ^= p[k];
+      h *= 16777619u;
+    }
+    total += s;
+  }
+  if (out_len) {
+    *out_len = total;
+  }
+  return h ^ total;
+}
+
+uint32_t D3D12CommandProcessor::PrecordH3CaptureVertexBuffers(Shader* vertex_shader,
+                                                              uint32_t max_ranges,
+                                                              uint32_t* out_addr,
+                                                              uint32_t* out_size,
+                                                              uint32_t* out_count,
+                                                              uint32_t* out_len) {
+  // [GPU-PRECORD H3-PROBE] Inc 6. Collect this draw's bound VB byte-ranges from the
+  // analyzed shader (the register file is correct at parse/capture time), PIN them into
+  // the out arrays, then hash their current bytes via PrecordH3HashCapturedVbRanges so
+  // replay uses the identical computation over the identical ranges. The bound-slot
+  // iteration mirrors the residency loop in IssueDrawImpl; bounded + range-checked so it
+  // can never stall or fault. Unanalyzed shader ⇒ empty bitmap ⇒ count 0 ⇒ len 0 ⇒
+  // replay skips the check.
+  if (out_count) {
+    *out_count = 0;
+  }
+  if (out_len) {
+    *out_len = 0;
+  }
+  if (!vertex_shader) {
+    return 0;
+  }
+  const RegisterFile& regs = GetActiveDrawRegisterFile();
+  const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+  uint32_t count = 0;
+  for (uint32_t i = 0;
+       i < rex::countof(constant_map_vertex.vertex_fetch_bitmap) && count < max_ranges; ++i) {
+    uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+      vfetch_bits_remaining &= ~(uint32_t(1) << j);
+      if (count >= max_ranges) {
+        break;
+      }
+      uint32_t vfetch_index = i * 32 + j;
+      xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+      if (vfetch_constant.type != xenos::FetchConstantType::kVertex) {
+        continue;
+      }
+      uint32_t addr = vfetch_constant.address << 2;
+      uint32_t size = vfetch_constant.size << 2;
+      // Bounded prefix per slot: a recycled scratch VB changes from the start, so this
+      // still catches the overwrite while keeping the parse-thread cost small at ~200k
+      // draws/sec (the residency loop can request many KB per slot).
+      if (size > 2048u) {
+        size = 2048u;
+      }
+      if (!size || addr == 0 || addr >= SharedMemory::kBufferSize ||
+          SharedMemory::kBufferSize - addr < size) {
+        continue;
+      }
+      out_addr[count] = addr;
+      out_size[count] = size;
+      ++count;
+    }
+  }
+  if (out_count) {
+    *out_count = count;
+  }
+  return PrecordH3HashCapturedVbRanges(out_addr, out_size, count, out_len);
 }
 
 void D3D12CommandProcessor::PrecordReplayEvents(RegisterFile* local_target) {
@@ -4349,6 +4627,32 @@ void D3D12CommandProcessor::PrecordReplayEvents(RegisterFile* local_target) {
         if (draw.has_index_buffer_info) {
           ibi = draw.index_buffer_info;
           ibi_ptr = &ibi;
+        }
+        // [GPU-PRECORD H3-PROBE] Inc 6: re-hash this draw's guest index buffer and
+        // compare to the parse-time capture; a mismatch = the guest overwrote the IB in
+        // the parse->replay lead window (the H3 flicker). Diagnostic only -- the draw
+        // still issues with whatever bytes are live (matching current overlap behavior).
+        if (g_h3_probe && draw.h3_ib_len && draw.has_index_buffer_info) {
+          uint32_t replay_len = 0;
+          uint32_t replay_hash =
+              PrecordH3HashIndexBuffer(draw.index_buffer_info, draw.index_count, &replay_len);
+          g_h3_ib_checked.fetch_add(1, std::memory_order_relaxed);
+          if (replay_len != draw.h3_ib_len || replay_hash != draw.h3_ib_hash) {
+            g_h3_ib_mismatch.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+        // [GPU-PRECORD H3-PROBE] Inc 6: same check for the bound vertex buffers, but
+        // over the ranges PINNED at capture (draw.h3_vb_range_*), so a mismatch is a
+        // guest overwrite of the vertex bytes -- not the register-read instability that
+        // gave the earlier ~50% false floor. The suspected H3 culprit (IB was 0%).
+        if (g_h3_probe && draw.h3_vb_len) {
+          uint32_t replay_len = 0;
+          uint32_t replay_hash = PrecordH3HashCapturedVbRanges(
+              draw.h3_vb_range_addr, draw.h3_vb_range_size, draw.h3_vb_range_count, &replay_len);
+          g_h3_vb_checked.fetch_add(1, std::memory_order_relaxed);
+          if (replay_len != draw.h3_vb_len || replay_hash != draw.h3_vb_hash) {
+            g_h3_vb_mismatch.fetch_add(1, std::memory_order_relaxed);
+          }
         }
         IssueDrawImpl(draw.primitive_type, draw.index_count, ibi_ptr, draw.major_mode_explicit);
         break;
@@ -4560,6 +4864,14 @@ void D3D12CommandProcessor::PrecordReplayLocal() {
   // caller here for localrf, or blocked waiting on us for thread mode).
   // [GPU-PRECORD] Phase 1b-1c Inc 3: replay the REPLAY slot (handed off by PrecordFlush),
   // building its own local register file from that slot's snapshot.
+  // [GPU-PRECORD] Phase 1b-1c Inc 5 (H4): assert we are the ONLY replayer -- the shared
+  // subsystems repointed below stay lock-free only because capture is pure (delta 2) and
+  // there is exactly one worker. A second concurrent replayer (Phase 2) trips this. The
+  // fetch_add must run unconditionally (assert_true compiles out in release), so the
+  // check reads its result separately.
+  int precord_prev_replays = precord_replays_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+  assert_true(precord_prev_replays == 0);
+  (void)precord_prev_replays;
   PrecordSegment& seg = precord_slots_[precord_replay_slot_];
   if (!seg.local_regfile) {
     seg.local_regfile = std::make_unique<RegisterFile>();
@@ -4610,6 +4922,7 @@ void D3D12CommandProcessor::PrecordReplayLocal() {
 
   PrecordResetSlot(precord_replay_slot_);
   ForceFullDrawStateReemit();
+  precord_replays_in_flight_.fetch_sub(1, std::memory_order_acq_rel);  // [Inc 5 H4]
 }
 
 void D3D12CommandProcessor::PrecordWorkerEnsureStarted() {
@@ -4630,9 +4943,14 @@ void D3D12CommandProcessor::PrecordWorkerMain() {
     if (precord_worker_shutdown_) {
       break;
     }
-    // The parse thread is blocked in PrecordFlush waiting for us, so the precord_*
-    // buffers and the shared D3D12 subsystems are ours exclusively -- run the
-    // replay with the lock released (Model C: no parse/worker overlap yet).
+    // Run the replay with the worker mutex released so the parse thread can post the next
+    // job / wait for us. What the worker owns while replaying:
+    //   - Model C (overlap off): the parse thread is blocked in PrecordFlush, so ALL
+    //     precord_* buffers + the shared D3D12 subsystems are ours exclusively.
+    //   - Overlap (Inc 5): the parse thread runs concurrently but only captures into the
+    //     OTHER slot (pure capture -- delta 2), so the replay slot we drain and the
+    //     subsystems we repoint (H4 tripwire) are still ours exclusively; backpressure in
+    //     PrecordFlush keeps the parse thread from reusing our slot until we finish.
     lock.unlock();
     PrecordReplayLocal();
     lock.lock();
@@ -4656,11 +4974,38 @@ void D3D12CommandProcessor::PrecordWorkerShutdown() {
   precord_worker_started_ = false;
 }
 
-void D3D12CommandProcessor::PrecordFlush() {
-  // Reentrancy guard: a replayed copy-mode op can re-enter via IssueCopy's flush.
+void D3D12CommandProcessor::PrecordWaitWorkerIdle() {
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: block until the worker has finished any posted
+  // segment. No-op if the worker was never started. Parse-thread-only.
+  if (!precord_worker_started_) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(precord_worker_mutex_);
+  precord_worker_cv_.wait(lock, [this] { return !precord_worker_job_pending_; });
+}
+
+void D3D12CommandProcessor::PrecordFlush(bool from_segment_boundary) {
+  // Reentrancy guard (thread_local): a replayed copy-mode op can re-enter via a flush on
+  // the SAME replay thread. The parse thread's copy is always false in thread/overlap
+  // mode, so a genuine parse-side flush proceeds even while the worker is replaying.
   if (precord_replaying_) {
     return;
   }
+
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: overlap only bites in worker mode; without it every
+  // path below drains and this stays exact Model C (the pixel-identical A/B reference).
+  const bool overlap = g_precord_overlap && g_precord_thread;
+
+  // Under overlap, make the worker idle before touching the slot machinery. At a TRUE
+  // flush point this DRAINS the previously-posted segment (ordering + visibility) before
+  // the caller's swap/copy/present/marker runs; at a SEGMENT BOUNDARY it is BACKPRESSURE
+  // -- the slot we are about to reuse (the current replay slot) must be free before we
+  // swap into it, which bounds the parse lead to 1 segment (2 slots). In every non-overlap
+  // mode the worker is already idle here (the previous flush waited), so this is a no-op.
+  if (overlap) {
+    PrecordWaitWorkerIdle();
+  }
+
   if (!precord_segment_open_) {
     // Nothing captured; keep the capture slot clean and bail (no handoff).
     PrecordResetSlot(precord_capture_slot_);
@@ -4685,14 +5030,31 @@ void D3D12CommandProcessor::PrecordFlush() {
   // otherwise take the 1b-0 shared-rewind path below.
   if (g_precord_localrf || g_precord_thread) {
     if (g_precord_thread) {
-      // Model C: hand the open segment to the worker and BLOCK until it has
-      // replayed it. No overlap yet -- this proves the off-thread replay plumbing
-      // and the local-regfile decoupling produce pixel-identical output.
+      // Hand the segment to the worker. Under overlap AT A SEGMENT BOUNDARY, post and
+      // return immediately -- the worker replays this slot while the parse thread keeps
+      // capturing the other one (the first parse/worker overlap). Otherwise (Model C, or
+      // an overlap TRUE flush point) BLOCK until the worker has replayed it (drain).
       PrecordWorkerEnsureStarted();
-      std::unique_lock<std::mutex> lock(precord_worker_mutex_);
-      precord_worker_job_pending_ = true;
-      precord_worker_cv_.notify_all();
-      precord_worker_cv_.wait(lock, [this] { return !precord_worker_job_pending_; });
+      {
+        std::unique_lock<std::mutex> lock(precord_worker_mutex_);
+        precord_worker_job_pending_ = true;
+        precord_worker_cv_.notify_all();
+      }
+      if (!(overlap && from_segment_boundary)) {
+        PrecordWaitWorkerIdle();
+      } else {
+        // [GPU-PRECORD] Phase 1b-1c Inc 6 (H3 fix, Option A): we posted the segment and are
+        // returning WITHOUT draining, so the parse thread is about to run the NEXT segment's
+        // setup register writes. EAGER-OPEN that segment now (on the freshly-swapped capture
+        // slot) so those writes DEFER -- skipping the parse-side D3D12 draw-state side
+        // effects (cbuffer/texture/vertex-residency invalidations) that would otherwise RACE
+        // the worker's in-flight replay on the shared draw-state members and cause the H3
+        // per-mesh flicker. The new capture slot is free: the wait-idle at the TOP of this
+        // flush drained the PREVIOUS posted segment, whose PrecordReplayLocal resets exactly
+        // this slot (PrecordResetSlot) before finishing. With the segment always open under
+        // overlap, there is no window where a parse write runs side effects live.
+        PrecordOpenSegment();
+      }
     } else {
       PrecordReplayLocal();
     }

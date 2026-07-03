@@ -359,7 +359,18 @@ class D3D12CommandProcessor : public CommandProcessor {
   // in original write/draw order, then clear it. No-op if no segment is open or
   // already replaying (reentrancy guard). Dispatches to the shared-rewind (1b-0),
   // local-register-file (1b-1b), or worker-thread (1b-1b Model C) path per cvar.
-  void PrecordFlush();
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: from_segment_boundary distinguishes the 256-draw
+  // boundary (the ONLY caller that passes true) from a true flush point (swap/copy/
+  // end-submission/markers/stateful writes -- the default false). Under overlap the
+  // boundary POSTs the segment to the worker and returns without waiting (parse keeps
+  // capturing the other slot); a true flush point DRAINS the worker before returning
+  // (ordering + visibility). In every non-overlap mode both fully drain -> Model C.
+  void PrecordFlush(bool from_segment_boundary = false);
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: block until the replay worker has finished any
+  // posted segment (job no longer pending). No-op if the worker was never started or is
+  // idle. Used as overlap backpressure (before reusing a slot) and to drain at flush
+  // points. Safe to call on the parse thread only.
+  void PrecordWaitWorkerIdle();
   // [GPU-PRECORD] Phase 1b-1b/1c: the event/draw replay loop, shared by every replay
   // mode. Replays the replay slot's events in order interleaved with IssueDrawImpl. Assumes the
   // register file is already rewound/built and the draw-state cache reset.
@@ -397,6 +408,38 @@ class D3D12CommandProcessor : public CommandProcessor {
   // the snapshot/local_regfile allocations for reuse. Used after a flush replays a slot,
   // and defensively at submission boundaries.
   void PrecordResetSlot(uint32_t slot);
+  // [GPU-PRECORD] Phase 1b-1c Inc 6 (H3 fix, Option A): open a capture segment on the
+  // current capture slot NOW (snapshot the shared register file, mark the segment open).
+  // Called lazily at the first draw, and EAGERLY at an overlap segment boundary so the
+  // next segment's setup writes DEFER (skipping the parse-side D3D12 draw-state side
+  // effects) instead of racing the worker's in-flight replay on the shared draw-state.
+  void PrecordOpenSegment();
+  // [GPU-PRECORD H3-PROBE] Inc 6: hash the guest index buffer for a draw (parse-time
+  // capture and replay-time re-check use the SAME inputs, so a hash mismatch isolates a
+  // guest overwrite of the source memory between capture and replay). Returns the hash;
+  // *out_len receives the byte count actually hashed (0 if there is no valid IB range).
+  uint32_t PrecordH3HashIndexBuffer(const IndexBufferInfo& ibi, uint32_t index_count,
+                                    uint32_t* out_len);
+  // Max bound vertex-fetch ranges pinned per draw for the VB probe (a draw rarely binds
+  // more than a handful; extras are truncated, only under-counting).
+  static constexpr uint32_t kH3MaxVbRanges = 8;
+  // [GPU-PRECORD H3-PROBE] Inc 6: CAPTURE a draw's bound guest VERTEX buffer ranges +
+  // a hash of their current bytes. Iterates the analyzed shader's vertex_fetch_bitmap
+  // exactly like the residency loop in IssueDrawImpl, reading the register file (correct
+  // at parse/capture time). Writes up to `max_ranges` (addr,size) pairs into the
+  // parallel out arrays and *out_count; returns the folded hash and *out_len = bytes
+  // hashed (0 if the shader is unanalyzed / binds no vertex buffers). The ranges are
+  // PINNED so replay re-hashes the SAME bytes (re-deriving them from the register file
+  // at replay gave a ~50% false-positive floor -- range instability, not a real
+  // overwrite; the IB probe avoids this by deep-copying its range, hence its clean 0%).
+  uint32_t PrecordH3CaptureVertexBuffers(Shader* vertex_shader, uint32_t max_ranges,
+                                         uint32_t* out_addr, uint32_t* out_size,
+                                         uint32_t* out_count, uint32_t* out_len);
+  // [GPU-PRECORD H3-PROBE] Inc 6: REPLAY-side re-hash of the pinned ranges (no register
+  // state involved), compared to the captured hash to detect a guest overwrite in the
+  // parse->replay lead window.
+  uint32_t PrecordH3HashCapturedVbRanges(const uint32_t* addr, const uint32_t* size,
+                                         uint32_t count, uint32_t* out_len);
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
   // as when there are unfinished graphics pipeline creation requests that would
@@ -563,6 +606,24 @@ class D3D12CommandProcessor : public CommandProcessor {
     // vertex-fetch bitmap -> spurious "invalid fetch" aborts (the black-screen bug).
     Shader* active_vs;
     Shader* active_ps;
+    // [GPU-PRECORD H3-PROBE] Inc 6 (default OFF): a hash of this draw's guest index
+    // buffer taken at parse/capture time, plus the byte length hashed. Re-hashed at
+    // replay and compared: a mismatch means the guest overwrote the IB in the
+    // parse->replay lead window (the H3 hazard that flickers foliage under overlap).
+    // len == 0 ⇒ no IB captured / out of range ⇒ replay skips the check.
+    uint32_t h3_ib_len = 0;
+    uint32_t h3_ib_hash = 0;
+    // [GPU-PRECORD H3-PROBE] Inc 6 (default OFF): same idea for the bound VERTEX
+    // buffers (the IB probe measured 0% overwrites in the heavy forest, so the
+    // corruption is the VB or a texture). The exact bound VB byte-ranges are PINNED at
+    // capture (addr/size below) and a bounded prefix of each is folded into one hash,
+    // re-hashed against the SAME ranges at replay. len == 0 ⇒ no bound VB / unanalyzed
+    // shader ⇒ replay skips the check.
+    uint32_t h3_vb_len = 0;
+    uint32_t h3_vb_hash = 0;
+    uint32_t h3_vb_range_count = 0;
+    uint32_t h3_vb_range_addr[kH3MaxVbRanges] = {};
+    uint32_t h3_vb_range_size[kH3MaxVbRanges] = {};
   };
   struct PrecordEvent {
     enum class Kind : uint8_t { kWriteSingle, kWriteFromMem, kDraw } kind;
@@ -597,7 +658,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t precord_capture_slot_ = 0;  // parse thread captures the open segment here
   uint32_t precord_replay_slot_ = 0;   // the replayer (inline or worker) drains this
   bool precord_segment_open_ = false;  // capture-side: gates the write-log hot path
-  bool precord_replaying_ = false;     // true while a replay is in progress
+  // [GPU-PRECORD] Phase 1b-1c Inc 5: true while THIS thread is replaying a segment.
+  // Made static thread_local (was a plain member) so the parse thread never observes
+  // the worker's replay state under overlap: the parse-side "should I defer?" tests
+  // (IssueDraw wrapper, PrecordFlush reentrancy guard) read this and must see the
+  // PARSE thread's own value (always false there in thread/overlap mode), not the
+  // worker's true. Inline replay (shared-rewind / localrf) runs on the parse thread,
+  // so it sets/reads its own copy -- correct in every mode. Single CP instance, so a
+  // static member == one value per thread. The hot WriteRegister/FromMem capture gate
+  // deliberately no longer reads this (it uses precord_segment_open_ alone, which is
+  // false during every inline replay) to keep TLS off that path.
+  static thread_local bool precord_replaying_;  // true while a replay is in progress
   uint32_t precord_draws_in_segment_ = 0;  // capture-side draw count -> flush at 256
   // [GPU-PRECORD] Phase 1b-1: see GetActiveDrawRegisterFile(). nullptr ⇒ the shared
   // register_file_ (default; no behavior change). A worker points this at its
@@ -613,6 +684,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool precord_worker_started_ = false;
   bool precord_worker_shutdown_ = false;
   bool precord_worker_job_pending_ = false;
+  // [GPU-PRECORD] Phase 1b-1c Inc 5 (H4): subsystem exclusivity tripwire. Exactly ONE
+  // replayer may hold the shared subsystems (PrimitiveProcessor / RenderTargetCache /
+  // TextureCache / PipelineCache) repointed to a local register file at a time -- true
+  // today because capture is pure (Inc 5 delta 2) and there is a single worker. Bumped
+  // around PrecordReplayLocal; a value >1 means a second concurrent replayer (Phase 2)
+  // has silently voided the invariant that lets those subsystems stay lock-free.
+  std::atomic<int> precord_replays_in_flight_{0};
 
   // [GPU-PRECORD] Phase 1b-1c Inc 4: coarse lock serializing pipeline-cache access
   // between the parse thread and the replay worker (H1/H2). The PARSE thread holds it
