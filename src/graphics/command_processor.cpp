@@ -58,6 +58,17 @@ REXCVAR_DEFINE_BOOL(gpu_split_profile, false, "GPU",
                     "parallelizing draws can help heavy-forest fps. Launch-time only "
                     "(read once at worker start, like gpu_worker_profile). Off by default.");
 
+REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
+                    "Write the ring-buffer read pointer back to the guest incrementally "
+                    "as ExecutePrimaryBuffer consumes packets (about every "
+                    "read_ptr_update_freq_ quadwords), instead of only once after the whole "
+                    "batch. Matches real X360 GPU behavior. The guest render thread's ring "
+                    "flow-control is a db16cyc spin-wait built around that incremental "
+                    "feedback; without it, a heavy scene stalls the producer ~18ms/frame "
+                    "waiting for a full drain (measured: guest sub_8212F708). This turns the "
+                    "lock-step drain into a producer/consumer pipeline. Off by default (A/B).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"
@@ -858,12 +869,46 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+
+  // [GPU-RB-INCREMENTAL-RPTR] On real X360 the GPU writes the ring read pointer
+  // back to the guest every read_ptr_update_freq_ quadwords as it drains the
+  // ring. The guest render thread's ring flow-control (a db16cyc spin-wait,
+  // guest sub_8212F708/sub_8212DF78) is built around that incremental feedback:
+  // it fills the ring, then spins until the read pointer advances enough to free
+  // the space it needs. Writing the read pointer back only ONCE, after the whole
+  // batch (see below), starves that feedback -> in a heavy scene the producer
+  // spins ~18ms/frame waiting for a full drain (measured: sub_8212F708 = ~98% of
+  // the guest render thread). Emitting the writeback mid-batch turns the
+  // lock-step drain into a producer/consumer pipeline. (Was Xenia's TODO.)
+  const bool incremental_rptr =
+      REXCVAR_GET(gpu_rb_incremental_readptr) && read_ptr_writeback_ptr_ != 0;
+  uint32_t wb_stride_bytes = 0;
+  uint32_t last_wb_offset = reader.read_offset();
+  if (incremental_rptr) {
+    // read_ptr_update_freq_ is in quadwords (8 bytes). Clamp so a degenerate
+    // CP_RB_CNTL can't make us write back every packet (cache ping-pong with the
+    // spinning guest) or effectively never.
+    uint32_t stride = read_ptr_update_freq_ ? (read_ptr_update_freq_ << 3) : 512u;
+    if (stride < 256u) stride = 256u;
+    if (stride > 8192u) stride = 8192u;
+    wb_stride_bytes = stride;
+  }
+  const uint32_t rb_mask = primary_buffer_size_ - 1;  // primary_buffer_size_ is a power of 2
+
   do {
     if (!ExecutePacket(&reader)) {
       // This probably should be fatal - but we're going to continue anyways.
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
       break;
+    }
+    if (incremental_rptr) {
+      uint32_t cur = reader.read_offset();
+      if (((cur - last_wb_offset) & rb_mask) >= wb_stride_bytes) {
+        memory::store_and_swap<uint32_t>(
+            memory_->TranslatePhysical(read_ptr_writeback_ptr_), cur / sizeof(uint32_t));
+        last_wb_offset = cur;
+      }
     }
   } while (reader.read_count());
 
