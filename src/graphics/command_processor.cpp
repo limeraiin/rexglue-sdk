@@ -58,6 +58,19 @@ REXCVAR_DEFINE_BOOL(gpu_split_profile, false, "GPU",
                     "parallelizing draws can help heavy-forest fps. Launch-time only "
                     "(read once at worker start, like gpu_worker_profile). Off by default.");
 
+// [PM4-CENSUS] Naruto §11.7 draw-emission census. Settles where the ~10k
+// heavy-forest draws/frame come from: counts DRAW_INDX vs DRAW_INDX_2 packets,
+// split by whether each is inside a PM4_INDIRECT_BUFFER (a pre-recorded /
+// replayed command buffer) vs inline in the primary ring, plus indirect-buffer
+// count/size per second. If most draws are inside big indirect buffers =>
+// pre-recorded replay (intercept at buffer build). If inline in the primary
+// ring => a per-frame guest draw loop (find + collapse it). '[pm4-census]',
+// ~1s report from the cmd-proc worker. Off by default; launch-time.
+REXCVAR_DEFINE_BOOL(gpu_pm4_census, false, "GPU",
+                    "Diagnostic [pm4-census]: count DRAW_INDX vs DRAW_INDX_2 packets, split "
+                    "by inside-INDIRECT_BUFFER vs primary-ring, + indirect-buffer count/size, "
+                    "~1s. Decides pre-recorded-replay vs per-frame draw loop. Off by default.");
+
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
                     "Write the ring-buffer read pointer back to the guest incrementally "
                     "as ExecutePrimaryBuffer consumes packets (about every "
@@ -312,6 +325,19 @@ thread_local uint64_t g_draw_cnt = 0;
 // Does NOT enable the per-packet g_exec_prof timing, so it stays ~clean.
 bool g_split_prof = false;
 thread_local uint64_t g_type0_split_ns = 0;
+
+// [PM4-CENSUS] Only the cmd-proc worker thread executes packets, so plain
+// globals (no atomics) -- same pattern as g_issuedraw_ns / g_split_prof. Depth
+// is tracked unconditionally (cheap, keeps it correct if the cvar toggles); the
+// counters are gated on g_pm4_census.
+bool g_pm4_census = false;
+uint32_t g_pm4_ib_depth = 0;               // PM4_INDIRECT_BUFFER nesting depth
+uint64_t g_pm4_draw_indx_primary = 0;      // DRAW_INDX (0x22) inline in the primary ring
+uint64_t g_pm4_draw_indx_indirect = 0;     // DRAW_INDX inside an indirect buffer
+uint64_t g_pm4_draw_indx2_primary = 0;     // DRAW_INDX_2 (0x36) inline
+uint64_t g_pm4_draw_indx2_indirect = 0;    // DRAW_INDX_2 inside an indirect buffer
+uint64_t g_pm4_ib_count = 0;               // indirect buffers executed
+uint64_t g_pm4_ib_dwords = 0;              // total dwords across indirect buffers
 }  // namespace
 
 void CommandProcessor::WorkerThreadMain() {
@@ -331,6 +357,9 @@ void CommandProcessor::WorkerThreadMain() {
   // [GPU-SPLIT] independent clean split mode (no per-packet timing).
   const bool kSplit = REXCVAR_GET(gpu_split_profile);
   g_split_prof = kSplit;
+  // [PM4-CENSUS] independent draw-emission census (no timing; just packet counts).
+  const bool kCensus = REXCVAR_GET(gpu_pm4_census);
+  g_pm4_census = kCensus;
   const bool kTimeExec = kProfile || kSplit;  // bracket ExecutePrimaryBuffer when either is on
   using prof_clock = std::chrono::steady_clock;
   uint64_t prof_spin_ns = 0, prof_exec_ns = 0;
@@ -412,8 +441,8 @@ void CommandProcessor::WorkerThreadMain() {
                                        read_ptr_index_);
     }
 
-    // [GPU-WORKER-PROFILE] / [GPU-SPLIT] ~1s wall-time report (either profile on).
-    if (kProfile || kSplit) {
+    // [GPU-WORKER-PROFILE] / [GPU-SPLIT] / [PM4-CENSUS] ~1s wall-time report.
+    if (kProfile || kSplit || kCensus) {
       auto now = prof_clock::now();
       uint64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              now - prof_last_report).count();
@@ -453,6 +482,23 @@ void CommandProcessor::WorkerThreadMain() {
               exec_ms, draw_ms, 100.0 * draw_ms / exec_ms, type0_ms,
               100.0 * type0_ms / exec_ms, other_ms, 100.0 * other_ms / exec_ms,
               g_draw_cnt - last_draw_cnt);
+        }
+        if (kCensus) {
+          // [PM4-CENSUS] per-second draw-emission census (counters reset each report).
+          const uint64_t di_p = g_pm4_draw_indx_primary, di_i = g_pm4_draw_indx_indirect;
+          const uint64_t d2_p = g_pm4_draw_indx2_primary, d2_i = g_pm4_draw_indx2_indirect;
+          const uint64_t ibc = g_pm4_ib_count, ibd = g_pm4_ib_dwords;
+          const uint64_t total = di_p + di_i + d2_p + d2_i;
+          const double sec = wall_ns / 1e9;
+          REXGPU_INFO(
+              "[pm4-census] draws/s={:.0f} | DRAW_INDX p={} i={} | DRAW_INDX_2 p={} i={} | "
+              "in-indirect={:.0f}% | indirect_buffers/s={:.0f} avg_dwords={}",
+              sec > 0 ? total / sec : 0.0, di_p, di_i, d2_p, d2_i,
+              total ? 100.0 * double(di_i + d2_i) / double(total) : 0.0,
+              sec > 0 ? ibc / sec : 0.0, ibc ? (ibd / ibc) : uint64_t(0));
+          g_pm4_draw_indx_primary = 0; g_pm4_draw_indx_indirect = 0;
+          g_pm4_draw_indx2_primary = 0; g_pm4_draw_indx2_indirect = 0;
+          g_pm4_ib_count = 0; g_pm4_ib_dwords = 0;
         }
         prof_last_report = now;
         last_type0_split_ns = g_type0_split_ns;
@@ -924,6 +970,13 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
 
+  // [PM4-CENSUS] track indirect-buffer nesting + size. Depth is unconditional
+  // (cheap; keeps it correct if gpu_pm4_census toggles mid-buffer); the census
+  // tallies are gated on the cvar. Draw packets executed below (via ExecutePacket
+  // -> ExecutePacketType3) will see g_pm4_ib_depth > 0 and count as "indirect".
+  ++g_pm4_ib_depth;
+  if (g_pm4_census) { ++g_pm4_ib_count; g_pm4_ib_dwords += count; }
+
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -935,6 +988,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+
+  --g_pm4_ib_depth;
 
   trace_writer_.WriteIndirectBufferEnd();
 }
@@ -1066,6 +1121,15 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   auto data_start_offset = reader->read_offset();
+
+  // [PM4-CENSUS] count draw packets, split by inside-indirect-buffer vs primary.
+  if (g_pm4_census) {
+    if (opcode == PM4_DRAW_INDX) {
+      if (g_pm4_ib_depth) ++g_pm4_draw_indx_indirect; else ++g_pm4_draw_indx_primary;
+    } else if (opcode == PM4_DRAW_INDX_2) {
+      if (g_pm4_ib_depth) ++g_pm4_draw_indx2_indirect; else ++g_pm4_draw_indx2_primary;
+    }
+  }
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
