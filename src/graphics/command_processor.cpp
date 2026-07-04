@@ -71,6 +71,15 @@ REXCVAR_DEFINE_BOOL(gpu_pm4_census, false, "GPU",
                     "by inside-INDIRECT_BUFFER vs primary-ring, + indirect-buffer count/size, "
                     "~1s. Decides pre-recorded-replay vs per-frame draw loop. Off by default.");
 
+// [PM4-IB-DUMP] Naruto §11.9: one-shot hex dump of the first sizable indirect
+// buffer, to reverse the per-draw packet structure (the DRAW_INDX 0x22 header
+// format, the SET_CONSTANT transform packets, the VB fetch constant) so the
+// guest DRAW_INDX recorder / the instancing intercept can be designed. Decode
+// offline. '[pm4-ib-dump]'. Off by default.
+REXCVAR_DEFINE_BOOL(gpu_pm4_ib_dump, false, "GPU",
+                    "Diagnostic [pm4-ib-dump]: one-shot hex dump of the first indirect buffer "
+                    ">=512 dwords, to reverse the per-draw PM4 structure. Off by default.");
+
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
                     "Write the ring-buffer read pointer back to the guest incrementally "
                     "as ExecutePrimaryBuffer consumes packets (about every "
@@ -338,6 +347,7 @@ uint64_t g_pm4_draw_indx2_primary = 0;     // DRAW_INDX_2 (0x36) inline
 uint64_t g_pm4_draw_indx2_indirect = 0;    // DRAW_INDX_2 inside an indirect buffer
 uint64_t g_pm4_ib_count = 0;               // indirect buffers executed
 uint64_t g_pm4_ib_dwords = 0;              // total dwords across indirect buffers
+bool g_pm4_ib_dump = false;                // [PM4-IB-DUMP] one-shot IB hex dump
 }  // namespace
 
 void CommandProcessor::WorkerThreadMain() {
@@ -360,6 +370,7 @@ void CommandProcessor::WorkerThreadMain() {
   // [PM4-CENSUS] independent draw-emission census (no timing; just packet counts).
   const bool kCensus = REXCVAR_GET(gpu_pm4_census);
   g_pm4_census = kCensus;
+  g_pm4_ib_dump = REXCVAR_GET(gpu_pm4_ib_dump);  // [PM4-IB-DUMP] one-shot IB structure dump
   const bool kTimeExec = kProfile || kSplit;  // bracket ExecutePrimaryBuffer when either is on
   using prof_clock = std::chrono::steady_clock;
   uint64_t prof_spin_ns = 0, prof_exec_ns = 0;
@@ -976,6 +987,61 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // -> ExecutePacketType3) will see g_pm4_ib_depth > 0 and count as "indirect".
   ++g_pm4_ib_depth;
   if (g_pm4_census) { ++g_pm4_ib_count; g_pm4_ib_dwords += count; }
+
+  // [PM4-IB-DUMP] one-shot decode + hex of the first sizable indirect buffer.
+  // ~37/frame in the forest, so gate on the launch-time bool first (short-
+  // circuits before the static once s_ib_dumped is set). PM4 in guest memory is
+  // big-endian -> bswap to host order for decode/display.
+  {
+    static bool s_ib_dumped = false;
+    if (g_pm4_ib_dump && !s_ib_dumped && count >= 64) {
+      const uint8_t* raw = memory_->TranslatePhysical(ptr);
+      auto rd = [&](uint32_t k) { return __builtin_bswap32(*(const uint32_t*)(raw + k * 4)); };
+      // Only dump a buffer that actually CONTAINS a draw (DRAW_INDX 0x22 /
+      // DRAW_INDX_2 0x36) -- the first sizable buffer is often pure state setup.
+      uint32_t draw_count = 0, first_draw_i = 0;
+      for (uint32_t j = 0; j < count;) {
+        uint32_t h = rd(j), ty = h >> 30;
+        if (ty == 3) { uint32_t op = (h >> 8) & 0x7F;
+                       if (op == 0x22 || op == 0x36) { if (!draw_count) first_draw_i = j; ++draw_count; }
+                       j += 1 + (((h >> 16) & 0x3FFF) + 1); }
+        else if (ty == 0) { j += 1 + (((h >> 16) & 0x3FFF) + 1); }
+        else j++;
+      }
+      if (draw_count >= 16) {  // a geometry buffer, not a sync/state one (op 0x3C=WAIT_REG_MEM)
+      s_ib_dumped = true;
+      const uint32_t start = first_draw_i > 24 ? first_draw_i - 24 : 0;
+      REXGPU_INFO("[pm4-ib-dump] GEOM IB @ {:08X} count={} draws={} first_draw@dw{} -- decode from dw{}:",
+                  ptr, count, draw_count, first_draw_i, start);
+      uint32_t i = start, pk = 0;
+      while (i < count && pk < 90) {
+        uint32_t hdr = rd(i);
+        uint32_t type = hdr >> 30;
+        if (type == 3) {
+          uint32_t op = (hdr >> 8) & 0x7F, cnt = ((hdr >> 16) & 0x3FFF) + 1;
+          REXGPU_INFO("[pm4-ib-dump]   [{:04}] type3 op=0x{:02X} cnt={} hdr={:08X} p0={:08X} p1={:08X}",
+                      i, op, cnt, hdr, i + 1 < count ? rd(i + 1) : 0, i + 2 < count ? rd(i + 2) : 0);
+          i += 1 + cnt;
+        } else if (type == 0) {
+          uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
+          REXGPU_INFO("[pm4-ib-dump]   [{:04}] type0 cnt={} base_reg=0x{:04X}", i, cnt, hdr & 0x7FFF);
+          i += 1 + cnt;
+        } else {
+          REXGPU_INFO("[pm4-ib-dump]   [{:04}] type{} hdr={:08X}", i, type, hdr);
+          i += 1;
+        }
+        pk++;
+      }
+      std::string line; char b[12];
+      uint32_t hend = (start + 224 < count) ? start + 224 : count;
+      for (uint32_t k = start; k < hend; ++k) {
+        std::snprintf(b, sizeof b, "%08X ", rd(k)); line += b;
+        if (((k - start) & 7) == 7) { REXGPU_INFO("[pm4-ib-hex] {:04}: {}", k - 7, line); line.clear(); }
+      }
+      if (!line.empty()) REXGPU_INFO("[pm4-ib-hex] {}", line);
+      }  // if (has_draw)
+    }
+  }
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
