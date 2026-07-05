@@ -153,7 +153,7 @@ REXCVAR_DEFINE_BOOL(gpu_instance_probe, false, "GPU/D3D12",
 // vertex float constants (the per-instance transform) is coalesced into a
 // single DrawIndexedInstanced; the vertex shader reads each instance's float
 // constants via SV_InstanceID. Default OFF (experimental); '[gpu-inst]'.
-REXCVAR_DEFINE_BOOL(gpu_instance, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(gpu_instance, true, "GPU/D3D12",
                     "Coalesce consecutive identical-except-transform draws into one "
                     "instanced draw (vertex-shader SV_InstanceID per-instance constants). "
                     "Off by default (experimental); reports '[gpu-inst]'.")

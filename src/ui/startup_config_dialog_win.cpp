@@ -29,7 +29,7 @@ namespace {
 
 constexpr int IDC_RENDERER = 1001;
 constexpr int IDC_RES = 1002;
-constexpr int IDC_VSYNC = 1003;
+// (IDC_VSYNC 1003 retired: vsync is always on, no dialog control.)
 constexpr int IDC_DISPLAY_MODE = 1004;
 constexpr int IDC_DATA = 1005;
 constexpr int IDC_BROWSE = 1006;
@@ -88,7 +88,6 @@ struct DialogState {
   HWND combo_renderer = nullptr;
   HWND combo_res = nullptr;
   HWND combo_internal_res = nullptr;
-  HWND check_vsync = nullptr;
   HWND check_exp_60fps = nullptr;
   HWND combo_display = nullptr;
   HWND edit_data = nullptr;
@@ -184,12 +183,10 @@ void BuildControls(HWND hwnd, DialogState* st) {
       MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 118,
                   260, 220, IDC_DISPLAY_MODE, font);
 
-  st->check_vsync = MakeControl(hwnd, L"BUTTON", L"Vsync (fixes screen tearing)",
-                                BS_AUTOCHECKBOX | WS_TABSTOP, 172, 154, 260, 22, IDC_VSYNC, font);
-
+  // Vsync is always on (no dialog control; forced true in ApplyAndSave).
   st->check_exp_60fps =
       MakeControl(hwnd, L"BUTTON", L"60 FPS overworld (EXPERIMENTAL)", BS_AUTOCHECKBOX | WS_TABSTOP,
-                  172, 180, 260, 22, IDC_EXP_60FPS, font);
+                  172, 154, 260, 22, IDC_EXP_60FPS, font);
 
   MakeControl(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 222, 200, 20, -1, font);
   st->edit_data = MakeControl(hwnd, L"EDIT", nullptr,
@@ -234,9 +231,6 @@ void BuildControls(HWND hwnd, DialogState* st) {
     if (cur_scale == kInternalResOptions[i].scale) internal_sel = i;
   }
   SendMessageW(st->combo_internal_res, CB_SETCURSEL, internal_sel, 0);
-
-  SendMessageW(st->check_vsync, BM_SETCHECK,
-               rex::cvar::GetFlagByName("vsync") == "true" ? BST_CHECKED : BST_UNCHECKED, 0);
 
   SendMessageW(st->check_exp_60fps, BM_SETCHECK,
                rex::cvar::GetFlagByName("experimental_60fps") == "true" ? BST_CHECKED
@@ -289,8 +283,8 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
   rex::cvar::SetFlagByName("resolution_scale",
                            std::to_string(kInternalResOptions[internal_sel].scale));
 
-  rex::cvar::SetFlagByName(
-      "vsync", SendMessageW(st->check_vsync, BM_GETCHECK, 0, 0) == BST_CHECKED ? "true" : "false");
+  // Vsync is always on (no dialog control) — force it true on every save.
+  rex::cvar::SetFlagByName("vsync", "true");
 
   rex::cvar::SetFlagByName("experimental_60fps",
                            SendMessageW(st->check_exp_60fps, BM_GETCHECK, 0, 0) == BST_CHECKED
