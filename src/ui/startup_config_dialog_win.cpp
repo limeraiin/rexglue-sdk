@@ -200,9 +200,9 @@ void BuildControls(HWND hwnd, DialogState* st) {
   // Bottom-left credits line, drawn in a smaller font. Spans the full client
   // width so it can wrap to a second line if the system font is large.
   MakeControl(hwnd, L"STATIC",
-              L"Special thanks to ctrlalt3l1t3, GUARD, Vexil Megga, Hailnate13x, Kalarot and seraf5 "
-              L"for their Patreon support.",
-              SS_LEFT, 16, 342, 416, 36, -1, st->font_small ? st->font_small : font);
+              L"Special thanks to Simeon, Kalarot, Vexil Megga, Hailnate13x, GUARD, ctrlalt3l1t3, "
+              L"Austin_Toonz, seraf5 and Mark_Rampage for their Patreon support.",
+              SS_LEFT, 16, 332, 416, 50, -1, st->font_small ? st->font_small : font);
 
   // --- Populate from current cvar values ---
   std::string gpu = rex::cvar::GetFlagByName("gpu");
