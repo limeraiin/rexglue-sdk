@@ -993,53 +993,62 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // circuits before the static once s_ib_dumped is set). PM4 in guest memory is
   // big-endian -> bswap to host order for decode/display.
   {
-    static bool s_ib_dumped = false;
-    if (g_pm4_ib_dump && !s_ib_dumped && count >= 64) {
+    static int s_ib_dumps = 0;
+    if (g_pm4_ib_dump && s_ib_dumps < 3 && count >= 64) {
       const uint8_t* raw = memory_->TranslatePhysical(ptr);
       auto rd = [&](uint32_t k) { return __builtin_bswap32(*(const uint32_t*)(raw + k * 4)); };
-      // Only dump a buffer that actually CONTAINS a draw (DRAW_INDX 0x22 /
-      // DRAW_INDX_2 0x36) -- the first sizable buffer is often pure state setup.
-      uint32_t draw_count = 0, first_draw_i = 0;
+      // Walk the whole buffer: count draws, and measure consecutive same-VB runs
+      // (the foliage signature -- reg 0x4800 fetch-const, first payload dword, is
+      // the VB base/key; identical across a run of the same mesh). Skip menu
+      // sync/state buffers by requiring a substantial draw count.
+      uint32_t draw_count = 0, first_draw_i = 0, last_vb = 0;
+      uint32_t run = 0, run_vb = 0, longest_run = 0, longest_vb = 0, num_runs = 0;
       for (uint32_t j = 0; j < count;) {
         uint32_t h = rd(j), ty = h >> 30;
-        if (ty == 3) { uint32_t op = (h >> 8) & 0x7F;
-                       if (op == 0x22 || op == 0x36) { if (!draw_count) first_draw_i = j; ++draw_count; }
-                       j += 1 + (((h >> 16) & 0x3FFF) + 1); }
-        else if (ty == 0) { j += 1 + (((h >> 16) & 0x3FFF) + 1); }
-        else j++;
+        if (ty == 3) {
+          uint32_t op = (h >> 8) & 0x7F, cnt = ((h >> 16) & 0x3FFF) + 1;
+          if (op == 0x22 || op == 0x36) {
+            if (!draw_count) first_draw_i = j;
+            ++draw_count;
+            if (run && last_vb == run_vb) { ++run; }
+            else { if (run > longest_run) { longest_run = run; longest_vb = run_vb; } run = 1; run_vb = last_vb; ++num_runs; }
+          }
+          j += 1 + cnt;
+        } else if (ty == 0) {
+          uint32_t reg = h & 0x7FFF, cnt = ((h >> 16) & 0x3FFF) + 1;
+          if (reg == 0x4800 && j + 1 < count) last_vb = rd(j + 1);
+          j += 1 + cnt;
+        } else j++;
       }
-      if (draw_count >= 16) {  // a geometry buffer, not a sync/state one (op 0x3C=WAIT_REG_MEM)
-      s_ib_dumped = true;
-      const uint32_t start = first_draw_i > 24 ? first_draw_i - 24 : 0;
-      REXGPU_INFO("[pm4-ib-dump] GEOM IB @ {:08X} count={} draws={} first_draw@dw{} -- decode from dw{}:",
-                  ptr, count, draw_count, first_draw_i, start);
-      uint32_t i = start, pk = 0;
-      while (i < count && pk < 90) {
-        uint32_t hdr = rd(i);
-        uint32_t type = hdr >> 30;
-        if (type == 3) {
-          uint32_t op = (hdr >> 8) & 0x7F, cnt = ((hdr >> 16) & 0x3FFF) + 1;
-          REXGPU_INFO("[pm4-ib-dump]   [{:04}] type3 op=0x{:02X} cnt={} hdr={:08X} p0={:08X} p1={:08X}",
-                      i, op, cnt, hdr, i + 1 < count ? rd(i + 1) : 0, i + 2 < count ? rd(i + 2) : 0);
-          i += 1 + cnt;
-        } else if (type == 0) {
-          uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
-          REXGPU_INFO("[pm4-ib-dump]   [{:04}] type0 cnt={} base_reg=0x{:04X}", i, cnt, hdr & 0x7FFF);
-          i += 1 + cnt;
-        } else {
-          REXGPU_INFO("[pm4-ib-dump]   [{:04}] type{} hdr={:08X}", i, type, hdr);
-          i += 1;
+      if (run > longest_run) { longest_run = run; longest_vb = run_vb; }
+      if (draw_count >= 150) {  // a substantial geometry buffer (menu geom buffers ~<=73)
+        ++s_ib_dumps;
+        REXGPU_INFO("[pm4-ib-dump] GEOM IB @ {:08X} count={} draws={} | consecutive same-VB runs: "
+                    "longest={} (VB={:08X}) num_runs={} -- decode from dw{}:",
+                    ptr, count, draw_count, longest_run, longest_vb, num_runs,
+                    first_draw_i > 24 ? first_draw_i - 24 : 0);
+        const uint32_t start = first_draw_i > 24 ? first_draw_i - 24 : 0;
+        uint32_t i = start, pk = 0, cur_vb = 0;
+        while (i < count && pk < 100) {
+          uint32_t hdr = rd(i), type = hdr >> 30;
+          if (type == 3) {
+            uint32_t op = (hdr >> 8) & 0x7F, cnt = ((hdr >> 16) & 0x3FFF) + 1;
+            if (op == 0x22 || op == 0x36)
+              REXGPU_INFO("[pm4-ib-dump]   [{:04}] DRAW op=0x{:02X} cnt={} VB={:08X}", i, op, cnt, cur_vb);
+            else
+              REXGPU_INFO("[pm4-ib-dump]   [{:04}] type3 op=0x{:02X} cnt={} p0={:08X}",
+                          i, op, cnt, i + 1 < count ? rd(i + 1) : 0);
+            i += 1 + cnt;
+          } else if (type == 0) {
+            uint32_t reg = hdr & 0x7FFF, cnt = ((hdr >> 16) & 0x3FFF) + 1;
+            if (reg == 0x4800 && i + 1 < count) cur_vb = rd(i + 1);
+            REXGPU_INFO("[pm4-ib-dump]   [{:04}] type0 cnt={} reg=0x{:04X}{}", i, cnt, reg,
+                        reg == 0x4800 ? " (VB)" : reg == 0x4000 ? " (xform)" : "");
+            i += 1 + cnt;
+          } else { i++; }
+          pk++;
         }
-        pk++;
       }
-      std::string line; char b[12];
-      uint32_t hend = (start + 224 < count) ? start + 224 : count;
-      for (uint32_t k = start; k < hend; ++k) {
-        std::snprintf(b, sizeof b, "%08X ", rd(k)); line += b;
-        if (((k - start) & 7) == 7) { REXGPU_INFO("[pm4-ib-hex] {:04}: {}", k - 7, line); line.clear(); }
-      }
-      if (!line.empty()) REXGPU_INFO("[pm4-ib-hex] {}", line);
-      }  // if (has_draw)
     }
   }
 
