@@ -12,6 +12,9 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <chrono>
+
+#include <rex/cvar.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -28,6 +31,14 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+// [NARUTO-IO-PROBE] guest file-I/O forensics for the streamed-music mid-track
+// feed stalls (see naruto-recomp/XMA-AUDIO-HANDOFF.md): logs every NtCreateFile/
+// NtOpenFile open and every NtReadFile with path/offset/size/duration so stalls
+// can be correlated with when the guest ISSUES stream-refill reads vs how long
+// the host read takes. Tag [nrio]; default OFF, zero cost when off.
+REXCVAR_DEFINE_BOOL(kernel_io_probe, false, "Kernel",
+                    "Log guest file opens/reads ([nrio]) with path/offset/size/duration");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -173,6 +184,10 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
   }
+  // [NARUTO-IO-PROBE]
+  if (REXCVAR_GET(kernel_io_probe)) {
+    REXKRNL_INFO("[nrio] OPEN handle={:#x} status={:#x} path={}", handle, result, target_path);
+  }
   return result;
 }
 
@@ -212,10 +227,27 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   if (XSUCCEEDED(result)) {
     if (true || file->is_synchronous()) {
       // Synchronous.
+      // [NARUTO-IO-PROBE] time the host-side read and log where in the file the
+      // guest is reading, to correlate stream-refill reads with XMA feed stalls.
+      const bool io_probe = REXCVAR_GET(kernel_io_probe);
+      const uint64_t probe_pos = io_probe && !byte_offset_ptr ? file->position() : byte_offset;
+      std::chrono::steady_clock::time_point probe_t0;
+      if (io_probe) {
+        probe_t0 = std::chrono::steady_clock::now();
+      }
       uint32_t bytes_read = 0;
       result = file->Read(buffer.guest_address(), buffer_length,
                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                           &bytes_read, apc_context.guest_address());
+      if (io_probe) {
+        const auto probe_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - probe_t0)
+                                  .count();
+        REXKRNL_INFO("[nrio] READ handle={:#x} off={} len={} got={} status={:#x} dur_us={} "
+                     "explicit_off={} path={}",
+                     (uint32_t)file_handle, probe_pos, (uint32_t)buffer_length, bytes_read,
+                     result, probe_us, byte_offset_ptr ? 1 : 0, file->path());
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;

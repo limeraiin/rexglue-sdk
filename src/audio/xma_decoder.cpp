@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
@@ -27,6 +29,160 @@ extern "C" {
 }  // extern "C"
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+
+// [NARUTO-XMA-PROBE]
+REXCVAR_DEFINE_BOOL(apu_xma_probe, false, "Audio",
+                    "Log XMA streaming diagnostics ([nrxma]): context lifecycle, buffer refills, "
+                    "starvation, loop events, 1Hz per-context status");
+REXCVAR_DEFINE_BOOL(apu_xma_locked_ops, false, "Audio",
+                    "Serialize guest XMASet* context writes against the XMA decode worker "
+                    "(candidate fix for long streamed sounds cutting out)");
+// [NARUTO-XMA-STARVE] Root-cause fix for "long minigame music cuts out"
+// (measured 2026-07-13, naruto_221 logs): at the END of a streamed track the
+// final buffer's last frame claims to span into a next buffer that will never
+// arrive; the post-2021-rewrite decoder holds the buffer valid + error_status=4
+// forever, while the game waits for full consumption before looping the track
+// => permanent deadlock, music dead. Pre-rewrite Xenia (last-good canary
+// 168db250d) invalidated the exhausted buffer instead, so the game looped.
+// With this ON, a context stuck >512 consecutive kicks (healthy refill storms
+// measured <=121) at the SAME spanning-frame state swaps the buffer out and
+// clears the error, unblocking the game's loop restart.
+REXCVAR_DEFINE_BOOL(apu_xma_starved_swap, true, "Audio",
+                    "Break XMA end-of-stream deadlock: a context stuck waiting for a next input "
+                    "buffer that never arrives consumes its exhausted buffer so the game can "
+                    "restart/loop the stream (fixes long streamed sounds cutting out)");
+// [NARUTO-XMA-CUMUL] On real hardware the context's input_buffer_read_offset
+// is CUMULATIVE across the whole submitted stream (it never resets per input
+// buffer — 26 bits cover an 8MB stream). Games/XMAPlayback arm loop_start/
+// loop_end as stream-global bit offsets (measured: Naruto music armed
+// loop_end=18172890 ≈ the whole 2.2MB track on a context with 16384-bit
+// buffers), so the loop wrap can only ever fire against a cumulative offset.
+// Xenia's 2021 XMA rewrite made the offset per-buffer, so streamed loops
+// never wrap => looping music dies at first track end. This restores the
+// hardware semantics: guest-visible offset = consumed-buffer base + intra-
+// buffer offset, and the loop wraps (buffer retire + rebase to loop_start)
+// when the cumulative offset reaches loop_end.
+REXCVAR_DEFINE_BOOL(apu_xma_cumulative_rdoff, true, "Audio",
+                    "Hardware-correct cumulative XMA input read offset + streamed loop wrap "
+                    "(fixes looping streamed music stopping at the first loop point)");
+// [NARUTO-XMA-SPLIT] When the last frame of an input buffer spans into a not-
+// yet-submitted next buffer, real hardware (and pre-rewrite Xenia, the last
+// version where looping streamed music worked in Naruto) treats the exhausted
+// buffer as CONSUMED immediately — it caches the partial frame internally,
+// releases the buffer to the game, and completes the frame when the next
+// buffer arrives. The post-2021-rewrite decoder instead holds the buffer
+// valid with error_status=4 until the next buffer shows up, which stalls the
+// game's packet-completion chain at a stream's final (loop-end-truncated)
+// packet => the feeder never wraps => looping music dies.
+REXCVAR_DEFINE_BOOL(apu_xma_split_frame_cache, true, "Audio",
+                    "Release an exhausted XMA input buffer immediately and cache the partial "
+                    "split frame until the next buffer arrives (hardware behavior; fixes "
+                    "looping streamed music dying at the loop seam)");
+// [NARUTO-XMA-SILENCE] Root-cause closure for "looping streamed music dies at
+// the loop seam" (measured 2026-07-13, naruto_226 + guest XAudio feeder
+// disassembly): the guest produces new XMA packets only while its RENDERED-
+// SAMPLES watermark stays within 2 packets of production. The final packet of
+// a looping stream is truncated at the loop point; its tail frames reference
+// data past the cut, so our decoder can't produce their samples, the guest's
+// watermark parks one packet short, and its producer never emits the
+// loop-wrap packet (real hardware decodes those tail frames against stale
+// buffer bytes and still RENDERS them). Emitting silent frames while a
+// split-frame-starved stream stays kicked advances the watermark and
+// unblocks the guest's loop wrap.
+REXCVAR_DEFINE_BOOL(apu_xma_starved_silence, true, "Audio",
+                    "Emit silent output frames when an XMA stream starves at a split frame so "
+                    "the game's rendered-samples watermark advances and its stream feeder can "
+                    "wrap the loop (fixes looping streamed music dying at the loop seam)");
+// [NARUTO-XMA-LOOPEND] The game arms the XMA context's loop_end field with the
+// loop point in OUTPUT PCM BYTES (measured 2026-07-14: ctx loop_end=18172890
+// exactly equals the cumulative decoded output at the seam, 8873 frames x
+// 512 x 2ch x 2B = 18171904, a 0.005% match). Counting decoded output bytes
+// and predicting the seam when they reach loop_end lets the decoder emit the
+// gap-filling silence at exactly the right instant on the FIRST-EVER encounter
+// of any track — no learning pass, no per-track table — because it reads the
+// game's own per-track loop point, exactly as real hardware did. Off => fall
+// back to the (confirmed-working) learned/persisted input-domain prediction.
+REXCVAR_DEFINE_BOOL(apu_xma_loopend_predict, true, "Audio",
+                    "Predict the XMA loop seam from the game's loop_end field (output-byte "
+                    "domain) for gapless looping on the first-ever encounter of a track");
+// [NARUTO-XMA-SILENCE] The game's producer is watermark-gated: at a loop seam
+// AND at mid-track streaming stalls it stops feeding until the rendered-sample
+// watermark advances, but the watermark can't advance without input — a
+// deadlock our silence breaks. Feeding resumes within ~11ms of the first
+// silent frame (measured), so this threshold directly sets the audible gap
+// length. Must stay above the longest NORMAL between-packet starvation (~34-74
+// polls) to avoid injecting silence during healthy streaming; lower = shorter
+// mid-track gaps. Tune live via --apu_xma_starve_kicks.
+// ⚠ 192 is the PROVEN-SAFE value (working loops). Lowering it to shorten
+// mid-track stall gaps is a DEAD END: 48 made all music "super stuttery"
+// (false-fires silence into healthy streaming). Do not lower below 192.
+REXCVAR_DEFINE_INT32(apu_xma_starve_kicks, 192, "Audio",
+                     "XMA starvation polls before gap-filling silence breaks the producer's "
+                     "watermark deadlock. 192 = proven safe; lower stutters healthy streaming.");
+// [NARUTO-XMA-PACE] Root-cause fix for the ~7.7s-periodic mid-track music gap
+// (measured 2026-07-15, runs 238/239): our decoder extracts packets ~10x
+// faster than real XMA hardware, so the game's per-tick puller sucks whole
+// packets into its XAudio submit queue as a LUMP. The game's rendered-samples
+// watermark [obj+440] only advances as submitted audio COMPLETES, and its
+// producer gate releases new packets keyed on that watermark; around the
+// authored high-frame-count quiet packets (25-39 frames, one per musical
+// phrase ~7.7s) the pull frontier runs ~400ms ahead of the watermark, the
+// pipeline (2 packets deep) can't cover the phase error, the puller drains the
+// ring, the watermark freezes, and the [NARUTO-XMA-SILENCE] backstop has to
+// drip it free = the audible 250-450ms gap. Real hardware decodes in real
+// time, so the lump can never form. This paces decode output to the stream's
+// sample rate (+small headroom) for STREAMED contexts only (single-packet 2KB
+// input buffers); in-memory SFX decode bursts are untouched.
+REXCVAR_DEFINE_BOOL(apu_xma_realtime_pace, false, "Audio",
+                    "Pace streamed XMA decode to the stream's real-time sample rate like real "
+                    "hardware (fixes periodic mid-track music gaps from watermark phase error)");
+
+// [NARUTO-XMA-RINGTRACE] Diagnostic (default OFF): emit a high-rate (~50Hz per
+// context) trajectory of the guest output-ring occupancy (used/free blocks +
+// read/write offsets) for streamed single-packet contexts. Purpose: measure
+// whether the decoded-PCM stockpile lives IN the guest ring (occupancy stays
+// high) or DOWNSTREAM of it (occupancy hugs empty => input-limited), and whether
+// the pull is bursty (sawtooth) or smooth. Disambiguates the mid-track-gap fix
+// (pacing vs elastic decode-ahead FIFO); see XMA-AUDIO-HANDOFF.md session 3.
+REXCVAR_DEFINE_BOOL(apu_xma_ring_trace, false, "Audio",
+                    "Trace streamed XMA output-ring occupancy over time (mid-track music-gap "
+                    "stockpile/jitter forensics; [nrxma-ring])");
+
+// [NARUTO-XMA-FIFO] The mid-track music-gap fix (measured 2026-07-15 run 243:
+// the guest output ring is ~44ms and hugs empty; the authored producer freeze is
+// 267-409ms, so the ~2-packet input pipeline starves and our silence backstop
+// drips the audible gap). This inserts a host-side elastic buffer between the
+// decoder and the tiny guest ring: decode fed packets EAGERLY into a large FIFO
+// (freeing the 2 input slots fast so the guest's watermark-gated producer feeds
+// its full ~6-packet lookahead), then meter FIFO->guest-ring at the guest pull
+// rate. During the authored freeze the FIFO keeps the ring fed with REAL audio,
+// so the render watermark advances and the producer gate reopens without a
+// STARVED-SILENCE gap. Streamed single-packet contexts only; genuine
+// FIFO-empty+input-dry starvation still falls through to the silence/seam path.
+REXCVAR_DEFINE_BOOL(apu_xma_elastic_fifo, false, "Audio",
+                    "Host-side elastic decode-ahead FIFO for streamed XMA (fixes the periodic "
+                    "mid-track music gap by buffering the producer's full lookahead as PCM)");
+
+// [NARUTO-XMA-STOCK] THE mid-track music-gap root cause (run-239 anatomy, 2026-07-16): the
+// ~7.7s-periodic "producer freeze" is BY DESIGN - the feeder's +2-ENTRY lookahead gate,
+// crossed with the authored 20-39-frame packets, pre-charges the game's downstream rendered
+// stock with ~500ms of early-slurped PCM (measured: 25,664 samples delivered ahead vs 25,650
+// drained during the freeze - a 0.05% match), which then plays out while the feeder idles.
+// Real playback is continuously covered; mark advances from the stock the whole time. Our
+// starve backstop (192-kick timeout) cannot see that stock, misreads the idle as starvation,
+// and injects silent frames that the game slurps BEHIND the real stock and plays ~300ms
+// later: the audible gap IS our own injected silence. Fix: estimate the guest's stock from
+// the SDK side (cumulative real PCM delivered to the ring minus wall-clock x sample rate)
+// and suppress the timeout-based silence drip while the stock still covers playback. When
+// the estimate drains to the floor, fall through to today's exact behavior - true
+// starvation (end-of-stream/loop park, where mark genuinely stops) still gets silence, just
+// after the stock argument expires; the loop_end/learned SEAM paths are untouched.
+REXCVAR_DEFINE_BOOL(apu_xma_stock_starve, false, "Audio",
+                    "Suppress starved-silence injection while the guest's downstream stock "
+                    "still covers playback (fixes the periodic mid-track music gap)");
+REXCVAR_DEFINE_INT32(apu_xma_stock_floor_ms, 16, "Audio",
+                     "Estimated guest-stock floor (ms) below which starved-silence injection "
+                     "resumes (safety margin for estimate drift)");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -206,7 +362,10 @@ int XmaDecoder::GetContextId(uint32_t guest_ptr) {
 uint32_t XmaDecoder::AllocateContext() {
   size_t index = context_bitmap_.Acquire();
   if (index == -1) {
-    // Out of contexts.
+    // Out of contexts. [NARUTO-XMA-PROBE] Always log: new sounds silently fail
+    // to play from this point on — a prime "sound cuts out over time" suspect.
+    REXAPU_WARN("[nrxma] XMA context pool EXHAUSTED ({} in use) - new sound will NOT play",
+                kContextCount);
     return 0;
   }
 
@@ -290,6 +449,8 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
+        // [NARUTO-XMA-PROBE] counts ALL kicks (kernel API and MMIO-direct).
+        context.probe_kicks_.fetch_add(1, std::memory_order_relaxed);
         context.Enable();
       }
     }
@@ -348,6 +509,69 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       }
 #pragma warning(suppress : 4065)
     }
+  }
+}
+
+// [NARUTO-XMA-PROBE] 1Hz status of every allocated context + XAudio submit
+// rate. One line per context so a cut stream's last known state is on record.
+void XmaDecoder::ProbeDumpStatus(uint64_t xaudio_submits) {
+  static std::chrono::steady_clock::time_point last_dump{};
+  static uint64_t last_submits = 0;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_dump < std::chrono::seconds(1)) {
+    return;
+  }
+  const auto submits_delta = xaudio_submits - last_submits;
+  last_dump = now;
+  last_submits = xaudio_submits;
+
+  uint32_t allocated = 0;
+  for (uint32_t n = 0; n < kContextCount; ++n) {
+    if (contexts_[n].is_allocated()) {
+      allocated++;
+    }
+  }
+  REXAPU_INFO("[nrxma] === status: alloc={} xaudio_submits/s={} ===", allocated, submits_delta);
+
+  for (uint32_t n = 0; n < kContextCount; ++n) {
+    XmaContext& context = contexts_[n];
+    if (!context.is_allocated()) {
+      continue;
+    }
+    const uint32_t decodes = context.probe_decodes_.exchange(0);
+    const uint32_t swaps = context.probe_swaps_.exchange(0);
+    const uint32_t starves = context.probe_starves_.exchange(0);
+    const uint32_t stalls = context.probe_out_stalls_.exchange(0);
+    const uint32_t p_in0 = context.probe_poll_in0_.exchange(0);
+    const uint32_t p_in1 = context.probe_poll_in1_.exchange(0);
+    const uint32_t p_owr = context.probe_poll_outwr_.exchange(0);
+    const uint32_t p_ord = context.probe_poll_outrd_.exchange(0);
+    const uint32_t p_oval = context.probe_poll_outval_.exchange(0);
+    const uint32_t p_ird = context.probe_poll_inrd_.exchange(0);
+    const uint32_t s_ord = context.probe_set_outrd_.exchange(0);
+    const uint32_t s_oval = context.probe_set_outval_.exchange(0);
+    const uint32_t kicks = context.probe_kicks_.exchange(0);
+
+    XMA_CONTEXT_DATA data(memory()->TranslateVirtual(context.guest_ptr()));
+    REXAPU_INFO(
+        "[nrxma] ctx={:03d} en={} in0={} in1={} cur={} pkts={}/{} rdoff={} base={} "
+        "out(rd={} wr={} val={} blk={}) loop(cnt={} s={} e={}) err={}/{} "
+        "dec/s={} swaps={} starves={} outstalls={} "
+        "guest(kick={} pIn0={} pIn1={} pOwr={} pOrd={} pOval={} pIrd={} sOrd={} sOval={})",
+        n, context.is_enabled() ? 1 : 0, static_cast<uint32_t>(data.input_buffer_0_valid),
+        static_cast<uint32_t>(data.input_buffer_1_valid),
+        static_cast<uint32_t>(data.current_buffer),
+        static_cast<uint32_t>(data.input_buffer_0_packet_count),
+        static_cast<uint32_t>(data.input_buffer_1_packet_count),
+        static_cast<uint32_t>(data.input_buffer_read_offset), context.stream_base_bits(),
+        static_cast<uint32_t>(data.output_buffer_read_offset),
+        static_cast<uint32_t>(data.output_buffer_write_offset),
+        static_cast<uint32_t>(data.output_buffer_valid),
+        static_cast<uint32_t>(data.output_buffer_block_count),
+        static_cast<uint32_t>(data.loop_count), static_cast<uint32_t>(data.loop_start),
+        static_cast<uint32_t>(data.loop_end), static_cast<uint32_t>(data.error_status),
+        static_cast<uint32_t>(data.error_set), decodes, swaps, starves, stalls, kicks, p_in0,
+        p_in1, p_owr, p_ord, p_oval, p_ird, s_ord, s_oval);
   }
 }
 

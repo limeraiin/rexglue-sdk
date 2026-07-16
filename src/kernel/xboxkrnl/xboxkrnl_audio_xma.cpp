@@ -12,10 +12,13 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <chrono>
 #include <cstring>
+#include <mutex>
 
 #include <rex/assert.h>
 #include <rex/audio/audio_system.h>
+#include <rex/audio/flags.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -63,6 +66,58 @@ using rex::audio::XMA_CONTEXT_DATA;
 // restrictions of frame/subframe/etc:
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.xaudio2.xaudio2_buffer(v=vs.85).aspx
 
+// [NARUTO-XMA-PROBE] helpers ------------------------------------------------
+static audio::XmaDecoder* NrXmaDecoder() {
+  return static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())
+      ->xma_decoder();
+}
+
+static int NrXmaId(uint32_t context_guest_ptr) {
+  return NrXmaDecoder()->GetContextId(context_guest_ptr);
+}
+
+// When apu_xma_locked_ops is on, serializes the guest's whole-context
+// read-modify-store against the decode worker's Work() (which holds the same
+// mutex for its whole snapshot->decode->merged-store span). Without this, a
+// guest XMASet* landing mid-decode can be overwritten by the worker's store
+// (or overwrite the worker's just-advanced offsets with its stale snapshot) —
+// a lost update whose probability grows with sound length.
+class NrXmaCtxGuard {
+ public:
+  explicit NrXmaCtxGuard(uint32_t context_guest_ptr) {
+    if (REXCVAR_GET(apu_xma_locked_ops)) {
+      auto* decoder = NrXmaDecoder();
+      auto* context = decoder->GetContextById(decoder->GetContextId(context_guest_ptr));
+      if (context) {
+        lock_ = std::unique_lock<std::mutex>(context->work_lock());
+      }
+    }
+  }
+
+ private:
+  std::unique_lock<std::mutex> lock_;
+};
+
+#define NRXMA_LOG(...)                 \
+  do {                                 \
+    if (REXCVAR_GET(apu_xma_probe)) {  \
+      REXAPU_INFO("[nrxma] " __VA_ARGS__); \
+    }                                  \
+  } while (0)
+
+// Guest-poll visibility: count what the game reads/writes per context.
+#define NRXMA_COUNT(guest_ptr, field)                                              \
+  do {                                                                             \
+    if (REXCVAR_GET(apu_xma_probe)) {                                              \
+      auto* nrxma_dec = NrXmaDecoder();                                            \
+      auto* nrxma_ctx = nrxma_dec->GetContextById(nrxma_dec->GetContextId(guest_ptr)); \
+      if (nrxma_ctx) {                                                             \
+        nrxma_ctx->field.fetch_add(1, std::memory_order_relaxed);                  \
+      }                                                                            \
+    }                                                                              \
+  } while (0)
+// ---------------------------------------------------------------------------
+
 u32 XMACreateContext_entry(mapped_u32 context_out_ptr) {
   REXKRNL_NOISY_DEBUG("XMACreateContext called!");
   auto xma_decoder =
@@ -71,8 +126,10 @@ u32 XMACreateContext_entry(mapped_u32 context_out_ptr) {
   uint32_t context_ptr = xma_decoder->AllocateContext();
   *context_out_ptr = context_ptr;
   if (!context_ptr) {
+    NRXMA_LOG("CreateContext FAILED (pool exhausted)");
     return X_STATUS_NO_MEMORY;
   }
+  NRXMA_LOG("ctx={:03d} CREATE", NrXmaId(context_ptr));
   return X_STATUS_SUCCESS;
 }
 
@@ -80,6 +137,7 @@ u32 XMAReleaseContext_entry(mapped_void context_ptr) {
   auto xma_decoder =
       static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())
           ->xma_decoder();
+  NRXMA_LOG("ctx={:03d} RELEASE", NrXmaId(context_ptr.guest_address()));
   xma_decoder->ReleaseContext(context_ptr.guest_address());
   return 0;
 }
@@ -161,6 +219,7 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
     return X_E_FALSE;
   }
 
+  NrXmaCtxGuard guard(context_ptr.guest_address());  // [NARUTO-XMA-PROBE]
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
 
   XMA_CONTEXT_DATA context(context_ptr);
@@ -186,12 +245,36 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
 
   context.Store(context_ptr);
 
+  // [NARUTO-XMA-CUMUL] a (re)initialized context starts a new stream.
+  {
+    auto* decoder = NrXmaDecoder();
+    auto* xma_context = decoder->GetContextById(decoder->GetContextId(context_ptr.guest_address()));
+    if (xma_context) {
+      xma_context->ResetStreamState();
+    }
+  }
+
+  NRXMA_LOG(
+      "ctx={:03d} INIT in0={:08X}({} pkts) in1={:08X}({} pkts) rdoff={} outblk={} sdc={} "
+      "stereo={} rate={} loop(s={} e={} n={})",
+      NrXmaId(context_ptr.guest_address()), static_cast<uint32_t>(context.input_buffer_0_ptr),
+      static_cast<uint32_t>(context.input_buffer_0_packet_count),
+      static_cast<uint32_t>(context.input_buffer_1_ptr),
+      static_cast<uint32_t>(context.input_buffer_1_packet_count),
+      static_cast<uint32_t>(context.input_buffer_read_offset),
+      static_cast<uint32_t>(context.output_buffer_block_count),
+      static_cast<uint32_t>(context.subframe_decode_count),
+      static_cast<uint32_t>(context.is_stereo), static_cast<uint32_t>(context.sample_rate),
+      static_cast<uint32_t>(context.loop_start), static_cast<uint32_t>(context.loop_end),
+      static_cast<uint32_t>(context.loop_count));
+
   StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1A80, context_ptr.guest_address());
 
   return 0;
 }
 
 u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> loop_data) {
+  NrXmaCtxGuard guard(context_ptr.guest_address());  // [NARUTO-XMA-PROBE]
   XMA_CONTEXT_DATA context(context_ptr);
 
   context.loop_start = loop_data->loop_start;
@@ -202,18 +285,26 @@ u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> lo
 
   context.Store(context_ptr);
 
+  NRXMA_LOG("ctx={:03d} SET_LOOP s={} e={} n={}", NrXmaId(context_ptr.guest_address()),
+            static_cast<uint32_t>(context.loop_start), static_cast<uint32_t>(context.loop_end),
+            static_cast<uint32_t>(context.loop_count));
+
   return 0;
 }
 
 u32 XMAGetInputBufferReadOffset_entry(mapped_void context_ptr) {
+  NRXMA_COUNT(context_ptr.guest_address(), probe_poll_inrd_);
   XMA_CONTEXT_DATA context(context_ptr);
   return context.input_buffer_read_offset;
 }
 
 u32 XMASetInputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
+  NrXmaCtxGuard guard(context_ptr.guest_address());  // [NARUTO-XMA-PROBE]
   XMA_CONTEXT_DATA context(context_ptr);
   context.input_buffer_read_offset = value;
   context.Store(context_ptr);
+
+  NRXMA_LOG("ctx={:03d} SET_RDOFF {}", NrXmaId(context_ptr.guest_address()), value);
 
   return 0;
 }
@@ -229,6 +320,7 @@ u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
     return X_E_FALSE;
   }
 
+  NrXmaCtxGuard guard(context_ptr.guest_address());  // [NARUTO-XMA-PROBE]
   XMA_CONTEXT_DATA context(context_ptr);
 
   context.input_buffer_0_ptr = buffer_physical_address;
@@ -236,18 +328,29 @@ u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
 
   context.Store(context_ptr);
 
+  NRXMA_LOG("ctx={:03d} SET_IN0 buf={:08X} pkts={}", NrXmaId(context_ptr.guest_address()),
+            buffer_physical_address, packet_count);
+
   return 0;
 }
 
 u32 XMAIsInputBuffer0Valid_entry(mapped_void context_ptr) {
+  NRXMA_COUNT(context_ptr.guest_address(), probe_poll_in0_);
   XMA_CONTEXT_DATA context(context_ptr);
   return context.input_buffer_0_valid;
 }
 
 u32 XMASetInputBuffer0Valid_entry(mapped_void context_ptr) {
+  NrXmaCtxGuard guard(context_ptr.guest_address());  // [NARUTO-XMA-PROBE]
   XMA_CONTEXT_DATA context(context_ptr);
   context.input_buffer_0_valid = 1;
   context.Store(context_ptr);
+
+  NRXMA_LOG("ctx={:03d} SET_IN0_VALID (in1={} cur={} rdoff={})",
+            NrXmaId(context_ptr.guest_address()),
+            static_cast<uint32_t>(context.input_buffer_1_valid),
+            static_cast<uint32_t>(context.current_buffer),
+            static_cast<uint32_t>(context.input_buffer_read_offset));
 
   return 0;
 }
@@ -263,6 +366,7 @@ u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
     return X_E_FALSE;
   }
 
+  NrXmaCtxGuard guard(context_ptr.guest_address());  // [NARUTO-XMA-PROBE]
   XMA_CONTEXT_DATA context(context_ptr);
 
   context.input_buffer_1_ptr = buffer_physical_address;
@@ -270,28 +374,42 @@ u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
 
   context.Store(context_ptr);
 
+  NRXMA_LOG("ctx={:03d} SET_IN1 buf={:08X} pkts={}", NrXmaId(context_ptr.guest_address()),
+            buffer_physical_address, packet_count);
+
   return 0;
 }
 
 u32 XMAIsInputBuffer1Valid_entry(mapped_void context_ptr) {
+  NRXMA_COUNT(context_ptr.guest_address(), probe_poll_in1_);
   XMA_CONTEXT_DATA context(context_ptr);
   return context.input_buffer_1_valid;
 }
 
 u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
+  NrXmaCtxGuard guard(context_ptr.guest_address());  // [NARUTO-XMA-PROBE]
   XMA_CONTEXT_DATA context(context_ptr);
   context.input_buffer_1_valid = 1;
   context.Store(context_ptr);
+
+  NRXMA_LOG("ctx={:03d} SET_IN1_VALID (in0={} cur={} rdoff={})",
+            NrXmaId(context_ptr.guest_address()),
+            static_cast<uint32_t>(context.input_buffer_0_valid),
+            static_cast<uint32_t>(context.current_buffer),
+            static_cast<uint32_t>(context.input_buffer_read_offset));
 
   return 0;
 }
 
 u32 XMAIsOutputBufferValid_entry(mapped_void context_ptr) {
+  NRXMA_COUNT(context_ptr.guest_address(), probe_poll_outval_);
   XMA_CONTEXT_DATA context(context_ptr);
   return context.output_buffer_valid;
 }
 
 u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
+  NRXMA_COUNT(context_ptr.guest_address(), probe_set_outval_);
+  NrXmaCtxGuard guard(context_ptr.guest_address());  // [NARUTO-XMA-PROBE]
   XMA_CONTEXT_DATA context(context_ptr);
   context.output_buffer_valid = 1;
   context.Store(context_ptr);
@@ -300,11 +418,16 @@ u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
 }
 
 u32 XMAGetOutputBufferReadOffset_entry(mapped_void context_ptr) {
+  NRXMA_COUNT(context_ptr.guest_address(), probe_poll_outrd_);
   XMA_CONTEXT_DATA context(context_ptr);
   return context.output_buffer_read_offset;
 }
 
 u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
+  NRXMA_COUNT(context_ptr.guest_address(), probe_set_outrd_);
+  // [NARUTO-XMA-PROBE] guard but no log: this is the guest's per-tick output
+  // drain pointer, far too hot to log per call.
+  NrXmaCtxGuard guard(context_ptr.guest_address());
   XMA_CONTEXT_DATA context(context_ptr);
   context.output_buffer_read_offset = value;
   context.Store(context_ptr);
@@ -313,6 +436,7 @@ u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
 }
 
 u32 XMAGetOutputBufferWriteOffset_entry(mapped_void context_ptr) {
+  NRXMA_COUNT(context_ptr.guest_address(), probe_poll_outwr_);
   XMA_CONTEXT_DATA context(context_ptr);
   return context.output_buffer_write_offset;
 }
@@ -323,12 +447,14 @@ u32 XMAGetPacketMetadata_entry(mapped_void context_ptr) {
 }
 
 u32 XMAEnableContext_entry(mapped_void context_ptr) {
+  NRXMA_LOG("ctx={:03d} ENABLE", NrXmaId(context_ptr.guest_address()));
   StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1940, context_ptr.guest_address());
   return 0;
 }
 
 u32 XMADisableContext_entry(mapped_void context_ptr, u32 wait) {
   X_HRESULT result = X_E_SUCCESS;
+  NRXMA_LOG("ctx={:03d} DISABLE wait={}", NrXmaId(context_ptr.guest_address()), wait);
   StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1A40, context_ptr.guest_address());
   if (!static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())
            ->xma_decoder()
@@ -339,6 +465,9 @@ u32 XMADisableContext_entry(mapped_void context_ptr, u32 wait) {
 }
 
 u32 XMABlockWhileInUse_entry(mapped_void context_ptr) {
+  // [NARUTO-XMA-PROBE] Time the wait: a guest audio thread stuck here stops
+  // ALL of that thread's sound servicing.
+  const auto block_start = std::chrono::steady_clock::now();
   do {
     XMA_CONTEXT_DATA context(context_ptr);
     if (!context.input_buffer_0_valid && !context.input_buffer_1_valid) {
@@ -349,6 +478,15 @@ u32 XMABlockWhileInUse_entry(mapped_void context_ptr) {
     }
     rex::thread::Sleep(std::chrono::milliseconds(1));
   } while (true);
+  if (REXCVAR_GET(apu_xma_probe)) {
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - block_start)
+                                .count();
+    if (elapsed_ms > 50) {
+      REXAPU_INFO("[nrxma] ctx={:03d} BlockWhileInUse took {}ms",
+                  NrXmaId(context_ptr.guest_address()), elapsed_ms);
+    }
+  }
   return 0;
 }
 
