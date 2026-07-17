@@ -1314,6 +1314,63 @@ void XmaContext::ResumeSplitFrame(XMA_CONTEXT_DATA* data, uint8_t* current_input
     return;
   }
 
+  // [NARUTO-XMA-WRAP] Deterministic wrap detection: a packet genuinely
+  // continuing the cached split frame MUST declare first_frame_offset ==
+  // header + remaining continuation bits (the field's definition). Any
+  // mismatch proves the buffer is loop-START data => an unpredicted seam.
+  // Learn + persist the loop length NOW (first provable wrap - a mid-track
+  // stall can never produce this signal, so no twice-consistency is needed)
+  // and resume exactly like the predicted-seam path above (skip the splice;
+  // decoding it would emit one garbage frame). Single-packet (streamed)
+  // buffers only: the continuation arithmetic below assumes pkts=1.
+  if (REXCVAR_GET(apu_xma_wrap_learn) && data->GetCurrentInputBufferPacketCount() == 1) {
+    const uint32_t consumed_bits = kBitsPerPacket - split_frame_offset_bits_;
+    const uint32_t remaining_bits =
+        split_frame_size_bits_ > consumed_bits ? split_frame_size_bits_ - consumed_bits : 0;
+    const uint32_t expected_first_off = kBitsPerPacketHeader + remaining_bits;
+    const uint32_t actual_first_off = xma::GetPacketFrameOffset(current_input_buffer);
+    // "no new frame starts in this packet" is one semantic state on both
+    // sides (the raw field saturates); only compare exact offsets when a
+    // first frame genuinely exists.
+    const bool none_expected = expected_first_off > kMaxFrameSizeinBits;
+    const bool none_actual = actual_first_off > kMaxFrameSizeinBits;
+    if (none_expected != none_actual ||
+        (!none_expected && actual_first_off != expected_first_off)) {
+      uint64_t candidate = episode_input_bits_;
+      if (last_seam_input_bits_ != 0 && episode_input_bits_ > last_seam_input_bits_) {
+        candidate = episode_input_bits_ - last_seam_input_bits_;
+      }
+      const bool cache_it = candidate >= kSeamMinLoopInputBits;
+      if (cache_it) {
+        loop_input_len_bits_ = candidate;
+        tentative_loop_len_bits_ = candidate;
+        if (stream_key_valid_) {
+          SeamCacheStore(stream_key_, candidate);
+        }
+      }
+      last_seam_input_bits_ = episode_input_bits_;
+      decoded_output_bytes_ = 0;  // [NARUTO-XMA-LOOPEND] new loop iteration
+      if (REXCVAR_GET(apu_xma_probe)) {
+        REXAPU_INFO(
+            "[nrxma] ctx={:03d} SEAM WRAP-DETECTED: first_off={} != expected {} => loop wrap "
+            "at input_bits={}; loop_len={} {} - splice skipped",
+            id(), actual_first_off, expected_first_off, episode_input_bits_, candidate,
+            cache_it ? "(learned+cached)" : "(below floor, not cached)");
+      }
+      uint32_t first_offset = actual_first_off;
+      if (first_offset > kMaxFrameSizeinBits) {
+        first_offset = GetNextPacketReadOffset(current_input_buffer, 1,
+                                               data->GetCurrentInputBufferPacketCount());
+        if (first_offset == kBitsPerPacketHeader) {
+          SwapInputBuffer(data);
+          return;
+        }
+      }
+      data->input_buffer_read_offset = first_offset;
+      return;
+    }
+  }
+
   std::memcpy(input_buffer_.data(), split_packet_payload_.data(), kBytesPerPacketData);
   std::memcpy(input_buffer_.data() + kBytesPerPacketData,
               current_input_buffer + kBytesPerPacketHeader, kBytesPerPacketData);
