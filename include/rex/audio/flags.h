@@ -15,3 +15,8 @@
 
 REXCVAR_DECLARE(bool, audio_mute);
 REXCVAR_DECLARE(bool, ffmpeg_verbose);
+
+// [NARUTO-XMA-HWPAR] Hardware-parity XMA decode (see xma_context.cpp).
+REXCVAR_DECLARE(bool, apu_xma_hw_parity);
+// [NARUTO-XMA-HWPAR] Compact XMA decode probe logging ([nrxma] lines).
+REXCVAR_DECLARE(bool, apu_xma_probe);

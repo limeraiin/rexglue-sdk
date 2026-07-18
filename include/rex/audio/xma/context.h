@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 
 #include <rex/kernel.h>
@@ -240,6 +241,11 @@ class XmaContext {
   void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
   void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
   void ClearLocked(XMA_CONTEXT_DATA* data);
+  // [NARUTO-XMA-HWPAR] Advance past the current packet exactly like the clean
+  // last-frame-in-packet path (mirror of the tail of Decode); used by the
+  // gated padding-tail finish so the stock path stays byte-identical.
+  void AdvanceToNextPacket(XMA_CONTEXT_DATA* data, uint8_t* current_input_buffer,
+                           uint32_t next_packet_index, uint32_t current_input_packet_count);
 
   memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
   int PrepareDecoder(int sample_rate, bool is_two_channel);
@@ -280,6 +286,16 @@ class XmaContext {
   // Loop subframe precision state
   uint8_t loop_frame_output_limit_ = 0;
   bool loop_start_skip_pending_ = false;
+
+ public:
+  // [NARUTO-XMA-HWPAR] Probe counters (written on the decoder worker thread,
+  // read for 1 Hz [nrxma] dumps; plain counters, logging-only precision).
+  uint32_t probe_frames_decoded_ = 0;
+  uint32_t probe_frames_silent_ = 0;   // hw-parity silent frames emitted
+  uint32_t probe_padding_finishes_ = 0;  // hw-parity 0x7FFF padding-tail packet finishes
+  uint32_t probe_err4_split_header_ = 0;  // stock err4 site A (0x7FFF after splice)
+  uint32_t probe_err4_no_continuation_ = 0;  // stock err4 site B (split body, no next packet)
+  uint32_t last_probe_err4_offset_ = UINT32_MAX;  // dedupe err4 park logging per offset
 };
 
 }  // namespace rex::audio

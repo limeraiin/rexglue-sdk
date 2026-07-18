@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+
+#include <rex/audio/flags.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
@@ -27,6 +30,28 @@ extern "C" {
 }  // extern "C"
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+
+// [NARUTO-XMA-HWPAR] Hardware-parity XMA decode behavior:
+// (1) a frame that fails to decode still emits one full frame of silent PCM
+//     (real hardware always produces a frame's worth of samples per chain-walked
+//     frame slot -- garbage bits decode to garbage samples that the game's
+//     sound engine trims/never renders; producing NOTHING under-delivers vs the
+//     game's authored per-packet sample tables and permanently parks its
+//     rendered-watermark feed gate = streamed-music death), and
+// (2) a split-frame "length" that reconstructs to all-ones (0x7FFF) is
+//     end-of-stream padding, not a frame: finish the packet via the normal
+//     next-packet/swap path instead of parking with error_status=4 forever
+//     while holding both input buffers (the loop-wrap deadlock).
+// No timeouts, no learned state, no persistence: pure per-packet structure.
+REXCVAR_DEFINE_BOOL(apu_xma_hw_parity, false, "Audio",
+                    "XMA hardware-parity decode: emit silent frames for undecodable frame slots "
+                    "and treat all-ones split lengths as end-of-packet padding instead of "
+                    "parking with error_status=4");
+// [NARUTO-XMA-HWPAR] Compact probe: logs hw-parity events + err4 parks + a 1 Hz
+// per-context dump ([nrxma] tag). Orders of magnitude lighter than the old
+// reverted kernel-call firehose probe.
+REXCVAR_DEFINE_BOOL(apu_xma_probe, false, "Audio",
+                    "Compact XMA decode probe logging ([nrxma] lines)");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -138,6 +163,8 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 }
 
 void XmaDecoder::WorkerThreadMain() {
+  // [NARUTO-XMA-HWPAR] 1 Hz per-context probe dump timer.
+  auto probe_last_dump = std::chrono::steady_clock::now();
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
@@ -149,6 +176,43 @@ void XmaDecoder::WorkerThreadMain() {
         PROFILE_XMA_FRAME_DECODED();
       }
       did_work = did_work || worked;
+    }
+
+    // [NARUTO-XMA-HWPAR] Compact 1 Hz dump of every allocated context: live
+    // guest-visible state (incl. the loop fields the game programs at
+    // XMAInitializeContext) + host decode counters.
+    if (REXCVAR_GET(apu_xma_probe)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - probe_last_dump >= std::chrono::seconds(1)) {
+        probe_last_dump = now;
+        for (uint32_t n = 0; n < kContextCount; n++) {
+          XmaContext& context = contexts_[n];
+          if (!context.is_allocated()) {
+            continue;
+          }
+          XMA_CONTEXT_DATA data(memory()->TranslateVirtual(context.guest_ptr()));
+          REXAPU_INFO(
+              "[nrxma] ctx={} en={} in0={} in1={} cur={} pkts={}/{} roff={} "
+              "out(rd={} wr={} val={} blk={}) loop(cnt={} s={} e={}) err={} "
+              "dec={} sil={} padfin={} e4hdr={} e4wait={}",
+              n, context.is_enabled() ? 1 : 0,
+              static_cast<uint32_t>(data.input_buffer_0_valid),
+              static_cast<uint32_t>(data.input_buffer_1_valid),
+              static_cast<uint32_t>(data.current_buffer),
+              static_cast<uint32_t>(data.input_buffer_0_packet_count),
+              static_cast<uint32_t>(data.input_buffer_1_packet_count),
+              static_cast<uint32_t>(data.input_buffer_read_offset),
+              static_cast<uint32_t>(data.output_buffer_read_offset),
+              static_cast<uint32_t>(data.output_buffer_write_offset),
+              static_cast<uint32_t>(data.output_buffer_valid),
+              static_cast<uint32_t>(data.output_buffer_block_count),
+              static_cast<uint32_t>(data.loop_count), static_cast<uint32_t>(data.loop_start),
+              static_cast<uint32_t>(data.loop_end), static_cast<uint32_t>(data.error_status),
+              context.probe_frames_decoded_, context.probe_frames_silent_,
+              context.probe_padding_finishes_, context.probe_err4_split_header_,
+              context.probe_err4_no_continuation_);
+        }
+      }
     }
 
     if (paused_) {

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include <rex/audio/flags.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
@@ -189,6 +190,16 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
+
+  // [NARUTO-XMA-HWPAR] Guest re-init (XMAInitializeContext -> Clear register)
+  // starts a new stream on this context: restart the probe counters so dumps
+  // read per-track, and re-arm the err4 log dedupe.
+  probe_frames_decoded_ = 0;
+  probe_frames_silent_ = 0;
+  probe_padding_finishes_ = 0;
+  probe_err4_split_header_ = 0;
+  probe_err4_no_continuation_ = 0;
+  last_probe_err4_offset_ = UINT32_MAX;
 }
 
 void XmaContext::Disable() {
@@ -213,6 +224,31 @@ void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
   }
   data->current_buffer ^= 1;
   data->input_buffer_read_offset = kBitsPerPacketHeader;
+}
+
+// [NARUTO-XMA-HWPAR] Verbatim mirror of the clean last-frame-in-packet advance
+// at the tail of Decode() (kept duplicated so the stock path stays untouched):
+// find the next packet with a valid first-frame offset, else release the
+// current buffer and resync to the other buffer's first frame.
+void XmaContext::AdvanceToNextPacket(XMA_CONTEXT_DATA* data, uint8_t* current_input_buffer,
+                                     uint32_t next_packet_index,
+                                     uint32_t current_input_packet_count) {
+  uint32_t next_input_offset =
+      GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
+
+  if (next_input_offset == kBitsPerPacketHeader) {
+    SwapInputBuffer(data);
+    if (data->IsAnyInputBufferValid()) {
+      next_input_offset = xma::GetPacketFrameOffset(
+          memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
+
+      if (next_input_offset > kMaxFrameSizeinBits) {
+        SwapInputBuffer(data);
+        return;
+      }
+    }
+  }
+  data->input_buffer_read_offset = next_input_offset;
 }
 
 void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
@@ -597,6 +633,31 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
     uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
     if (frame_size == xma::kMaxFrameLength) {
+      // [NARUTO-XMA-HWPAR] An all-ones reconstructed "length" means the packet
+      // tail is end-of-stream padding (XMA pads packet tails with 1-bits), not
+      // a split frame. Stock code parks with error_status=4 forever -- even
+      // though the next packet is already present in the other buffer -- which
+      // deadlocks a looping track's final packet against the game feeder's
+      // rendered+2 gate (streamed-music death). Real hardware just proceeds to
+      // the next packet. Finish this packet via the normal advance path.
+      if (REXCVAR_GET(apu_xma_hw_parity)) {
+        probe_padding_finishes_++;
+        if (REXCVAR_GET(apu_xma_probe)) {
+          REXAPU_INFO("[nrxma] ctx={} HWPAR-PADFIN roff={} next_pkt={} (padding tail, finishing packet)",
+                      id(), static_cast<uint32_t>(data->input_buffer_read_offset),
+                      next_packet_index);
+        }
+        AdvanceToNextPacket(data, current_input_buffer, next_packet_index,
+                            current_input_packet_count);
+        return;
+      }
+      probe_err4_split_header_++;
+      if (REXCVAR_GET(apu_xma_probe) &&
+          last_probe_err4_offset_ != data->input_buffer_read_offset) {
+        last_probe_err4_offset_ = data->input_buffer_read_offset;
+        REXAPU_INFO("[nrxma] ctx={} ERR4 site=split-header-0x7FFF roff={} (park)", id(),
+                    static_cast<uint32_t>(data->input_buffer_read_offset));
+      }
       data->error_status = 4;
       return;
     }
@@ -620,6 +681,19 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       const uint8_t* next_packet =
           GetNextPacket(data, next_packet_index, current_input_packet_count);
       if (!next_packet) {
+        // [NARUTO-XMA-HWPAR note] This is the legitimate transient wait: a
+        // split frame whose continuation packet the guest has not fed yet.
+        // Real hardware also cannot decode bits it does not have; the cursor
+        // stays frozen and decode resumes when the next SET_IN arrives. Kept
+        // as-is (only probe-logged).
+        probe_err4_no_continuation_++;
+        if (REXCVAR_GET(apu_xma_probe) &&
+            last_probe_err4_offset_ != data->input_buffer_read_offset) {
+          last_probe_err4_offset_ = data->input_buffer_read_offset;
+          REXAPU_INFO("[nrxma] ctx={} ERR4 site=split-body-wait roff={} frame_size={} (waiting for continuation)",
+                      id(), static_cast<uint32_t>(data->input_buffer_read_offset),
+                      packet_info.current_frame_size_);
+        }
         data->error_status = 4;
         return;
       }
@@ -642,9 +716,28 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   PrepareDecoder(data->sample_rate, bool(data->is_stereo));
   PreparePacket(packet_info.current_frame_size_, padding_start);
-  if (DecodePacket(av_context_, av_packet_, av_frame_)) {
+  const bool frame_decoded = DecodePacket(av_context_, av_packet_, av_frame_);
+  if (frame_decoded) {
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                  raw_frame_.data());
+    probe_frames_decoded_++;
+  }
+  // [NARUTO-XMA-HWPAR] Real hardware emits a full frame of PCM for every
+  // chain-walked frame slot, valid bits or not (garbage decodes to garbage
+  // samples the game trims). Producing nothing for an undecodable frame
+  // under-delivers vs the game's authored per-packet sample tables, which is
+  // what parks its rendered-watermark feed gate. raw_frame_ is already
+  // zero-filled above, so accounting for the frame without converting emits
+  // exactly one frame of silence.
+  if (frame_decoded || REXCVAR_GET(apu_xma_hw_parity)) {
+    if (!frame_decoded) {
+      probe_frames_silent_++;
+      if (REXCVAR_GET(apu_xma_probe)) {
+        REXAPU_INFO("[nrxma] ctx={} HWPAR-SILENT roff={} frame_size={} (undecodable frame slot -> silence)",
+                    id(), static_cast<uint32_t>(data->input_buffer_read_offset),
+                    packet_info.current_frame_size_);
+      }
+    }
     current_frame_remaining_subframes_ = 4 << data->is_stereo;
 
     // Loop end: limit output to subframes 0..loop_subframe_end.
