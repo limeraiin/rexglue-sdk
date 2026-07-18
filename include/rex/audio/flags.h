@@ -41,6 +41,3 @@ REXCVAR_DECLARE(bool, apu_xma_elastic_fifo);
 // downstream rendered-stock still covers playback (the REAL mid-track music-gap fix).
 REXCVAR_DECLARE(bool, apu_xma_stock_starve);
 REXCVAR_DECLARE(int32_t, apu_xma_stock_floor_ms);
-// [NARUTO-XMA-WRAP] deterministic loop-wrap detection at split-frame resume: learn + cache the
-// loop length on the FIRST wrap (only the first-ever loop of a track is gapped).
-REXCVAR_DECLARE(bool, apu_xma_wrap_learn);

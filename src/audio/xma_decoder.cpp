@@ -184,21 +184,6 @@ REXCVAR_DEFINE_INT32(apu_xma_stock_floor_ms, 16, "Audio",
                      "Estimated guest-stock floor (ms) below which starved-silence injection "
                      "resumes (safety margin for estimate drift)");
 
-// [NARUTO-XMA-WRAP] Deterministic loop-wrap detection (2026-07-16). For a true mid-stream
-// continuation, the packet that resumes a cached split frame ALWAYS declares its first-frame
-// offset as header + the cached frame's remaining bits - that is the field's definition. A
-// mismatch is machine-checkable proof the arriving buffer is NOT the continuation: the stream
-// wrapped to its loop start. On that first provable wrap the loop length is learned AND
-// persisted immediately (no twice-consistency needed - the signal cannot come from a mid-track
-// stall, unlike the starvation-timeout heuristic, which stays guarded). Result: only a track's
-// FIRST-EVER loop is gapped; the 2nd loop onward predicts in-session, and the cache makes all
-// loops (incl. the 1st) gapless in later sessions. Also skips the garbage splice frame the
-// unpredicted-seam path used to decode.
-REXCVAR_DEFINE_BOOL(apu_xma_wrap_learn, true, "Audio",
-                    "Detect XMA loop wraps deterministically at split-frame resume and "
-                    "learn+cache the loop length on the first wrap (first loop gapped, "
-                    "all later loops gapless)");
-
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
 // decoders. Later games use XAudio*() and direct memory writes to the XMA
