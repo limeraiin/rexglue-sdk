@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 
@@ -246,6 +247,9 @@ class XmaContext {
   // gated padding-tail finish so the stock path stays byte-identical.
   void AdvanceToNextPacket(XMA_CONTEXT_DATA* data, uint8_t* current_input_buffer,
                            uint32_t next_packet_index, uint32_t current_input_packet_count);
+  // [NARUTO-XMA-HWPAR] Emit one silent frame (sample-count completion) for a
+  // starved guest-declared looper; shared by the tail fire + dry drip.
+  void HwparEmitSilentFrame(XMA_CONTEXT_DATA* data);
 
   memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
   int PrepareDecoder(int sample_rate, bool is_two_channel);
@@ -287,12 +291,33 @@ class XmaContext {
   uint8_t loop_frame_output_limit_ = 0;
   bool loop_start_skip_pending_ = false;
 
+  // [NARUTO-XMA-HWPAR] Looper-tail completion state (gated on
+  // apu_xma_hw_parity). Measured across runs naruto_257/258: the guest feeder
+  // gates production of the loop-wrap packet on SAMPLE COMPLETION of the final
+  // packet (not buffer occupancy -- early release was tried and refuted: slots
+  // sat free for 40 s and the wrap never came, while the early consumed
+  // signal made the guest voice hiccup ~0.1 s at every by-design ~7.7 s
+  // producer freeze). The final packet of a looping track is truncated
+  // mid-frame at the loop point, so its tail frame can never decode without
+  // data that will never arrive -> mutual deadlock (music death). For contexts
+  // the GAME declared as loopers (loop_count != 0, programmed via
+  // XMAInitializeContext -- one-shots are all-zero and stay pure stock), a
+  // split-frame starvation hold that outlives the by-design freeze envelope
+  // (measured max 469 ms) completes the pending frame as silence and keeps
+  // real-time-paced silence flowing while dry, until the guest feeds again.
+  // Nothing is rewound and nothing is learned: the GUEST performs the loop.
+  uint32_t hwpar_hold_roff_ = 0xFFFFFFFFu;  // read offset the hold timer is armed on
+  std::chrono::steady_clock::time_point hwpar_hold_since_{};
+  bool hwpar_tail_active_ = false;  // fired: dripping silence while input dry
+
  public:
   // [NARUTO-XMA-HWPAR] Probe counters (written on the decoder worker thread,
   // read for 1 Hz [nrxma] dumps; plain counters, logging-only precision).
   uint32_t probe_frames_decoded_ = 0;
   uint32_t probe_frames_silent_ = 0;   // hw-parity silent frames emitted
   uint32_t probe_padding_finishes_ = 0;  // hw-parity 0x7FFF padding-tail packet finishes
+  uint32_t probe_tail_fires_ = 0;   // hw-parity looper-tail completions (threshold crossings)
+  uint32_t probe_tail_frames_ = 0;  // hw-parity silent frames emitted while tail-dry
   uint32_t probe_err4_split_header_ = 0;  // stock err4 site A (0x7FFF after splice)
   uint32_t probe_err4_no_continuation_ = 0;  // stock err4 site B (split body, no next packet)
   uint32_t last_probe_err4_offset_ = UINT32_MAX;  // dedupe err4 park logging per offset

@@ -43,10 +43,17 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
 //     next-packet/swap path instead of parking with error_status=4 forever
 //     while holding both input buffers (the loop-wrap deadlock).
 // No timeouts, no learned state, no persistence: pure per-packet structure.
-REXCVAR_DEFINE_BOOL(apu_xma_hw_parity, false, "Audio",
-                    "XMA hardware-parity decode: emit silent frames for undecodable frame slots "
-                    "and treat all-ones split lengths as end-of-packet padding instead of "
-                    "parking with error_status=4");
+REXCVAR_DEFINE_BOOL(apu_xma_hw_parity, true, "Audio",
+                    "XMA hardware-parity decode: emit silent frames for undecodable frame slots, "
+                    "treat all-ones split lengths as end-of-packet padding, and complete a "
+                    "starved guest-declared looper's truncated tail frame as silence (fixes "
+                    "streamed-music death at the loop seam)");
+// [NARUTO-XMA-HWPAR] Threshold before the looper-tail completion fires. Must
+// exceed the game's by-design producer-freeze envelope (measured 200-475 ms at
+// the ~7.7 s musical phrase boundaries) so mid-track waits are never touched.
+REXCVAR_DEFINE_INT32(apu_xma_looper_tail_ms, 600, "Audio",
+                     "ms a guest-declared looping XMA context must starve mid-frame before its "
+                     "pending tail frame is completed as silence");
 // [NARUTO-XMA-HWPAR] Compact probe: logs hw-parity events + err4 parks + a 1 Hz
 // per-context dump ([nrxma] tag). Orders of magnitude lighter than the old
 // reverted kernel-call firehose probe.
@@ -194,7 +201,7 @@ void XmaDecoder::WorkerThreadMain() {
           REXAPU_INFO(
               "[nrxma] ctx={} en={} in0={} in1={} cur={} pkts={}/{} roff={} "
               "out(rd={} wr={} val={} blk={}) loop(cnt={} s={} e={}) err={} "
-              "dec={} sil={} padfin={} e4hdr={} e4wait={}",
+              "dec={} sil={} padfin={} e4hdr={} e4wait={} tail={}/{}",
               n, context.is_enabled() ? 1 : 0,
               static_cast<uint32_t>(data.input_buffer_0_valid),
               static_cast<uint32_t>(data.input_buffer_1_valid),
@@ -210,7 +217,8 @@ void XmaDecoder::WorkerThreadMain() {
               static_cast<uint32_t>(data.loop_end), static_cast<uint32_t>(data.error_status),
               context.probe_frames_decoded_, context.probe_frames_silent_,
               context.probe_padding_finishes_, context.probe_err4_split_header_,
-              context.probe_err4_no_continuation_);
+              context.probe_err4_no_continuation_, context.probe_tail_fires_,
+              context.probe_tail_frames_);
         }
       }
     }

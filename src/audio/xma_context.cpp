@@ -10,6 +10,7 @@
 */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include <rex/audio/flags.h>
@@ -192,8 +193,13 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   loop_start_skip_pending_ = false;
 
   // [NARUTO-XMA-HWPAR] Guest re-init (XMAInitializeContext -> Clear register)
-  // starts a new stream on this context: restart the probe counters so dumps
-  // read per-track, and re-arm the err4 log dedupe.
+  // starts a new stream on this context: drop the looper-tail state
+  // (retry-guard #2 -- nothing survives a stream switch), restart the probe
+  // counters so dumps read per-track, and re-arm the err4 log dedupe.
+  hwpar_tail_active_ = false;
+  hwpar_hold_roff_ = 0xFFFFFFFFu;
+  probe_tail_fires_ = 0;
+  probe_tail_frames_ = 0;
   probe_frames_decoded_ = 0;
   probe_frames_silent_ = 0;
   probe_padding_finishes_ = 0;
@@ -249,6 +255,17 @@ void XmaContext::AdvanceToNextPacket(XMA_CONTEXT_DATA* data, uint8_t* current_in
     }
   }
   data->input_buffer_read_offset = next_input_offset;
+}
+
+// [NARUTO-XMA-HWPAR] One frame of silence into the normal Consume path:
+// completes the sample count the guest's feeder accounting expects from a
+// starved guest-declared looper (real hardware never stops producing).
+void XmaContext::HwparEmitSilentFrame(XMA_CONTEXT_DATA* data) {
+  raw_frame_.fill(0);
+  current_frame_remaining_subframes_ = 4 << data->is_stereo;
+  loop_frame_output_limit_ = 0;
+  probe_frames_silent_++;
+  probe_tail_frames_++;
 }
 
 void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
@@ -544,6 +561,13 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   SCOPE_profile_cpu_f("apu");
 
   if (!data->IsAnyInputBufferValid()) {
+    // [NARUTO-XMA-HWPAR] A guest-declared looper past the tail fire keeps
+    // real-time-paced silence flowing while dry (Work's output-ring gate
+    // paces the drip to the game's own pull) until the guest feeds again.
+    if (REXCVAR_GET(apu_xma_hw_parity) && hwpar_tail_active_ && data->loop_count != 0 &&
+        current_frame_remaining_subframes_ == 0) {
+      HwparEmitSilentFrame(data);
+    }
     return;
   }
 
@@ -557,6 +581,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       return;
     }
   }
+
+  // [NARUTO-XMA-HWPAR] Input available: the looper-tail drip (if any) ends. A
+  // post-fire buffer starts at rdoff=32 and the standard first-frame-offset
+  // snap below resyncs it. NOTE: the starvation hold timer is deliberately
+  // NOT disarmed here -- a parked split-frame re-parses through this point on
+  // every kick with the held buffer still valid, and disarming per kick
+  // would reset the timer forever (the round-3 zero-fire bug). It disarms on
+  // actual frame progress below.
+  hwpar_tail_active_ = false;
 
   uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
 
@@ -681,11 +714,39 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       const uint8_t* next_packet =
           GetNextPacket(data, next_packet_index, current_input_packet_count);
       if (!next_packet) {
-        // [NARUTO-XMA-HWPAR note] This is the legitimate transient wait: a
-        // split frame whose continuation packet the guest has not fed yet.
-        // Real hardware also cannot decode bits it does not have; the cursor
-        // stays frozen and decode resumes when the next SET_IN arrives. Kept
-        // as-is (only probe-logged).
+        // [NARUTO-XMA-HWPAR] A split frame whose continuation the guest has
+        // not fed yet. The stock hold-and-wait IS correct mid-track (measured
+        // p50 74 ms / max 469 ms waits that always resolve at the next feed;
+        // early buffer release was tried and REFUTED -- it made the guest
+        // voice hiccup at the ~7.7 s by-design freezes and did not unblock
+        // the seam). But a looping track's FINAL packet is truncated
+        // mid-frame at the loop point and its continuation never comes: the
+        // guest feeder is gated on this packet's sample completion -> mutual
+        // deadlock (music death; roff frozen forever at dec=5182 in
+        // naruto_257/258). For contexts the game itself declared looping
+        // (loop_count != 0), a hold that outlives the freeze envelope
+        // completes the pending frame as silence and releases the buffer;
+        // the guest then wraps on its own. One-shots stay pure stock.
+        if (REXCVAR_GET(apu_xma_hw_parity) && data->loop_count != 0) {
+          const auto now = std::chrono::steady_clock::now();
+          if (hwpar_hold_roff_ != data->input_buffer_read_offset) {
+            hwpar_hold_roff_ = data->input_buffer_read_offset;
+            hwpar_hold_since_ = now;
+          } else if (now - hwpar_hold_since_ >= std::chrono::milliseconds(
+                                                    REXCVAR_GET(apu_xma_looper_tail_ms))) {
+            probe_tail_fires_++;
+            hwpar_tail_active_ = true;
+            hwpar_hold_roff_ = 0xFFFFFFFFu;
+            if (REXCVAR_GET(apu_xma_probe)) {
+              REXAPU_INFO("[nrxma] ctx={} TAIL-COMPLETE roff={} frame_size={} (looper starved past freeze envelope: silence + release)",
+                          id(), static_cast<uint32_t>(data->input_buffer_read_offset),
+                          packet_info.current_frame_size_);
+            }
+            HwparEmitSilentFrame(data);
+            SwapInputBuffer(data);
+            return;
+          }
+        }
         probe_err4_no_continuation_++;
         if (REXCVAR_GET(apu_xma_probe) &&
             last_probe_err4_offset_ != data->input_buffer_read_offset) {
@@ -756,6 +817,12 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       loop_start_skip_pending_ = false;
     }
   }
+
+  // [NARUTO-XMA-HWPAR] A frame was parsed (decoded or skipped) = real
+  // progress: disarm the looper-tail starvation hold. This is the only
+  // disarm point besides Clear, so a continuous park accumulates wall-clock
+  // and an armed offset can never go stale across decoded frames.
+  hwpar_hold_roff_ = 0xFFFFFFFFu;
 
   // Compute where to go next.
   if (!packet_info.isLastFrameInPacket()) {
