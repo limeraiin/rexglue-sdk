@@ -53,15 +53,8 @@ class XmaDecoder {
   void Pause();
   void Resume();
 
+ protected:
   int GetContextId(uint32_t guest_ptr);
-
-  // [NARUTO-XMA-PROBE]
-  XmaContext* GetContextById(int id) {
-    return (id >= 0 && id < static_cast<int>(kContextCount)) ? &contexts_[id] : nullptr;
-  }
-  // Once-per-second per-context status dump (apu_xma_probe). Called from the
-  // audio-system worker pump; rate-limits internally.
-  void ProbeDumpStatus(uint64_t xaudio_submits);
 
  private:
   void WorkerThreadMain();

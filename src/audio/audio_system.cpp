@@ -9,8 +9,6 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <atomic>
-
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
@@ -29,9 +27,6 @@
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
-
-// [NARUTO-XMA-PROBE] XAudio render-driver submit counter (mixer liveness).
-static std::atomic<uint64_t> g_nrxma_submit_count{0};
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -164,11 +159,6 @@ void AudioSystem::WorkerThreadMain() {
       break;
     }
 
-    // [NARUTO-XMA-PROBE] 1Hz XMA status dump (rate-limited inside).
-    if (REXCVAR_GET(apu_xma_probe)) {
-      xma_decoder_->ProbeDumpStatus(g_nrxma_submit_count.load(std::memory_order_relaxed));
-    }
-
     if (!pumped) {
       SCOPE_profile_cpu_i("apu", "Sleep");
       rex::thread::Sleep(std::chrono::milliseconds(500));
@@ -260,8 +250,6 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
 
 void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   SCOPE_profile_cpu_f("apu");
-
-  g_nrxma_submit_count.fetch_add(1, std::memory_order_relaxed);  // [NARUTO-XMA-PROBE]
 
   static uint32_t submit_count = 0;
   if (submit_count < 10) {
