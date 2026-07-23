@@ -67,6 +67,15 @@ REXCVAR_DEFINE_STRING(gpu, "any", "GPU", "Graphics backend: any, d3d12, vulkan")
 REXCVAR_DEFINE_BOOL(skip_config_dialog, false, "UI",
                     "Skip the pre-launch configuration dialog and start immediately");
 
+// Path to an STFS content package (DLC .LIVE file) to import once at boot. When
+// set, the runtime mounts the package and extracts it into the user data content
+// tree (<user_data>/0000000000000000/<title_id>/00000002/<name>/ + .header) so
+// the guest's XamContentCreateEnumerator finds it like installed HDD content.
+// One-shot: extraction is idempotent (skips if the destination already exists via
+// the game's own CREATE semantics is not used here; re-running simply re-extracts).
+REXCVAR_DEFINE_STRING(install_content, "", "Runtime",
+                      "Import an STFS DLC package at boot (path to the .LIVE file)");
+
 namespace rex {
 
 namespace {
@@ -351,6 +360,29 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   }
 
   OnPostLoadXexImage();
+
+  // Optional one-shot DLC import. The XEX is loaded (so title_id() is valid) but
+  // the guest has not started, so the content tree is ready before the game's
+  // first XamContentCreateEnumerator call.
+  {
+    std::string install_pkg = REXCVAR_GET(install_content);
+    if (!install_pkg.empty()) {
+      auto* ks = runtime_->kernel_state();
+      auto* cm = ks ? ks->content_manager() : nullptr;
+      if (cm) {
+        X_RESULT ir = cm->InstallContent(rex::to_path(install_pkg));
+        if (ir == X_ERROR_ALREADY_EXISTS) {
+          REXLOG_INFO("DLC already installed, skipping import: {}", install_pkg);
+        } else if (XSUCCEEDED(ir)) {
+          REXLOG_INFO("DLC import succeeded (title {:08X}): {}", ks->title_id(), install_pkg);
+        } else {
+          REXLOG_ERROR("DLC import failed ({:08X}): {}", ir, install_pkg);
+        }
+      } else {
+        REXLOG_ERROR("DLC import requested but content manager unavailable");
+      }
+    }
+  }
 
   if (ppc_info_.rexcrt_heap) {
     if (!rex::kernel::crt::InitHeap(REXCVAR_GET(rexcrt_heap_size_mb), runtime_->memory())) {

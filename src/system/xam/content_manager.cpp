@@ -574,6 +574,24 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
     return X_ERROR_FILE_NOT_FOUND;
   }
 
+  // Skip if this package is already installed. The destination is derived from
+  // the package's file name (no need to mount the STFS to know it), so this is
+  // cheap — it lets a persisted DLC path (e.g. set in the launcher) be re-checked
+  // every boot without re-extracting. Returns ALREADY_EXISTS so callers can tell
+  // "already installed" from a fresh import.
+  {
+    XCONTENT_AGGREGATE_DATA probe;
+    probe.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+    probe.content_type = XContentType::kMarketplaceContent;
+    probe.title_id = kernel_state_->title_id();
+    probe.xuid = 0;
+    probe.set_file_name(rex::path_to_utf8(package_path.filename()));
+    auto existing = ResolvePackagePath(0, probe);
+    if (std::filesystem::exists(existing) && !std::filesystem::is_empty(existing)) {
+      return X_ERROR_ALREADY_EXISTS;
+    }
+  }
+
   // Mount the STFS package as a virtual filesystem device
   auto device = std::make_unique<rex::filesystem::StfsContainerDevice>("", package_path);
   if (!device->Initialize()) {

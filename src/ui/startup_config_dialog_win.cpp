@@ -21,6 +21,7 @@
 // clang-format off
 #include <windows.h>
 #include <shlobj.h>   // SHBrowseForFolderW, SHGetPathFromIDListW
+#include <commdlg.h>  // GetOpenFileNameW (DLC file picker)
 // clang-format on
 
 namespace rex::ui {
@@ -35,6 +36,8 @@ constexpr int IDC_DATA = 1005;
 constexpr int IDC_BROWSE = 1006;
 constexpr int IDC_INTERNAL_RES = 1007;
 constexpr int IDC_EXP_60FPS = 1008;
+constexpr int IDC_DLC = 1009;
+constexpr int IDC_DLC_BROWSE = 1010;
 
 struct GpuOption {
   const wchar_t* label;
@@ -91,6 +94,7 @@ struct DialogState {
   HWND check_exp_60fps = nullptr;
   HWND combo_display = nullptr;
   HWND edit_data = nullptr;
+  HWND edit_dlc = nullptr;
   HFONT font = nullptr;
   HFONT font_small = nullptr;  // smaller font for the bottom-left credits line
 };
@@ -149,6 +153,28 @@ std::wstring BrowseForFolder(HWND owner, const std::wstring& initial) {
   return result;
 }
 
+// Opens a standard file-open dialog to pick a single DLC package. Xbox 360
+// content packages usually have no file extension (the on-disc name is a content
+// hash), so the filter defaults to all files. Returns "" if cancelled.
+std::wstring BrowseForFile(HWND owner, const std::wstring& initial) {
+  wchar_t path[MAX_PATH] = {};
+  if (!initial.empty() && initial.size() < MAX_PATH) {
+    wcscpy_s(path, initial.c_str());
+  }
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = owner;
+  ofn.lpstrFilter = L"DLC / content package (*.*)\0*.*\0\0";
+  ofn.lpstrFile = path;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.lpstrTitle = L"Select a DLC package file";
+  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+  if (GetOpenFileNameW(&ofn)) {
+    return path;
+  }
+  return {};
+}
+
 HWND MakeControl(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y,
                  int w, int h, int id, HFONT font) {
   HWND ctl = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
@@ -188,21 +214,27 @@ void BuildControls(HWND hwnd, DialogState* st) {
       MakeControl(hwnd, L"BUTTON", L"60 FPS overworld (EXPERIMENTAL)", BS_AUTOCHECKBOX | WS_TABSTOP,
                   172, 154, 260, 22, IDC_EXP_60FPS, font);
 
-  MakeControl(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 222, 200, 20, -1, font);
-  st->edit_data = MakeControl(hwnd, L"EDIT", nullptr,
-                              WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, 244, 330, 24, IDC_DATA,
-                              font);
-  MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 243, 80, 26, IDC_BROWSE, font);
+  MakeControl(hwnd, L"STATIC", L"DLC package (Japanese voices, etc.):", SS_LEFT, 16, 190, 300, 20,
+              -1, font);
+  st->edit_dlc = MakeControl(hwnd, L"EDIT", nullptr, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16,
+                             212, 330, 24, IDC_DLC, font);
+  MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 211, 80, 26, IDC_DLC_BROWSE, font);
 
-  MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 298, 84, 30, IDOK, font);
-  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 298, 84, 30, IDCANCEL, font);
+  MakeControl(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 256, 200, 20, -1, font);
+  st->edit_data = MakeControl(hwnd, L"EDIT", nullptr,
+                              WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, 278, 330, 24, IDC_DATA,
+                              font);
+  MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 277, 80, 26, IDC_BROWSE, font);
+
+  MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 332, 84, 30, IDOK, font);
+  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 332, 84, 30, IDCANCEL, font);
 
   // Bottom-left credits line, drawn in a smaller font. Spans the full client
   // width so it can wrap to a second line if the system font is large.
   MakeControl(hwnd, L"STATIC",
               L"Special thanks to Simeon, Kalarot, Vexil Megga, Hailnate13x, GUARD, ctrlalt3l1t3, "
               L"Austin_Toonz, seraf5 and Mark_Rampage for their Patreon support.",
-              SS_LEFT, 16, 332, 416, 50, -1, st->font_small ? st->font_small : font);
+              SS_LEFT, 16, 368, 416, 50, -1, st->font_small ? st->font_small : font);
 
   // --- Populate from current cvar values ---
   std::string gpu = rex::cvar::GetFlagByName("gpu");
@@ -248,6 +280,9 @@ void BuildControls(HWND hwnd, DialogState* st) {
 
   std::wstring data_dir = Widen(rex::cvar::GetFlagByName("game_data_root"));
   SetWindowTextW(st->edit_data, data_dir.c_str());
+
+  std::wstring dlc_pkg = Widen(rex::cvar::GetFlagByName("install_content"));
+  SetWindowTextW(st->edit_dlc, dlc_pkg.c_str());
 }
 
 // Applies the dialog selections to cvars and persists them. Returns false (with
@@ -296,6 +331,14 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
   rex::cvar::SetFlagByName("fullscreen", kDisplayModes[display_sel].fullscreen ? "true" : "false");
   rex::cvar::SetFlagByName("game_data_root", Narrow(data));
 
+  // Optional DLC package path (trimmed). Persists until the user clears/changes
+  // it; the runtime imports it once at boot and skips if already installed.
+  std::wstring dlc = GetEditText(st->edit_dlc);
+  while (!dlc.empty() && (dlc.back() == L' ' || dlc.back() == L'\t')) {
+    dlc.pop_back();
+  }
+  rex::cvar::SetFlagByName("install_content", Narrow(dlc));
+
   rex::cvar::SaveConfig(config_path);
   return true;
 }
@@ -318,6 +361,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       if (id == IDC_BROWSE) {
         std::wstring picked = BrowseForFolder(hwnd, GetEditText(st->edit_data));
         if (!picked.empty()) SetWindowTextW(st->edit_data, picked.c_str());
+        return 0;
+      }
+      if (id == IDC_DLC_BROWSE) {
+        std::wstring picked = BrowseForFile(hwnd, GetEditText(st->edit_dlc));
+        if (!picked.empty()) SetWindowTextW(st->edit_dlc, picked.c_str());
         return 0;
       }
       if (id == IDOK) {
@@ -389,10 +437,11 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
 
   g_config_path = &config_path;
 
-  // Client area 448 x 384; size the window to fit it (the extra bottom strip
-  // below the buttons holds the smaller-font credits line).
+  // Client area 448 x 436; size the window to fit it (the extra bottom strip
+  // below the buttons holds the smaller-font credits line). Height grew from 384
+  // to fit the DLC package row between the 60fps checkbox and the game-data row.
   const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-  RECT rc{0, 0, 448, 384};
+  RECT rc{0, 0, 448, 436};
   AdjustWindowRectEx(&rc, style, FALSE, 0);
   int win_w = rc.right - rc.left;
   int win_h = rc.bottom - rc.top;

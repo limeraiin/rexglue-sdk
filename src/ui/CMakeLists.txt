@@ -139,6 +139,7 @@ if(WIN32)
         Shcore
         Shell32   # SHBrowseForFolderW / SHGetPathFromIDListW (startup config dialog)
         ole32     # CoTaskMemFree (startup config dialog)
+        comdlg32  # GetOpenFileNameW (startup config dialog — DLC file picker)
     )
 else()
     find_package(PkgConfig REQUIRED)
