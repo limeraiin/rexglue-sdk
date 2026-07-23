@@ -38,6 +38,7 @@ constexpr int IDC_INTERNAL_RES = 1007;
 constexpr int IDC_EXP_60FPS = 1008;
 constexpr int IDC_DLC = 1009;
 constexpr int IDC_DLC_BROWSE = 1010;
+constexpr int IDC_SKIP_LAUNCHER = 1011;
 
 struct GpuOption {
   const wchar_t* label;
@@ -95,6 +96,7 @@ struct DialogState {
   HWND combo_display = nullptr;
   HWND edit_data = nullptr;
   HWND edit_dlc = nullptr;
+  HWND check_skip_launcher = nullptr;
   HFONT font = nullptr;
   HFONT font_small = nullptr;  // smaller font for the bottom-left credits line
 };
@@ -226,15 +228,23 @@ void BuildControls(HWND hwnd, DialogState* st) {
                               font);
   MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 277, 80, 26, IDC_BROWSE, font);
 
+  // Skip this dialog on future launches (persists to the skip_config_dialog
+  // cvar). Bottom-left, aligned with the Play/Quit buttons.
+  st->check_skip_launcher =
+      MakeControl(hwnd, L"BUTTON", L"Skip launcher next time", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 338,
+                  228, 22, IDC_SKIP_LAUNCHER, font);
+
   MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 332, 84, 30, IDOK, font);
   MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 332, 84, 30, IDCANCEL, font);
 
   // Bottom-left credits line, drawn in a smaller font. Spans the full client
   // width so it can wrap to a second line if the system font is large.
   MakeControl(hwnd, L"STATIC",
-              L"Special thanks to Simeon, Kalarot, Vexil Megga, Hailnate13x, GUARD, ctrlalt3l1t3, "
-              L"Austin_Toonz, seraf5 and Mark_Rampage for their Patreon support.",
-              SS_LEFT, 16, 368, 416, 50, -1, st->font_small ? st->font_small : font);
+              L"Special thanks to Simeon, Armin Suljovikj, ObsoleteSponge, Kalarot, Dante Smith, "
+              L"Vexil Megga, cody russell, Hailnate13x, GUARD, ctrlalt3l1t3, Austin_Toonz, "
+              L"Mark_Rampage, PELIODAS(Bubu), Sega The Hedgehog, Jesus Cantu, Enel, Chris Parnell "
+              L"and eddie for their Patreon support.",
+              SS_LEFT, 16, 366, 416, 74, -1, st->font_small ? st->font_small : font);
 
   // --- Populate from current cvar values ---
   std::string gpu = rex::cvar::GetFlagByName("gpu");
@@ -283,6 +293,11 @@ void BuildControls(HWND hwnd, DialogState* st) {
 
   std::wstring dlc_pkg = Widen(rex::cvar::GetFlagByName("install_content"));
   SetWindowTextW(st->edit_dlc, dlc_pkg.c_str());
+
+  SendMessageW(st->check_skip_launcher, BM_SETCHECK,
+               rex::cvar::GetFlagByName("skip_config_dialog") == "true" ? BST_CHECKED
+                                                                        : BST_UNCHECKED,
+               0);
 }
 
 // Applies the dialog selections to cvars and persists them. Returns false (with
@@ -338,6 +353,14 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
     dlc.pop_back();
   }
   rex::cvar::SetFlagByName("install_content", Narrow(dlc));
+
+  // Persist the "skip launcher next time" choice. If set, the next launch boots
+  // straight into the game; clear skip_config_dialog in naruto.toml to get the
+  // dialog back.
+  rex::cvar::SetFlagByName("skip_config_dialog",
+                           SendMessageW(st->check_skip_launcher, BM_GETCHECK, 0, 0) == BST_CHECKED
+                               ? "true"
+                               : "false");
 
   rex::cvar::SaveConfig(config_path);
   return true;
@@ -437,11 +460,11 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
 
   g_config_path = &config_path;
 
-  // Client area 448 x 436; size the window to fit it (the extra bottom strip
-  // below the buttons holds the smaller-font credits line). Height grew from 384
-  // to fit the DLC package row between the 60fps checkbox and the game-data row.
+  // Client area 448 x 452; size the window to fit it (the extra bottom strip
+  // below the buttons holds the smaller-font credits block). Height grew to fit
+  // the DLC package row plus the multi-line Patreon credits block.
   const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-  RECT rc{0, 0, 448, 436};
+  RECT rc{0, 0, 448, 452};
   AdjustWindowRectEx(&rc, style, FALSE, 0);
   int win_w = rc.right - rc.left;
   int win_h = rc.bottom - rc.top;
