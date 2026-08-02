@@ -11,7 +11,9 @@
 
 #include <array>
 #include <cstring>
+#include <mutex>
 #include <queue>
+#include <set>
 #include <string>
 
 #include <fmt/format.h>
@@ -20,8 +22,10 @@
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/string.h>
+#include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
+#include <rex/system/xam/content_install.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xobject.h>
@@ -153,6 +157,35 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
       // Directories only.
       continue;
+    }
+
+    // Hide DLC that ships PowerPC guest code (e.g. a replacement AI2C@N.dll).
+    // The module was never fed to the recompiler, so the moment the guest loads
+    // it every call traps and the title dies during startup. Enumerating it is
+    // what triggers that load, so such content is withheld: the game boots
+    // normally, just without this DLC. The launcher still lists it (flagged) so
+    // it can be removed.
+    if (content_type == XContentType::kMarketplaceContent) {
+      std::string guest_module;
+      if (ContentDirectoryHasGuestModule(file_info.path / file_info.name, &guest_module)) {
+        // Games poll the content enumerator constantly (this title: ~660x per
+        // boot), so warn once per package instead of flooding the log.
+        static std::mutex warned_mutex;
+        static std::set<std::string> warned;
+        auto name = rex::path_to_utf8(file_info.name);
+        bool first_time;
+        {
+          std::lock_guard lock(warned_mutex);
+          first_time = warned.insert(name).second;
+        }
+        if (first_time) {
+          REXLOG_WARN(
+              "Skipping unsupported DLC '{}': contains guest module '{}', which this "
+              "recompiled build cannot load. Remove it from the launcher's DLC panel.",
+              name, guest_module);
+        }
+        continue;
+      }
     }
 
     XCONTENT_AGGREGATE_DATA content_data;
@@ -518,147 +551,36 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
   }
 }
 
-static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
-                             const std::filesystem::path& base_path) {
-  auto dest_path = base_path / rex::to_path(rex::string::utf8_fix_path_separators(entry->path()));
-
-  if (entry->attributes() & rex::filesystem::kFileAttributeDirectory) {
-    std::error_code ec;
-    std::filesystem::create_directories(dest_path, ec);
-    if (ec) {
-      return X_ERROR_ACCESS_DENIED;
-    }
-    return X_ERROR_SUCCESS;
-  }
-
-  // Ensure parent directory exists
-  std::error_code ec;
-  std::filesystem::create_directories(dest_path.parent_path(), ec);
-
-  rex::filesystem::File* in_file = nullptr;
-  X_STATUS status = entry->Open(rex::filesystem::FileAccess::kFileReadData, &in_file);
-  if (status != X_STATUS_SUCCESS) {
-    return X_ERROR_ACCESS_DENIED;
-  }
-
-  auto out_file = rex::filesystem::OpenFile(dest_path, "wb");
-  if (!out_file) {
-    in_file->Destroy();
-    return X_ERROR_ACCESS_DENIED;
-  }
-
-  constexpr size_t kBufferSize = 4 * 1024 * 1024;  // 4 MiB
-  auto buffer = std::make_unique<uint8_t[]>(kBufferSize);
-  size_t remaining = entry->size();
-  size_t offset = 0;
-
-  while (remaining > 0) {
-    size_t bytes_read = 0;
-    size_t to_read = std::min(remaining, kBufferSize);
-    in_file->ReadSync(std::span<uint8_t>(buffer.get(), to_read), offset, &bytes_read);
-    if (bytes_read == 0) {
-      break;
-    }
-    fwrite(buffer.get(), 1, bytes_read, out_file);
-    offset += bytes_read;
-    remaining -= bytes_read;
-  }
-
-  fclose(out_file);
-  in_file->Destroy();
-  return X_ERROR_SUCCESS;
-}
-
 X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
-  if (!std::filesystem::exists(package_path)) {
-    return X_ERROR_FILE_NOT_FOUND;
-  }
+  // Extraction, header writing and the already-installed shortcut all live in
+  // content_install.cpp so the pre-launch launcher (which has no KernelState)
+  // installs DLC exactly the way the runtime does.
+  //
+  // The title check matters: this used to file *any* package under the running
+  // title's DLC directory, so a package for another game — or one carrying guest
+  // code the recompiler never processed — was happily installed and then broke
+  // the next boot.
+  auto result = InstallContentPackage(package_path, root_path_, kernel_state_->title_id(),
+                                     /*allow_guest_module=*/false);
 
-  // Skip if this package is already installed. The destination is derived from
-  // the package's file name (no need to mount the STFS to know it), so this is
-  // cheap — it lets a persisted DLC path (e.g. set in the launcher) be re-checked
-  // every boot without re-extracting. Returns ALREADY_EXISTS so callers can tell
-  // "already installed" from a fresh import.
-  {
-    XCONTENT_AGGREGATE_DATA probe;
-    probe.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
-    probe.content_type = XContentType::kMarketplaceContent;
-    probe.title_id = kernel_state_->title_id();
-    probe.xuid = 0;
-    probe.set_file_name(rex::path_to_utf8(package_path.filename()));
-    auto existing = ResolvePackagePath(0, probe);
-    if (std::filesystem::exists(existing) && !std::filesystem::is_empty(existing)) {
+  switch (result) {
+    case ContentInstallResult::kSuccess:
+      return X_ERROR_SUCCESS;
+    case ContentInstallResult::kAlreadyInstalled:
       return X_ERROR_ALREADY_EXISTS;
-    }
+    case ContentInstallResult::kPackageNotFound:
+      return X_ERROR_FILE_NOT_FOUND;
+    case ContentInstallResult::kNotAContentPackage:
+    case ContentInstallResult::kUnsupportedContentType:
+    case ContentInstallResult::kWrongTitle:
+    case ContentInstallResult::kUnsupportedGuestModule:
+      REXLOG_ERROR("InstallContent({}): {}", rex::path_to_utf8(package_path),
+                   ContentInstallResultToString(result));
+      return X_ERROR_INVALID_PARAMETER;
+    case ContentInstallResult::kExtractFailed:
+      return X_ERROR_ACCESS_DENIED;
   }
-
-  // Mount the STFS package as a virtual filesystem device
-  auto device = std::make_unique<rex::filesystem::StfsContainerDevice>("", package_path);
-  if (!device->Initialize()) {
-    return X_ERROR_ACCESS_DENIED;
-  }
-
-  // Derive install destination:
-  // root_path_/0000000000000000/{title_id}/00000002/{filename}/
-  auto file_name = rex::path_to_utf8(package_path.filename());
-
-  XCONTENT_AGGREGATE_DATA content_data;
-  content_data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
-  content_data.content_type = XContentType::kMarketplaceContent;
-  content_data.title_id = kernel_state_->title_id();
-  content_data.xuid = 0;
-  content_data.set_file_name(file_name);
-
-  // Read display name from STFS metadata
-  auto display_name = device->header().metadata.display_name(rex::system::XLanguage::kEnglish);
-  if (!display_name.empty()) {
-    content_data.set_display_name(display_name);
-  } else {
-    content_data.set_display_name(rex::path_to_utf16(package_path.filename()));
-  }
-
-  auto install_path = ResolvePackagePath(0, content_data);
-
-  // Create destination directory
-  std::error_code ec;
-  std::filesystem::create_directories(install_path, ec);
-  if (ec) {
-    return X_ERROR_ACCESS_DENIED;
-  }
-
-  // Extract all files breadth-first
-  auto* root = device->ResolvePath("");
-  if (!root) {
-    return X_ERROR_ACCESS_DENIED;
-  }
-
-  std::queue<rex::filesystem::Entry*> queue;
-  queue.push(root);
-
-  while (!queue.empty()) {
-    auto* entry = queue.front();
-    queue.pop();
-
-    for (auto& child : entry->children()) {
-      queue.push(child.get());
-    }
-
-    auto result = ExtractEntry(entry, install_path);
-    if (result != X_ERROR_SUCCESS) {
-      return result;
-    }
-  }
-
-  // Compute license mask from STFS header licenses
-  uint32_t license_mask = 0;
-  for (size_t i = 0; i < 0x10; i++) {
-    if (device->header().header.licenses[i].license_flags) {
-      license_mask |= device->header().header.licenses[i].license_bits;
-    }
-  }
-
-  // Write .header file
-  return WriteContentHeaderFile(0, content_data, license_mask);
+  return X_ERROR_FUNCTION_FAILED;
 }
 
 }  // namespace xam

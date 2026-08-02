@@ -14,7 +14,8 @@
 namespace rex::ui {
 
 bool ShowStartupConfigDialog(std::string_view /*app_name*/,
-                             const std::filesystem::path& /*config_path*/) {
+                             const std::filesystem::path& /*config_path*/,
+                             const std::filesystem::path& /*content_root*/) {
   return true;
 }
 

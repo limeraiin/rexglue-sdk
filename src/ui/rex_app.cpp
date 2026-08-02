@@ -71,8 +71,13 @@ REXCVAR_DEFINE_BOOL(skip_config_dialog, false, "UI",
 // set, the runtime mounts the package and extracts it into the user data content
 // tree (<user_data>/0000000000000000/<title_id>/00000002/<name>/ + .header) so
 // the guest's XamContentCreateEnumerator finds it like installed HDD content.
-// One-shot: extraction is idempotent (skips if the destination already exists via
-// the game's own CREATE semantics is not used here; re-running simply re-extracts).
+// Idempotent: an already-populated destination is skipped, so leaving the path set
+// costs nothing on later boots. Packages for another title, or ones carrying guest
+// code the recompiler never processed, are rejected (see InstallContentPackage).
+//
+// This is the headless/CLI import path. Interactive users install and remove DLC
+// from the pre-launch dialog's DLC panel, which does the work immediately and
+// leaves this cvar alone.
 REXCVAR_DEFINE_STRING(install_content, "", "Runtime",
                       "Import an STFS DLC package at boot (path to the .LIVE file)");
 
@@ -174,17 +179,27 @@ bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
   // Native pre-launch configuration dialog (graphics backend, vsync, resolution,
-  // fullscreen, game data folder). Load any persisted config first so the dialog
-  // shows the user's previous choices, then let it override the cvars and save
-  // them. Returning false here (Quit) exits the app before any window/graphics
-  // are created. Skipped with --skip_config_dialog true (automated launches).
+  // fullscreen, game data folder, installed DLC). Load any persisted config first
+  // so the dialog shows the user's previous choices, then let it override the
+  // cvars and save them. Returning false here (Quit) exits the app before any
+  // window/graphics are created. Skipped with --skip_config_dialog true
+  // (automated launches).
   {
     std::filesystem::path startup_config = exe_dir / (std::string(GetName()) + ".toml");
     if (std::filesystem::exists(startup_config)) {
       rex::cvar::LoadConfig(startup_config);
     }
     if (!REXCVAR_GET(skip_config_dialog)) {
-      if (!rex::ui::ShowStartupConfigDialog(GetDisplayName(), startup_config)) {
+      // The dialog's DLC panel installs/removes content directly, so it needs the
+      // user data root up front. Resolved the same way as below; note this is the
+      // pre-OnConfigurePaths value, so an app that relocates user data in that hook
+      // would need to surface it here too.
+      std::string user_data_cvar = REXCVAR_GET(user_data_root);
+      std::filesystem::path dialog_content_root =
+          user_data_cvar.empty() ? rex::filesystem::GetUserFolder() / GetName()
+                                 : std::filesystem::path(user_data_cvar);
+      if (!rex::ui::ShowStartupConfigDialog(GetDisplayName(), startup_config,
+                                            dialog_content_root)) {
         return false;
       }
     }

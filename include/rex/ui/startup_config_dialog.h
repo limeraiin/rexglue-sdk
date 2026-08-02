@@ -22,9 +22,16 @@ namespace rex::ui {
 // Shows the modal startup configuration dialog. `app_name` is used for the
 // window title; `config_path` is the TOML file chosen settings are saved to.
 //
+// `content_root` is the user data root the runtime will use (the parent of the
+// `0000000000000000/<title_id>/...` content tree). Supplying it enables the
+// installed-DLC panel, which installs and uninstalls content directly — the
+// dialog runs before the kernel exists, so it cannot ask the runtime for this.
+// Pass an empty path to disable that panel.
+//
 // Returns true if the user chose to launch the game (settings have been applied
 // to cvars and persisted), or false if the user chose to quit. On non-Windows
 // platforms this is a no-op that returns true.
-bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::path& config_path);
+bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::path& config_path,
+                            const std::filesystem::path& content_root = {});
 
 }  // namespace rex::ui
