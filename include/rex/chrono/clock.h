@@ -56,6 +56,11 @@ class Clock {
   // Sets the guest time scalar, adjusting tick and wall clock speed.
   // Ex: 1x=normal, 2x=double speed, 1/2x=half speed.
   static void set_guest_time_scalar(double scalar);
+  // Applies the `time_scalar` cvar if it changed since the last call. Cheap
+  // enough to poll; the vsync worker does so every millisecond, which is what
+  // makes a live edit from the console or the settings overlay take effect
+  // without a restart. Not thread safe - keep it to one caller.
+  static void ApplyTimeScalarCvar();
   // Get the tick ration between host and guest including time scaling if set.
   static std::pair<uint64_t, uint64_t> guest_tick_ratio();
   // Guest ticks-per-second.

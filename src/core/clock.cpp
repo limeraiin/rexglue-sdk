@@ -15,12 +15,21 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 
 REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
                     "Disable clock scaling (inverted: false = scaling enabled)");
 
 REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");
+
+// Guest speed multiplier, polled live by the vsync worker (see
+// Clock::ApplyTimeScalarCvar). Scales the guest tick count and system time, so
+// vblanks arrive faster and guest sleeps get shorter: the whole title runs
+// faster without changing a single simulation step.
+REXCVAR_DEFINE_DOUBLE(time_scalar, 1.0, "Clock",
+                      "Guest speed multiplier (2 = 2x fast forward, 0.5 = half speed)")
+    .range(0.05, 16.0);
 
 namespace rex::chrono {
 
@@ -131,6 +140,23 @@ void Clock::set_guest_time_scalar(double scalar) {
 
   guest_time_scalar_ = scalar;
   RecomputeGuestTickScalar();
+}
+
+void Clock::ApplyTimeScalarCvar() {
+  // Single-caller (the vsync worker), so the last-value latch needs no lock.
+  static double last_requested = 1.0;
+  double scalar = REXCVAR_GET(time_scalar);
+  if (!(scalar > 0.0)) {
+    scalar = 1.0;
+  }
+  if (scalar == last_requested) {
+    return;
+  }
+  last_requested = scalar;
+  set_guest_time_scalar(scalar);
+  // Log what actually took effect: set_guest_time_scalar is a no-op when
+  // clock_no_scaling is set, and this is the only way to see that.
+  REXLOG_INFO("clock: guest time scalar now {:.2f}x", guest_time_scalar_);
 }
 
 std::pair<uint64_t, uint64_t> Clock::guest_tick_ratio() {
