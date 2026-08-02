@@ -18,6 +18,11 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 
+// IDXGIFactory6 / DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE for the discrete-GPU selection
+// below; d3d12_api.h only pulls in dxgi1_5.h. MUST come after the rex headers: including
+// it earlier drags in windows.h without NOMINMAX and its min/max macros break rex/math.h.
+#include <dxgi1_6.h>
+
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
@@ -253,7 +258,38 @@ bool D3D12Provider::Initialize() {
   // Choose the adapter.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+
+  // d3d12_adapter == -1 (the default) used to mean "the first non-software adapter DXGI
+  // enumerates", which on a hybrid laptop is the INTEGRATED GPU -- DXGI lists it first.
+  // Measured cost on one such machine (RTX 3060 Laptop + Intel UHD 0x9BC4), same scene:
+  // 3.6 fps on the iGPU vs a locked 30.1 on the discrete GPU. Ask DXGI for the
+  // high-performance adapter instead; this is what every hybrid-aware app does.
+  // Requires IDXGIFactory6 (Windows 10 1803+); falls back to the enumeration loop below
+  // when unavailable, and -2 (WARP) / >=0 (pin by index) are unaffected.
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    IDXGIFactory6* dxgi_factory6 = nullptr;
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6)))) {
+      IDXGIAdapter1* preferred = nullptr;
+      for (uint32_t i = 0; dxgi_factory6->EnumAdapterByGpuPreference(
+                               i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                               IID_PPV_ARGS(&preferred)) == S_OK;
+           ++i) {
+        DXGI_ADAPTER_DESC1 preferred_desc;
+        if (SUCCEEDED(preferred->GetDesc1(&preferred_desc)) &&
+            !(preferred_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(pfn_d3d12_create_device_(preferred, D3D_FEATURE_LEVEL_11_0,
+                                               _uuidof(ID3D12Device), nullptr))) {
+          adapter = preferred;
+          break;
+        }
+        preferred->Release();
+        preferred = nullptr;
+      }
+      dxgi_factory6->Release();
+    }
+  }
+
+  while (adapter == nullptr && dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
