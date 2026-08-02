@@ -1181,7 +1181,13 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       // state-only buffers, which would otherwise pad every rate with matches
       // that mean nothing.
       if (e->draws) {
-        const nr::QueryResult q = nr::QueryRange(ptr, e->dwords * 4);
+        // Length comes from THIS execution's packet, never from what the ledger
+        // remembers. A buffer re-recorded shorter at the same address leaves the
+        // granules past its new end holding the previous pass, so asking at the
+        // stale length would sum two recordings. tools/nr-registry-test.cpp
+        // pins both halves of that behaviour.
+        e->dwords = count;
+        const nr::QueryResult q = nr::QueryRange(ptr, count * 4);
         const uint32_t sum = q.draws;
         // The ledger's draw count was walked the first time this address was
         // seen in the window, but the engine re-records a city buffer roughly
@@ -1194,7 +1200,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         // record/execute interleaving it is measuring.
         uint32_t truth = e->draws, truth2 = e->draws2;
         if (sum != truth) {
-          CountBufferDraws(memory_->TranslatePhysical(ptr), e->dwords, &truth,
+          CountBufferDraws(memory_->TranslatePhysical(ptr), count, &truth,
                            &truth2);
           e->draws = truth;
           e->draws2 = truth2;
