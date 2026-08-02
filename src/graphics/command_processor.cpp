@@ -25,6 +25,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/nr_buffer_cache.h>
 #include <rex/graphics/nr_draw_cache.h>
 #include <rex/graphics/nr_draw_registry.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -106,6 +107,16 @@ REXCVAR_DEFINE_BOOL(gpu_nr_cache, false, "GPU",
                     "Diagnostic [nr-cache]: per-draw comparison of the native-renderer "
                     "draw-record cache against each executed indirect buffer's DRAW_INDX "
                     "packets. Needs nr_record_map; implies gpu_ib_ledger. Off by default.");
+
+// [NR-BUF] Increment 2: per-buffer draw-list snapshots (nr_buffer_cache.h).
+// Measures the renderer's actual serving model -- admit a snapshot on a clean
+// join, serve it while the range's dirty-epoch holds, re-admit after patches
+// -- and, probe-mode, VERIFIES every would-be serve against a live join
+// (stale serves must be ~0). Implies gpu_nr_cache.
+REXCVAR_DEFINE_BOOL(gpu_nr_bufcache, false, "GPU",
+                    "Diagnostic [nr-buf]: per-buffer snapshot cache (admit/serve/"
+                    "invalidate) with live verification of every served snapshot. "
+                    "Needs nr_record_map; implies gpu_nr_cache. Off by default.");
 
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
                     "Write the ring-buffer read pointer back to the guest incrementally "
@@ -448,6 +459,28 @@ constexpr uint32_t kNrcSamples = 4;
 NrcSample g_nrc_samp[kNrcSamples];
 uint32_t g_nrc_samp_n = 0;
 
+// [NR-BUF] Increment-2 scoring: how executions would be SERVED by the
+// per-buffer snapshot cache, and whether any serve would be stale (the gate:
+// g_nrb_vne must stay ~0 -- a stale serve means the epoch invalidation rule
+// missed a patch, the exact failure class that killed v2). The walk cost is
+// unchanged in probe mode -- serving executions are re-walked anyway to
+// verify -- so served% here is the fraction of walks the real renderer
+// SKIPS, not a probe speedup.
+bool g_nr_bufcache = false;
+uint64_t g_nrb_execs = 0;    // scored executions (draw-carrying, depth 1)
+uint64_t g_nrb_served = 0;   //   valid snapshot present (renderer replays it)
+uint64_t g_nrb_vok = 0;      //     served and verified identical
+uint64_t g_nrb_vne = 0;      //     served but STALE -- must be ~0
+uint64_t g_nrb_absent = 0;   //   no snapshot yet for this address
+uint64_t g_nrb_dirty = 0;    //   invalidated: draws re-recorded in range
+uint64_t g_nrb_resized = 0;  //   invalidated: buffer length changed
+uint64_t g_nrb_draws_served = 0;  // draws inside served executions
+uint64_t g_nrb_draws_total = 0;   // draws inside all scored executions
+uint64_t g_nrb_walk_ovf = 0;      // walks over the packet scratch bound
+// One executed DRAW_INDX as walked, for the join + snapshot layers.
+constexpr uint32_t kNrbMaxPkts = 4096;  // city ~350/buffer; order of magnitude
+nr::PacketRef g_nrb_pkts[kNrbMaxPkts];
+
 // Walk a PM4 buffer and count its draw packets, split by opcode: DRAW_INDX
 // (0x22) is what the guest D3D9 recorder emits and therefore what the registry
 // can possibly know about, while DRAW_INDX_2 (0x36) comes from paths that are
@@ -496,9 +529,11 @@ void CommandProcessor::WorkerThreadMain() {
   // [PM4-CENSUS] independent draw-emission census (no timing; just packet counts).
   const bool kCensus = REXCVAR_GET(gpu_pm4_census);
   g_pm4_census = kCensus;
-  // [NR-CACHE] implies the ledger: the exact-sequence scoring lives on the
-  // ledger's per-buffer walk in ExecuteIndirectBuffer.
-  const bool kNrCache = REXCVAR_GET(gpu_nr_cache);
+  // [NR-BUF] implies [NR-CACHE] implies the ledger: each layer's scoring
+  // lives on the previous one's per-buffer walk in ExecuteIndirectBuffer.
+  const bool kNrBuf = REXCVAR_GET(gpu_nr_bufcache);
+  g_nr_bufcache = kNrBuf;
+  const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf;
   g_nr_cache = kNrCache;
   const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger) || kNrCache;  // [NR-IBL] record/replay gate
   g_ib_ledger = kIbLedger;
@@ -755,6 +790,33 @@ void CommandProcessor::WorkerThreadMain() {
             g_nrc_pkts = g_nrc_hit = g_nrc_miss = 0;
             g_nrc_arg_eq = g_nrc_prim_ne = g_nrc_cnt_ne = g_nrc_rid0 = 0;
             g_nrc_samp_n = 0;
+          }
+          // [NR-BUF] The serving verdict. served= is the fraction of
+          // executions the renderer replays from a snapshot without
+          // walking; vne= is the stale-serve gate and must stay ~0;
+          // same= prices the epoch scheme's false invalidations.
+          if (g_nr_bufcache && g_nrb_execs) {
+            const double pc = 100.0 / double(g_nrb_execs);
+            REXGPU_INFO(
+                "[nr-buf] execs={} served={:.1f}% (vok={} VNE={}) absent={:.1f}% "
+                "dirty={:.1f}% resized={:.1f}% ovf={} | draws served={:.1f}%",
+                g_nrb_execs, g_nrb_served * pc, g_nrb_vok, g_nrb_vne,
+                g_nrb_absent * pc, g_nrb_dirty * pc, g_nrb_resized * pc,
+                g_nrb_walk_ovf,
+                g_nrb_draws_total ? 100.0 * double(g_nrb_draws_served) /
+                                        double(g_nrb_draws_total)
+                                  : 0.0);
+            const nr::BufCacheStats& bs = nr::GetBufCacheStats();
+            REXGPU_INFO(
+                "[nr-buf]   snaps admit={} same={} reject={} toobig={} "
+                "displaced={} live={}",
+                bs.admissions, bs.admissions_same, bs.rejects, bs.toobig,
+                bs.displaced, bs.live);
+            nr::ResetBufCacheStats();
+            g_nrb_execs = g_nrb_served = g_nrb_vok = g_nrb_vne = 0;
+            g_nrb_absent = g_nrb_dirty = g_nrb_resized = 0;
+            g_nrb_draws_served = g_nrb_draws_total = 0;
+            g_nrb_walk_ovf = 0;
           }
           // Clear for the next window. Addresses are re-walked when they
           // reappear, which is what keeps a stale draw count from surviving a
@@ -1318,18 +1380,23 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
             ++g_reg_r_one;
           }
         }
-        // [NR-CACHE] The v3 per-packet join. Walk this buffer's packets and
-        // look each DRAW_INDX up by its own header address -- the join the
-        // real renderer performs (it walks the packets anyway for RT/clear/
-        // resolve recovery). Per ExecutePacketType3_DRAW_INDX the packet is
-        // header, viz-query token, VGT_DRAW_INITIATOR (prim = bits 0..5,
-        // num_indices = bits 16..31). DRAW_INDX_2 (0x36) comes from unhooked
-        // paths and is not scored, matching the ledger's `draws` count.
-        // Depth-1 only, keeping the rates comparable across runs.
+        // [NR-CACHE]/[NR-BUF] Walk this buffer's DRAW_INDX packets once into
+        // the packet scratch, then score the per-packet join (increment 1)
+        // and the snapshot cache (increment 2) from it. Per
+        // ExecutePacketType3_DRAW_INDX the packet is header, viz-query
+        // token, VGT_DRAW_INITIATOR (prim = bits 0..5, num_indices = bits
+        // 16..31). DRAW_INDX_2 (0x36) comes from unhooked paths and is not
+        // scored, matching the ledger's `draws` count. Depth-1 only, keeping
+        // the rates comparable across runs.
         if (g_nr_cache && truth && g_pm4_ib_depth == 1) {
           const uint8_t* raw = memory_->TranslatePhysical(ptr);
-          ++g_nrc_execs;
-          bool full = true;
+          // The snapshot layer's dirty-epoch is read BEFORE the walk: a
+          // patch racing the walk then reads as dirty at the next
+          // execution, never as a stale serve.
+          const uint64_t epoch =
+              g_nr_bufcache ? nr::SumRangeEpoch(ptr, count * 4) : 0;
+          uint32_t npkt = 0;
+          bool ovf = false;
           for (uint32_t j = 0; j < count;) {
             const uint32_t hdr =
                 __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
@@ -1337,48 +1404,13 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
             if (ty == 3) {
               const uint32_t op = (hdr >> 8) & 0x7F;
               if (op == 0x22 && j + 2 < count) {
-                const uint32_t pkt_addr = ptr + j * 4;
+                if (npkt >= kNrbMaxPkts) {
+                  ovf = true;
+                  break;
+                }
                 const uint32_t init = __builtin_bswap32(
                     *(const uint32_t*)(raw + (j + 2) * 4));
-                const uint32_t pkt_prim = init & 0x3F;
-                const uint32_t pkt_n = init >> 16;
-                ++g_nrc_pkts;
-                nr::DrawRecord rec;
-                if (!nr::LookupDraw(pkt_addr, &rec)) {
-                  ++g_nrc_miss;
-                  full = false;
-                  if (g_nrc_samp_n < kNrcSamples) {
-                    g_nrc_samp[g_nrc_samp_n++] = {ptr,   pkt_addr, j,
-                                                  pkt_prim, pkt_n, 0,
-                                                  0,     0,        0,
-                                                  1};
-                  }
-                } else {
-                  ++g_nrc_hit;
-                  // rid 0 (sub_821375A0) draws entirely from device state
-                  // and takes no draw arguments; there is nothing to
-                  // compare, and counting it as a mismatch would misread
-                  // the hook layer.
-                  if (rec.rid == 0) {
-                    ++g_nrc_rid0;
-                  } else {
-                    const bool prim_eq = (rec.prim & 0x3F) == pkt_prim;
-                    const bool cnt_eq = rec.count == pkt_n;
-                    if (prim_eq && cnt_eq) {
-                      ++g_nrc_arg_eq;
-                    } else {
-                      if (!prim_eq) ++g_nrc_prim_ne;
-                      if (!cnt_eq) ++g_nrc_cnt_ne;
-                      full = false;
-                      if (g_nrc_samp_n < kNrcSamples) {
-                        g_nrc_samp[g_nrc_samp_n++] = {
-                            ptr,      pkt_addr,  j,       pkt_prim, pkt_n,
-                            rec.rid,  rec.prim,  rec.start, rec.count,
-                            0};
-                      }
-                    }
-                  }
-                }
+                g_nrb_pkts[npkt++] = {ptr + j * 4, init & 0x3F, init >> 16};
               }
               j += 1 + cnt;
             } else if (ty == 0) {
@@ -1387,7 +1419,86 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
               ++j;
             }
           }
-          if (full) ++g_nrc_execs_full;
+          if (ovf) {
+            ++g_nrb_walk_ovf;
+          } else {
+            // Increment 1: the per-packet join rates.
+            ++g_nrc_execs;
+            bool full = true;
+            for (uint32_t i = 0; i < npkt; ++i) {
+              const nr::PacketRef& pk = g_nrb_pkts[i];
+              ++g_nrc_pkts;
+              nr::DrawRecord rec;
+              if (!nr::LookupDraw(pk.addr, &rec)) {
+                ++g_nrc_miss;
+                full = false;
+                if (g_nrc_samp_n < kNrcSamples) {
+                  g_nrc_samp[g_nrc_samp_n++] = {ptr, pk.addr, i,
+                                                pk.prim, pk.count, 0,
+                                                0,   0,       0,
+                                                1};
+                }
+              } else {
+                ++g_nrc_hit;
+                // rid 0 (sub_821375A0) draws entirely from device state
+                // and takes no draw arguments; there is nothing to
+                // compare, and counting it as a mismatch would misread
+                // the hook layer.
+                if (rec.rid == 0) {
+                  ++g_nrc_rid0;
+                } else {
+                  const bool prim_eq = (rec.prim & 0x3F) == pk.prim;
+                  const bool cnt_eq = rec.count == pk.count;
+                  if (prim_eq && cnt_eq) {
+                    ++g_nrc_arg_eq;
+                  } else {
+                    if (!prim_eq) ++g_nrc_prim_ne;
+                    if (!cnt_eq) ++g_nrc_cnt_ne;
+                    full = false;
+                    if (g_nrc_samp_n < kNrcSamples) {
+                      g_nrc_samp[g_nrc_samp_n++] = {
+                          ptr,     pk.addr,  i,         pk.prim, pk.count,
+                          rec.rid, rec.prim, rec.start, rec.count,
+                          0};
+                    }
+                  }
+                }
+              }
+            }
+            if (full) ++g_nrc_execs_full;
+            // Increment 2: how this execution would be SERVED. A valid
+            // snapshot is what the renderer replays without walking; in
+            // probe mode it is verified against a live join instead --
+            // any difference is a stale serve, the must-be-zero gate.
+            if (g_nr_bufcache) {
+              ++g_nrb_execs;
+              g_nrb_draws_total += npkt;
+              const nr::BufSnapshot* snap = nullptr;
+              const nr::BufQuery q =
+                  nr::QuerySnapshot(ptr, count, epoch, &snap);
+              if (q == nr::BufQuery::kValid) {
+                ++g_nrb_served;
+                g_nrb_draws_served += npkt;
+                if (nr::VerifySnapshot(snap, g_nrb_pkts, npkt)) {
+                  ++g_nrb_vok;
+                } else {
+                  ++g_nrb_vne;
+                }
+              } else {
+                if (q == nr::BufQuery::kAbsent) {
+                  ++g_nrb_absent;
+                } else if (q == nr::BufQuery::kDirty) {
+                  ++g_nrb_dirty;
+                } else {
+                  ++g_nrb_resized;
+                }
+                // Not servable: try to (re)admit from this walk's clean
+                // join; rejection means the buffer is mid-patch and the
+                // next execution retries. Outcomes are the unit's stats.
+                nr::AdmitFromPackets(ptr, count, g_nrb_pkts, npkt, epoch);
+              }
+            }
+          }
         }
       }
     } else {

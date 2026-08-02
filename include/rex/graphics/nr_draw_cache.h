@@ -76,6 +76,19 @@ struct DrawRecord {
 // Safe to call while recording continues.
 bool LookupDraw(uint32_t phys_addr, DrawRecord* out);
 
+// Granule dirty-epochs, for the per-buffer snapshot layer (nr_buffer_cache.h,
+// increment 2): every recorded draw also bumps a counter for its 16KB granule
+// of physical address, so summing the counters over a range yields a value
+// that RISES whenever any draw is recorded into that range. A snapshot
+// admitted when the range summed to E is still current iff it still sums to
+// E. The map is a keyless direct-mapped 8192-slot counter array: counters
+// only increment and a record's own granule is always inside its range's sum,
+// so a real patch can never be hidden -- aliasing (two granules 128MB apart
+// sharing a slot, or a neighbour's draws in a shared edge granule) only ever
+// ADDS dirt, i.e. a false invalidation, which the consumer measures as
+// re-admissions with unchanged content.
+uint64_t SumRangeEpoch(uint32_t phys_addr, uint32_t bytes);
+
 struct CacheStats {
   uint64_t recorded;   // draws stored since the last reset
   uint64_t replaced;   // upserts: same-address re-records (patch-in-place rate)

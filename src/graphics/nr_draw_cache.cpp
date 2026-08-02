@@ -31,6 +31,11 @@ DrawRecord g_tab[kTableSize] = {};  // addr == 0 means empty
 uint32_t g_seq = 0;
 CacheStats g_stats = {};
 
+// Granule dirty-epochs (see the header). Keyless by design.
+constexpr uint32_t kGranuleShift = 14;  // 16KB
+constexpr uint32_t kEpochSlots = 8192;
+uint32_t g_gran_epoch[kEpochSlots] = {};
+
 // Packet headers are word-aligned; multiplicative hash, top bits.
 inline uint32_t Slot(uint32_t addr) {
   return ((addr >> 2) * 2654435761u) >> (32 - kTableBits);
@@ -51,12 +56,25 @@ bool LookupDraw(uint32_t phys_addr, DrawRecord* out) {
   return out->addr == addr;
 }
 
+uint64_t SumRangeEpoch(uint32_t phys_addr, uint32_t bytes) {
+  if (!bytes) return 0;
+  const uint32_t p = phys_addr & kPhysMask;
+  const uint32_t first = p >> kGranuleShift;
+  const uint32_t last = (p + bytes - 1) >> kGranuleShift;
+  uint64_t sum = 0;
+  for (uint32_t g = first; g <= last; ++g) {
+    sum += g_gran_epoch[g & (kEpochSlots - 1)];
+  }
+  return sum;
+}
+
 const CacheStats& GetCacheStats() { return g_stats; }
 
 void ResetCacheStats() { g_stats = CacheStats{}; }
 
 void ResetCache() {
   for (uint32_t i = 0; i < kTableSize; ++i) g_tab[i].addr = 0;
+  for (uint32_t i = 0; i < kEpochSlots; ++i) g_gran_epoch[i] = 0;
   g_seq = 0;
   ResetCacheStats();
 }
@@ -89,5 +107,6 @@ extern "C" void rex_nr_record_draw_args(uint32_t guest_addr, uint32_t rid,
   slot->start = start;
   slot->count = count;
   slot->addr = addr;  // key last: the record becomes visible complete
+  g_gran_epoch[(addr >> kGranuleShift) & (kEpochSlots - 1)] += 1;
   ++g_stats.recorded;
 }
