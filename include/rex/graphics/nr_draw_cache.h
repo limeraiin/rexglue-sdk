@@ -12,50 +12,46 @@
 
 #include <cstdint>
 
-// [NR-CACHE] Exact draw-record cache: native-renderer build-out increment 1.
+// [NR-CACHE] Exact draw-record cache, v3: native-renderer build-out.
 //
-// The draw registry (nr_draw_registry.h) reduced the renderer's cache to
-// counting and answered the gate: every executed draw is attributable to a
-// recorded one (Run 3, PASS). This unit is the same cache with the counting
-// replaced by the actual records a renderer will replay: for every draw the
-// guest recorder emits, the hook stores WHERE it was written plus the draw
-// arguments it was recorded with (recorder id, primitive type, start index,
-// index count). At execution time the command processor asks for the records
-// inside the buffer's range and compares them, per draw and in order, against
-// the DRAW_INDX packets the buffer actually contains.
+// For every draw the guest D3D9 recorder emits, the hook stores the draw's
+// arguments (recorder id, primitive type, start index, index count) keyed by
+// the EXACT physical address of the draw's own DRAW_INDX packet header --
+// located by the post-call forward parse in record_map.cpp, exact for 98.6%
+// of draws. At execution time the command processor walks the buffer's
+// packets (a renderer must anyway, for RT/clear/resolve recovery) and JOINS
+// each 0x22 packet to its hook context by header address: LookupDraw(addr).
 //
-// What this changes versus the registry, and why:
+// Why address-keyed (v3), replacing the ordered-granule store (v2): the city
+// run `naruto_291` proved THE CITY RECORDER PATCHES BUFFERS IN PLACE --
+// individual draws of a stable buffer re-recorded in arbitrary order, not a
+// forward sweep. That killed both v2 assumptions at once: pool order is not
+// address order under patching (args ~55%), and entering-a-granule-resets-it
+// kills a patched granule's untouched neighbours (short 25-33%). The join
+// needs neither: insert is an upsert (a re-record of the same packet address
+// replaces its record, wherever in the buffer and whenever it happens), and
+// there is NO invalidation heuristic at all -- a forward sweep is just
+// patching in address order, so menus, forest and city unify. Records of an
+// abandoned buffer layout simply never join; they surface as lookup misses,
+// not as wrong answers.
 //
-//   * Records carry their exact address, so a query FILTERS to [ptr, ptr+bytes)
-//     instead of summing whole granules. Run 3's one systematic artifact -- the
-//     21.9% "registry long" bucket caused by edge granules shared with ring
-//     neighbours -- is eliminated by construction, not corrected for.
-//
-//   * The comparison is per-draw argument equality, not a count. If it holds,
-//     the hook layer demonstrably captures enough to regenerate the buffer's
-//     draw stream, which is the data path the real renderer replays.
-//
-// What stays, because it was load-bearing and proven:
-//
-//   * Granules for the index, entering-a-granule-invalidates, no boundary
-//     detection anywhere (Ch.9: a segment boundary advances the write pointer
-//     monotonically and cannot be told from an ordinary advance).
+// What stays from v2, because it was load-bearing and proven:
 //
 //   * Both sides masked to 0x1FFFFFFF; the registry's alias tally remains the
 //     check on that assumption (the game hook feeds both units).
 //
-//   * Deliberately unsynchronised, same argument as the registry: recording
-//     runs on a guest thread inside the engine's raised-IRQL section, a mutex
-//     would risk the known lock inversion, and a torn read costs one sample.
+//   * Deliberately unsynchronised: recording runs on a guest thread inside
+//     the engine's raised-IRQL section, a mutex would risk the known lock
+//     inversion, and a torn read costs one sample. The writer stores the key
+//     last on a slot claim and the reader re-checks the key after copying, so
+//     a race reads as a miss, never as another draw's arguments.
 //
-// Storage is a single fixed pool written in recording order. A granule's
-// records are contiguous in the pool (the recorder walks forward; re-entering
-// a granule resets it), so the granule table stores {head, count} into the
-// pool. The pool can wrap over records of a recording that is still live; a
-// query detects that (the slot's address no longer belongs to the granule) and
-// reports it as 'evicted' rather than returning another recording's draws.
-// The eviction rate is itself a measurement: it says how long recordings stay
-// live, which sizes the real per-buffer cache.
+// Storage is one direct-mapped hash of 2^20 records (24MB static). Live
+// draws measure ~36k in the city (~102 buffers x ~350 draws), a ~3.5% load;
+// a different address hashing onto an occupied slot displaces it (counted
+// 'evictions' -- the displaced draw will re-miss and re-record), a same-
+// address re-record is the upsert (counted 'replaced' -- this is the city's
+// patch-in-place, and its rate measures the patch cadence).
 
 namespace rex {
 namespace graphics {
@@ -63,43 +59,27 @@ namespace nr {
 
 // One recorded draw, exactly as the guest hook saw it.
 struct DrawRecord {
-  uint32_t addr;   // masked physical address of the draw's packet group start
-  uint32_t seq;    // global recording order (rises within a clean recording)
+  uint32_t addr;   // masked physical address of the draw's DRAW_INDX header
+  uint32_t seq;    // global recording order (diagnostic: record age)
   uint32_t rid;    // which of the three DRAW_INDX recorders fired (0/1/2)
   uint32_t prim;   // r4: primitive type (4 = TRIANGLELIST on this title)
-  uint32_t start;  // r6: start index (the recorder scales it x2/x4 to bytes)
-  uint32_t count;  // r7: index count (recorder splits packets above 65535)
+  uint32_t start;  // start index (the recorder scales it x2/x4 to bytes)
+  uint32_t count;  // index count (recorder splits packets above 65535)
 };
 
-struct CacheQueryResult {
-  uint32_t n;               // records written to out[], in recording order
-  uint32_t truncated;       // in-range records that did not fit out[]
-  uint32_t evicted;         // slots the pool overwrote before this query
-  uint32_t seq_inversions;  // recording-order breaks (torn / mixed recording)
-};
-
-// Return the records recorded into [phys_addr, phys_addr + bytes), oldest
-// first. Cost is one pass over the granules the range covers plus their
-// records. Safe to call while recording continues.
-CacheQueryResult QueryDraws(uint32_t phys_addr, uint32_t bytes,
-                            DrawRecord* out, uint32_t max_out);
-
-// Drop stale-epoch survivors from the front of a query result, in place, and
-// return the new count. The current recording pass wrote its draws in one
-// forward sweep by a single writer, so its records are CONSECUTIVE in seq
-// walking the range's tail backwards; a record in front that breaks the run
-// belongs to an older layout, surviving in a granule the new pass wrote only
-// state into -- no draw header lands there, so draw-event-keyed invalidation
-// cannot reset it, and its seq rises, so the torn detector rightly stays
-// quiet. Measured live before this existed: menu buffers read "long, args=0",
-// a perfect current-pass match plus a stale front. This is the snapshot
-// admission rule the renderer's per-buffer cache uses.
-uint32_t TrimStaleFront(DrawRecord* recs, uint32_t n);
+// Join one executed DRAW_INDX packet to its recorded draw: look up the record
+// whose packet header lives at phys_addr (any alias; masked internally).
+// Copies the record into *out and returns true on a hit. A miss means the
+// packet was never recorded while the hook was attached, was recorded under
+// an abandoned layout at a different address, or was displaced by a
+// direct-map collision -- never that some other draw's record was returned.
+// Safe to call while recording continues.
+bool LookupDraw(uint32_t phys_addr, DrawRecord* out);
 
 struct CacheStats {
-  uint64_t recorded;        // draws stored since the last reset
-  uint64_t granule_resets;  // invalidations (recorder entering a granule)
-  uint64_t collisions;      // granules displaced by a direct-map conflict
+  uint64_t recorded;   // draws stored since the last reset
+  uint64_t replaced;   // upserts: same-address re-records (patch-in-place rate)
+  uint64_t evictions;  // records displaced by a direct-map conflict
 };
 
 const CacheStats& GetCacheStats();
@@ -115,8 +95,9 @@ void ResetCache();
 
 // Called once per recorded draw from the guest D3D9 recorder hook
 // ([NARUTO-NRMAP], naruto-recomp/src/record_map.cpp), alongside
-// rex_nr_record_draw. Same constraints: guest thread, raised IRQL, so no
-// logging, no allocation, no locks -- and none are used.
+// rex_nr_record_draw. guest_addr is the draw's own DRAW_INDX packet header
+// (the post-call parse result). Same constraints: guest thread, raised IRQL,
+// so no logging, no allocation, no locks -- and none are used.
 extern "C" void rex_nr_record_draw_args(uint32_t guest_addr, uint32_t rid,
                                         uint32_t prim, uint32_t start,
                                         uint32_t count);

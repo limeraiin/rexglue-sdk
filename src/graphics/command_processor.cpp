@@ -418,50 +418,35 @@ uint64_t g_reg_draws_ledger = 0;
 uint64_t g_reg_gran_hit = 0, g_reg_gran_miss = 0;
 uint64_t g_reg_split = 0;         // buffers caught with a half-overwritten recording
 
-// [NR-CACHE] Per-execution exact-sequence scoring against the draw-record
-// cache (nr_draw_cache.h). Buckets are mutually exclusive, listed in the
-// priority they are decided: an execution whose walk or query overflowed the
-// scratch arrays cannot be judged at all, one with evicted records lost data
-// to the pool ring (a lifetime measurement, not a model failure), and only a
-// clean full comparison lands in exact / args-mismatch.
+// [NR-CACHE] Per-execution JOIN of the buffer's DRAW_INDX packets against the
+// address-keyed draw-record cache (nr_draw_cache.h, v3). The consumer walks
+// the buffer's packets and looks each 0x22 up by its own header address --
+// LookupDraw -- which is exactly the join the real renderer performs. No
+// order assumption, no invalidation heuristic (the city recorder patches
+// buffers in place, in arbitrary per-draw order); a miss is a packet the
+// hook never recorded at that address (torn window, pre-attach, abandoned
+// layout, or a direct-map displacement), never another draw's record.
 bool g_nr_cache = false;
-uint64_t g_nrc_execs = 0;      // scored executions (draw-carrying, depth 1)
-uint64_t g_nrc_exact = 0;      // same length, every (rid,prim,count) pair equal
-uint64_t g_nrc_args = 0;       // same length, some argument differs
-uint64_t g_nrc_short = 0;      // cache held fewer draws than the buffer
-uint64_t g_nrc_long = 0;       // cache held more (re-record the GPU has not run)
-uint64_t g_nrc_empty = 0;      // cache held nothing for the range
-uint64_t g_nrc_torn = 0;       // recording-order inversions (mixed recording)
-uint64_t g_nrc_evicted = 0;    // pool ring overwrote part of the recording
-uint64_t g_nrc_trunc = 0;      // buffer bigger than the scratch arrays
-uint64_t g_nrc_pairs_cmp = 0;  // per-draw pairs compared
-uint64_t g_nrc_pairs_eq = 0;   //   of which equal
-uint64_t g_nrc_prim_ne = 0;    //   primitive-type mismatches
-uint64_t g_nrc_cnt_ne = 0;     //   index-count mismatches
-uint64_t g_nrc_pairs_unk = 0;  //   rid-0 draws: no args exist to compare
-uint64_t g_nrc_trimmed = 0;    // stale-epoch records trimmed off range fronts
-// First few mismatching pairs each window, logged verbatim at report time so a
-// systematic argument-format difference (e.g. prim-count vs index-count) names
-// itself instead of being a rate.
+uint64_t g_nrc_execs = 0;       // scored executions (draw-carrying, depth 1)
+uint64_t g_nrc_execs_full = 0;  //   of which every packet hit with args equal
+uint64_t g_nrc_pkts = 0;        // DRAW_INDX packets walked
+uint64_t g_nrc_hit = 0;         //   joined to a record at their exact address
+uint64_t g_nrc_miss = 0;        //   no record at that address
+uint64_t g_nrc_arg_eq = 0;      //   hits whose (prim, count) match the packet
+uint64_t g_nrc_prim_ne = 0;     //   primitive-type mismatches
+uint64_t g_nrc_cnt_ne = 0;      //   index-count mismatches
+uint64_t g_nrc_rid0 = 0;        //   rid-0 hits: draws from device state, no args
+// First few misses and mismatches each window, logged verbatim at report time
+// so a systematic difference (a bad address base, an argument-format skew)
+// names itself instead of being a rate. miss=1 => the rec_* fields are absent.
 struct NrcSample {
-  uint32_t buf, i, pkt_prim, pkt_cnt, rec_rid, rec_prim, rec_start, rec_cnt;
-  uint32_t rec_addr, nbuf, ncache;  // rec_addr 0 => a short buffer's unpaired PACKET
+  uint32_t buf, addr, i, pkt_prim, pkt_cnt;
+  uint32_t rec_rid, rec_prim, rec_start, rec_cnt;
+  uint32_t miss;
 };
 constexpr uint32_t kNrcSamples = 4;
 NrcSample g_nrc_samp[kNrcSamples];
 uint32_t g_nrc_samp_n = 0;
-
-// One executed draw as the buffer itself states it: the VGT_DRAW_INITIATOR
-// dword of a DRAW_INDX packet. prim_type is bits 0..5, num_indices bits
-// 16..31; dma_base is the index-data address when the source is DMA, kept for
-// the mismatch samples.
-struct NrcBufDraw {
-  uint32_t prim;
-  uint32_t indices;
-  uint32_t dma_base;
-};
-// City buffers measure ~350 draws; 4096 leaves an order of magnitude.
-constexpr uint32_t kNrcMaxDraws = 4096;
 
 // Walk a PM4 buffer and count its draw packets, split by opcode: DRAW_INDX
 // (0x22) is what the guest D3D9 recorder emits and therefore what the registry
@@ -489,41 +474,6 @@ void CountBufferDraws(const uint8_t* raw, uint32_t dwords, uint32_t* out_draw_in
   *out_draw_indx2 = d2;
 }
 
-// [NR-CACHE] Walk a PM4 buffer and extract each DRAW_INDX (0x22) packet's
-// arguments, in packet order. Layout per ExecutePacketType3_DRAW_INDX: header,
-// viz-query token, VGT_DRAW_INITIATOR, then VGT_DMA_BASE + VGT_DMA_SIZE when
-// the source select is DMA. DRAW_INDX_2 (0x36) draws come from unhooked paths
-// and are excluded here exactly as they are from the ledger's `draws` count,
-// so the two sequences being compared describe the same packets.
-uint32_t WalkBufferDrawArgs(const uint8_t* raw, uint32_t dwords, NrcBufDraw* out,
-                            uint32_t max_out) {
-  uint32_t n = 0;
-  for (uint32_t j = 0; j < dwords;) {
-    const uint32_t hdr = __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
-    const uint32_t ty = hdr >> 30, cnt = ((hdr >> 16) & 0x3FFF) + 1;
-    if (ty == 3) {
-      const uint32_t op = (hdr >> 8) & 0x7F;
-      if (op == 0x22 && j + 2 < dwords) {
-        if (n >= max_out) return max_out + 1;  // caller counts it truncated
-        const uint32_t init = __builtin_bswap32(*(const uint32_t*)(raw + (j + 2) * 4));
-        out[n].prim = init & 0x3F;
-        out[n].indices = init >> 16;
-        const uint32_t src_sel = (init >> 6) & 0x3;
-        out[n].dma_base =
-            (src_sel == 0 && j + 3 < dwords)
-                ? __builtin_bswap32(*(const uint32_t*)(raw + (j + 3) * 4))
-                : 0;
-        ++n;
-      }
-      j += 1 + cnt;
-    } else if (ty == 0) {
-      j += 1 + cnt;
-    } else {
-      ++j;
-    }
-  }
-  return n;
-}
 }  // namespace
 
 void CommandProcessor::WorkerThreadMain() {
@@ -768,42 +718,42 @@ void CommandProcessor::WorkerThreadMain() {
             g_reg_draws_registry = g_reg_draws_ledger = 0;
             g_reg_gran_hit = g_reg_gran_miss = 0;
           }
-          // [NR-CACHE] The exact-sequence verdict. 'exact' is the build-out
-          // bucket: the cached records regenerate the buffer's draw stream
-          // argument-for-argument. Samples name any systematic difference.
+          // [NR-CACHE] The per-packet join verdict. 'hit' is the build-out
+          // bucket: every executed DRAW_INDX found its hook context at its
+          // own header address (success bar: city hit >= 95%, arg_eq ~100%).
+          // Samples name any systematic difference.
           if (g_nr_cache && g_nrc_execs) {
-            const double pc = 100.0 / double(g_nrc_execs);
+            const uint64_t known = g_nrc_hit - g_nrc_rid0;
             REXGPU_INFO(
-                "[nr-cache] execs={} exact={:.1f}% args={:.1f}% short={:.1f}% "
-                "long={:.1f}% empty={:.1f}% torn={:.1f}% evicted={:.1f}% trunc={}",
-                g_nrc_execs, g_nrc_exact * pc, g_nrc_args * pc, g_nrc_short * pc,
-                g_nrc_long * pc, g_nrc_empty * pc, g_nrc_torn * pc,
-                g_nrc_evicted * pc, g_nrc_trunc);
+                "[nr-cache] execs={} full={:.1f}% | pkts={} hit={:.1f}% "
+                "miss={} | args eq={:.2f}% prim_ne={} cnt_ne={} rid0={}",
+                g_nrc_execs, 100.0 * double(g_nrc_execs_full) / double(g_nrc_execs),
+                g_nrc_pkts,
+                g_nrc_pkts ? 100.0 * double(g_nrc_hit) / double(g_nrc_pkts) : 0.0,
+                g_nrc_miss,
+                known ? 100.0 * double(g_nrc_arg_eq) / double(known) : 0.0,
+                g_nrc_prim_ne, g_nrc_cnt_ne, g_nrc_rid0);
             const nr::CacheStats& cs = nr::GetCacheStats();
-            const uint64_t known = g_nrc_pairs_cmp - g_nrc_pairs_unk;
-            REXGPU_INFO(
-                "[nr-cache]   pairs cmp={} eq={:.2f}% prim_ne={} cnt_ne={} "
-                "rid0={} trimmed={} | pool recorded={} resets={} collisions={}",
-                g_nrc_pairs_cmp,
-                known ? 100.0 * double(g_nrc_pairs_eq) / double(known) : 0.0,
-                g_nrc_prim_ne, g_nrc_cnt_ne, g_nrc_pairs_unk, g_nrc_trimmed,
-                cs.recorded, cs.granule_resets, cs.collisions);
+            REXGPU_INFO("[nr-cache]   cache recorded={} replaced={} evictions={}",
+                        cs.recorded, cs.replaced, cs.evictions);
             for (uint32_t s = 0; s < g_nrc_samp_n; ++s) {
               const NrcSample& sm = g_nrc_samp[s];
-              REXGPU_INFO(
-                  "[nr-cache]   MISMATCH buf={:08X} draw[{}] pkt(prim={} n={}) "
-                  "rec(rid={} prim={} start={} n={} addr={:08X}) len {}vs{}",
-                  sm.buf, sm.i, sm.pkt_prim, sm.pkt_cnt, sm.rec_rid,
-                  sm.rec_prim, sm.rec_start, sm.rec_cnt, sm.rec_addr, sm.nbuf,
-                  sm.ncache);
+              if (sm.miss) {
+                REXGPU_INFO(
+                    "[nr-cache]   MISS buf={:08X} pkt[{}]@{:08X} (prim={} n={})",
+                    sm.buf, sm.i, sm.addr, sm.pkt_prim, sm.pkt_cnt);
+              } else {
+                REXGPU_INFO(
+                    "[nr-cache]   MISMATCH buf={:08X} pkt[{}]@{:08X} "
+                    "pkt(prim={} n={}) rec(rid={} prim={} start={} n={})",
+                    sm.buf, sm.i, sm.addr, sm.pkt_prim, sm.pkt_cnt, sm.rec_rid,
+                    sm.rec_prim, sm.rec_start, sm.rec_cnt);
+              }
             }
             nr::ResetCacheStats();
-            g_nrc_execs = g_nrc_exact = g_nrc_args = g_nrc_short = 0;
-            g_nrc_long = g_nrc_empty = g_nrc_torn = g_nrc_evicted = 0;
-            g_nrc_trunc = 0;
-            g_nrc_pairs_cmp = g_nrc_pairs_eq = g_nrc_prim_ne = g_nrc_cnt_ne = 0;
-            g_nrc_pairs_unk = 0;
-            g_nrc_trimmed = 0;
+            g_nrc_execs = g_nrc_execs_full = 0;
+            g_nrc_pkts = g_nrc_hit = g_nrc_miss = 0;
+            g_nrc_arg_eq = g_nrc_prim_ne = g_nrc_cnt_ne = g_nrc_rid0 = 0;
             g_nrc_samp_n = 0;
           }
           // Clear for the next window. Addresses are re-walked when they
@@ -1368,97 +1318,76 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
             ++g_reg_r_one;
           }
         }
-        // [NR-CACHE] Exact-sequence comparison. Depth-1 only: the scratch
-        // arrays are function-local statics on the one CP thread, and a
-        // nested indirect buffer would reuse them mid-comparison.
+        // [NR-CACHE] The v3 per-packet join. Walk this buffer's packets and
+        // look each DRAW_INDX up by its own header address -- the join the
+        // real renderer performs (it walks the packets anyway for RT/clear/
+        // resolve recovery). Per ExecutePacketType3_DRAW_INDX the packet is
+        // header, viz-query token, VGT_DRAW_INITIATOR (prim = bits 0..5,
+        // num_indices = bits 16..31). DRAW_INDX_2 (0x36) comes from unhooked
+        // paths and is not scored, matching the ledger's `draws` count.
+        // Depth-1 only, keeping the rates comparable across runs.
         if (g_nr_cache && truth && g_pm4_ib_depth == 1) {
-          static NrcBufDraw s_buf[kNrcMaxDraws];
-          static nr::DrawRecord s_rec[kNrcMaxDraws];
-          const uint32_t nbuf = WalkBufferDrawArgs(
-              memory_->TranslatePhysical(ptr), count, s_buf, kNrcMaxDraws);
-          nr::CacheQueryResult cq =
-              nr::QueryDraws(ptr, count * 4, s_rec, kNrcMaxDraws);
+          const uint8_t* raw = memory_->TranslatePhysical(ptr);
           ++g_nrc_execs;
-          if (nbuf > kNrcMaxDraws || cq.truncated) {
-            ++g_nrc_trunc;
-          } else if (cq.evicted) {
-            ++g_nrc_evicted;
-          } else if (cq.n == 0) {
-            ++g_nrc_empty;
-          } else {
-            // [NR-CACHE] Trim stale-epoch survivors -- the snapshot admission
-            // rule, implemented in the cache library (see TrimStaleFront's
-            // rationale in nr_draw_cache.h).
-            const uint32_t kept = nr::TrimStaleFront(s_rec, cq.n);
-            g_nrc_trimmed += cq.n - kept;
-            cq.n = kept;
-            // Compare the overlap pairwise even when the lengths differ; the
-            // pair rates stay meaningful (a pure tail difference leaves them
-            // at 100%) and the length difference picks the bucket.
-            const uint32_t ncmp = nbuf < cq.n ? nbuf : cq.n;
-            uint32_t ne = 0;
-            for (uint32_t i = 0; i < ncmp; ++i) {
-              // rid 0 (sub_821375A0) draws entirely from device state and
-              // takes no draw arguments; there is nothing to compare, and
-              // counting it as a mismatch would misread the hook layer.
-              if (s_rec[i].rid == 0) {
-                ++g_nrc_pairs_unk;
-                continue;
-              }
-              const bool prim_eq = (s_rec[i].prim & 0x3F) == s_buf[i].prim;
-              const bool cnt_eq = s_rec[i].count == s_buf[i].indices;
-              if (prim_eq && cnt_eq) {
-                ++g_nrc_pairs_eq;
-              } else {
-                ++ne;
-                if (!prim_eq) ++g_nrc_prim_ne;
-                if (!cnt_eq) ++g_nrc_cnt_ne;
-                if (g_nrc_samp_n < kNrcSamples) {
-                  g_nrc_samp[g_nrc_samp_n++] = {ptr,
-                                                i,
-                                                s_buf[i].prim,
-                                                s_buf[i].indices,
-                                                s_rec[i].rid,
-                                                s_rec[i].prim,
-                                                s_rec[i].start,
-                                                s_rec[i].count,
-                                                s_rec[i].addr,
-                                                nbuf,
-                                                cq.n};
+          bool full = true;
+          for (uint32_t j = 0; j < count;) {
+            const uint32_t hdr =
+                __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
+            const uint32_t ty = hdr >> 30, cnt = ((hdr >> 16) & 0x3FFF) + 1;
+            if (ty == 3) {
+              const uint32_t op = (hdr >> 8) & 0x7F;
+              if (op == 0x22 && j + 2 < count) {
+                const uint32_t pkt_addr = ptr + j * 4;
+                const uint32_t init = __builtin_bswap32(
+                    *(const uint32_t*)(raw + (j + 2) * 4));
+                const uint32_t pkt_prim = init & 0x3F;
+                const uint32_t pkt_n = init >> 16;
+                ++g_nrc_pkts;
+                nr::DrawRecord rec;
+                if (!nr::LookupDraw(pkt_addr, &rec)) {
+                  ++g_nrc_miss;
+                  full = false;
+                  if (g_nrc_samp_n < kNrcSamples) {
+                    g_nrc_samp[g_nrc_samp_n++] = {ptr,   pkt_addr, j,
+                                                  pkt_prim, pkt_n, 0,
+                                                  0,     0,        0,
+                                                  1};
+                  }
+                } else {
+                  ++g_nrc_hit;
+                  // rid 0 (sub_821375A0) draws entirely from device state
+                  // and takes no draw arguments; there is nothing to
+                  // compare, and counting it as a mismatch would misread
+                  // the hook layer.
+                  if (rec.rid == 0) {
+                    ++g_nrc_rid0;
+                  } else {
+                    const bool prim_eq = (rec.prim & 0x3F) == pkt_prim;
+                    const bool cnt_eq = rec.count == pkt_n;
+                    if (prim_eq && cnt_eq) {
+                      ++g_nrc_arg_eq;
+                    } else {
+                      if (!prim_eq) ++g_nrc_prim_ne;
+                      if (!cnt_eq) ++g_nrc_cnt_ne;
+                      full = false;
+                      if (g_nrc_samp_n < kNrcSamples) {
+                        g_nrc_samp[g_nrc_samp_n++] = {
+                            ptr,      pkt_addr,  j,       pkt_prim, pkt_n,
+                            rec.rid,  rec.prim,  rec.start, rec.count,
+                            0};
+                      }
+                    }
+                  }
                 }
               }
-            }
-            g_nrc_pairs_cmp += ncmp;
-            // A pure length mismatch (clean prefix, extra or missing tail)
-            // never trips the pair sampler above, so capture the first
-            // UNPAIRED element instead: the extra record (long, with its
-            // address) or the extra packet (short, rec_addr 0).
-            if (ne == 0 && cq.n != nbuf && g_nrc_samp_n < kNrcSamples) {
-              if (cq.n > nbuf) {
-                g_nrc_samp[g_nrc_samp_n++] = {
-                    ptr,           ncmp,          0,
-                    0,             s_rec[ncmp].rid, s_rec[ncmp].prim,
-                    s_rec[ncmp].start, s_rec[ncmp].count, s_rec[ncmp].addr,
-                    nbuf,          cq.n};
-              } else {
-                g_nrc_samp[g_nrc_samp_n++] = {
-                    ptr, ncmp, s_buf[ncmp].prim, s_buf[ncmp].indices,
-                    0,   0,    0,                0,
-                    0,   nbuf, cq.n};
-              }
-            }
-            if (cq.seq_inversions) {
-              ++g_nrc_torn;
-            } else if (cq.n < nbuf) {
-              ++g_nrc_short;
-            } else if (cq.n > nbuf) {
-              ++g_nrc_long;
-            } else if (ne == 0) {
-              ++g_nrc_exact;
+              j += 1 + cnt;
+            } else if (ty == 0) {
+              j += 1 + cnt;
             } else {
-              ++g_nrc_args;
+              ++j;
             }
           }
+          if (full) ++g_nrc_execs_full;
         }
       }
     } else {
