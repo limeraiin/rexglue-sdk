@@ -379,7 +379,7 @@ struct IbLedgerEntry {
   uint32_t draws;     // DRAW_INDX + DRAW_INDX_2 packets inside it
   uint64_t execs;     // times executed since the last report
 };
-constexpr uint32_t kIbLedgerSize = 256;  // power of two, ~12 live in the forest
+constexpr uint32_t kIbLedgerSize = 1024;  // power of two; ~102 live in the city
 IbLedgerEntry g_ib_ledger_tab[kIbLedgerSize] = {};
 uint32_t g_ib_ledger_used = 0;
 uint64_t g_ib_ledger_evictions = 0;  // distinct buffers that did not fit
@@ -573,7 +573,7 @@ void CommandProcessor::WorkerThreadMain() {
                       "({:.0f}/s) overflow={}",
                       n, tot_exec, tot_draw_exec, sec > 0 ? tot_draw_exec / sec : 0.0,
                       g_ib_ledger_evictions);
-          const uint32_t kShow = 24;
+          const uint32_t kShow = 256;  // all of them; the correlator needs every buffer
           for (uint32_t k = 0; k < n && k < kShow; ++k) {
             const IbLedgerEntry& e = g_ib_ledger_tab[order[k]];
             REXGPU_INFO("[nr-ibl]   buf={:08X}..{:08X} dwords={} draws={} execs={}",
