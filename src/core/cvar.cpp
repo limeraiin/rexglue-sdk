@@ -442,16 +442,27 @@ static std::string TomlEscapeBasicString(const std::string& s) {
   return out;
 }
 
+// A flag is written out when its value differs from the default (the usual
+// "only save what the user changed" rule) or when it opted into being pinned
+// explicitly via `always_persist()`.
+static bool ShouldSerialize(const FlagEntry& entry) {
+  return entry.always_persist || entry.getter() != entry.default_value;
+}
+
+static void AppendTomlAssignment(std::string& out, const FlagEntry& entry) {
+  if (entry.type == FlagType::String) {
+    out += entry.name + " = \"" + TomlEscapeBasicString(entry.getter()) + "\"\n";
+  } else {
+    out += entry.name + " = " + entry.getter() + "\n";
+  }
+}
+
 std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.getter() != entry.default_value) {
-      if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + TomlEscapeBasicString(entry.getter()) + "\"\n";
-      } else {
-        result += entry.name + " = " + entry.getter() + "\n";
-      }
+    if (ShouldSerialize(entry)) {
+      AppendTomlAssignment(result, entry);
     }
   }
   return result;
@@ -461,12 +472,8 @@ std::string SerializeToTOML(std::string_view category) {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.category == category && entry.getter() != entry.default_value) {
-      if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + TomlEscapeBasicString(entry.getter()) + "\"\n";
-      } else {
-        result += entry.name + " = " + entry.getter() + "\n";
-      }
+    if (entry.category == category && ShouldSerialize(entry)) {
+      AppendTomlAssignment(result, entry);
     }
   }
   return result;

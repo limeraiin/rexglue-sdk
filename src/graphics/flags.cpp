@@ -15,6 +15,18 @@
 
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
+// Default false = Xenia-canary parity (canary rejects these uploads too). A game
+// that points fetch constants at physical memory it never allocated feeds garbage
+// to the draws that read it, which shows up as black-screen flashing; rejecting
+// the upload drops those draws instead. Pinned into saved configs
+// (always_persist) because the escape hatch matters: if a scene ever loses
+// legitimate geometry, the `[nr-upl]` log line names the range and this key is
+// already sitting in naruto.toml to flip back to true.
+REXCVAR_DEFINE_BOOL(gpu_allow_invalid_upload_range, false, "GPU",
+                    "Allow shared-memory uploads sourced from guest physical pages marked "
+                    "no-access (never allocated). false rejects such uploads, dropping the "
+                    "draws that consume them (Xenia-canary parity).")
+    .always_persist();
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",

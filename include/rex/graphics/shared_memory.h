@@ -130,6 +130,13 @@ class SharedMemory {
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
 
+  // [NR-UPLCHK] Validates an upload range (in pages) against the physical
+  // heap's page table before the backend copies from guest memory. Logs
+  // (throttled) whenever the range starts or ends in a no-access page; returns
+  // false — reject the upload — only when gpu_allow_invalid_upload_range is
+  // false. Call from UploadRanges implementations for each range.
+  bool CheckUploadRangeAccess(uint32_t start_pages, uint32_t length_pages);
+
   // Uploads a range of host pages - only called if host GPU sparse memory
   // allocation succeeded if needed. While uploading, MakeRangeValid must be
   // called for each successfully uploaded range as early as possible, before

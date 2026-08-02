@@ -146,6 +146,13 @@ struct FlagEntry {
   Constraints constraints;
   std::string default_value;
   bool is_debug_only = false;
+
+  // Write this flag to the config file even when it still holds its default.
+  // SerializeToTOML normally emits only non-default values (keeping configs
+  // small), but a hazardous opt-in reads better pinned to an explicit value:
+  // the user can see it is off, and toggling it by hand needs no knowledge of
+  // the key's name. See `always_persist()`.
+  bool always_persist = false;
 };
 
 std::vector<FlagEntry>& GetRegistry();
@@ -259,6 +266,12 @@ struct FlagRegistrar {
 
   FlagRegistrar&& debug_only() && {
     apply_([](FlagEntry& entry) { entry.is_debug_only = true; });
+    return std::move(*this);
+  }
+
+  // Always write this flag to saved configs, default-valued or not.
+  FlagRegistrar&& always_persist() && {
+    apply_([](FlagEntry& entry) { entry.always_persist = true; });
     return std::move(*this);
   }
 

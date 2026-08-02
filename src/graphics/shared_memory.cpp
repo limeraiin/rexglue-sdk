@@ -10,13 +10,16 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
 #include <rex/dbg.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 
@@ -334,6 +337,37 @@ bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
       "Sparse host GPU memory allocation has been initialized, but the "
       "implementation doesn't provide AllocateSparseHostGpuMemoryRange");
   return false;
+}
+
+// [NR-UPLCHK] Xenia-canary parity (gpu_allow_invalid_upload_range): a game can
+// point fetch constants at physical memory it never allocated; uploading from
+// there feeds garbage to draws. Detect it via the physical heap's page table
+// (start and end page, like canary), always log throttled evidence, and reject
+// the upload only when the cvar is set to false.
+bool SharedMemory::CheckUploadRangeAccess(uint32_t start_pages, uint32_t length_pages) {
+  if (length_pages == 0) {
+    return true;
+  }
+  const uint32_t range_start_addr = start_pages << page_size_log2_;
+  const uint32_t range_end_addr = (start_pages + length_pages - 1) << page_size_log2_;
+  auto* physical_heap = memory_.GetPhysicalHeap();
+  const auto start_access = physical_heap->QueryRangeAccess(range_start_addr, range_start_addr);
+  const auto end_access = physical_heap->QueryRangeAccess(range_end_addr, range_end_addr);
+  if (start_access != rex::memory::PageAccess::kNoAccess &&
+      end_access != rex::memory::PageAccess::kNoAccess) {
+    return true;
+  }
+  static std::atomic<uint32_t> invalid_upload_hits{0};
+  uint32_t hit = invalid_upload_hits.fetch_add(1, std::memory_order_relaxed);
+  if (hit < 64 || (hit & 1023) == 0) {
+    REXGPU_ERROR(
+        "[nr-upl] invalid upload range {:08X}-{:08X} ({} pages, start_access={} end_access={}) "
+        "hit#{}{}",
+        range_start_addr, range_end_addr | ((uint32_t(1) << page_size_log2_) - 1), length_pages,
+        uint32_t(start_access), uint32_t(end_access), hit,
+        REXCVAR_GET(gpu_allow_invalid_upload_range) ? " (allowed)" : " (REJECTED)");
+  }
+  return REXCVAR_GET(gpu_allow_invalid_upload_range);
 }
 
 void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu) {
