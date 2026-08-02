@@ -439,11 +439,13 @@ uint64_t g_nrc_pairs_eq = 0;   //   of which equal
 uint64_t g_nrc_prim_ne = 0;    //   primitive-type mismatches
 uint64_t g_nrc_cnt_ne = 0;     //   index-count mismatches
 uint64_t g_nrc_pairs_unk = 0;  //   rid-0 draws: no args exist to compare
+uint64_t g_nrc_trimmed = 0;    // stale-epoch records trimmed off range fronts
 // First few mismatching pairs each window, logged verbatim at report time so a
 // systematic argument-format difference (e.g. prim-count vs index-count) names
 // itself instead of being a rate.
 struct NrcSample {
   uint32_t buf, i, pkt_prim, pkt_cnt, rec_rid, rec_prim, rec_start, rec_cnt;
+  uint32_t rec_addr, nbuf, ncache;  // rec_addr 0 => a short buffer's unpaired PACKET
 };
 constexpr uint32_t kNrcSamples = 4;
 NrcSample g_nrc_samp[kNrcSamples];
@@ -781,18 +783,19 @@ void CommandProcessor::WorkerThreadMain() {
             const uint64_t known = g_nrc_pairs_cmp - g_nrc_pairs_unk;
             REXGPU_INFO(
                 "[nr-cache]   pairs cmp={} eq={:.2f}% prim_ne={} cnt_ne={} "
-                "rid0={} | pool recorded={} resets={} collisions={}",
+                "rid0={} trimmed={} | pool recorded={} resets={} collisions={}",
                 g_nrc_pairs_cmp,
                 known ? 100.0 * double(g_nrc_pairs_eq) / double(known) : 0.0,
-                g_nrc_prim_ne, g_nrc_cnt_ne, g_nrc_pairs_unk, cs.recorded,
-                cs.granule_resets, cs.collisions);
+                g_nrc_prim_ne, g_nrc_cnt_ne, g_nrc_pairs_unk, g_nrc_trimmed,
+                cs.recorded, cs.granule_resets, cs.collisions);
             for (uint32_t s = 0; s < g_nrc_samp_n; ++s) {
               const NrcSample& sm = g_nrc_samp[s];
               REXGPU_INFO(
                   "[nr-cache]   MISMATCH buf={:08X} draw[{}] pkt(prim={} n={}) "
-                  "rec(rid={} prim={} start={} n={})",
+                  "rec(rid={} prim={} start={} n={} addr={:08X}) len {}vs{}",
                   sm.buf, sm.i, sm.pkt_prim, sm.pkt_cnt, sm.rec_rid,
-                  sm.rec_prim, sm.rec_start, sm.rec_cnt);
+                  sm.rec_prim, sm.rec_start, sm.rec_cnt, sm.rec_addr, sm.nbuf,
+                  sm.ncache);
             }
             nr::ResetCacheStats();
             g_nrc_execs = g_nrc_exact = g_nrc_args = g_nrc_short = 0;
@@ -800,6 +803,7 @@ void CommandProcessor::WorkerThreadMain() {
             g_nrc_trunc = 0;
             g_nrc_pairs_cmp = g_nrc_pairs_eq = g_nrc_prim_ne = g_nrc_cnt_ne = 0;
             g_nrc_pairs_unk = 0;
+            g_nrc_trimmed = 0;
             g_nrc_samp_n = 0;
           }
           // Clear for the next window. Addresses are re-walked when they
@@ -1372,7 +1376,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           static nr::DrawRecord s_rec[kNrcMaxDraws];
           const uint32_t nbuf = WalkBufferDrawArgs(
               memory_->TranslatePhysical(ptr), count, s_buf, kNrcMaxDraws);
-          const nr::CacheQueryResult cq =
+          nr::CacheQueryResult cq =
               nr::QueryDraws(ptr, count * 4, s_rec, kNrcMaxDraws);
           ++g_nrc_execs;
           if (nbuf > kNrcMaxDraws || cq.truncated) {
@@ -1382,6 +1386,26 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           } else if (cq.n == 0) {
             ++g_nrc_empty;
           } else {
+            // [NR-CACHE] Trim stale-epoch survivors (the first increment-2
+            // mechanism, living where the renderer will need it). A recording
+            // pass is one forward sweep by a single writer, so its records
+            // are CONSECUTIVE in seq walking the range tail backwards; a
+            // record in front that breaks the run is a survivor of an older
+            // layout, left in a granule the new pass wrote only state into
+            // (draw-event-keyed invalidation cannot reset those). Measured:
+            // menu buffers read "long, args=0" -- perfect current-pass match
+            // plus a stale front -- before this trim existed.
+            uint32_t first = cq.n - 1;
+            while (first > 0 && s_rec[first - 1].seq + 1 == s_rec[first].seq) {
+              --first;
+            }
+            if (first) {
+              g_nrc_trimmed += first;
+              for (uint32_t i = first; i < cq.n; ++i) {
+                s_rec[i - first] = s_rec[i];
+              }
+              cq.n -= first;
+            }
             // Compare the overlap pairwise even when the lengths differ; the
             // pair rates stay meaningful (a pure tail difference leaves them
             // at 100%) and the length difference picks the bucket.
@@ -1411,11 +1435,32 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                                                 s_rec[i].rid,
                                                 s_rec[i].prim,
                                                 s_rec[i].start,
-                                                s_rec[i].count};
+                                                s_rec[i].count,
+                                                s_rec[i].addr,
+                                                nbuf,
+                                                cq.n};
                 }
               }
             }
             g_nrc_pairs_cmp += ncmp;
+            // A pure length mismatch (clean prefix, extra or missing tail)
+            // never trips the pair sampler above, so capture the first
+            // UNPAIRED element instead: the extra record (long, with its
+            // address) or the extra packet (short, rec_addr 0).
+            if (ne == 0 && cq.n != nbuf && g_nrc_samp_n < kNrcSamples) {
+              if (cq.n > nbuf) {
+                g_nrc_samp[g_nrc_samp_n++] = {
+                    ptr,           ncmp,          0,
+                    0,             s_rec[ncmp].rid, s_rec[ncmp].prim,
+                    s_rec[ncmp].start, s_rec[ncmp].count, s_rec[ncmp].addr,
+                    nbuf,          cq.n};
+              } else {
+                g_nrc_samp[g_nrc_samp_n++] = {
+                    ptr, ncmp, s_buf[ncmp].prim, s_buf[ncmp].indices,
+                    0,   0,    0,                0,
+                    0,   nbuf, cq.n};
+              }
+            }
             if (cq.seq_inversions) {
               ++g_nrc_torn;
             } else if (cq.n < nbuf) {
