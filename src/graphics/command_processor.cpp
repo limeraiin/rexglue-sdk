@@ -25,6 +25,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/nr_draw_registry.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -376,13 +377,57 @@ bool g_ib_ledger = false;
 struct IbLedgerEntry {
   uint32_t ptr;       // buffer address as passed to ExecuteIndirectBuffer
   uint32_t dwords;    // its length
-  uint32_t draws;     // DRAW_INDX + DRAW_INDX_2 packets inside it
+  uint32_t draws;     // DRAW_INDX (0x22) packets -- what the guest hooks see
+  uint32_t draws2;    // DRAW_INDX_2 (0x36) packets -- emitted by other code paths
   uint64_t execs;     // times executed since the last report
+  uint32_t reg;       // [NR-REG] draws the registry held at the last execution
 };
 constexpr uint32_t kIbLedgerSize = 1024;  // power of two; ~102 live in the city
 IbLedgerEntry g_ib_ledger_tab[kIbLedgerSize] = {};
 uint32_t g_ib_ledger_used = 0;
 uint64_t g_ib_ledger_evictions = 0;  // distinct buffers that did not fit
+
+// [NR-REG] Per-execution scoring against the draw registry (nr_draw_registry.h,
+// which holds the registry itself and explains the design). Every time a buffer
+// containing draws is about to run, ask the registry how many draws were
+// recorded into that address range and compare it against the count walked out
+// of the buffer's own DRAW_INDX packets. Agreement means every executed draw is
+// attributable to a recorded one, which is the gate the whole port depends on.
+uint64_t g_reg_queries = 0;       // executions of a buffer that contains draws
+uint64_t g_reg_r_zero = 0;        // registry had nothing for the range
+uint64_t g_reg_r_under = 0;       // held some, but fewer than the buffer's own count
+uint64_t g_reg_r_one = 0;         // matched within 5 percent -- the PASS bucket
+uint64_t g_reg_r_over = 0;        // held more (a re-record the GPU has not run yet)
+uint64_t g_reg_draws_registry = 0;
+uint64_t g_reg_draws_ledger = 0;
+uint64_t g_reg_gran_hit = 0, g_reg_gran_miss = 0;
+uint64_t g_reg_split = 0;         // buffers caught with a half-overwritten recording
+
+// Walk a PM4 buffer and count its draw packets, split by opcode: DRAW_INDX
+// (0x22) is what the guest D3D9 recorder emits and therefore what the registry
+// can possibly know about, while DRAW_INDX_2 (0x36) comes from paths that are
+// not hooked. Keeping them apart stops the unhooked draw type from reading as a
+// failed gate. Guest memory is big-endian.
+void CountBufferDraws(const uint8_t* raw, uint32_t dwords, uint32_t* out_draw_indx,
+                      uint32_t* out_draw_indx2) {
+  uint32_t d1 = 0, d2 = 0;
+  for (uint32_t j = 0; j < dwords;) {
+    const uint32_t hdr = __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
+    const uint32_t ty = hdr >> 30, cnt = ((hdr >> 16) & 0x3FFF) + 1;
+    if (ty == 3) {
+      const uint32_t op = (hdr >> 8) & 0x7F;
+      if (op == 0x22) ++d1;
+      else if (op == 0x36) ++d2;
+      j += 1 + cnt;
+    } else if (ty == 0) {
+      j += 1 + cnt;
+    } else {
+      ++j;
+    }
+  }
+  *out_draw_indx = d1;
+  *out_draw_indx2 = d2;
+}
 }  // namespace
 
 void CommandProcessor::WorkerThreadMain() {
@@ -554,12 +599,13 @@ void CommandProcessor::WorkerThreadMain() {
           // Sort by index (the table is small and this runs once a second).
           uint32_t order[kIbLedgerSize];
           uint32_t n = 0;
-          uint64_t tot_exec = 0, tot_draw_exec = 0;
+          uint64_t tot_exec = 0, tot_draw_exec = 0, tot_draw2_exec = 0;
           for (uint32_t i = 0; i < kIbLedgerSize; ++i) {
             if (!g_ib_ledger_tab[i].execs) continue;
             order[n++] = i;
             tot_exec += g_ib_ledger_tab[i].execs;
             tot_draw_exec += g_ib_ledger_tab[i].execs * g_ib_ledger_tab[i].draws;
+            tot_draw2_exec += g_ib_ledger_tab[i].execs * g_ib_ledger_tab[i].draws2;
           }
           for (uint32_t a = 0; a + 1 < n; ++a) {
             for (uint32_t b = a + 1; b < n; ++b) {
@@ -569,17 +615,59 @@ void CommandProcessor::WorkerThreadMain() {
             }
           }
           const double sec = wall_ns / 1e9;
+          // draws_executed counts DRAW_INDX only, which is what the guest hooks
+          // see; DRAW_INDX_2 is reported beside it so a mismatch caused by the
+          // draw type we do not hook cannot be mistaken for a failed gate.
           REXGPU_INFO("[nr-ibl] distinct_buffers={} executions={} draws_executed={} "
-                      "({:.0f}/s) overflow={}",
-                      n, tot_exec, tot_draw_exec, sec > 0 ? tot_draw_exec / sec : 0.0,
-                      g_ib_ledger_evictions);
+                      "({:.0f}/s) draw_indx2={} overflow={}",
+                      n, tot_exec, tot_draw_exec + tot_draw2_exec,
+                      sec > 0 ? (tot_draw_exec + tot_draw2_exec) / sec : 0.0,
+                      tot_draw2_exec, g_ib_ledger_evictions);
           const uint32_t kShow = 256;  // all of them; the correlator needs every buffer
           for (uint32_t k = 0; k < n && k < kShow; ++k) {
             const IbLedgerEntry& e = g_ib_ledger_tab[order[k]];
-            REXGPU_INFO("[nr-ibl]   buf={:08X}..{:08X} dwords={} draws={} execs={}",
-                        e.ptr, e.ptr + e.dwords * 4, e.dwords, e.draws, e.execs);
+            REXGPU_INFO("[nr-ibl]   buf={:08X}..{:08X} dwords={} draws={}+{} execs={} reg={}",
+                        e.ptr, e.ptr + e.dwords * 4, e.dwords, e.draws, e.draws2,
+                        e.execs, e.reg);
           }
           if (n > kShow) REXGPU_INFO("[nr-ibl]   ... {} more not shown", n - kShow);
+
+          // [NR-REG] The gate verdict. Every scored execution asked the registry
+          // how many draws were recorded into the range it was about to run; the
+          // buffer's own DRAW_INDX packets say how many are really there. 'one'
+          // is the pass bucket. Read it together with alias and split: a wrong
+          // address alias shows up as zero everywhere, and a recording caught
+          // half-overwritten shows up as split.
+          {
+            const uint64_t q = g_reg_queries;
+            const double pc = q ? 100.0 / double(q) : 0.0;
+            REXGPU_INFO("[nr-reg] queries={} one={:.1f}% under={:.1f}% over={:.1f}% "
+                        "zero={:.1f}% split={:.1f}%",
+                        q, g_reg_r_one * pc, g_reg_r_under * pc, g_reg_r_over * pc,
+                        g_reg_r_zero * pc, g_reg_split * pc);
+            const nr::Stats& rs = nr::GetStats();
+            REXGPU_INFO("[nr-reg]   draws registry={} ledger={} ratio={:.3f} | "
+                        "granules hit={} miss={} | recorded={} collisions={}",
+                        g_reg_draws_registry, g_reg_draws_ledger,
+                        g_reg_draws_ledger
+                            ? double(g_reg_draws_registry) / double(g_reg_draws_ledger)
+                            : 0.0,
+                        g_reg_gran_hit, g_reg_gran_miss, rs.recorded, rs.collisions);
+            // Which physical alias the recorder's pointers arrived through. If
+            // this is not the alias the buffer addresses live in, the mask is
+            // wrong and every other number here is meaningless.
+            for (uint32_t a = 0; a < 8; ++a) {
+              if (rs.alias[a]) {
+                REXGPU_INFO("[nr-reg]   alias {:08X} -> {} draws", a << 29, rs.alias[a]);
+              }
+            }
+            nr::ResetStats();
+            g_reg_queries = 0;
+            g_reg_r_one = g_reg_r_under = g_reg_r_over = g_reg_r_zero = 0;
+            g_reg_split = 0;
+            g_reg_draws_registry = g_reg_draws_ledger = 0;
+            g_reg_gran_hit = g_reg_gran_miss = 0;
+          }
           // Clear for the next window. Addresses are re-walked when they
           // reappear, which is what keeps a stale draw count from surviving a
           // buffer being re-recorded at the same address with different content.
@@ -1076,20 +1164,10 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         c->ptr = ptr;
         c->dwords = count;
         c->draws = 0;
-        const uint8_t* raw = memory_->TranslatePhysical(ptr);
-        for (uint32_t j = 0; j < count;) {
-          uint32_t hdr = __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
-          uint32_t ty = hdr >> 30, cnt = ((hdr >> 16) & 0x3FFF) + 1;
-          if (ty == 3) {
-            uint32_t op = (hdr >> 8) & 0x7F;
-            if (op == 0x22 || op == 0x36) ++c->draws;
-            j += 1 + cnt;
-          } else if (ty == 0) {
-            j += 1 + cnt;
-          } else {
-            ++j;
-          }
-        }
+        c->draws2 = 0;
+        c->reg = 0;
+        CountBufferDraws(memory_->TranslatePhysical(ptr), count, &c->draws,
+                         &c->draws2);
         ++g_ib_ledger_used;
         e = c;
         break;
@@ -1097,6 +1175,56 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     }
     if (e) {
       ++e->execs;
+      // [NR-REG] Ask the registry what it recorded into the range about to run,
+      // and compare against the count walked out of the buffer's own packets.
+      // Only buffers that actually draw are scored; the engine also replays
+      // state-only buffers, which would otherwise pad every rate with matches
+      // that mean nothing.
+      if (e->draws) {
+        const nr::QueryResult q = nr::QueryRange(ptr, e->dwords * 4);
+        const uint32_t sum = q.draws;
+        // The ledger's draw count was walked the first time this address was
+        // seen in the window, but the engine re-records a city buffer roughly
+        // every third frame, so by now it can be stale -- and scoring a fresh
+        // registry against a stale truth would invent disagreements. Re-walk
+        // whenever the two differ. Agreement needs no walk (a cached count that
+        // equals the current recording is not stale in the value being
+        // compared), so the O(dwords) cost is paid only where the answer is
+        // actually in doubt, which keeps the probe from perturbing the very
+        // record/execute interleaving it is measuring.
+        uint32_t truth = e->draws, truth2 = e->draws2;
+        if (sum != truth) {
+          CountBufferDraws(memory_->TranslatePhysical(ptr), e->dwords, &truth,
+                           &truth2);
+          e->draws = truth;
+          e->draws2 = truth2;
+        }
+        e->reg = sum;
+        // The re-walk can find the buffer no longer draws at all, in which case
+        // there is nothing to score against and counting it either way would be
+        // a made-up number.
+        if (truth) {
+          ++g_reg_queries;
+          g_reg_gran_hit += q.granules_hit;
+          g_reg_gran_miss += q.granules_miss;
+          g_reg_draws_registry += sum;
+          g_reg_draws_ledger += truth;
+          // Recording order must rise across a buffer written in one pass, so
+          // any inversion means the registry was caught holding half of a
+          // re-record. A real hazard for the renderer rather than a probe
+          // artifact, so it is counted rather than smoothed away.
+          if (q.seq_inversions) ++g_reg_split;
+          if (sum == 0) {
+            ++g_reg_r_zero;
+          } else if (sum * 100u < truth * 95u) {
+            ++g_reg_r_under;
+          } else if (sum * 100u > truth * 105u) {
+            ++g_reg_r_over;
+          } else {
+            ++g_reg_r_one;
+          }
+        }
+      }
     } else {
       ++g_ib_ledger_evictions;
     }
