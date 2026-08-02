@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -27,6 +28,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/nr_buffer_cache.h>
 #include <rex/graphics/nr_draw_cache.h>
+#include <rex/graphics/nr_state_walk.h>
 #include <rex/graphics/nr_draw_registry.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
@@ -116,6 +118,15 @@ REXCVAR_DEFINE_BOOL(gpu_nr_cache, false, "GPU",
 REXCVAR_DEFINE_BOOL(gpu_nr_bufcache, false, "GPU",
                     "Diagnostic [nr-buf]: per-buffer snapshot cache (admit/serve/"
                     "invalidate) with live verification of every served snapshot. "
+                    "Needs nr_record_map; implies gpu_nr_cache. Off by default.");
+
+// [NR-STATE] Increment 3: RT/clear/resolve/viewport recovery census on the
+// same packet walk (nr_state_walk.h). Classifies every register write and
+// type-3 opcode in the executed buffers, flags copy-mode (resolve) draws and
+// inherited-state draws, and splits the [nr-cache] misses by mode.
+REXCVAR_DEFINE_BOOL(gpu_nr_state, false, "GPU",
+                    "Diagnostic [nr-state]: register/opcode census + RT/resolve/"
+                    "viewport context recovery over executed indirect buffers. "
                     "Needs nr_record_map; implies gpu_nr_cache. Off by default.");
 
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
@@ -481,6 +492,33 @@ uint64_t g_nrb_walk_ovf = 0;      // walks over the packet scratch bound
 constexpr uint32_t kNrbMaxPkts = 4096;  // city ~350/buffer; order of magnitude
 nr::PacketRef g_nrb_pkts[kNrbMaxPkts];
 
+// [NR-STATE] Increment-3 window counters: the state census, aggregated over
+// the executions scored this window, plus the per-draw context splits and the
+// join-miss attribution the flags make possible.
+bool g_nr_state = false;
+uint64_t g_nrs_execs = 0;
+uint64_t g_nrs_regs[nr::kRegClassCount] = {};
+uint64_t g_nrs_ops[128] = {};
+uint64_t g_nrs_t0 = 0, g_nrs_t1 = 0, g_nrs_t2 = 0, g_nrs_t3 = 0;
+uint64_t g_nrs_draws = 0;          // 0x22 draws flagged
+uint64_t g_nrs_copy = 0;           // draws under kCopy (resolves/clears)
+uint64_t g_nrs_mode_inherited = 0; // draws before any in-buffer RB_MODECONTROL
+uint64_t g_nrs_rt_set = 0;         // draws with an RT reg written earlier in-buffer
+uint64_t g_nrs_vport_set = 0;      // same, viewport
+uint64_t g_nrs_desync = 0;         // walks whose flag count != join pkt count
+uint64_t g_nrs_mode_mem = 0;       // RB_MODECONTROL covered by a memory load
+// Join-miss attribution: what was the mode context of each [nr-cache] miss?
+uint64_t g_nrs_miss_copy = 0, g_nrs_miss_inherited = 0, g_nrs_miss_plain = 0;
+// Last resolve setup seen, reported once per window.
+uint32_t g_nrs_copy_control = 0, g_nrs_copy_dest = 0, g_nrs_copy_dest_info = 0;
+// Unclassified registers, merged across the window's walks.
+struct NrsOtherReg {
+  uint32_t reg;
+  uint64_t count;
+};
+NrsOtherReg g_nrs_other[16] = {};
+uint8_t g_nrs_flags[kNrbMaxPkts];
+
 // Walk a PM4 buffer and count its draw packets, split by opcode: DRAW_INDX
 // (0x22) is what the guest D3D9 recorder emits and therefore what the registry
 // can possibly know about, while DRAW_INDX_2 (0x36) comes from paths that are
@@ -529,11 +567,14 @@ void CommandProcessor::WorkerThreadMain() {
   // [PM4-CENSUS] independent draw-emission census (no timing; just packet counts).
   const bool kCensus = REXCVAR_GET(gpu_pm4_census);
   g_pm4_census = kCensus;
-  // [NR-BUF] implies [NR-CACHE] implies the ledger: each layer's scoring
-  // lives on the previous one's per-buffer walk in ExecuteIndirectBuffer.
+  // [NR-BUF]/[NR-STATE] imply [NR-CACHE] implies the ledger: each layer's
+  // scoring lives on the previous one's per-buffer walk in
+  // ExecuteIndirectBuffer.
   const bool kNrBuf = REXCVAR_GET(gpu_nr_bufcache);
   g_nr_bufcache = kNrBuf;
-  const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf;
+  const bool kNrState = REXCVAR_GET(gpu_nr_state);
+  g_nr_state = kNrState;
+  const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState;
   g_nr_cache = kNrCache;
   const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger) || kNrCache;  // [NR-IBL] record/replay gate
   g_ib_ledger = kIbLedger;
@@ -817,6 +858,76 @@ void CommandProcessor::WorkerThreadMain() {
             g_nrb_absent = g_nrb_dirty = g_nrb_resized = 0;
             g_nrb_draws_served = g_nrb_draws_total = 0;
             g_nrb_walk_ovf = 0;
+          }
+          // [NR-STATE] The recovery census. copy= is the resolve/clear rate
+          // (draws under kCopy); mode_inh= are draws whose EDRAM mode the
+          // buffer inherits from ring state; rt/vport= how many draws had
+          // that state established IN the buffer. The miss split tests
+          // whether the join misses are precisely the unhooked resolve
+          // draws. other= registers name any classification hole.
+          if (g_nr_state && g_nrs_execs) {
+            const double dp =
+                g_nrs_draws ? 100.0 / double(g_nrs_draws) : 0.0;
+            REXGPU_INFO(
+                "[nr-state] execs={} draws={} copy={} mode_inh={:.1f}% "
+                "rt_set={:.1f}% vport_set={:.1f}% desync={} mode_mem={} | pkts "
+                "t0={} t1={} t2={} t3={}",
+                g_nrs_execs, g_nrs_draws, g_nrs_copy,
+                g_nrs_mode_inherited * dp, g_nrs_rt_set * dp,
+                g_nrs_vport_set * dp, g_nrs_desync, g_nrs_mode_mem, g_nrs_t0,
+                g_nrs_t1, g_nrs_t2, g_nrs_t3);
+            const uint64_t* rc = g_nrs_regs;
+            REXGPU_INFO(
+                "[nr-state]   regs const={} fetch={} bool={} rt={} vport={} "
+                "sciss={} copy={} clear={} mode={} dev={} coher={} other={}",
+                rc[nr::kRegShaderConst], rc[nr::kRegFetchConst],
+                rc[nr::kRegBoolLoop], rc[nr::kRegRenderTarget],
+                rc[nr::kRegViewport], rc[nr::kRegScissor], rc[nr::kRegCopy],
+                rc[nr::kRegClearValue], rc[nr::kRegModeControl],
+                rc[nr::kRegDeviceState], rc[nr::kRegCoher], rc[nr::kRegOther]);
+            REXGPU_INFO(
+                "[nr-state]   miss split copy={} inherited={} plain={} | last "
+                "resolve ctl={:08X} dest={:08X} info={:08X}",
+                g_nrs_miss_copy, g_nrs_miss_inherited, g_nrs_miss_plain,
+                g_nrs_copy_control, g_nrs_copy_dest, g_nrs_copy_dest_info);
+            // Top type-3 opcodes beyond the draws, and any unclassified regs.
+            {
+              char ops[160];
+              int n = 0;
+              for (uint32_t pass = 0; pass < 6; ++pass) {
+                uint32_t best = 0, best_op = 0;
+                for (uint32_t op = 0; op < 128; ++op) {
+                  if (op == 0x22 || op == 0x36) continue;
+                  if (g_nrs_ops[op] > best) {
+                    best = uint32_t(g_nrs_ops[op]);
+                    best_op = op;
+                  }
+                }
+                if (!best) break;
+                n += snprintf(ops + n, sizeof(ops) - n, " %02X=%u", best_op,
+                              best);
+                g_nrs_ops[best_op] = 0;  // window resets below anyway
+                if (n >= int(sizeof(ops)) - 12) break;
+              }
+              char oth[160];
+              int m = 0;
+              for (const auto& o : g_nrs_other) {
+                if (!o.count) break;
+                m += snprintf(oth + m, sizeof(oth) - m, " %04X=%llu", o.reg,
+                              (unsigned long long)o.count);
+                if (m >= int(sizeof(oth)) - 16) break;
+              }
+              REXGPU_INFO("[nr-state]   ops:{} | other:{}", n ? ops : " none",
+                          m ? oth : " none");
+            }
+            g_nrs_execs = g_nrs_draws = g_nrs_copy = 0;
+            g_nrs_mode_inherited = g_nrs_rt_set = g_nrs_vport_set = 0;
+            g_nrs_desync = g_nrs_mode_mem = 0;
+            g_nrs_t0 = g_nrs_t1 = g_nrs_t2 = g_nrs_t3 = 0;
+            for (uint32_t c = 0; c < nr::kRegClassCount; ++c) g_nrs_regs[c] = 0;
+            for (uint32_t op = 0; op < 128; ++op) g_nrs_ops[op] = 0;
+            g_nrs_miss_copy = g_nrs_miss_inherited = g_nrs_miss_plain = 0;
+            for (auto& o : g_nrs_other) o = NrsOtherReg{};
           }
           // Clear for the next window. Addresses are re-walked when they
           // reappear, which is what keeps a stale draw count from surviving a
@@ -1422,6 +1533,60 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           if (ovf) {
             ++g_nrb_walk_ovf;
           } else {
+            // Increment 3: the state census + per-draw context flags, from
+            // the unit's own walk of the same buffer. Flags align with the
+            // join list by construction (same walk rules, same packet
+            // subset); a count mismatch means a decode divergence and is
+            // counted, never guessed through.
+            bool state_flags_ok = false;
+            if (g_nr_state) {
+              static nr::StateWalkResult s_swr;
+              const uint32_t nf = nr::WalkBufferState(raw, count, &s_swr,
+                                                      g_nrs_flags, kNrbMaxPkts);
+              ++g_nrs_execs;
+              for (uint32_t c = 0; c < nr::kRegClassCount; ++c) {
+                g_nrs_regs[c] += s_swr.reg_writes[c];
+              }
+              for (uint32_t op = 0; op < 128; ++op) {
+                g_nrs_ops[op] += s_swr.type3_ops[op];
+              }
+              g_nrs_t0 += s_swr.type0_pkts;
+              g_nrs_t1 += s_swr.type1_pkts;
+              g_nrs_t2 += s_swr.type2_pkts;
+              g_nrs_t3 += s_swr.type3_pkts;
+              g_nrs_copy += s_swr.copy_draws;
+              g_nrs_mode_inherited += s_swr.inherited_draws;
+              g_nrs_mode_mem += s_swr.mode_loads_from_mem;
+              if (s_swr.reg_writes[nr::kRegCopy]) {
+                g_nrs_copy_control = s_swr.last_copy_control;
+                g_nrs_copy_dest = s_swr.last_copy_dest_base;
+                g_nrs_copy_dest_info = s_swr.last_copy_dest_info;
+              }
+              for (const auto& o : s_swr.other_top) {
+                if (!o.count) break;
+                for (auto& g : g_nrs_other) {
+                  if (g.count && g.reg == o.reg) {
+                    g.count += o.count;
+                    break;
+                  }
+                  if (!g.count) {
+                    g.reg = o.reg;
+                    g.count = o.count;
+                    break;
+                  }
+                }
+              }
+              if (nf == npkt) {
+                state_flags_ok = true;
+                g_nrs_draws += nf;
+                for (uint32_t i = 0; i < nf; ++i) {
+                  if (g_nrs_flags[i] & nr::kDrawFlagRtSet) ++g_nrs_rt_set;
+                  if (g_nrs_flags[i] & nr::kDrawFlagVportSet) ++g_nrs_vport_set;
+                }
+              } else {
+                ++g_nrs_desync;
+              }
+            }
             // Increment 1: the per-packet join rates.
             ++g_nrc_execs;
             bool full = true;
@@ -1432,6 +1597,19 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
               if (!nr::LookupDraw(pk.addr, &rec)) {
                 ++g_nrc_miss;
                 full = false;
+                // The miss-attribution the increment-3 flags enable: is the
+                // unhooked draw a resolve (copy mode), a draw whose mode the
+                // buffer inherits, or a plain geometry miss (torn window)?
+                if (state_flags_ok) {
+                  const uint8_t f = g_nrs_flags[i];
+                  if (f & nr::kDrawFlagCopyMode) {
+                    ++g_nrs_miss_copy;
+                  } else if (f & nr::kDrawFlagModeInherited) {
+                    ++g_nrs_miss_inherited;
+                  } else {
+                    ++g_nrs_miss_plain;
+                  }
+                }
                 if (g_nrc_samp_n < kNrcSamples) {
                   g_nrc_samp[g_nrc_samp_n++] = {ptr, pk.addr, i,
                                                 pk.prim, pk.count, 0,
