@@ -80,6 +80,17 @@ REXCVAR_DEFINE_BOOL(gpu_pm4_ib_dump, false, "GPU",
                     "Diagnostic [pm4-ib-dump]: one-shot hex dump of the first indirect buffer "
                     ">=512 dwords, to reverse the per-draw PM4 structure. Off by default.");
 
+// [NR-IBL] Native-renderer gate: the replay half of the record/replay
+// correlation. Reports every indirect buffer executed in the last second by
+// address, with its length, its draw count and how many times it ran. Pair it
+// with the game-side 'nr_record_map' cvar ([nrmap]), which reports the address
+// ranges the guest RECORDED draws into, then correlate offline with
+// tools/correlate-record-replay.py. Off by default.
+REXCVAR_DEFINE_BOOL(gpu_ib_ledger, false, "GPU",
+                    "Diagnostic [nr-ibl]: per-indirect-buffer execution ledger (address, "
+                    "dwords, draws, exec count), ~1s. The replay half of the native-renderer "
+                    "record/replay gate. Off by default.");
+
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
                     "Write the ring-buffer read pointer back to the guest incrementally "
                     "as ExecutePrimaryBuffer consumes packets (about every "
@@ -348,6 +359,30 @@ uint64_t g_pm4_draw_indx2_indirect = 0;    // DRAW_INDX_2 inside an indirect buf
 uint64_t g_pm4_ib_count = 0;               // indirect buffers executed
 uint64_t g_pm4_ib_dwords = 0;              // total dwords across indirect buffers
 bool g_pm4_ib_dump = false;                // [PM4-IB-DUMP] one-shot IB hex dump
+
+// [NR-IBL] Native-renderer gate: per-indirect-buffer execution ledger.
+//
+// The gate asks whether every EXECUTED draw is attributable to exactly one
+// RECORDED draw. The guest side ([nrmap], src/record_map.cpp) reports the
+// address ranges it recorded draws into; this side reports the address ranges
+// the GPU actually executed and how many times each. Correlating the two
+// answers whether the record/replay model holds, which decides the whole port.
+//
+// Keyed on the buffer address, so a buffer replayed N times in a frame shows up
+// once with execs=N. Draws are counted by walking the buffer, but only the first
+// time an address is seen (the walk is O(dwords), the point is to keep the
+// steady-state cost at one hash probe per execution).
+bool g_ib_ledger = false;
+struct IbLedgerEntry {
+  uint32_t ptr;       // buffer address as passed to ExecuteIndirectBuffer
+  uint32_t dwords;    // its length
+  uint32_t draws;     // DRAW_INDX + DRAW_INDX_2 packets inside it
+  uint64_t execs;     // times executed since the last report
+};
+constexpr uint32_t kIbLedgerSize = 256;  // power of two, ~12 live in the forest
+IbLedgerEntry g_ib_ledger_tab[kIbLedgerSize] = {};
+uint32_t g_ib_ledger_used = 0;
+uint64_t g_ib_ledger_evictions = 0;  // distinct buffers that did not fit
 }  // namespace
 
 void CommandProcessor::WorkerThreadMain() {
@@ -370,6 +405,8 @@ void CommandProcessor::WorkerThreadMain() {
   // [PM4-CENSUS] independent draw-emission census (no timing; just packet counts).
   const bool kCensus = REXCVAR_GET(gpu_pm4_census);
   g_pm4_census = kCensus;
+  const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger);  // [NR-IBL] record/replay gate
+  g_ib_ledger = kIbLedger;
   g_pm4_ib_dump = REXCVAR_GET(gpu_pm4_ib_dump);  // [PM4-IB-DUMP] one-shot IB structure dump
   const bool kTimeExec = kProfile || kSplit;  // bracket ExecutePrimaryBuffer when either is on
   using prof_clock = std::chrono::steady_clock;
@@ -453,7 +490,7 @@ void CommandProcessor::WorkerThreadMain() {
     }
 
     // [GPU-WORKER-PROFILE] / [GPU-SPLIT] / [PM4-CENSUS] ~1s wall-time report.
-    if (kProfile || kSplit || kCensus) {
+    if (kProfile || kSplit || kCensus || kIbLedger) {
       auto now = prof_clock::now();
       uint64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              now - prof_last_report).count();
@@ -510,6 +547,45 @@ void CommandProcessor::WorkerThreadMain() {
           g_pm4_draw_indx_primary = 0; g_pm4_draw_indx_indirect = 0;
           g_pm4_draw_indx2_primary = 0; g_pm4_draw_indx2_indirect = 0;
           g_pm4_ib_count = 0; g_pm4_ib_dwords = 0;
+        }
+        if (kIbLedger) {
+          // [NR-IBL] One line per distinct indirect buffer executed this second,
+          // busiest first, plus the totals the gate actually compares against.
+          // Sort by index (the table is small and this runs once a second).
+          uint32_t order[kIbLedgerSize];
+          uint32_t n = 0;
+          uint64_t tot_exec = 0, tot_draw_exec = 0;
+          for (uint32_t i = 0; i < kIbLedgerSize; ++i) {
+            if (!g_ib_ledger_tab[i].execs) continue;
+            order[n++] = i;
+            tot_exec += g_ib_ledger_tab[i].execs;
+            tot_draw_exec += g_ib_ledger_tab[i].execs * g_ib_ledger_tab[i].draws;
+          }
+          for (uint32_t a = 0; a + 1 < n; ++a) {
+            for (uint32_t b = a + 1; b < n; ++b) {
+              if (g_ib_ledger_tab[order[b]].execs > g_ib_ledger_tab[order[a]].execs) {
+                uint32_t t = order[a]; order[a] = order[b]; order[b] = t;
+              }
+            }
+          }
+          const double sec = wall_ns / 1e9;
+          REXGPU_INFO("[nr-ibl] distinct_buffers={} executions={} draws_executed={} "
+                      "({:.0f}/s) overflow={}",
+                      n, tot_exec, tot_draw_exec, sec > 0 ? tot_draw_exec / sec : 0.0,
+                      g_ib_ledger_evictions);
+          const uint32_t kShow = 24;
+          for (uint32_t k = 0; k < n && k < kShow; ++k) {
+            const IbLedgerEntry& e = g_ib_ledger_tab[order[k]];
+            REXGPU_INFO("[nr-ibl]   buf={:08X}..{:08X} dwords={} draws={} execs={}",
+                        e.ptr, e.ptr + e.dwords * 4, e.dwords, e.draws, e.execs);
+          }
+          if (n > kShow) REXGPU_INFO("[nr-ibl]   ... {} more not shown", n - kShow);
+          // Clear for the next window. Addresses are re-walked when they
+          // reappear, which is what keeps a stale draw count from surviving a
+          // buffer being re-recorded at the same address with different content.
+          for (uint32_t i = 0; i < kIbLedgerSize; ++i) g_ib_ledger_tab[i] = IbLedgerEntry{};
+          g_ib_ledger_used = 0;
+          g_ib_ledger_evictions = 0;
         }
         prof_last_report = now;
         last_type0_split_ns = g_type0_split_ns;
@@ -987,6 +1063,44 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // -> ExecutePacketType3) will see g_pm4_ib_depth > 0 and count as "indirect".
   ++g_pm4_ib_depth;
   if (g_pm4_census) { ++g_pm4_ib_count; g_pm4_ib_dwords += count; }
+
+  // [NR-IBL] record this execution against the buffer's address.
+  if (g_ib_ledger) {
+    uint32_t h = (ptr >> 2) * 2654435761u;
+    uint32_t i = h & (kIbLedgerSize - 1);
+    IbLedgerEntry* e = nullptr;
+    for (uint32_t probe = 0; probe < kIbLedgerSize; ++probe) {
+      IbLedgerEntry* c = &g_ib_ledger_tab[(i + probe) & (kIbLedgerSize - 1)];
+      if (c->execs && c->ptr == ptr) { e = c; break; }
+      if (!c->execs) {  // free slot: claim it and count the draws once
+        c->ptr = ptr;
+        c->dwords = count;
+        c->draws = 0;
+        const uint8_t* raw = memory_->TranslatePhysical(ptr);
+        for (uint32_t j = 0; j < count;) {
+          uint32_t hdr = __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
+          uint32_t ty = hdr >> 30, cnt = ((hdr >> 16) & 0x3FFF) + 1;
+          if (ty == 3) {
+            uint32_t op = (hdr >> 8) & 0x7F;
+            if (op == 0x22 || op == 0x36) ++c->draws;
+            j += 1 + cnt;
+          } else if (ty == 0) {
+            j += 1 + cnt;
+          } else {
+            ++j;
+          }
+        }
+        ++g_ib_ledger_used;
+        e = c;
+        break;
+      }
+    }
+    if (e) {
+      ++e->execs;
+    } else {
+      ++g_ib_ledger_evictions;
+    }
+  }
 
   // [PM4-IB-DUMP] one-shot decode + hex of the first sizable indirect buffer.
   // ~37/frame in the forest, so gate on the launch-time bool first (short-
