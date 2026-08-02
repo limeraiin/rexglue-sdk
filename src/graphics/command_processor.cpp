@@ -25,6 +25,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/nr_draw_cache.h>
 #include <rex/graphics/nr_draw_registry.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
@@ -91,6 +92,20 @@ REXCVAR_DEFINE_BOOL(gpu_ib_ledger, false, "GPU",
                     "Diagnostic [nr-ibl]: per-indirect-buffer execution ledger (address, "
                     "dwords, draws, exec count), ~1s. The replay half of the native-renderer "
                     "record/replay gate. Off by default.");
+
+// [NR-CACHE] Native-renderer build-out increment 1: exact draw-record cache
+// validation. The gate (Run 3) proved every executed draw is attributable to a
+// recorded one by COUNT; this compares the actual cached records -- recorder
+// id, primitive type, start, index count -- per draw and in order against the
+// DRAW_INDX packets each executed buffer really contains. If the sequences
+// match, the hook layer captures enough to regenerate the buffer's draw stream,
+// which is exactly what the renderer will replay. Requires the game-side
+// nr_record_map hook; implies gpu_ib_ledger (the scoring lives on its walk).
+// Costs an O(dwords) buffer walk per scored execution, so diagnostic-only.
+REXCVAR_DEFINE_BOOL(gpu_nr_cache, false, "GPU",
+                    "Diagnostic [nr-cache]: per-draw comparison of the native-renderer "
+                    "draw-record cache against each executed indirect buffer's DRAW_INDX "
+                    "packets. Needs nr_record_map; implies gpu_ib_ledger. Off by default.");
 
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
                     "Write the ring-buffer read pointer back to the guest incrementally "
@@ -403,6 +418,49 @@ uint64_t g_reg_draws_ledger = 0;
 uint64_t g_reg_gran_hit = 0, g_reg_gran_miss = 0;
 uint64_t g_reg_split = 0;         // buffers caught with a half-overwritten recording
 
+// [NR-CACHE] Per-execution exact-sequence scoring against the draw-record
+// cache (nr_draw_cache.h). Buckets are mutually exclusive, listed in the
+// priority they are decided: an execution whose walk or query overflowed the
+// scratch arrays cannot be judged at all, one with evicted records lost data
+// to the pool ring (a lifetime measurement, not a model failure), and only a
+// clean full comparison lands in exact / args-mismatch.
+bool g_nr_cache = false;
+uint64_t g_nrc_execs = 0;      // scored executions (draw-carrying, depth 1)
+uint64_t g_nrc_exact = 0;      // same length, every (rid,prim,count) pair equal
+uint64_t g_nrc_args = 0;       // same length, some argument differs
+uint64_t g_nrc_short = 0;      // cache held fewer draws than the buffer
+uint64_t g_nrc_long = 0;       // cache held more (re-record the GPU has not run)
+uint64_t g_nrc_empty = 0;      // cache held nothing for the range
+uint64_t g_nrc_torn = 0;       // recording-order inversions (mixed recording)
+uint64_t g_nrc_evicted = 0;    // pool ring overwrote part of the recording
+uint64_t g_nrc_trunc = 0;      // buffer bigger than the scratch arrays
+uint64_t g_nrc_pairs_cmp = 0;  // per-draw pairs compared
+uint64_t g_nrc_pairs_eq = 0;   //   of which equal
+uint64_t g_nrc_prim_ne = 0;    //   primitive-type mismatches
+uint64_t g_nrc_cnt_ne = 0;     //   index-count mismatches
+uint64_t g_nrc_pairs_unk = 0;  //   rid-0 draws: no args exist to compare
+// First few mismatching pairs each window, logged verbatim at report time so a
+// systematic argument-format difference (e.g. prim-count vs index-count) names
+// itself instead of being a rate.
+struct NrcSample {
+  uint32_t buf, i, pkt_prim, pkt_cnt, rec_rid, rec_prim, rec_start, rec_cnt;
+};
+constexpr uint32_t kNrcSamples = 4;
+NrcSample g_nrc_samp[kNrcSamples];
+uint32_t g_nrc_samp_n = 0;
+
+// One executed draw as the buffer itself states it: the VGT_DRAW_INITIATOR
+// dword of a DRAW_INDX packet. prim_type is bits 0..5, num_indices bits
+// 16..31; dma_base is the index-data address when the source is DMA, kept for
+// the mismatch samples.
+struct NrcBufDraw {
+  uint32_t prim;
+  uint32_t indices;
+  uint32_t dma_base;
+};
+// City buffers measure ~350 draws; 4096 leaves an order of magnitude.
+constexpr uint32_t kNrcMaxDraws = 4096;
+
 // Walk a PM4 buffer and count its draw packets, split by opcode: DRAW_INDX
 // (0x22) is what the guest D3D9 recorder emits and therefore what the registry
 // can possibly know about, while DRAW_INDX_2 (0x36) comes from paths that are
@@ -428,6 +486,42 @@ void CountBufferDraws(const uint8_t* raw, uint32_t dwords, uint32_t* out_draw_in
   *out_draw_indx = d1;
   *out_draw_indx2 = d2;
 }
+
+// [NR-CACHE] Walk a PM4 buffer and extract each DRAW_INDX (0x22) packet's
+// arguments, in packet order. Layout per ExecutePacketType3_DRAW_INDX: header,
+// viz-query token, VGT_DRAW_INITIATOR, then VGT_DMA_BASE + VGT_DMA_SIZE when
+// the source select is DMA. DRAW_INDX_2 (0x36) draws come from unhooked paths
+// and are excluded here exactly as they are from the ledger's `draws` count,
+// so the two sequences being compared describe the same packets.
+uint32_t WalkBufferDrawArgs(const uint8_t* raw, uint32_t dwords, NrcBufDraw* out,
+                            uint32_t max_out) {
+  uint32_t n = 0;
+  for (uint32_t j = 0; j < dwords;) {
+    const uint32_t hdr = __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
+    const uint32_t ty = hdr >> 30, cnt = ((hdr >> 16) & 0x3FFF) + 1;
+    if (ty == 3) {
+      const uint32_t op = (hdr >> 8) & 0x7F;
+      if (op == 0x22 && j + 2 < dwords) {
+        if (n >= max_out) return max_out + 1;  // caller counts it truncated
+        const uint32_t init = __builtin_bswap32(*(const uint32_t*)(raw + (j + 2) * 4));
+        out[n].prim = init & 0x3F;
+        out[n].indices = init >> 16;
+        const uint32_t src_sel = (init >> 6) & 0x3;
+        out[n].dma_base =
+            (src_sel == 0 && j + 3 < dwords)
+                ? __builtin_bswap32(*(const uint32_t*)(raw + (j + 3) * 4))
+                : 0;
+        ++n;
+      }
+      j += 1 + cnt;
+    } else if (ty == 0) {
+      j += 1 + cnt;
+    } else {
+      ++j;
+    }
+  }
+  return n;
+}
 }  // namespace
 
 void CommandProcessor::WorkerThreadMain() {
@@ -450,7 +544,11 @@ void CommandProcessor::WorkerThreadMain() {
   // [PM4-CENSUS] independent draw-emission census (no timing; just packet counts).
   const bool kCensus = REXCVAR_GET(gpu_pm4_census);
   g_pm4_census = kCensus;
-  const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger);  // [NR-IBL] record/replay gate
+  // [NR-CACHE] implies the ledger: the exact-sequence scoring lives on the
+  // ledger's per-buffer walk in ExecuteIndirectBuffer.
+  const bool kNrCache = REXCVAR_GET(gpu_nr_cache);
+  g_nr_cache = kNrCache;
+  const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger) || kNrCache;  // [NR-IBL] record/replay gate
   g_ib_ledger = kIbLedger;
   g_pm4_ib_dump = REXCVAR_GET(gpu_pm4_ib_dump);  // [PM4-IB-DUMP] one-shot IB structure dump
   const bool kTimeExec = kProfile || kSplit;  // bracket ExecutePrimaryBuffer when either is on
@@ -667,6 +765,42 @@ void CommandProcessor::WorkerThreadMain() {
             g_reg_split = 0;
             g_reg_draws_registry = g_reg_draws_ledger = 0;
             g_reg_gran_hit = g_reg_gran_miss = 0;
+          }
+          // [NR-CACHE] The exact-sequence verdict. 'exact' is the build-out
+          // bucket: the cached records regenerate the buffer's draw stream
+          // argument-for-argument. Samples name any systematic difference.
+          if (g_nr_cache && g_nrc_execs) {
+            const double pc = 100.0 / double(g_nrc_execs);
+            REXGPU_INFO(
+                "[nr-cache] execs={} exact={:.1f}% args={:.1f}% short={:.1f}% "
+                "long={:.1f}% empty={:.1f}% torn={:.1f}% evicted={:.1f}% trunc={}",
+                g_nrc_execs, g_nrc_exact * pc, g_nrc_args * pc, g_nrc_short * pc,
+                g_nrc_long * pc, g_nrc_empty * pc, g_nrc_torn * pc,
+                g_nrc_evicted * pc, g_nrc_trunc);
+            const nr::CacheStats& cs = nr::GetCacheStats();
+            const uint64_t known = g_nrc_pairs_cmp - g_nrc_pairs_unk;
+            REXGPU_INFO(
+                "[nr-cache]   pairs cmp={} eq={:.2f}% prim_ne={} cnt_ne={} "
+                "rid0={} | pool recorded={} resets={} collisions={}",
+                g_nrc_pairs_cmp,
+                known ? 100.0 * double(g_nrc_pairs_eq) / double(known) : 0.0,
+                g_nrc_prim_ne, g_nrc_cnt_ne, g_nrc_pairs_unk, cs.recorded,
+                cs.granule_resets, cs.collisions);
+            for (uint32_t s = 0; s < g_nrc_samp_n; ++s) {
+              const NrcSample& sm = g_nrc_samp[s];
+              REXGPU_INFO(
+                  "[nr-cache]   MISMATCH buf={:08X} draw[{}] pkt(prim={} n={}) "
+                  "rec(rid={} prim={} start={} n={})",
+                  sm.buf, sm.i, sm.pkt_prim, sm.pkt_cnt, sm.rec_rid,
+                  sm.rec_prim, sm.rec_start, sm.rec_cnt);
+            }
+            nr::ResetCacheStats();
+            g_nrc_execs = g_nrc_exact = g_nrc_args = g_nrc_short = 0;
+            g_nrc_long = g_nrc_empty = g_nrc_torn = g_nrc_evicted = 0;
+            g_nrc_trunc = 0;
+            g_nrc_pairs_cmp = g_nrc_pairs_eq = g_nrc_prim_ne = g_nrc_cnt_ne = 0;
+            g_nrc_pairs_unk = 0;
+            g_nrc_samp_n = 0;
           }
           // Clear for the next window. Addresses are re-walked when they
           // reappear, which is what keeps a stale draw count from surviving a
@@ -1228,6 +1362,71 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
             ++g_reg_r_over;
           } else {
             ++g_reg_r_one;
+          }
+        }
+        // [NR-CACHE] Exact-sequence comparison. Depth-1 only: the scratch
+        // arrays are function-local statics on the one CP thread, and a
+        // nested indirect buffer would reuse them mid-comparison.
+        if (g_nr_cache && truth && g_pm4_ib_depth == 1) {
+          static NrcBufDraw s_buf[kNrcMaxDraws];
+          static nr::DrawRecord s_rec[kNrcMaxDraws];
+          const uint32_t nbuf = WalkBufferDrawArgs(
+              memory_->TranslatePhysical(ptr), count, s_buf, kNrcMaxDraws);
+          const nr::CacheQueryResult cq =
+              nr::QueryDraws(ptr, count * 4, s_rec, kNrcMaxDraws);
+          ++g_nrc_execs;
+          if (nbuf > kNrcMaxDraws || cq.truncated) {
+            ++g_nrc_trunc;
+          } else if (cq.evicted) {
+            ++g_nrc_evicted;
+          } else if (cq.n == 0) {
+            ++g_nrc_empty;
+          } else {
+            // Compare the overlap pairwise even when the lengths differ; the
+            // pair rates stay meaningful (a pure tail difference leaves them
+            // at 100%) and the length difference picks the bucket.
+            const uint32_t ncmp = nbuf < cq.n ? nbuf : cq.n;
+            uint32_t ne = 0;
+            for (uint32_t i = 0; i < ncmp; ++i) {
+              // rid 0 (sub_821375A0) draws entirely from device state and
+              // takes no draw arguments; there is nothing to compare, and
+              // counting it as a mismatch would misread the hook layer.
+              if (s_rec[i].rid == 0) {
+                ++g_nrc_pairs_unk;
+                continue;
+              }
+              const bool prim_eq = (s_rec[i].prim & 0x3F) == s_buf[i].prim;
+              const bool cnt_eq = s_rec[i].count == s_buf[i].indices;
+              if (prim_eq && cnt_eq) {
+                ++g_nrc_pairs_eq;
+              } else {
+                ++ne;
+                if (!prim_eq) ++g_nrc_prim_ne;
+                if (!cnt_eq) ++g_nrc_cnt_ne;
+                if (g_nrc_samp_n < kNrcSamples) {
+                  g_nrc_samp[g_nrc_samp_n++] = {ptr,
+                                                i,
+                                                s_buf[i].prim,
+                                                s_buf[i].indices,
+                                                s_rec[i].rid,
+                                                s_rec[i].prim,
+                                                s_rec[i].start,
+                                                s_rec[i].count};
+                }
+              }
+            }
+            g_nrc_pairs_cmp += ncmp;
+            if (cq.seq_inversions) {
+              ++g_nrc_torn;
+            } else if (cq.n < nbuf) {
+              ++g_nrc_short;
+            } else if (cq.n > nbuf) {
+              ++g_nrc_long;
+            } else if (ne == 0) {
+              ++g_nrc_exact;
+            } else {
+              ++g_nrc_args;
+            }
           }
         }
       }
