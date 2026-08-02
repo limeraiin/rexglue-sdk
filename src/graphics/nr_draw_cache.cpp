@@ -92,6 +92,19 @@ CacheQueryResult QueryDraws(uint32_t phys_addr, uint32_t bytes, DrawRecord* out,
   return r;
 }
 
+uint32_t TrimStaleFront(DrawRecord* recs, uint32_t n) {
+  if (n < 2) return n;
+  uint32_t first = n - 1;
+  while (first > 0 && recs[first - 1].seq + 1 == recs[first].seq) {
+    --first;
+  }
+  if (first) {
+    for (uint32_t i = first; i < n; ++i) recs[i - first] = recs[i];
+    n -= first;
+  }
+  return n;
+}
+
 const CacheStats& GetCacheStats() { return g_stats; }
 
 void ResetCacheStats() { g_stats = CacheStats{}; }

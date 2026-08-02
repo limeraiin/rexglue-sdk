@@ -1386,26 +1386,12 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           } else if (cq.n == 0) {
             ++g_nrc_empty;
           } else {
-            // [NR-CACHE] Trim stale-epoch survivors (the first increment-2
-            // mechanism, living where the renderer will need it). A recording
-            // pass is one forward sweep by a single writer, so its records
-            // are CONSECUTIVE in seq walking the range tail backwards; a
-            // record in front that breaks the run is a survivor of an older
-            // layout, left in a granule the new pass wrote only state into
-            // (draw-event-keyed invalidation cannot reset those). Measured:
-            // menu buffers read "long, args=0" -- perfect current-pass match
-            // plus a stale front -- before this trim existed.
-            uint32_t first = cq.n - 1;
-            while (first > 0 && s_rec[first - 1].seq + 1 == s_rec[first].seq) {
-              --first;
-            }
-            if (first) {
-              g_nrc_trimmed += first;
-              for (uint32_t i = first; i < cq.n; ++i) {
-                s_rec[i - first] = s_rec[i];
-              }
-              cq.n -= first;
-            }
+            // [NR-CACHE] Trim stale-epoch survivors -- the snapshot admission
+            // rule, implemented in the cache library (see TrimStaleFront's
+            // rationale in nr_draw_cache.h).
+            const uint32_t kept = nr::TrimStaleFront(s_rec, cq.n);
+            g_nrc_trimmed += cq.n - kept;
+            cq.n = kept;
             // Compare the overlap pairwise even when the lengths differ; the
             // pair rates stay meaningful (a pure tail difference leaves them
             // at 100%) and the length difference picks the bucket.

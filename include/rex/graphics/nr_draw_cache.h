@@ -84,6 +84,18 @@ struct CacheQueryResult {
 CacheQueryResult QueryDraws(uint32_t phys_addr, uint32_t bytes,
                             DrawRecord* out, uint32_t max_out);
 
+// Drop stale-epoch survivors from the front of a query result, in place, and
+// return the new count. The current recording pass wrote its draws in one
+// forward sweep by a single writer, so its records are CONSECUTIVE in seq
+// walking the range's tail backwards; a record in front that breaks the run
+// belongs to an older layout, surviving in a granule the new pass wrote only
+// state into -- no draw header lands there, so draw-event-keyed invalidation
+// cannot reset it, and its seq rises, so the torn detector rightly stays
+// quiet. Measured live before this existed: menu buffers read "long, args=0",
+// a perfect current-pass match plus a stale front. This is the snapshot
+// admission rule the renderer's per-buffer cache uses.
+uint32_t TrimStaleFront(DrawRecord* recs, uint32_t n);
+
 struct CacheStats {
   uint64_t recorded;        // draws stored since the last reset
   uint64_t granule_resets;  // invalidations (recorder entering a granule)
