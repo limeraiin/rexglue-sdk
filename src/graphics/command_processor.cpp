@@ -27,6 +27,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/nr_buffer_cache.h>
+#include <rex/graphics/nr_context.h>
 #include <rex/graphics/nr_draw_cache.h>
 #include <rex/graphics/nr_state_walk.h>
 #include <rex/graphics/nr_draw_registry.h>
@@ -128,6 +129,19 @@ REXCVAR_DEFINE_BOOL(gpu_nr_state, false, "GPU",
                     "Diagnostic [nr-state]: register/opcode census + RT/resolve/"
                     "viewport context recovery over executed indirect buffers. "
                     "Needs nr_record_map; implies gpu_nr_cache. Off by default.");
+
+// [NR-CTX] Increment 4a: the RUNNING state context (nr_context.h). The city
+// census (increment 3) proved buffers inherit recovery state from ring order
+// (rt_set 19%, mode_inh 40%), so the replay carries a persistent mirror of
+// the recovery register set + active shaders across buffers in execution
+// order. This probe builds exactly that context, measures per-draw context
+// completeness WITH carry, attributes carry vs in-buffer state, censuses the
+// live shader working set, and validates the mirror against the live
+// register file at every buffer entry (the ground-truth divergence gate).
+REXCVAR_DEFINE_BOOL(gpu_nr_ctx, false, "GPU",
+                    "Diagnostic [nr-ctx]: carried state context across executed "
+                    "indirect buffers, with register-file ground-truth validation. "
+                    "Implies gpu_nr_cache. Off by default.");
 
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
                     "Write the ring-buffer read pointer back to the guest incrementally "
@@ -519,6 +533,68 @@ struct NrsOtherReg {
 NrsOtherReg g_nrs_other[16] = {};
 uint8_t g_nrs_flags[kNrbMaxPkts];
 
+// [NR-CTX] Increment-4a state: the running context itself (CP-thread-only,
+// like everything else here) plus the window counters. The context is NOT
+// reset per window -- it is the persistent thing being measured.
+bool g_nr_ctx = false;
+nr::StateContext g_ctx_state;
+uint16_t g_ctx_flags[kNrbMaxPkts];
+uint64_t g_ctx_execs = 0;   // depth-1 buffers walked into the context
+uint64_t g_ctx_depth2 = 0;  // nested executions NOT walked (hole if nonzero)
+uint64_t g_ctx_draws = 0;
+uint64_t g_ctx_rt_def = 0, g_ctx_vp_def = 0, g_ctx_mode_def = 0,
+         g_ctx_sh_def = 0;
+uint64_t g_ctx_full = 0;  // all four groups defined at the draw
+uint64_t g_ctx_copy = 0;  // draws under EFFECTIVE kCopy (carry included)
+uint64_t g_ctx_rt_carry = 0, g_ctx_vp_carry = 0, g_ctx_mode_carry = 0,
+         g_ctx_sh_carry = 0;
+uint64_t g_ctx_flags_ovf = 0;
+uint64_t g_ctx_checks = 0, g_ctx_diverge = 0;
+uint64_t g_ctx_mem_loads = 0, g_ctx_poisoned = 0;
+uint64_t g_ctx_im_loads = 0, g_ctx_im_imms = 0;
+// Divergence attribution: which mirrored registers disagree with the live
+// register file at buffer entry, plus verbatim first samples.
+struct CtxDivReg {
+  uint32_t reg;
+  uint64_t count;
+};
+CtxDivReg g_ctx_div_top[8] = {};
+struct CtxDivSample {
+  uint32_t reg, ours, live, buf;
+};
+constexpr uint32_t kCtxDivSamples = 4;
+CtxDivSample g_ctx_div_samp[kCtxDivSamples];
+uint32_t g_ctx_div_samp_n = 0;
+// Distinct shaders this window: open-addressed set keyed on (addr, size,
+// immediate). Sizes increment 4b's live translation cache (offline corpus
+// caps the honest answer at 3,320 unique).
+constexpr uint32_t kCtxShaderSetSize = 4096;  // power of two
+uint64_t g_ctx_shader_set[kCtxShaderSetSize];
+uint64_t g_ctx_sh_distinct = 0, g_ctx_sh_set_ovf = 0;
+
+void CtxShaderSeen(void*, const nr::ShaderRef& ref) {
+  uint64_t key = (uint64_t(ref.addr) << 17) ^ (uint64_t(ref.size_dwords) << 1) ^
+                 (ref.immediate ? 1u : 0u);
+  if (!key) key = 1;
+  uint32_t i = uint32_t((key * 2654435761ull) >> 16) & (kCtxShaderSetSize - 1);
+  for (uint32_t probe = 0; probe < 16; ++probe) {
+    uint64_t& slot = g_ctx_shader_set[(i + probe) & (kCtxShaderSetSize - 1)];
+    if (slot == key) return;
+    if (!slot) {
+      slot = key;
+      ++g_ctx_sh_distinct;
+      return;
+    }
+  }
+  ++g_ctx_sh_set_ovf;
+}
+
+uint32_t CtxMemRead(void* user, uint32_t phys) {
+  auto* mem = static_cast<memory::Memory*>(user);
+  return __builtin_bswap32(
+      *reinterpret_cast<const uint32_t*>(mem->TranslatePhysical(phys)));
+}
+
 // Walk a PM4 buffer and count its draw packets, split by opcode: DRAW_INDX
 // (0x22) is what the guest D3D9 recorder emits and therefore what the registry
 // can possibly know about, while DRAW_INDX_2 (0x36) comes from paths that are
@@ -574,7 +650,9 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_bufcache = kNrBuf;
   const bool kNrState = REXCVAR_GET(gpu_nr_state);
   g_nr_state = kNrState;
-  const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState;
+  const bool kNrCtx = REXCVAR_GET(gpu_nr_ctx);
+  g_nr_ctx = kNrCtx;
+  const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState || kNrCtx;
   g_nr_cache = kNrCache;
   const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger) || kNrCache;  // [NR-IBL] record/replay gate
   g_ib_ledger = kIbLedger;
@@ -928,6 +1006,65 @@ void CommandProcessor::WorkerThreadMain() {
             for (uint32_t op = 0; op < 128; ++op) g_nrs_ops[op] = 0;
             g_nrs_miss_copy = g_nrs_miss_inherited = g_nrs_miss_plain = 0;
             for (auto& o : g_nrs_other) o = NrsOtherReg{};
+          }
+          // [NR-CTX] The carried-context verdict. def%: with carry, how many
+          // draws have each recovery group fully established (bar: near 100%
+          // once past the first frames -- anything else means a state source
+          // this stream cannot see). diverge: mirrored regs disagreeing with
+          // the live register file at buffer entry (bar ~0; nonzero = state
+          // arrives outside depth-1 IBs, and the reg names itself). carry%:
+          // draws depending on cross-buffer carry (menu ~0, city high --
+          // increment 3's inheritance, now resolved instead of just counted).
+          if (g_nr_ctx && g_ctx_execs) {
+            const double dp = g_ctx_draws ? 100.0 / double(g_ctx_draws) : 0.0;
+            REXGPU_INFO(
+                "[nr-ctx] execs={} draws={} | def rt={:.1f}% vp={:.1f}% "
+                "mode={:.1f}% sh={:.1f}% full={:.1f}% | copy={} | carry "
+                "rt={:.1f}% vp={:.1f}% mode={:.1f}% sh={:.1f}%",
+                g_ctx_execs, g_ctx_draws, g_ctx_rt_def * dp, g_ctx_vp_def * dp,
+                g_ctx_mode_def * dp, g_ctx_sh_def * dp, g_ctx_full * dp,
+                g_ctx_copy, g_ctx_rt_carry * dp, g_ctx_vp_carry * dp,
+                g_ctx_mode_carry * dp, g_ctx_sh_carry * dp);
+            REXGPU_INFO(
+                "[nr-ctx]   validate checks={} diverge={} | shaders im={} "
+                "imm={} distinct={} set_ovf={} | mem_ld={} poison={} depth2={} "
+                "ovf={}",
+                g_ctx_checks, g_ctx_diverge, g_ctx_im_loads, g_ctx_im_imms,
+                g_ctx_sh_distinct, g_ctx_sh_set_ovf, g_ctx_mem_loads,
+                g_ctx_poisoned, g_ctx_depth2, g_ctx_flags_ovf);
+            if (g_ctx_diverge) {
+              char dv[160];
+              int n = 0;
+              for (const auto& d : g_ctx_div_top) {
+                if (!d.count) break;
+                n += snprintf(dv + n, sizeof(dv) - n, " %04X=%llu", d.reg,
+                              (unsigned long long)d.count);
+                if (n >= int(sizeof(dv)) - 16) break;
+              }
+              REXGPU_INFO("[nr-ctx]   diverge regs:{}", n ? dv : " none");
+              for (uint32_t s = 0; s < g_ctx_div_samp_n; ++s) {
+                const CtxDivSample& sm = g_ctx_div_samp[s];
+                REXGPU_INFO(
+                    "[nr-ctx]   DIVERGE buf={:08X} reg={:04X} ctx={:08X} "
+                    "live={:08X}",
+                    sm.buf, sm.reg, sm.ours, sm.live);
+              }
+            }
+            g_ctx_execs = g_ctx_depth2 = g_ctx_draws = 0;
+            g_ctx_rt_def = g_ctx_vp_def = g_ctx_mode_def = g_ctx_sh_def = 0;
+            g_ctx_full = g_ctx_copy = 0;
+            g_ctx_rt_carry = g_ctx_vp_carry = g_ctx_mode_carry = 0;
+            g_ctx_sh_carry = 0;
+            g_ctx_checks = g_ctx_diverge = 0;
+            g_ctx_mem_loads = g_ctx_poisoned = 0;
+            g_ctx_im_loads = g_ctx_im_imms = 0;
+            g_ctx_flags_ovf = 0;
+            for (auto& d : g_ctx_div_top) d = CtxDivReg{};
+            g_ctx_div_samp_n = 0;
+            for (uint32_t i = 0; i < kCtxShaderSetSize; ++i) {
+              g_ctx_shader_set[i] = 0;
+            }
+            g_ctx_sh_distinct = g_ctx_sh_set_ovf = 0;
           }
           // Clear for the next window. Addresses are re-walked when they
           // reappear, which is what keeps a stale draw count from surviving a
@@ -1412,6 +1549,75 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // -> ExecutePacketType3) will see g_pm4_ib_depth > 0 and count as "indirect".
   ++g_pm4_ib_depth;
   if (g_pm4_census) { ++g_pm4_ib_count; g_pm4_ib_dwords += count; }
+
+  // [NR-CTX] Increment 4a: update the RUNNING state context, in execution
+  // order, for EVERY top-level buffer -- state-only buffers carry state the
+  // next buffer's draws depend on, so this cannot ride the ledger's
+  // draw-carrying filter. It runs BEFORE the buffer's packets execute, so
+  // the live register file still holds the carried (pre-buffer) state:
+  // comparing every defined mirrored slot against it is the ground-truth
+  // check that recovery state only ever arrives through this stream. Nested
+  // indirect buffers are skipped and counted; a nonzero count names a
+  // context hole instead of absorbing it.
+  if (g_nr_ctx) {
+    if (g_pm4_ib_depth != 1) {
+      ++g_ctx_depth2;
+    } else {
+      for (uint32_t s = 0; s < nr::kCtxRegCount; ++s) {
+        if (!g_ctx_state.defined[s]) continue;
+        ++g_ctx_checks;
+        const uint32_t reg = nr::CtxSlotReg(s);
+        const uint32_t live = register_file_->values[reg];
+        if (live != g_ctx_state.values[s]) {
+          ++g_ctx_diverge;
+          for (auto& d : g_ctx_div_top) {
+            if (d.count && d.reg == reg) {
+              ++d.count;
+              break;
+            }
+            if (!d.count) {
+              d.reg = reg;
+              d.count = 1;
+              break;
+            }
+          }
+          if (g_ctx_div_samp_n < kCtxDivSamples) {
+            g_ctx_div_samp[g_ctx_div_samp_n++] = {reg, g_ctx_state.values[s],
+                                                  live, ptr};
+          }
+        }
+      }
+      nr::CtxWalkStats cst;
+      const uint32_t nf = nr::WalkBufferContext(
+          memory_->TranslatePhysical(ptr), count, ptr, &g_ctx_state,
+          g_ctx_flags, kNrbMaxPkts, &cst, CtxMemRead, memory_, CtxShaderSeen,
+          nullptr);
+      ++g_ctx_execs;
+      if (cst.draws22 > nf) ++g_ctx_flags_ovf;
+      g_ctx_mem_loads += cst.mem_loads;
+      g_ctx_poisoned += cst.mem_poisoned;
+      g_ctx_im_loads += cst.im_loads;
+      g_ctx_im_imms += cst.im_load_imms;
+      g_ctx_draws += nf;
+      for (uint32_t i = 0; i < nf; ++i) {
+        const uint16_t f = g_ctx_flags[i];
+        const bool rt = f & nr::kCtxDrawRtDef;
+        const bool vp = f & nr::kCtxDrawVportDef;
+        const bool md = f & nr::kCtxDrawModeDef;
+        const bool sh = f & nr::kCtxDrawShadersDef;
+        if (rt) ++g_ctx_rt_def;
+        if (vp) ++g_ctx_vp_def;
+        if (md) ++g_ctx_mode_def;
+        if (sh) ++g_ctx_sh_def;
+        if (rt && vp && md && sh) ++g_ctx_full;
+        if (f & nr::kCtxDrawCopy) ++g_ctx_copy;
+        if (f & nr::kCtxDrawRtCarried) ++g_ctx_rt_carry;
+        if (f & nr::kCtxDrawVportCarried) ++g_ctx_vp_carry;
+        if (f & nr::kCtxDrawModeCarried) ++g_ctx_mode_carry;
+        if (f & nr::kCtxDrawShadersCarried) ++g_ctx_sh_carry;
+      }
+    }
+  }
 
   // [NR-IBL] record this execution against the buffer's address.
   if (g_ib_ledger) {
