@@ -578,6 +578,14 @@ uint64_t g_ctx_sh_distinct = 0, g_ctx_sh_set_ovf = 0;
 // path that bypasses the command processor entirely (e.g. guest MMIO).
 uint64_t g_ctx_ext_ring = 0, g_ctx_ext_nested = 0;
 CtxDivReg g_ctx_ext_top[8] = {};
+// [NR-RING] REG_RMW (0x21) and COND_WRITE (0x45) write registers through
+// WriteRegister but are NOT decoded by the context walker -- inside a
+// depth-1 buffer they are a walker blind spot (the 4a "outside the stream"
+// diverge signature fits them exactly: too rare to crack the increment-3
+// top-ops list). The handlers tag their WriteRegister calls so the tap can
+// capture and attribute them at EVERY depth.
+bool g_nr_in_rmw = false, g_nr_in_cond = false;
+uint64_t g_ctx_ext_rmw = 0, g_ctx_ext_cond = 0;
 
 void CtxShaderSeen(void*, const nr::ShaderRef& ref) {
   uint64_t key = (uint64_t(ref.addr) << 17) ^ (uint64_t(ref.size_dwords) << 1) ^
@@ -603,13 +611,19 @@ uint32_t CtxMemRead(void* user, uint32_t phys) {
 }
 
 // [NR-RING] Called from CommandProcessor::WriteRegister (CP thread, same as
-// every other g_ctx_* touch) for writes at depth != 1 landing in the 0x2xxx
-// probe window. Depth-1 writes are excluded at the call site: the entry walk
-// already applied them to the context ahead of execution, and re-applying
-// here would mask a walker decode bug the diverge check exists to catch.
+// every other g_ctx_* touch) for writes landing in the 0x2xxx probe window
+// at depth != 1, PLUS depth-1 writes issued by the tagged blind-spot ops
+// (REG_RMW / COND_WRITE, which the walker does not decode). Plain depth-1
+// writes stay excluded: the entry walk already applied them ahead of
+// execution, and re-applying here would mask a walker decode bug the
+// diverge check exists to catch.
 void NrCtxExternalWrite(uint32_t reg, uint32_t value) {
   if (nr::CtxApplyExternalWrite(&g_ctx_state, reg, value) < 0) return;
-  if (g_pm4_ib_depth) {
+  if (g_nr_in_rmw) {
+    ++g_ctx_ext_rmw;
+  } else if (g_nr_in_cond) {
+    ++g_ctx_ext_cond;
+  } else if (g_pm4_ib_depth) {
     ++g_ctx_ext_nested;
   } else {
     ++g_ctx_ext_ring;
@@ -1064,8 +1078,10 @@ void CommandProcessor::WorkerThreadMain() {
                 g_ctx_checks, g_ctx_diverge, g_ctx_im_loads, g_ctx_im_imms,
                 g_ctx_sh_distinct, g_ctx_sh_set_ovf, g_ctx_mem_loads,
                 g_ctx_poisoned, g_ctx_depth2, g_ctx_flags_ovf);
-            // [NR-RING] What the observer captured out-of-stream this window.
-            if (g_ctx_ext_ring || g_ctx_ext_nested) {
+            // [NR-RING] What the observer captured out-of-stream (ring /
+            // nested) or through the walker's blind-spot ops (rmw / cond).
+            if (g_ctx_ext_ring || g_ctx_ext_nested || g_ctx_ext_rmw ||
+                g_ctx_ext_cond) {
               char ex[160];
               int n = 0;
               for (const auto& d : g_ctx_ext_top) {
@@ -1074,9 +1090,11 @@ void CommandProcessor::WorkerThreadMain() {
                               (unsigned long long)d.count);
                 if (n >= int(sizeof(ex)) - 16) break;
               }
-              REXGPU_INFO("[nr-ctx]   ring obs: ring={} nested={} regs:{}",
-                          g_ctx_ext_ring, g_ctx_ext_nested,
-                          n ? ex : " none");
+              REXGPU_INFO(
+                  "[nr-ctx]   ring obs: ring={} nested={} rmw={} cond={} "
+                  "regs:{}",
+                  g_ctx_ext_ring, g_ctx_ext_nested, g_ctx_ext_rmw,
+                  g_ctx_ext_cond, n ? ex : " none");
             }
             if (g_ctx_diverge) {
               char dv[160];
@@ -1108,6 +1126,7 @@ void CommandProcessor::WorkerThreadMain() {
             for (auto& d : g_ctx_div_top) d = CtxDivReg{};
             g_ctx_div_samp_n = 0;
             g_ctx_ext_ring = g_ctx_ext_nested = 0;
+            g_ctx_ext_rmw = g_ctx_ext_cond = 0;
             for (auto& d : g_ctx_ext_top) d = CtxDivReg{};
             for (uint32_t i = 0; i < kCtxShaderSetSize; ++i) {
               g_ctx_shader_set[i] = 0;
@@ -1253,7 +1272,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // depth 0 = primary ring, depth >= 2 = nested IB. Depth-1 writes were
   // already applied ahead of execution by the entry walk. Cost when the
   // probe is off: one predictable branch on a bool.
-  if (g_nr_ctx && g_pm4_ib_depth != 1 && index - 0x2000u <= 0x321u) {
+  if (g_nr_ctx && index - 0x2000u <= 0x321u &&
+      (g_pm4_ib_depth != 1 || g_nr_in_rmw || g_nr_in_cond)) {
     NrCtxExternalWrite(index, value);
   }
   // [PERF] GetRegisterInfo() is a ~20k-case switch, and WriteRegister sits on
@@ -2540,7 +2560,11 @@ bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, ui
     // | imm
     value |= or_mask;
   }
+  // [NR-RING] Tag this write so the context tap can attribute it: the
+  // walker does not decode REG_RMW, so at depth 1 this is its blind spot.
+  if (g_nr_ctx) g_nr_in_rmw = true;
   WriteRegister(rmw_info & 0x1FFF, value);
+  g_nr_in_rmw = false;
   return true;
 }
 
@@ -2639,7 +2663,11 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
     } else {
       // Register.
+      // [NR-RING] Tag: COND_WRITE register writes are the walker's other
+      // blind-spot op (see REG_RMW).
+      if (g_nr_ctx) g_nr_in_cond = true;
       WriteRegister(write_reg_addr, write_data);
+      g_nr_in_cond = false;
     }
   }
   return true;
