@@ -154,6 +154,17 @@ uint32_t WalkBufferContext(const uint8_t* raw, uint32_t dwords,
                            void* mem_user, CtxShaderFn shader_fn = nullptr,
                            void* shader_user = nullptr);
 
+// [NR-RING] Increment 4b-0: the ring-side observer's apply. The 4a city
+// verdict proved exactly 4 recovery registers arrive OUTSIDE the depth-1 IB
+// stream (per-frame swap state: PA_SC_WINDOW_OFFSET/SCISSOR_TL/BR +
+// RB_COPY_DEST_BASE); the consumer taps those writes at the command
+// processor's WriteRegister and applies them here. Sets value + defined for a
+// mirrored register but NOT in_buffer -- an out-of-stream value is by
+// definition not established by any buffer, so draws depending on it
+// truthfully read as carried. Returns the slot, or -1 if `reg` is not
+// mirrored (nothing written).
+int32_t CtxApplyExternalWrite(StateContext* ctx, uint32_t reg, uint32_t value);
+
 }  // namespace nr
 }  // namespace graphics
 }  // namespace rex

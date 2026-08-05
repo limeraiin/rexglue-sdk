@@ -571,6 +571,13 @@ uint32_t g_ctx_div_samp_n = 0;
 constexpr uint32_t kCtxShaderSetSize = 4096;  // power of two
 uint64_t g_ctx_shader_set[kCtxShaderSetSize];
 uint64_t g_ctx_sh_distinct = 0, g_ctx_sh_set_ovf = 0;
+// [NR-RING] Increment 4b-0: out-of-stream writes captured into the context
+// by the WriteRegister tap, split by where they came from (depth 0 = primary
+// ring, depth >= 2 = nested IB), plus which registers. With the tap, the
+// walk+observer pair must drive `diverge` to ~0; any residual names a write
+// path that bypasses the command processor entirely (e.g. guest MMIO).
+uint64_t g_ctx_ext_ring = 0, g_ctx_ext_nested = 0;
+CtxDivReg g_ctx_ext_top[8] = {};
 
 void CtxShaderSeen(void*, const nr::ShaderRef& ref) {
   uint64_t key = (uint64_t(ref.addr) << 17) ^ (uint64_t(ref.size_dwords) << 1) ^
@@ -593,6 +600,31 @@ uint32_t CtxMemRead(void* user, uint32_t phys) {
   auto* mem = static_cast<memory::Memory*>(user);
   return __builtin_bswap32(
       *reinterpret_cast<const uint32_t*>(mem->TranslatePhysical(phys)));
+}
+
+// [NR-RING] Called from CommandProcessor::WriteRegister (CP thread, same as
+// every other g_ctx_* touch) for writes at depth != 1 landing in the 0x2xxx
+// probe window. Depth-1 writes are excluded at the call site: the entry walk
+// already applied them to the context ahead of execution, and re-applying
+// here would mask a walker decode bug the diverge check exists to catch.
+void NrCtxExternalWrite(uint32_t reg, uint32_t value) {
+  if (nr::CtxApplyExternalWrite(&g_ctx_state, reg, value) < 0) return;
+  if (g_pm4_ib_depth) {
+    ++g_ctx_ext_nested;
+  } else {
+    ++g_ctx_ext_ring;
+  }
+  for (auto& d : g_ctx_ext_top) {
+    if (d.count && d.reg == reg) {
+      ++d.count;
+      break;
+    }
+    if (!d.count) {
+      d.reg = reg;
+      d.count = 1;
+      break;
+    }
+  }
 }
 
 // Walk a PM4 buffer and count its draw packets, split by opcode: DRAW_INDX
@@ -1032,6 +1064,20 @@ void CommandProcessor::WorkerThreadMain() {
                 g_ctx_checks, g_ctx_diverge, g_ctx_im_loads, g_ctx_im_imms,
                 g_ctx_sh_distinct, g_ctx_sh_set_ovf, g_ctx_mem_loads,
                 g_ctx_poisoned, g_ctx_depth2, g_ctx_flags_ovf);
+            // [NR-RING] What the observer captured out-of-stream this window.
+            if (g_ctx_ext_ring || g_ctx_ext_nested) {
+              char ex[160];
+              int n = 0;
+              for (const auto& d : g_ctx_ext_top) {
+                if (!d.count) break;
+                n += snprintf(ex + n, sizeof(ex) - n, " %04X=%llu", d.reg,
+                              (unsigned long long)d.count);
+                if (n >= int(sizeof(ex)) - 16) break;
+              }
+              REXGPU_INFO("[nr-ctx]   ring obs: ring={} nested={} regs:{}",
+                          g_ctx_ext_ring, g_ctx_ext_nested,
+                          n ? ex : " none");
+            }
             if (g_ctx_diverge) {
               char dv[160];
               int n = 0;
@@ -1061,6 +1107,8 @@ void CommandProcessor::WorkerThreadMain() {
             g_ctx_flags_ovf = 0;
             for (auto& d : g_ctx_div_top) d = CtxDivReg{};
             g_ctx_div_samp_n = 0;
+            g_ctx_ext_ring = g_ctx_ext_nested = 0;
+            for (auto& d : g_ctx_ext_top) d = CtxDivReg{};
             for (uint32_t i = 0; i < kCtxShaderSetSize; ++i) {
               g_ctx_shader_set[i] = 0;
             }
@@ -1197,6 +1245,17 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+
+  // [NR-RING] Increment 4b-0: the ring observer. The 4a city verdict proved
+  // per-frame swap state (PA_SC_WINDOW_OFFSET/SCISSOR_TL/BR +
+  // RB_COPY_DEST_BASE) is written OUTSIDE the depth-1 IB stream, so the
+  // running context also captures out-of-stream writes to its mirrored regs:
+  // depth 0 = primary ring, depth >= 2 = nested IB. Depth-1 writes were
+  // already applied ahead of execution by the entry walk. Cost when the
+  // probe is off: one predictable branch on a bool.
+  if (g_nr_ctx && g_pm4_ib_depth != 1 && index - 0x2000u <= 0x321u) {
+    NrCtxExternalWrite(index, value);
+  }
   // [PERF] GetRegisterInfo() is a ~20k-case switch, and WriteRegister sits on
   // the command-processor hot path (~1-2M calls/sec). Its only use here is to
   // gate an unknown-register DEBUG log that is off during normal play, so only

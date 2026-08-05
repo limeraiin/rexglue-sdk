@@ -93,6 +93,17 @@ CtxGroup CtxSlotGroup(uint32_t slot) {
   return kCtxGroupCount;
 }
 
+int32_t CtxApplyExternalWrite(StateContext* ctx, uint32_t reg,
+                              uint32_t value) {
+  const int32_t s = CtxSlot(reg);
+  if (s < 0) return -1;
+  ctx->values[s] = value;
+  ctx->defined[s] = 1;
+  // Deliberately NOT in_buffer: the value did not come from the buffer
+  // stream, so carry attribution must keep counting draws that depend on it.
+  return s;
+}
+
 uint32_t WalkBufferContext(const uint8_t* raw, uint32_t dwords,
                            uint32_t buffer_phys, StateContext* ctx,
                            uint16_t* draw_flags, uint32_t max_draws,
