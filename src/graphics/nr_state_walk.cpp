@@ -129,6 +129,14 @@ uint32_t WalkBufferState(const uint8_t* raw, uint32_t dwords,
 
   for (uint32_t j = 0; j < dwords;) {
     const uint32_t hdr = BE32(raw, j);
+    // A zero dword is a one-dword no-op (ExecutePacket tests `packet == 0`
+    // before the type field). Decoding it as type-0 consumes two dwords and
+    // desyncs the rest of the walk -- see nr_context.cpp's header.
+    if (!hdr) {
+      ++out->type2_pkts;
+      ++j;
+      continue;
+    }
     const uint32_t ty = hdr >> 30;
     if (ty == 0) {
       ++out->type0_pkts;

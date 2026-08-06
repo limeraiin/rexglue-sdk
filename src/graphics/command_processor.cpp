@@ -587,6 +587,59 @@ CtxDivReg g_ctx_ext_top[8] = {};
 bool g_nr_in_rmw = false, g_nr_in_cond = false;
 uint64_t g_ctx_ext_rmw = 0, g_ctx_ext_cond = 0;
 
+// [NR-WSAMP] Increment 4b-1: the write sampler. 4b-0 eliminated every
+// out-of-stream write path (the tap fired zero times while diverge held at
+// ~480/s) and its samples showed the context holding IMPOSSIBLE values where
+// the live file held plausible ones -- so the walker itself was writing them.
+// This pairs a walker-side sampler (which packet produced each write to a
+// watched register) with an executor-side twin on the same registers (which
+// PM4 opcode produced it downstream): one frame of both, diffed, names the
+// misdecoded bytes. The watch set is the 4a divergence signature.
+constexpr uint32_t kNrWatchRegs[] = {0x2080, 0x2081, 0x2082, 0x2319};
+inline bool NrWatched(uint32_t reg) {
+  for (uint32_t r : kNrWatchRegs) {
+    if (r == reg) return true;
+  }
+  return false;
+}
+struct NrWalkSample {
+  uint32_t buf, dw, hdr, arg, reg, value;
+};
+struct NrExecSample {
+  uint32_t pkt, depth, reg, value;
+};
+constexpr uint32_t kNrSampleMax = 8;
+NrWalkSample g_nr_wsamp[kNrSampleMax];
+NrExecSample g_nr_esamp[kNrSampleMax];
+uint32_t g_nr_wsamp_n = 0, g_nr_esamp_n = 0;
+uint64_t g_nr_wsamp_tot = 0, g_nr_esamp_tot = 0;
+uint64_t g_ctx_nop0 = 0, g_ctx_sc2 = 0;
+// [NR-TILE] Predicated tiling: packets (and draws) the bin check rejected,
+// and SET_BIN_* packets found INSIDE buffers. Naruto draws 720p as three
+// EDRAM tiles, replaying the same buffer once per bin.
+uint64_t g_ctx_pred = 0, g_ctx_pred_draws = 0, g_ctx_bin_pkts = 0;
+uint64_t g_ctx_pred_draws_run = 0;
+// Packet the executor is currently running, so a sampled write names its
+// source: 0x100 | type for types 0-2, 0x200 | opcode for type 3.
+uint32_t g_nr_cur_pkt = 0;
+uint32_t g_nr_walk_buf = 0;  // buffer being walked, for the walker samples
+
+void NrCtxWatch(void*, uint32_t reg, uint32_t value, uint32_t dw, uint32_t hdr,
+                uint32_t arg) {
+  if (!NrWatched(reg)) return;
+  ++g_nr_wsamp_tot;
+  if (g_nr_wsamp_n < kNrSampleMax) {
+    g_nr_wsamp[g_nr_wsamp_n++] = {g_nr_walk_buf, dw, hdr, arg, reg, value};
+  }
+}
+
+void NrExecWatch(uint32_t reg, uint32_t value) {
+  ++g_nr_esamp_tot;
+  if (g_nr_esamp_n < kNrSampleMax) {
+    g_nr_esamp[g_nr_esamp_n++] = {g_nr_cur_pkt, g_pm4_ib_depth, reg, value};
+  }
+}
+
 void CtxShaderSeen(void*, const nr::ShaderRef& ref) {
   uint64_t key = (uint64_t(ref.addr) << 17) ^ (uint64_t(ref.size_dwords) << 1) ^
                  (ref.immediate ? 1u : 0u);
@@ -647,13 +700,29 @@ void NrCtxExternalWrite(uint32_t reg, uint32_t value) {
 // not hooked. Keeping them apart stops the unhooked draw type from reading as a
 // failed gate. Guest memory is big-endian.
 void CountBufferDraws(const uint8_t* raw, uint32_t dwords, uint32_t* out_draw_indx,
-                      uint32_t* out_draw_indx2) {
+                      uint32_t* out_draw_indx2, uint64_t bin_select,
+                      uint64_t bin_mask) {
   uint32_t d1 = 0, d2 = 0;
+  // [NR-TILE] Count what this pass EXECUTES: predicated packets the bin check
+  // rejects are skipped, exactly as the command processor skips them.
+  nr::CtxBinState bin{bin_select, bin_mask};
   for (uint32_t j = 0; j < dwords;) {
     const uint32_t hdr = __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
+    if (!hdr) {  // one-dword no-op, per ExecutePacket; NOT a type-0 packet
+      ++j;
+      continue;
+    }
     const uint32_t ty = hdr >> 30, cnt = ((hdr >> 16) & 0x3FFF) + 1;
     if (ty == 3) {
       const uint32_t op = (hdr >> 8) & 0x7F;
+      if (nr::CtxPredicatedOut(bin, hdr)) {
+        j += 1 + cnt;
+        continue;
+      }
+      nr::CtxApplyBinPacket(
+          &bin, op,
+          (j + 1 < dwords) ? __builtin_bswap32(*(const uint32_t*)(raw + (j + 1) * 4)) : 0,
+          (j + 2 < dwords) ? __builtin_bswap32(*(const uint32_t*)(raw + (j + 2) * 4)) : 0);
       if (op == 0x22) ++d1;
       else if (op == 0x36) ++d2;
       j += 1 + cnt;
@@ -1096,6 +1165,35 @@ void CommandProcessor::WorkerThreadMain() {
                   g_ctx_ext_ring, g_ctx_ext_nested, g_ctx_ext_rmw,
                   g_ctx_ext_cond, n ? ex : " none");
             }
+            // [NR-WSAMP] The one-frame diff: what the WALK wrote into the
+            // watched registers (with the packet bytes it decoded them from)
+            // against what the EXECUTOR wrote into the same registers
+            // downstream. Equal streams mean the walk mirrors execution;
+            // walker-only writes with impossible values name a misdecode, and
+            // executor-only writes name an opcode the walk does not handle.
+            if (g_nr_wsamp_tot || g_nr_esamp_tot || g_ctx_nop0 || g_ctx_sc2 ||
+                g_ctx_pred) {
+              REXGPU_INFO(
+                  "[nr-ctx]   wsamp: walk={} exec={} | nop0={} setconst2={} | "
+                  "pred_skip={} pred_draws={}/{} bin_pkts={}",
+                  g_nr_wsamp_tot, g_nr_esamp_tot, g_ctx_nop0, g_ctx_sc2,
+                  g_ctx_pred, g_ctx_pred_draws, g_ctx_pred_draws_run,
+                  g_ctx_bin_pkts);
+              for (uint32_t s = 0; s < g_nr_wsamp_n; ++s) {
+                const NrWalkSample& w = g_nr_wsamp[s];
+                REXGPU_INFO(
+                    "[nr-ctx]   WSAMP buf={:08X} dw={} hdr={:08X} arg={:08X} "
+                    "reg={:04X} val={:08X}",
+                    w.buf, w.dw, w.hdr, w.arg, w.reg, w.value);
+              }
+              for (uint32_t s = 0; s < g_nr_esamp_n; ++s) {
+                const NrExecSample& e = g_nr_esamp[s];
+                REXGPU_INFO(
+                    "[nr-ctx]   ESAMP pkt={:03X} depth={} reg={:04X} "
+                    "val={:08X}",
+                    e.pkt, e.depth, e.reg, e.value);
+              }
+            }
             if (g_ctx_diverge) {
               char dv[160];
               int n = 0;
@@ -1127,6 +1225,11 @@ void CommandProcessor::WorkerThreadMain() {
             g_ctx_div_samp_n = 0;
             g_ctx_ext_ring = g_ctx_ext_nested = 0;
             g_ctx_ext_rmw = g_ctx_ext_cond = 0;
+            g_nr_wsamp_n = g_nr_esamp_n = 0;
+            g_nr_wsamp_tot = g_nr_esamp_tot = 0;
+            g_ctx_nop0 = g_ctx_sc2 = 0;
+            g_ctx_pred = g_ctx_pred_draws = g_ctx_bin_pkts = 0;
+            g_ctx_pred_draws_run = 0;
             for (auto& d : g_ctx_ext_top) d = CtxDivReg{};
             for (uint32_t i = 0; i < kCtxShaderSetSize; ++i) {
               g_ctx_shader_set[i] = 0;
@@ -1272,9 +1375,14 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // depth 0 = primary ring, depth >= 2 = nested IB. Depth-1 writes were
   // already applied ahead of execution by the entry walk. Cost when the
   // probe is off: one predictable branch on a bool.
-  if (g_nr_ctx && index - 0x2000u <= 0x321u &&
-      (g_pm4_ib_depth != 1 || g_nr_in_rmw || g_nr_in_cond)) {
-    NrCtxExternalWrite(index, value);
+  if (g_nr_ctx && index - 0x2000u <= 0x321u) {
+    // [NR-WSAMP] executor-side twin: every write to a watched register, at
+    // EVERY depth and from every opcode, purely observed (no context
+    // mutation, so the diverge check it exists to explain stays intact).
+    if (NrWatched(index)) NrExecWatch(index, value);
+    if (g_pm4_ib_depth != 1 || g_nr_in_rmw || g_nr_in_cond) {
+      NrCtxExternalWrite(index, value);
+    }
   }
   // [PERF] GetRegisterInfo() is a ~20k-case switch, and WriteRegister sits on
   // the command-processor hot path (~1-2M calls/sec). Its only use here is to
@@ -1667,11 +1775,18 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         }
       }
       nr::CtxWalkStats cst;
+      g_nr_walk_buf = ptr;
       const uint32_t nf = nr::WalkBufferContext(
           memory_->TranslatePhysical(ptr), count, ptr, &g_ctx_state,
           g_ctx_flags, kNrbMaxPkts, &cst, CtxMemRead, memory_, CtxShaderSeen,
-          nullptr);
+          nullptr, NrCtxWatch, nullptr, bin_select_, bin_mask_);
       ++g_ctx_execs;
+      g_ctx_nop0 += cst.nop0;
+      g_ctx_sc2 += cst.set_const2;
+      g_ctx_pred += cst.pred_skipped;
+      g_ctx_pred_draws += cst.pred_draws;
+      g_ctx_pred_draws_run += cst.pred_draws_run;
+      g_ctx_bin_pkts += cst.bin_pkts;
       if (cst.draws22 > nf) ++g_ctx_flags_ovf;
       g_ctx_mem_loads += cst.mem_loads;
       g_ctx_poisoned += cst.mem_poisoned;
@@ -1713,7 +1828,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         c->draws2 = 0;
         c->reg = 0;
         CountBufferDraws(memory_->TranslatePhysical(ptr), count, &c->draws,
-                         &c->draws2);
+                         &c->draws2, bin_select_, bin_mask_);
         ++g_ib_ledger_used;
         e = c;
         break;
@@ -1747,7 +1862,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         uint32_t truth = e->draws, truth2 = e->draws2;
         if (sum != truth) {
           CountBufferDraws(memory_->TranslatePhysical(ptr), count, &truth,
-                           &truth2);
+                           &truth2, bin_select_, bin_mask_);
           e->draws = truth;
           e->draws2 = truth2;
         }
@@ -1793,12 +1908,32 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
               g_nr_bufcache ? nr::SumRangeEpoch(ptr, count * 4) : 0;
           uint32_t npkt = 0;
           bool ovf = false;
+          // [NR-TILE] The join list is what a replay would execute, so it
+          // obeys the same predicate + bin rules the executor does: a
+          // predicated-out draw never runs and must not be listed.
+          nr::CtxBinState join_bin{bin_select_, bin_mask_};
           for (uint32_t j = 0; j < count;) {
             const uint32_t hdr =
                 __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
+            if (!hdr) {  // one-dword no-op, per ExecutePacket
+              ++j;
+              continue;
+            }
             const uint32_t ty = hdr >> 30, cnt = ((hdr >> 16) & 0x3FFF) + 1;
             if (ty == 3) {
               const uint32_t op = (hdr >> 8) & 0x7F;
+              if (nr::CtxPredicatedOut(join_bin, hdr)) {
+                j += 1 + cnt;
+                continue;
+              }
+              nr::CtxApplyBinPacket(
+                  &join_bin, op,
+                  (j + 1 < count) ? __builtin_bswap32(
+                                        *(const uint32_t*)(raw + (j + 1) * 4))
+                                  : 0,
+                  (j + 2 < count) ? __builtin_bswap32(
+                                        *(const uint32_t*)(raw + (j + 2) * 4))
+                                  : 0);
               if (op == 0x22 && j + 2 < count) {
                 if (npkt >= kNrbMaxPkts) {
                   ovf = true;
@@ -2074,6 +2209,12 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
 
   if (packet == 0xCDCDCDCD) {
     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+  }
+
+  // [NR-WSAMP] name the packet a sampled register write came from.
+  if (g_nr_ctx) {
+    g_nr_cur_pkt = packet_type == 3 ? (0x200u | ((packet >> 8) & 0x7F))
+                                    : (0x100u | packet_type);
   }
 
   if (!g_exec_prof) {
