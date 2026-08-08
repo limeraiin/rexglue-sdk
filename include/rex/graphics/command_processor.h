@@ -326,21 +326,24 @@ class CommandProcessor {
   Shader* precord_replay_active_vertex_shader_ = nullptr;
   Shader* precord_replay_active_pixel_shader_ = nullptr;
 
-  // [NR-ISSUE] Increment 4d: the arm/disarm handshake between the base
+  // [NR-ISSUE] Increment 4d/4e: the arm/disarm handshake between the base
   // executor and the backend's IssueDraw. At a lockstep draw stop the base
-  // composes the 4c shadow with the live file (RegShadowCompose), resolves the
-  // walk's own shader refs through LoadShader, and arms; the backend copies
-  // nr_issue_values_ into a private RegisterFile, repoints every draw-path
-  // holder at it (the proven precord SetRegisterFile machinery), issues, and
-  // restores. The base disarms unconditionally right after IssueDraw returns.
-  // All on the CP thread; unsupported alongside precord capture (backend falls
-  // through to the normal path and counts it).
+  // points nr_issue_file_ at ITS OWN persistent RegisterFile -- seeded once by
+  // composing the 4c shadow with the live file (RegShadowCompose), then
+  // maintained INCREMENTALLY by the walk's decoded writes (increment 4e; the
+  // 4d per-draw recompose cost the city 4x its fps and a real replay applies
+  // writes as they decode anyway) -- resolves the walk's own shader refs
+  // through LoadShader, and arms. The backend repoints every draw-path holder
+  // at that file (the proven precord SetRegisterFile machinery), issues, and
+  // restores; no copy at either end. The base disarms unconditionally right
+  // after IssueDraw returns. All on the CP thread; unsupported alongside
+  // precord capture (backend falls through to the normal path and counts it).
   //
   // The shader fields have their own gate rather than riding the precord
   // replay fields: those belong to the precord worker's lifecycle, and sharing
   // them would make two default-off features corrupt each other when combined.
   bool nr_issue_armed_ = false;
-  const uint32_t* nr_issue_values_ = nullptr;  // RegisterFile::kRegisterCount
+  const RegisterFile* nr_issue_file_ = nullptr;
   bool nr_issue_shaders_active_ = false;
   Shader* nr_issue_vertex_shader_ = nullptr;
   Shader* nr_issue_pixel_shader_ = nullptr;

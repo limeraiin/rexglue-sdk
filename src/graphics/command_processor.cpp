@@ -928,15 +928,36 @@ int64_t g_nri_from = 0;
 int64_t g_nri_count = -1;
 uint64_t g_nri_ordinal = 0;      // lockstep geometry stops since boot (cumulative)
 uint64_t g_nri_armed = 0;        // window: draws armed for the backend
-uint64_t g_nri_copy_live = 0;    // window: kCopy draws left on the live path
-                                 // (IssueCopy is not repointed by 1b-1a)
+uint64_t g_nri_copy_armed = 0;   // window: kCopy draws (resolves) armed --
+                                 // shadow-issued like everything else since
+                                 // 4f, split out so the report keeps naming
+                                 // the resolve population
 uint64_t g_nri_sh_invalid = 0;   // window: walk shader refs not yet valid
 uint64_t g_nri_sh_mismatch = 0;  // window: walk-resolved shader != live active
                                  // (issued from the walk's anyway -- that IS
                                  // the recovered path; nonzero names a 4b-2
                                  // tracking hole)
-// The composed file the backend copies from. Static rather than stack: 80 KB.
-uint32_t g_nri_compose[RegisterFile::kRegisterCount];
+// [NR-ISSUE] Increment 4e: THE REPLAY REGISTER FILE -- the persistent file
+// draws are issued from, maintained INCREMENTALLY. 4d rebuilt it per draw
+// (RegShadowCompose over 20,483 registers + an 82 KB copy into the backend's
+// private file, per draw, on the Ch.9 bottleneck thread) and the city paid
+// 4x its fps for that (naruto_318: ~7.8 vs 30.1). A replay never needs the
+// rebuild: the walk already decodes every write in execution order, so the
+// file is seeded ONCE (compose: shadow values where the stream has written,
+// live elsewhere) and each decoded write is applied as it happens. The six
+// registers the stream never carries (4 externs + 2 ports, the 4c closure)
+// are refreshed from live at each arm -- "read it once", performed per draw
+// because it is six loads, not a policy.
+RegisterFile g_nri_file;
+bool g_nri_seeded = false;
+constexpr uint32_t kNriNonStreamRegs[] = {
+    0x0081,  // SCLK_PWRMGT_CNTL2_REG   extern, power
+    0x01C5,  // CP_RB_WPTR              extern, ring bookkeeping
+    0x0A31,  // COHER_STATUS_HOST       sfx port (coherency handshake)
+    0x0D00,  // SQ_GPR_MANAGEMENT       extern, THE draw-state init constant
+    0x1922,  // DC_LUT_RW_INDEX         sfx port (gamma write cursor)
+    0x21F9,  // VGT_EVENT_INITIATOR     extern, event trigger
+};
 
 // Applies whatever is left of the buffer and folds the walk's per-draw flags
 // and stats into the window counters. Called at buffer entry when the shadow
@@ -1011,6 +1032,12 @@ void NrWalkRegWrite(void*, uint32_t reg, uint32_t value, bool from_memory) {
   }
   if (g_nr_draw) {
     nr::RegShadowApplyWrite(&g_reg_shadow, &g_reg_stats, reg, value);
+  }
+  // [NR-ISSUE] Increment 4e: the replay file takes every decoded write as it
+  // happens (execution order -- the walk is in lockstep). Same range rule as
+  // the shadow: out-of-range is dropped, never clamped onto a real register.
+  if (g_nr_issue && g_nri_seeded && reg < RegisterFile::kRegisterCount) {
+    g_nri_file.values[reg] = value;
   }
 }
 
@@ -1287,6 +1314,9 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_issue = kNrIssue;
   g_nri_from = REXCVAR_GET(gpu_nr_issue_from);
   g_nri_count = REXCVAR_GET(gpu_nr_issue_count);
+  // [NR-ISSUE] Increment 4e: while issue is off the replay file receives no
+  // writes, so a later enable must reseed rather than trust a stale file.
+  if (!kNrIssue) g_nri_seeded = false;
   // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
   const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue;
   g_nr_draw = kNrDraw;
@@ -2014,13 +2044,14 @@ void CommandProcessor::WorkerThreadMain() {
         // tracking has a hole.
         if (kNrIssue && (g_nri_ordinal || g_nri_armed)) {
           REXGPU_INFO(
-              "[nr-issue] issued={} armed={} copy_live={} sh_invalid={} "
+              "[nr-issue] issued={} armed={} copy_armed={} sh_invalid={} "
               "sh_mismatch={} precord_skip={} ordinal={}",
-              nr_issue_issued_, g_nri_armed, g_nri_copy_live, g_nri_sh_invalid,
-              g_nri_sh_mismatch, nr_issue_precord_skips_, g_nri_ordinal);
+              nr_issue_issued_, g_nri_armed, g_nri_copy_armed,
+              g_nri_sh_invalid, g_nri_sh_mismatch, nr_issue_precord_skips_,
+              g_nri_ordinal);
           nr_issue_issued_ = 0;
           nr_issue_precord_skips_ = 0;
-          g_nri_armed = g_nri_copy_live = 0;
+          g_nri_armed = g_nri_copy_armed = 0;
           g_nri_sh_invalid = g_nri_sh_mismatch = 0;
         }
         prof_last_report = now;
@@ -3830,11 +3861,13 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
           nr::RegShadowSweep(&g_reg_shadow, &g_reg_stats, kNrdSweepPerDraw,
                              register_file_->values, NrdFinding, nullptr);
           // [NR-ISSUE] Increment 4d: arm this draw to be issued from the
-          // shadow. Copy-mode draws stay on the live path (they route to
-          // IssueCopy, which 1b-1a never decoupled), as do draws whose walk
-          // shader refs are not yet valid (boot moments before carry is
-          // established): a partially recovered issue would blur what an A/B
-          // mismatch means.
+          // shadow. Increment 4f: copy-mode draws (resolves) arm too --
+          // IssueCopy's state reads now honor the active draw file (the one
+          // stray direct read fixed; RenderTargetCache::Resolve always read
+          // the repointed member) -- counted apart so the report still splits
+          // geometry from resolves. Draws whose walk shader refs are not yet
+          // valid (boot moments before carry is established) stay live: a
+          // partially recovered issue would blur what an A/B mismatch means.
           if (g_nr_issue) {
             const uint64_t ord = g_nri_ordinal++;
             if (ord >= uint64_t(g_nri_from) &&
@@ -3842,8 +3875,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
                  ord < uint64_t(g_nri_from) + uint64_t(g_nri_count))) {
               if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode ==
                   xenos::EdramMode::kCopy) {
-                ++g_nri_copy_live;
-              } else if (!g_ctx_state.vs.valid || !g_ctx_state.ps.valid) {
+                ++g_nri_copy_armed;
+              }
+              if (!g_ctx_state.vs.valid || !g_ctx_state.ps.valid) {
                 ++g_nri_sh_invalid;
               } else {
                 // Resolve the walk's own shader refs exactly as IM_LOAD does.
@@ -3865,9 +3899,20 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
                     ps != active_pixel_shader_) {
                   ++g_nri_sh_mismatch;
                 }
-                nr::RegShadowCompose(&g_reg_shadow, register_file_->values,
-                                     g_nri_compose);
-                nr_issue_values_ = g_nri_compose;
+                // [NR-ISSUE] Increment 4e: seed the replay file ONCE (the
+                // shadow already holds every stream write up to this stop, so
+                // the compose loses nothing to the pre-seed window), then
+                // rely on the incremental applies. Per arm, only the six
+                // non-stream registers are re-read from live.
+                if (!g_nri_seeded) {
+                  nr::RegShadowCompose(&g_reg_shadow, register_file_->values,
+                                       g_nri_file.values);
+                  g_nri_seeded = true;
+                }
+                for (uint32_t r : kNriNonStreamRegs) {
+                  g_nri_file.values[r] = register_file_->values[r];
+                }
+                nr_issue_file_ = &g_nri_file;
                 nr_issue_vertex_shader_ = vs;
                 nr_issue_pixel_shader_ = ps;
                 nr_issue_shaders_active_ = true;
@@ -3889,7 +3934,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       if (nr_issue_armed_ || nr_issue_shaders_active_) {
         nr_issue_armed_ = false;
         nr_issue_shaders_active_ = false;
-        nr_issue_values_ = nullptr;
+        nr_issue_file_ = nullptr;
         nr_issue_vertex_shader_ = nullptr;
         nr_issue_pixel_shader_ = nullptr;
       }

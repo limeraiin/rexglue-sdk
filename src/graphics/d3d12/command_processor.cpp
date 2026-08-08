@@ -3079,20 +3079,17 @@ bool D3D12CommandProcessor::NrIssueDrawFromShadow(xenos::PrimitiveType primitive
                                                   uint32_t index_count,
                                                   IndexBufferInfo* index_buffer_info,
                                                   bool major_mode_explicit) {
-  // [NR-ISSUE] Increment 4d: one draw, issued end to end from walk-recovered
-  // state. The repoint/restore pair is PrecordReplayLocal's, proven
-  // pixel-identical by the 1b-1b A/B; the file's contents are the difference:
-  // the 4c shadow's decoded values on every register the stream has written,
-  // live's on the rest (the four named externs, the two ports, dead registers
-  // -- RegShadowCompose in the base). Everything runs inline on the CP thread,
-  // between two packets of the same draw, so no other reader can observe the
-  // repointed holders.
-  if (!nr_issue_regfile_) {
-    nr_issue_regfile_ = std::make_unique<RegisterFile>();
-  }
-  RegisterFile* local = nr_issue_regfile_.get();
-  std::memcpy(local->values, nr_issue_values_,
-              RegisterFile::kRegisterCount * sizeof(uint32_t));
+  // [NR-ISSUE] Increment 4d/4e: one draw, issued end to end from
+  // walk-recovered state. The repoint/restore pair is PrecordReplayLocal's,
+  // proven pixel-identical by the 1b-1b A/B; the file's contents are the
+  // difference: the 4c shadow's decoded values on every register the stream
+  // has written, live's on the rest (the four named externs, the two ports,
+  // dead registers). 4e: the file is the base's PERSISTENT replay file,
+  // maintained incrementally by the walk -- no copy at either end (4d's
+  // per-draw 82 KB copy + full compose cost the city 4x its fps). Everything
+  // runs inline on the CP thread, between two packets of the same draw, so no
+  // other reader can observe the repointed holders.
+  const RegisterFile* local = nr_issue_file_;
 
   RegisterFile* shared = register_file_;
   active_draw_register_file_ = local;
@@ -4135,7 +4132,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
-    reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+    // [NR-ISSUE] Increment 4f: through the active draw file, not the shared
+    // one -- a shadow-issued resolve must read ITS state here too (the rest
+    // of the resolve path already does: RenderTargetCache::Resolve reads the
+    // repointed member).
+    reg::RB_COPY_DEST_INFO copy_dest_info =
+        GetActiveDrawRegisterFile().Get<reg::RB_COPY_DEST_INFO>();
     const FormatInfo* format_info = FormatInfo::Get(uint32_t(copy_dest_info.copy_dest_format));
     uint32_t bits_per_pixel = format_info->bits_per_pixel;
     if (bits_per_pixel != 8 && bits_per_pixel != 16 && bits_per_pixel != 32 &&
