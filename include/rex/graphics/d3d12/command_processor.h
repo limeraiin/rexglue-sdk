@@ -357,14 +357,36 @@ class D3D12CommandProcessor : public CommandProcessor {
                      IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
   // [NR-ISSUE] Increment 4d/4e: issue one draw from the replay register file
   // the base executor armed (nr_issue_file_ -- persistent, walk-maintained;
-  // no copy). Repoints every draw-path holder at it (the proven 1b-1a/1b-1b
-  // SetRegisterFile machinery), runs IssueDrawImpl, restores. The active
-  // shaders come from the walk via the base's nr_issue_* accessor gate. No
-  // ForceFullDrawStateReemit: this is the SAME draw at the SAME moment, so the
-  // deferred list's dirty tracking stays valid whether or not the values match
-  // (dirty state compares against internal shadows, not the register file).
+  // no copy). Builds the NrDrawInput record and hands it to NrSubmitDraw.
   bool NrIssueDrawFromShadow(xenos::PrimitiveType primitive_type, uint32_t index_count,
                              IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
+
+  // [NR-NATIVE] Phase 5-0: THE NATIVE DRAW SEAM. One record carrying
+  // everything a draw is made of, all of it proven recoverable by increments
+  // 4a-4f: the replay register file, the walk-resolved shaders, and the
+  // executor's own draw arguments. The phase-5 ladder swaps the internals of
+  // NrSubmitDraw -- state mirror (5-1), shader cache (5-2), native
+  // submission subsystem by subsystem (5-3) -- without the executor or the
+  // arming handshake changing shape again.
+  struct NrDrawInput {
+    const RegisterFile* regs;  // the replay file (never null when armed)
+    Shader* vertex_shader;     // walk-resolved via LoadShader
+    Shader* pixel_shader;
+    xenos::PrimitiveType primitive_type;
+    uint32_t index_count;
+    IndexBufferInfo* index_buffer_info;  // null = auto-index draw
+    bool major_mode_explicit;
+  };
+  // Phase 5-0 body: delegate to the emulated pipeline -- repoint every
+  // draw-path holder at input.regs (the proven 1b-1a/1b-1b SetRegisterFile
+  // machinery), run IssueDrawImpl, restore. The active shaders reach
+  // IssueDrawImpl via the base's nr_issue_* accessor gate (set for the whole
+  // armed call); the record carries them explicitly for the native path. No
+  // ForceFullDrawStateReemit: this is the SAME draw at the SAME moment, so
+  // the deferred list's dirty tracking stays valid whether or not the values
+  // match (dirty state compares against internal shadows, not the register
+  // file).
+  bool NrSubmitDraw(const NrDrawInput& input);
   // Replay the pending captured segment into the current deferred command list,
   // in original write/draw order, then clear it. No-op if no segment is open or
   // already replaying (reentrancy guard). Dispatches to the shared-rewind (1b-0),

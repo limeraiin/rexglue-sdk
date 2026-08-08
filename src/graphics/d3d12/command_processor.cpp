@@ -3079,6 +3079,21 @@ bool D3D12CommandProcessor::NrIssueDrawFromShadow(xenos::PrimitiveType primitive
                                                   uint32_t index_count,
                                                   IndexBufferInfo* index_buffer_info,
                                                   bool major_mode_explicit) {
+  // [NR-NATIVE] Phase 5-0: build the seam record. The accessors return the
+  // walk-resolved shaders here (the base's nr_issue_* gate is set for the
+  // whole armed call).
+  NrDrawInput input;
+  input.regs = nr_issue_file_;
+  input.vertex_shader = active_vertex_shader();
+  input.pixel_shader = active_pixel_shader();
+  input.primitive_type = primitive_type;
+  input.index_count = index_count;
+  input.index_buffer_info = index_buffer_info;
+  input.major_mode_explicit = major_mode_explicit;
+  return NrSubmitDraw(input);
+}
+
+bool D3D12CommandProcessor::NrSubmitDraw(const NrDrawInput& input) {
   // [NR-ISSUE] Increment 4d/4e: one draw, issued end to end from
   // walk-recovered state. The repoint/restore pair is PrecordReplayLocal's,
   // proven pixel-identical by the 1b-1b A/B; the file's contents are the
@@ -3089,7 +3104,10 @@ bool D3D12CommandProcessor::NrIssueDrawFromShadow(xenos::PrimitiveType primitive
   // per-draw 82 KB copy + full compose cost the city 4x its fps). Everything
   // runs inline on the CP thread, between two packets of the same draw, so no
   // other reader can observe the repointed holders.
-  const RegisterFile* local = nr_issue_file_;
+  // [NR-NATIVE] Phase 5-0: this body IS the delegate path. The 5-x ladder
+  // replaces it piecewise (state mirror, shader cache, native submission),
+  // reading input.regs directly instead of repointing the emulated holders.
+  const RegisterFile* local = input.regs;
 
   RegisterFile* shared = register_file_;
   active_draw_register_file_ = local;
@@ -3098,8 +3116,8 @@ bool D3D12CommandProcessor::NrIssueDrawFromShadow(xenos::PrimitiveType primitive
   texture_cache_->SetRegisterFile(local);
   pipeline_cache_->SetRegisterFile(local);
 
-  const bool draw_succeeded =
-      IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  const bool draw_succeeded = IssueDrawImpl(input.primitive_type, input.index_count,
+                                            input.index_buffer_info, input.major_mode_explicit);
 
   active_draw_register_file_ = nullptr;
   primitive_processor_->SetRegisterFile(shared);
