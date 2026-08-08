@@ -37,6 +37,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/dxbc.h>
 #include <rex/graphics/nr_pipeline_state.h>
+#include <rex/graphics/nr_shader_cache.h>
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
@@ -79,6 +80,25 @@ REXCVAR_DEFINE_BOOL(gpu_nr_pso, false, "GPU",
                     "the draw's register file with the native renderer's own "
                     "mapping and compare it against the emulated pipeline "
                     "cache's, per draw. Off by default.");
+
+// [NR-SC] Phase 5-2: the shader half of a native pipeline. Our own cache,
+// keyed on {stage, ucode hash, modification}, translating with the SDK's
+// DxbcShaderTranslator from a Shader we build out of the ucode dwords alone.
+// The gate is byte equality with the emulated pipeline cache's binary for the
+// same key, checked once per key; the deliverable alongside it is the hit rate
+// and the first-sighting latency at city load.
+REXCVAR_DEFINE_BOOL(gpu_nr_shadercache, false, "GPU",
+                    "Diagnostic [nr-sc]: translate each draw's shaders through "
+                    "the native renderer's own ucode->DXBC cache and byte-"
+                    "compare the result against the emulated pipeline cache's. "
+                    "Off by default.");
+REXCVAR_DEFINE_UINT32(gpu_nr_shadercache_entries, 8192, "GPU",
+                      "[nr-sc] Maximum number of distinct {stage, ucode, modification} keys the "
+                      "native shader cache holds. Beyond it, keys are refused and counted, never "
+                      "evicted.");
+REXCVAR_DEFINE_UINT32(gpu_nr_shadercache_mb, 256, "GPU",
+                      "[nr-sc] Budget in megabytes for the translated shader binaries the native "
+                      "shader cache holds.");
 
 namespace rex::graphics::d3d12 {
 
@@ -1019,6 +1039,14 @@ bool PipelineCache::ConfigurePipeline(
                bound_depth_and_color_render_target_formats, description);
   }
 
+  // [NR-SC] Phase 5-2: the other half of the pipeline, asked for at the same
+  // moment. The modification is only decided a few lines above this, and it is
+  // half of the shader's identity, so this is where a native renderer would
+  // ask its cache for the two blobs.
+  if (REXCVAR_GET(gpu_nr_shadercache)) {
+    NrShaderCacheCheck(vertex_shader, pixel_shader);
+  }
+
   if (current_pipeline_ != nullptr && !std::memcmp(&current_pipeline_->description.description,
                                                    &description, sizeof(description))) {
     *pipeline_handle_out = current_pipeline_;
@@ -1502,6 +1530,146 @@ void PipelineCache::NrPsoReportIfDue() {
   p.mismatch = p.pad_diff = p.dc_mismatch = p.cm_mismatch = 0;
   // The field tallies are NOT cleared: the named first-differing field is the
   // deliverable of this increment, and a mismatch seen once stays named.
+}
+
+// [NR-SC] Phase 5-2: the shader cache. Same thread rule as [NR-PSO] above --
+// ConfigurePipeline runs on exactly one thread, so the counter that does not
+// live in the cache module is a plain static here.
+namespace {
+// Their translation exists but is marked ignored. Nothing to compare against,
+// and the emulated path drops the draw too; counted so it is never silent.
+uint64_t g_nr_sc_theirs_invalid = 0;
+}  // namespace
+
+bool PipelineCache::NrShaderTranslate(void* ctx, uint32_t stage, uint64_t ucode_hash,
+                                      const uint32_t* ucode_dwords, uint32_t ucode_dword_count,
+                                      uint64_t modification, std::vector<uint8_t>* dxbc_out) {
+  PipelineCache* self = static_cast<PipelineCache*>(ctx);
+  // A Shader built from the ucode and nothing else: no storage index, no
+  // binding layout UIDs, no D3D12Shader subclass. That is the point -- if this
+  // produces the same bytes, the native renderer needs only what the walk
+  // already recovers.
+  //
+  // The dwords arrive in HOST order, because they come from
+  // Shader::ucode_data(), which the Shader constructor already swapped out of
+  // the guest's big endian. Passing the default (big) here would swap a second
+  // time and translate garbage that still "succeeds" -- the trap recorded in
+  // tools/xeshader-census.cpp, which cost that census its first set of numbers.
+  Shader shader(stage == nr::kNrShaderStagePixel ? xenos::ShaderType::kPixel
+                                                 : xenos::ShaderType::kVertex,
+                ucode_hash, ucode_dwords, ucode_dword_count, std::endian::native);
+  self->nr_ucode_disasm_buffer_.Reset();
+  shader.AnalyzeUcode(self->nr_ucode_disasm_buffer_);
+  Shader::Translation* translation = shader.GetOrCreateTranslation(modification);
+  if (!translation) {
+    return false;
+  }
+  if (!self->nr_shader_translator_->TranslateAnalyzedShader(*translation) ||
+      !translation->is_valid()) {
+    return false;
+  }
+  *dxbc_out = translation->translated_binary();
+  return true;
+}
+
+void PipelineCache::NrShaderCacheCheck(const D3D12Shader::D3D12Translation* vertex_shader,
+                                       const D3D12Shader::D3D12Translation* pixel_shader) {
+  if (!nr_shader_translator_) {
+    // Constructed with the same parameters as the emulated translator: those
+    // parameters are part of the translation's identity (vendor workarounds,
+    // ROV, gamma handling, resolution scale), so a native renderer that got
+    // them wrong would produce different, still-valid DXBC. Getting them from
+    // the same two objects is deliberate -- what is being tested here is the
+    // cache and the ucode path, not the choice of translator options.
+    const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+    const bool edram_rov_used =
+        render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+    nr_shader_translator_ = std::make_unique<DxbcShaderTranslator>(
+        provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
+        !render_target_cache_.gamma_render_target_as_unorm16(),
+        render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
+        render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
+    // Reset as well as configure: the cache is a process global and holds the
+    // owning pointer of whichever PipelineCache configured it, so a device
+    // reset that builds a new one must not leave the old one's entries behind.
+    nr::NrShaderCacheConfigure(&PipelineCache::NrShaderTranslate, this,
+                               REXCVAR_GET(gpu_nr_shadercache_entries),
+                               uint64_t(REXCVAR_GET(gpu_nr_shadercache_mb)) << 20);
+    nr::NrShaderCacheReset();
+    g_nr_sc_theirs_invalid = 0;
+  }
+  NrShaderCacheCheckOne(vertex_shader, nr::kNrShaderStageVertex);
+  if (pixel_shader) {
+    NrShaderCacheCheckOne(pixel_shader, nr::kNrShaderStagePixel);
+  }
+}
+
+void PipelineCache::NrShaderCacheCheckOne(const D3D12Shader::D3D12Translation* translation,
+                                          uint32_t stage) {
+  const Shader& shader = translation->shader();
+  nr::NrShaderEntry* ours =
+      nr::NrShaderCacheLookup(stage, shader.ucode_data_hash(), shader.ucode_data().data(),
+                              uint32_t(shader.ucode_dword_count()), translation->modification());
+  if (!ours || ours->verified) {
+    return;
+  }
+  if (!translation->is_translated()) {
+    // Async compilation: their binary does not exist yet. Left unverified so a
+    // later draw with the same key settles it.
+    nr::NrShaderCacheVerify(ours, nullptr, 0);
+    return;
+  }
+  if (!translation->is_valid()) {
+    ++g_nr_sc_theirs_invalid;
+    return;
+  }
+  const std::vector<uint8_t>& theirs = translation->translated_binary();
+  nr::NrShaderCacheVerify(ours, theirs.data(), uint64_t(theirs.size()));
+}
+
+void PipelineCache::NrShaderCacheReportIfDue() {
+  if (!REXCVAR_GET(gpu_nr_shadercache)) {
+    return;
+  }
+  static auto last_report = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_report < std::chrono::seconds(1)) {
+    return;
+  }
+  last_report = now;
+  const nr::NrShaderCacheStats& st = nr::NrShaderCacheGetStats();
+  if (!st.lookups) {
+    return;
+  }
+  // `keys` is the cache's real population: distinct {stage, ucode,
+  // modification} triples. `ucodes` is how many distinct shader programs those
+  // came from, and `mods_max` is the largest number of keys any one of them
+  // produced -- the number that decides whether an offline corpus translation
+  // is possible, because the .sdb supplies ucode and says nothing about
+  // modifications.
+  REXGPU_INFO(
+      "[nr-sc] lookups={} hit={:.2f}% miss={} refused={} invalid_hits={} | "
+      "keys={} ucodes={} vs={}/{} ps={}/{} mods_max={} ({:016X}) | "
+      "translate ok={} fail={} avg={}us max={}us ({:016X}) dxbc={:.1f}MB | "
+      "verify checked={} agreed={} bytes_ne={} size_ne={} valid_ne={} pending={} "
+      "theirs_invalid={} ovf={}",
+      st.lookups, st.lookups ? 100.0 * double(st.hits) / double(st.lookups) : 0.0, st.misses,
+      st.refused, st.invalid_hits, st.entries, st.ucodes, st.vs_entries, st.vs_ucodes,
+      st.ps_entries, st.ps_ucodes, st.mods_max, st.mods_max_hash,
+      st.translations - st.translate_fail, st.translate_fail,
+      st.translations ? (st.translate_ns_total / st.translations) / 1000 : uint64_t(0),
+      st.translate_ns_max / 1000, st.translate_ns_max_hash, double(st.dxbc_bytes) / (1024.0 * 1024.0),
+      st.verified, st.agreed, st.bytes_ne, st.size_ne, st.valid_ne, st.pending,
+      g_nr_sc_theirs_invalid, st.probe_ovf);
+  if (st.have_first_ne) {
+    REXGPU_INFO(
+        "[nr-sc]   FIRST DIFFERENCE {} hash={:016X} mod={:016X} at byte {} "
+        "ours={:#x} theirs={:#x} sizes={}/{}",
+        st.first_ne_stage == nr::kNrShaderStagePixel ? "ps" : "vs", st.first_ne_hash,
+        st.first_ne_modification, st.first_ne_offset, st.first_ne_ours, st.first_ne_theirs,
+        st.first_ne_ours_size, st.first_ne_theirs_size);
+  }
+  nr::NrShaderCacheEndWindow();
 }
 
 bool PipelineCache::GetCurrentStateDescription(

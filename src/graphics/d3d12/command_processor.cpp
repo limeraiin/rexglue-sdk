@@ -2565,6 +2565,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // draw path.
   if (pipeline_cache_) {
     pipeline_cache_->NrPsoReportIfDue();
+    // [NR-SC] Phase 5-2: the shader cache's verdict, from the same place.
+    pipeline_cache_->NrShaderCacheReportIfDue();
   }
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {

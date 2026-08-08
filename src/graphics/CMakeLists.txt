@@ -27,6 +27,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     nr_resource.cpp
     nr_shader_db.cpp
     nr_pipeline_state.cpp
+    nr_shader_cache.cpp
     trace_writer.cpp
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp

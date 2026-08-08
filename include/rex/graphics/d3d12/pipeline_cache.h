@@ -108,6 +108,10 @@ class PipelineCache {
   // reading a clock is not on the command-processor thread's draw path.
   void NrPsoReportIfDue();
 
+  // [NR-SC] Phase 5-2: emit the shader-cache verdict, at most once a second,
+  // from the same place and for the same reason.
+  void NrShaderCacheReportIfDue();
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -313,6 +317,22 @@ class PipelineCache {
                   const uint32_t* bound_depth_and_color_render_target_formats,
                   const PipelineDescription& theirs);
 
+  // [NR-SC] Phase 5-2: ask the native renderer's own shader cache for this
+  // draw's two shaders, and settle the byte comparison for any key it has not
+  // checked yet. Runs here, beside NrPsoCheck, for the same reason: it is the
+  // only point where our translation and the emulated one are provably about
+  // the same shader with the same modification.
+  void NrShaderCacheCheck(const D3D12Shader::D3D12Translation* vertex_shader,
+                          const D3D12Shader::D3D12Translation* pixel_shader);
+  void NrShaderCacheCheckOne(const D3D12Shader::D3D12Translation* translation, uint32_t stage);
+  // Translation callback handed to the cache. Builds a Shader from the ucode
+  // dwords alone -- none of this class's shader bookkeeping -- which is what
+  // makes byte equality with `translation.translated_binary()` mean that a
+  // native renderer can translate from what the walk recovers.
+  static bool NrShaderTranslate(void* ctx, uint32_t stage, uint64_t ucode_hash,
+                                const uint32_t* ucode_dwords, uint32_t ucode_dword_count,
+                                uint64_t modification, std::vector<uint8_t>* dxbc_out);
+
   static bool GetGeometryShaderKey(PipelineGeometryShader geometry_shader_type,
                                    DxbcShaderTranslator::Modification vertex_shader_modification,
                                    DxbcShaderTranslator::Modification pixel_shader_modification,
@@ -334,6 +354,14 @@ class PipelineCache {
   // Reusable shader translator for the processor thread.
   std::unique_ptr<DxbcShaderTranslator> shader_translator_;
   std::mutex translation_request_lock_;
+
+  // [NR-SC] Phase 5-2. The native renderer's own translator and disassembly
+  // buffer, kept apart from the two above so that the emulated path and ours
+  // never share a translator's internal state -- the comparison has to be
+  // between two independent runs, not two calls on one object. Created on
+  // first use, only when the probe is on.
+  std::unique_ptr<DxbcShaderTranslator> nr_shader_translator_;
+  string::StringBuffer nr_ucode_disasm_buffer_;
 
   // Command processor thread DXIL conversion/disassembly interfaces, if DXIL
   // disassembly is enabled.
