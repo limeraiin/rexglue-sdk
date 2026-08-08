@@ -86,6 +86,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   const rex::graphics::RegisterFile& GetActiveDrawRegisterFile() const {
     return active_draw_register_file_ ? *active_draw_register_file_ : *register_file_;
   }
+  // [NR-PSO] Phase 5-1: whether the draw currently being set up reads a
+  // repointed file rather than the shared one -- which, with gpu_nr_issue on,
+  // means it is being issued from the walk-recovered replay file. Lets a probe
+  // in a subsystem report how much of its coverage is recovered state instead
+  // of assuming it.
+  bool is_draw_register_file_repointed() const { return active_draw_register_file_ != nullptr; }
 
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }

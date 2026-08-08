@@ -2560,6 +2560,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       s_h3_last_vb_mismatch = vb_mismatch;
     }
   }
+  // [NR-PSO] Phase 5-1: the state mirror's verdict, once a second. Emitted
+  // from here rather than from the per-draw check so no clock is read on the
+  // draw path.
+  if (pipeline_cache_) {
+    pipeline_cache_->NrPsoReportIfDue();
+  }
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);

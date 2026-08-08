@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -35,6 +36,7 @@
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/dxbc.h>
+#include <rex/graphics/nr_pipeline_state.h>
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
@@ -61,6 +63,22 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
+
+// [NR-PSO] Phase 5-1: the state mirror. Phase 4 proved every register a draw
+// reads is recoverable from the buffer stream and then proved it by
+// consumption (4d-4f: every draw and resolve issued from the walk-maintained
+// replay file, pixel identical, at baseline speed). What still belongs to the
+// emulator is the DERIVATION -- turning those registers into the D3D12
+// pipeline state a PSO is keyed on. This probe runs a second, independent
+// derivation (nr_pipeline_state, sharing no code with this file or with
+// draw_util) against the same register file at the same moment, and compares
+// the packed descriptions byte for byte. mismatch must be 0 at city load
+// before the native pipeline is allowed to use our mapping instead.
+REXCVAR_DEFINE_BOOL(gpu_nr_pso, false, "GPU",
+                    "Diagnostic [nr-pso]: derive the D3D12 pipeline state from "
+                    "the draw's register file with the native renderer's own "
+                    "mapping and compare it against the emulated pipeline "
+                    "cache's, per draw. Off by default.");
 
 namespace rex::graphics::d3d12 {
 
@@ -989,6 +1007,18 @@ bool PipelineCache::ConfigurePipeline(
   }
   PipelineDescription& description = runtime_description.description;
 
+  // [NR-PSO] Phase 5-1: the same draw, derived a second time by the native
+  // renderer's own mapping, and compared. Here rather than at the call site
+  // because this is the only place both derivations can be run against
+  // provably the same register file at provably the same moment -- the trap
+  // increment 4c had to correct, where a probe answered a per-draw question
+  // with state read at another time.
+  if (REXCVAR_GET(gpu_nr_pso)) {
+    NrPsoCheck(vertex_shader, pixel_shader, primitive_processing_result, normalized_depth_control,
+               normalized_color_mask, bound_depth_and_color_render_target_bits,
+               bound_depth_and_color_render_target_formats, description);
+  }
+
   if (current_pipeline_ != nullptr && !std::memcmp(&current_pipeline_->description.description,
                                                    &description, sizeof(description))) {
     *pipeline_handle_out = current_pipeline_;
@@ -1232,6 +1262,246 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
   }
 
   return translation.is_valid();
+}
+
+// [NR-PSO] Phase 5-1. Command-processor-thread only, like every other nr
+// probe: the counters are plain statics on purpose (an atomic per draw at
+// ~190k draws/s would be measuring itself). Under the precord worker modes
+// ConfigurePipeline runs on the worker instead, but still on exactly one
+// thread, and precord is unsupported together with the issue path anyway.
+namespace {
+
+struct NrPsoFieldTally {
+  uint32_t field;
+  uint64_t count;
+  uint64_t ours, theirs;
+};
+
+// How many DISTINCT descriptions the gate has seen. Without this, mismatch=0
+// over a hundred thousand draws could be one state agreed with a hundred
+// thousand times, and the number would read like coverage it does not have.
+// Sized at 65536 slots from the start: increment 4b-2's shader census silently
+// undercounted at 80% table load, and the fix there was the same one.
+//
+// Counted TWICE, because the two counts mean different things. The whole
+// description includes the four shader-identity fields, and both derivations
+// copy those from the same translation pointer -- they cannot disagree, so
+// they inflate the distinct count without covering any risk. The second set
+// zeroes them, leaving exactly the part this increment derives: topology,
+// cull, fill, bias, depth, stencil, blend, masks, MSAA. `distinct_state` is
+// therefore the honest coverage number, and it is the smaller one.
+constexpr uint32_t kNrPsoSetSize = 65536;
+constexpr uint32_t kNrPsoSetProbes = 16;
+
+struct NrPsoProbe {
+  // Window counters.
+  uint64_t compares;     // draws both derivations produced a description for
+  uint64_t armed;        // ... of which were issued from the replay file
+  uint64_t derive_fail;  // our derivation refused a draw theirs accepted
+  uint64_t mismatch;     // ... and the descriptions differed. THE GATE.
+  uint64_t pad_diff;     // bytes differ but every named field agrees, i.e. the
+                         // two layouts disagree about padding, not about state
+  uint64_t dc_mismatch;  // our normalized RB_DEPTHCONTROL != theirs
+  uint64_t cm_mismatch;  // our normalized colour mask != theirs
+  // Cumulative, so a mismatch that happened once is still named at the end of
+  // the run rather than scrolling away with its window, and so the distinct
+  // set measures the session rather than the second.
+  uint64_t mismatch_total;
+  uint64_t distinct;        // whole descriptions, shaders included
+  uint64_t distinct_state;  // ... with the shader identity removed
+  uint64_t set_ovf;         // insertions that found no free slot in kNrPsoSetProbes
+  NrPsoFieldTally top[6];
+  uint64_t set[kNrPsoSetSize];
+  uint64_t state_set[kNrPsoSetSize];
+};
+
+NrPsoProbe g_nr_pso_probe{};
+
+// Counts a hash as seen in one of the two sets. Hash 0 is treated as the empty
+// slot: it costs one description in 2^64 and keeps the set free of a separate
+// occupancy map.
+void NrPsoCountDistinct(uint64_t* set, uint64_t* count, uint64_t hash) {
+  if (!hash) {
+    return;
+  }
+  uint32_t slot = uint32_t(hash) & (kNrPsoSetSize - 1);
+  for (uint32_t i = 0; i < kNrPsoSetProbes; ++i) {
+    uint64_t& entry = set[slot];
+    if (entry == hash) {
+      return;
+    }
+    if (!entry) {
+      entry = hash;
+      ++*count;
+      return;
+    }
+    slot = (slot + 1) & (kNrPsoSetSize - 1);
+  }
+  ++g_nr_pso_probe.set_ovf;
+}
+
+void NrPsoTally(uint32_t field, uint64_t ours, uint64_t theirs) {
+  NrPsoFieldTally* free_slot = nullptr;
+  for (NrPsoFieldTally& t : g_nr_pso_probe.top) {
+    if (t.count && t.field == field) {
+      ++t.count;
+      t.ours = ours;
+      t.theirs = theirs;
+      return;
+    }
+    if (!t.count && !free_slot) {
+      free_slot = &t;
+    }
+  }
+  if (free_slot) {
+    *free_slot = NrPsoFieldTally{field, 1, ours, theirs};
+  }
+}
+
+}  // namespace
+
+void PipelineCache::NrPsoCheck(
+    const D3D12Shader::D3D12Translation* vertex_shader,
+    const D3D12Shader::D3D12Translation* pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    uint32_t bound_depth_and_color_render_target_bits,
+    const uint32_t* bound_depth_and_color_render_target_formats,
+    const PipelineDescription& theirs) {
+  // If these ever differ the mirror is describing a different structure than
+  // the one being compared, and every other number here would be noise.
+  static_assert(sizeof(nr::NrPsoDesc) == sizeof(PipelineDescription),
+                "the state mirror's description must match the back end's byte for byte");
+
+  nr::NrPsoInputs in{};
+  in.regs = register_file_->values;
+
+  // Owned by the primitive processor until increment 5-3.
+  in.tessellated = primitive_processing_result.IsTessellated();
+  in.tessellation_mode = uint32_t(primitive_processing_result.tessellation_mode);
+  in.host_primitive_type = uint32_t(primitive_processing_result.host_primitive_type);
+  in.host_primitive_reset_enabled = primitive_processing_result.host_primitive_reset_enabled;
+  in.host_index_format_32 =
+      primitive_processing_result.host_index_format == xenos::IndexFormat::kInt32;
+
+  // Owned by the render target cache until increment 5-3.
+  in.bound_rt_bits = bound_depth_and_color_render_target_bits;
+  in.bound_rt_formats = bound_depth_and_color_render_target_formats;
+  in.edram_rov_used =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+
+  // Owned by the shader translations until increment 5-2.
+  in.vertex_shader_hash = vertex_shader->shader().ucode_data_hash();
+  in.vertex_shader_modification = vertex_shader->modification();
+  in.has_pixel_shader = pixel_shader != nullptr;
+  if (pixel_shader) {
+    in.pixel_shader_hash = pixel_shader->shader().ucode_data_hash();
+    in.pixel_shader_modification = pixel_shader->modification();
+    in.pixel_shader_writes_color_targets = pixel_shader->shader().writes_color_targets();
+  }
+  in.tessellation_wireframe = REXCVAR_GET(d3d12_tessellation_wireframe);
+
+  nr::NrPsoDesc ours;
+  if (!nr::NrPsoDerive(in, &ours)) {
+    // Only reachable where the emulated derivation returns false too, so it
+    // never coincides with a description to compare against; counted rather
+    // than ignored because a nonzero here means the two disagree about when a
+    // draw is describable at all.
+    ++g_nr_pso_probe.derive_fail;
+    return;
+  }
+
+  ++g_nr_pso_probe.compares;
+  if (command_processor_.is_draw_register_file_repointed()) {
+    ++g_nr_pso_probe.armed;
+  }
+  // Hash OURS, not theirs: the question the distinct counts answer is how many
+  // different states this mapping was actually made to produce.
+  NrPsoCountDistinct(g_nr_pso_probe.set, &g_nr_pso_probe.distinct,
+                     XXH3_64bits(&ours, sizeof(ours)));
+  {
+    nr::NrPsoDesc state_only = ours;
+    state_only.vertex_shader_hash = 0;
+    state_only.vertex_shader_modification = 0;
+    state_only.pixel_shader_hash = 0;
+    state_only.pixel_shader_modification = 0;
+    NrPsoCountDistinct(g_nr_pso_probe.state_set, &g_nr_pso_probe.distinct_state,
+                       XXH3_64bits(&state_only, sizeof(state_only)));
+  }
+
+  // The two normalizations, checked directly. These feed the render target
+  // cache as well as the key, so an error in them can matter on a draw whose
+  // packed description happens to agree.
+  if (nr::NrPsoNormalizedDepthControl(in.regs) != normalized_depth_control.value) {
+    ++g_nr_pso_probe.dc_mismatch;
+  }
+  if (nr::NrPsoNormalizedColorMask(in.regs, in.pixel_shader_writes_color_targets) !=
+      normalized_color_mask) {
+    ++g_nr_pso_probe.cm_mismatch;
+  }
+
+  const bool bytes_equal = std::memcmp(&ours, &theirs, sizeof(ours)) == 0;
+  // Read the back end's bytes through the mirror's own layout rather than
+  // aliasing its type: if the two layouts ever disagree, that shows up as a
+  // named field difference here and as pad_diff below, not as undefined
+  // behaviour.
+  nr::NrPsoDesc theirs_mirrored;
+  std::memcpy(&theirs_mirrored, &theirs, sizeof(theirs_mirrored));
+  uint64_t ours_value = 0, theirs_value = 0;
+  const uint32_t field =
+      nr::NrPsoFirstDifference(ours, theirs_mirrored, &ours_value, &theirs_value);
+  if (field != nr::kNrPsoFieldCount) {
+    ++g_nr_pso_probe.mismatch;
+    ++g_nr_pso_probe.mismatch_total;
+    NrPsoTally(field, ours_value, theirs_value);
+  } else if (!bytes_equal) {
+    // Every field agrees but the bytes do not: the padding bits differ, which
+    // is a layout finding rather than a state one -- and a real one, because
+    // the back end hashes and memcmps these bytes to identify a pipeline.
+    ++g_nr_pso_probe.pad_diff;
+  }
+}
+
+void PipelineCache::NrPsoReportIfDue() {
+  if (!REXCVAR_GET(gpu_nr_pso)) {
+    return;
+  }
+  static auto last_report = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_report < std::chrono::seconds(1)) {
+    return;
+  }
+  last_report = now;
+  NrPsoProbe& p = g_nr_pso_probe;
+  if (!p.compares && !p.derive_fail) {
+    return;
+  }
+  // `compares` is the population that reaches a pipeline description at all:
+  // resolves go to IssueCopy, and draws whose rasterization is disabled or
+  // whose host vertex count is zero are dropped before ConfigurePipeline, so
+  // they are not draws this mapping is asked about. The two distinct counts
+  // are what make mismatch=0 mean something, and `distinct_state` is the one
+  // to quote: it excludes the shader-identity fields, which are copied through
+  // both derivations and cannot disagree. Both are cumulative over the session.
+  REXGPU_INFO(
+      "[nr-pso] compares={} armed={} distinct={} distinct_state={} set_ovf={} "
+      "| mismatch={} (total={}) pad_diff={} derive_fail={} | "
+      "depthcontrol_mismatch={} colormask_mismatch={}",
+      p.compares, p.armed, p.distinct, p.distinct_state, p.set_ovf, p.mismatch, p.mismatch_total,
+      p.pad_diff, p.derive_fail, p.dc_mismatch, p.cm_mismatch);
+  for (const NrPsoFieldTally& t : p.top) {
+    if (!t.count) {
+      continue;
+    }
+    char name[64];
+    nr::NrPsoFieldName(t.field, name, uint32_t(sizeof(name)));
+    REXGPU_INFO("[nr-pso]   MISMATCH {} x{} ours={:#x} theirs={:#x}", name, t.count, t.ours,
+                t.theirs);
+  }
+  p.compares = p.armed = p.derive_fail = 0;
+  p.mismatch = p.pad_diff = p.dc_mismatch = p.cm_mismatch = 0;
+  // The field tallies are NOT cleared: the named first-differing field is the
+  // deliverable of this increment, and a mismatch seen once stays named.
 }
 
 bool PipelineCache::GetCurrentStateDescription(

@@ -103,6 +103,11 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
 
+  // [NR-PSO] Phase 5-1: emit the state-mirror verdict, at most once a second.
+  // Called from the frame path rather than from the per-draw check so that
+  // reading a clock is not on the command-processor thread's draw path.
+  void NrPsoReportIfDue();
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -288,6 +293,25 @@ class PipelineCache {
       uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_target_formats,
       PipelineRuntimeDescription& runtime_description_out, bool for_placeholder = false);
+
+  // [NR-PSO] Phase 5-1: THE STATE MIRROR GATE. Derives the same pipeline
+  // description from the same register file with our own independent mapping
+  // (nr_pipeline_state, which shares no code with this file or with
+  // draw_util), and compares. `theirs` is what GetCurrentStateDescription just
+  // produced. Everything the mirror cannot yet obtain from registers -- the
+  // primitive processing result, the bound render targets, the shader
+  // translations -- is handed over, because those are the subsystems
+  // increments 5-2 and 5-3 replace; this increment measures the register
+  // mapping alone. The two normalized values are compared directly as well,
+  // so that a normalization error is named even on draws where it happens not
+  // to reach the packed key.
+  void NrPsoCheck(const D3D12Shader::D3D12Translation* vertex_shader,
+                  const D3D12Shader::D3D12Translation* pixel_shader,
+                  const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+                  reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+                  uint32_t bound_depth_and_color_render_target_bits,
+                  const uint32_t* bound_depth_and_color_render_target_formats,
+                  const PipelineDescription& theirs);
 
   static bool GetGeometryShaderKey(PipelineGeometryShader geometry_shader_type,
                                    DxbcShaderTranslator::Modification vertex_shader_modification,
