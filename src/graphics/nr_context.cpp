@@ -79,6 +79,19 @@ constexpr SlotRange kRanges[] = {
     {0x2320, 2, 22, kCtxGroupCopy},     {0x231D, 3, 24, kCtxGroupClear},
 };
 
+// [NR-DRAW] The registers a draw packet's own payload writes. The executor
+// writes these from ExecutePacketType3Draw before issuing (VGT_DRAW_INITIATOR
+// always; the two DMA registers only for an indexed draw), so a walk that
+// skips them leaves the index-buffer binding -- which is the draw's geometry
+// source -- missing from the mirror while the live file has it. Values from
+// register_table.inc; spelled numerically because this file builds bare.
+constexpr uint32_t kRegVgtDmaBase = 0x21FA;
+constexpr uint32_t kRegVgtDmaSize = 0x21FB;
+constexpr uint32_t kRegVgtDrawInitiator = 0x21FC;
+// VGT_DRAW_INITIATOR::source_select, bits 6-7. kDMA(0) is the indexed draw
+// that carries VGT_DMA_BASE + VGT_DMA_SIZE after the initiator.
+constexpr uint32_t kSourceSelectDma = 0;
+
 }  // namespace
 
 bool CtxApplyBinPacket(CtxBinState* bin, uint32_t op, uint32_t p0,
@@ -134,6 +147,26 @@ CtxGroup CtxSlotGroup(uint32_t slot) {
   return kCtxGroupCount;
 }
 
+uint32_t CtxConstantBase(uint32_t offset_type) {
+  // The index field is 11 bits for the constant files and the register file
+  // alike (ExecutePacketType3_SET_CONSTANT masks 0x7FF before dispatching).
+  const uint32_t index = offset_type & 0x7FF;
+  switch ((offset_type >> 16) & 0xFF) {
+    case 0:
+      return 0x4000 + index;  // ALU
+    case 1:
+      return 0x4800 + index;  // FETCH
+    case 2:
+      return 0x4900 + index;  // BOOL
+    case 3:
+      return 0x4908 + index;  // LOOP
+    case 4:
+      return 0x2000 + index;  // REGISTERS
+    default:
+      return kCtxNoBase;
+  }
+}
+
 int32_t CtxApplyExternalWrite(StateContext* ctx, uint32_t reg,
                               uint32_t value) {
   const int32_t s = CtxSlot(reg);
@@ -145,6 +178,292 @@ int32_t CtxApplyExternalWrite(StateContext* ctx, uint32_t reg,
   return s;
 }
 
+namespace {
+
+// Every decoded write reaches reg_fn, mirrored or not: the resource census is
+// interested in precisely the registers the mirror ignores.
+void CtxWriteReg(CtxWalker* w, uint32_t reg, uint32_t value,
+                 bool from_memory = false) {
+  if (w->reg_fn) w->reg_fn(w->reg_user, reg, value, from_memory);
+  const int32_t s = CtxSlot(reg);
+  if (s < 0) return;
+  w->ctx->values[s] = value;
+  w->ctx->defined[s] = 1;
+  w->ctx->in_buffer[s] = 1;
+  if (w->watch_fn) {
+    w->watch_fn(w->watch_user, reg, value, w->cur_dw, w->cur_hdr, w->cur_arg);
+  }
+}
+
+uint16_t CtxGroupBits(const StateContext* ctx, uint32_t first, uint32_t n,
+                      uint16_t def_bit, uint16_t carry_bit) {
+  bool def = true, all_local = true;
+  for (uint32_t s = first; s < first + n; ++s) {
+    if (!ctx->defined[s]) def = false;
+    if (!ctx->in_buffer[s]) all_local = false;
+  }
+  if (!def) return 0;
+  return uint16_t(def_bit | (all_local ? 0 : carry_bit));
+}
+
+// Computes this draw's flags word and stores it if there is room. Returns it
+// either way, so a stop past max_draws still reports the draw truthfully.
+uint16_t CtxFlagDraw(CtxWalker* w) {
+  const StateContext* ctx = w->ctx;
+  uint16_t f = 0;
+  f |= CtxGroupBits(ctx, kRtRequired0, kRtRequiredN, kCtxDrawRtDef,
+                    kCtxDrawRtCarried);
+  f |= CtxGroupBits(ctx, kVportFirst, kVportN, kCtxDrawVportDef,
+                    kCtxDrawVportCarried);
+  f |= CtxGroupBits(ctx, kSlotMode, 1, kCtxDrawModeDef, kCtxDrawModeCarried);
+  if (ctx->vs.valid && ctx->ps.valid) {
+    f |= kCtxDrawShadersDef;
+    if (!ctx->vs_in_buffer || !ctx->ps_in_buffer) f |= kCtxDrawShadersCarried;
+  }
+  if (ctx->defined[kSlotMode] && (ctx->values[kSlotMode] & 0x7) == 6) {
+    f |= kCtxDrawCopy;
+  }
+  if (w->nflags < w->max_draws) w->draw_flags[w->nflags++] = f;
+  return f;
+}
+
+// [NR-DRAW] The draw packet's own payload, applied exactly as
+// ExecutePacketType3Draw applies it: VGT_DRAW_INITIATOR always, and for an
+// indexed (kDMA) draw the two registers that carry the index buffer.
+// DRAW_INDX leads with a viz-query token; DRAW_INDX_2 does not.
+void CtxApplyDrawPayload(CtxWalker* w, uint32_t op, uint32_t j, uint32_t cnt) {
+  const uint32_t end = j + 1 + cnt;
+  uint32_t p = j + 1 + (op == 0x22 ? 1u : 0u);
+  if (p >= end || p >= w->dwords) return;
+  const uint32_t initiator = BE32(w->raw, p);
+  CtxWriteReg(w, kRegVgtDrawInitiator, initiator);
+  if (((initiator >> 6) & 3u) != kSourceSelectDma) return;
+  if (++p < end && p < w->dwords) CtxWriteReg(w, kRegVgtDmaBase, BE32(w->raw, p));
+  if (++p < end && p < w->dwords) CtxWriteReg(w, kRegVgtDmaSize, BE32(w->raw, p));
+}
+
+// Decodes exactly one packet at the cursor, advancing it past that packet.
+// Returns true when the packet was an EXECUTED draw, filling `stop`.
+bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop) {
+  const uint8_t* raw = w->raw;
+  const uint32_t dwords = w->dwords;
+  const uint32_t j = w->cursor;
+  const uint32_t hdr = BE32(raw, j);
+  // ExecutePacket's first test: a zero dword is a one-dword no-op.
+  if (!hdr) {
+    ++w->stats->nop0;
+    w->cursor = j + 1;
+    return false;
+  }
+  const uint32_t ty = hdr >> 30;
+  w->cur_dw = j;
+  w->cur_hdr = hdr;
+  w->cur_arg = (j + 1 < dwords) ? BE32(raw, j + 1) : 0;
+  if (ty == 0) {
+    const uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
+    const uint32_t base = hdr & 0x7FFF;
+    const bool one_reg = (hdr >> 15) & 1;
+    for (uint32_t m = 0; m < cnt && j + 1 + m < dwords; ++m) {
+      CtxWriteReg(w, one_reg ? base : base + m, BE32(raw, j + 1 + m));
+    }
+    w->cursor = j + 1 + cnt;
+    return false;
+  }
+  if (ty == 1) {
+    if (j + 2 < dwords) {
+      CtxWriteReg(w, hdr & 0x7FF, BE32(raw, j + 1));
+      CtxWriteReg(w, (hdr >> 11) & 0x7FF, BE32(raw, j + 2));
+    }
+    w->cursor = j + 3;
+    return false;
+  }
+  if (ty == 2) {
+    w->cursor = j + 1;
+    return false;
+  }
+
+  const uint32_t op = (hdr >> 8) & 0x7F;
+  const uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
+  w->cursor = j + 1 + cnt;
+  // Predicate bit: the command processor skips the whole packet when no
+  // selected bin passes the mask. Mirror it before decoding anything --
+  // a predicated-out packet writes nothing and a predicated-out draw does
+  // not execute, so it gets no flags word either.
+  if (CtxPredicatedOut(w->bin, hdr)) {
+    ++w->stats->pred_skipped;
+    if (op == 0x22) ++w->stats->pred_draws;
+    return false;
+  }
+  if (hdr & 1) {
+    if (op == 0x22) ++w->stats->pred_draws_run;
+  }
+  if (op == 0x22 || op == 0x36) {
+    uint16_t f = 0;
+    uint32_t index = 0;
+    if (op == 0x22) {
+      ++w->stats->draws22;
+      f = CtxFlagDraw(w);
+      // Ordinal among executed 0x22 draws, taken from the stat rather than the
+      // flags array so it stays right past max_draws.
+      index = w->stats->draws22 - 1;
+      // After the flags, so both see the same moment: everything written by
+      // this buffer up to and including the packets before this draw.
+      if (w->draw_fn) w->draw_fn(w->draw_user);
+    } else {
+      ++w->stats->draws36;
+    }
+    CtxApplyDrawPayload(w, op, j, cnt);
+    if (stop) {
+      stop->opcode = op;
+      stop->dword = j;
+      stop->flags = f;
+      stop->index = index;
+    }
+    return true;
+  }
+  StateContext* ctx = w->ctx;
+  if (op == 0x27 && cnt >= 2 && j + 2 < dwords) {
+    // IM_LOAD: pointer-based shader load.
+    const uint32_t addr_type = BE32(raw, j + 1);
+    const uint32_t start_size = BE32(raw, j + 2);
+    ShaderRef ref;
+    ref.addr = (addr_type & ~3u) & 0x1FFFFFFF;
+    ref.size_dwords = start_size & 0xFFFF;
+    ref.immediate = 0;
+    ref.valid = 1;
+    if ((addr_type & 0x3) == 0) {
+      ctx->vs = ref;
+      ctx->vs_in_buffer = 1;
+    } else {
+      ctx->ps = ref;
+      ctx->ps_in_buffer = 1;
+    }
+    ++w->stats->im_loads;
+    if (w->shader_fn) w->shader_fn(w->shader_user, ref);
+  } else if (op == 0x2B && cnt >= 3 && j + 2 < dwords) {
+    // IM_LOAD_IMMEDIATE: ucode inline after the two header dwords.
+    const uint32_t type = BE32(raw, j + 1);
+    const uint32_t start_size = BE32(raw, j + 2);
+    ShaderRef ref;
+    ref.addr = ((w->buffer_phys & 0x1FFFFFFF) + (j + 3) * 4);
+    ref.size_dwords = start_size & 0xFFFF;
+    ref.immediate = 1;
+    ref.valid = 1;
+    if (type == 0) {
+      ctx->vs = ref;
+      ctx->vs_in_buffer = 1;
+    } else {
+      ctx->ps = ref;
+      ctx->ps_in_buffer = 1;
+    }
+    ++w->stats->im_load_imms;
+    if (w->shader_fn) w->shader_fn(w->shader_user, ref);
+  } else if (op == 0x2D && cnt >= 2 && j + 1 < dwords) {
+    // SET_CONSTANT: typed offset, values inline. All five constant files,
+    // not just type 4: the recovery mirror only ever needed the register
+    // file, but the resource census consumes the ALU/fetch/bool/loop
+    // writes through reg_fn and a walk that dropped them would report
+    // them as never written.
+    const uint32_t offset_type = BE32(raw, j + 1);
+    const uint32_t base = CtxConstantBase(offset_type);
+    if (base != kCtxNoBase) {
+      for (uint32_t m = 0; m + 1 < cnt && j + 2 + m < dwords; ++m) {
+        CtxWriteReg(w, base + m, BE32(raw, j + 2 + m));
+      }
+    }
+  } else if (CtxApplyBinPacket(&w->bin, op,
+                               (j + 1 < dwords) ? BE32(raw, j + 1) : 0,
+                               (j + 2 < dwords) ? BE32(raw, j + 2) : 0)) {
+    // SET_BIN_MASK / SET_BIN_SELECT (and the LO/HI halves): which of the
+    // following predicated blocks this pass executes.
+    ++w->stats->bin_pkts;
+  } else if ((op == 0x55 || op == 0x56) && cnt >= 2 && j + 1 < dwords) {
+    // SET_CONSTANT2 / SET_SHADER_CONSTANTS: RAW register index, values
+    // inline (ExecutePacketType3_SET_CONSTANT2 / _SET_SHADER_CONSTANTS ->
+    // WriteRegisterRangeFromRing with no typed base).
+    const uint32_t base = BE32(raw, j + 1) & 0xFFFF;
+    ++w->stats->set_const2;
+    for (uint32_t m = 0; m + 1 < cnt && j + 2 + m < dwords; ++m) {
+      CtxWriteReg(w, base + m, BE32(raw, j + 2 + m));
+    }
+  } else if (op == 0x2F && cnt >= 3 && j + 3 < dwords) {
+    // LOAD_ALU_CONSTANT: typed offset, values in guest memory. Same five
+    // files as SET_CONSTANT.
+    const uint32_t address = BE32(raw, j + 1) & 0x1FFFFFFF;
+    const uint32_t offset_type = BE32(raw, j + 2);
+    const uint32_t size_dwords = BE32(raw, j + 3) & 0xFFF;
+    const uint32_t base = CtxConstantBase(offset_type);
+    if (base != kCtxNoBase) {
+      for (uint32_t m = 0; m < size_dwords; ++m) {
+        const int32_t s = CtxSlot(base + m);
+        // A non-mirrored register still has to reach reg_fn: the resource
+        // census cares about exactly the registers the mirror does not.
+        if (!w->mem_read) {
+          if (s >= 0) {
+            ctx->defined[s] = 0;
+            ctx->in_buffer[s] = 0;
+          }
+          ++w->stats->mem_poisoned;
+          continue;
+        }
+        const uint32_t value = w->mem_read(w->mem_user, address + m * 4);
+        CtxWriteReg(w, base + m, value, /*from_memory=*/true);
+        ++w->stats->mem_loads;
+      }
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+void CtxWalkBegin(CtxWalker* w, const uint8_t* raw, uint32_t dwords,
+                  uint32_t buffer_phys, StateContext* ctx, uint16_t* draw_flags,
+                  uint32_t max_draws, CtxWalkStats* stats, CtxMemReadFn mem_read,
+                  void* mem_user, CtxShaderFn shader_fn, void* shader_user,
+                  CtxWatchFn watch_fn, void* watch_user, uint64_t bin_select,
+                  uint64_t bin_mask, CtxRegWriteFn reg_fn, void* reg_user,
+                  CtxDrawFn draw_fn, void* draw_user) {
+  *w = CtxWalker{};
+  w->raw = raw;
+  w->dwords = dwords;
+  w->buffer_phys = buffer_phys;
+  w->ctx = ctx;
+  w->draw_flags = draw_flags;
+  w->max_draws = max_draws;
+  w->stats = stats;
+  w->mem_read = mem_read;
+  w->mem_user = mem_user;
+  w->shader_fn = shader_fn;
+  w->shader_user = shader_user;
+  w->watch_fn = watch_fn;
+  w->watch_user = watch_user;
+  w->reg_fn = reg_fn;
+  w->reg_user = reg_user;
+  w->draw_fn = draw_fn;
+  w->draw_user = draw_user;
+  // Bin state in effect for this pass, advanced by in-buffer SET_BIN_*.
+  w->bin = CtxBinState{bin_select, bin_mask};
+
+  *stats = CtxWalkStats{};
+  // "Written by THIS buffer" resets at entry; definedness and values persist.
+  for (uint32_t s = 0; s < kCtxRegCount; ++s) ctx->in_buffer[s] = 0;
+  ctx->vs_in_buffer = 0;
+  ctx->ps_in_buffer = 0;
+}
+
+bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop) {
+  while (w->cursor < w->dwords) {
+    if (CtxWalkStep(w, stop)) return true;
+  }
+  return false;
+}
+
+uint32_t CtxWalkFinish(CtxWalker* w) {
+  while (w->cursor < w->dwords) CtxWalkStep(w, nullptr);
+  return w->nflags;
+}
+
 uint32_t WalkBufferContext(const uint8_t* raw, uint32_t dwords,
                            uint32_t buffer_phys, StateContext* ctx,
                            uint16_t* draw_flags, uint32_t max_draws,
@@ -152,187 +471,14 @@ uint32_t WalkBufferContext(const uint8_t* raw, uint32_t dwords,
                            void* mem_user, CtxShaderFn shader_fn,
                            void* shader_user, CtxWatchFn watch_fn,
                            void* watch_user, uint64_t bin_select,
-                           uint64_t bin_mask) {
-  *stats = CtxWalkStats{};
-  uint32_t nflags = 0;
-
-  // Packet currently being decoded, for the write sampler.
-  uint32_t cur_dw = 0, cur_hdr = 0, cur_arg = 0;
-  // Bin state in effect for this pass, advanced by in-buffer SET_BIN_*.
-  CtxBinState bin{bin_select, bin_mask};
-
-  // "Written by THIS buffer" resets at entry; definedness and values persist.
-  for (uint32_t s = 0; s < kCtxRegCount; ++s) ctx->in_buffer[s] = 0;
-  ctx->vs_in_buffer = 0;
-  ctx->ps_in_buffer = 0;
-
-  auto write_reg = [&](uint32_t reg, uint32_t value) {
-    const int32_t s = CtxSlot(reg);
-    if (s < 0) return;
-    ctx->values[s] = value;
-    ctx->defined[s] = 1;
-    ctx->in_buffer[s] = 1;
-    if (watch_fn) watch_fn(watch_user, reg, value, cur_dw, cur_hdr, cur_arg);
-  };
-
-  auto group_bits = [&](uint32_t first, uint32_t n, uint16_t def_bit,
-                        uint16_t carry_bit) -> uint16_t {
-    bool def = true, all_local = true;
-    for (uint32_t s = first; s < first + n; ++s) {
-      if (!ctx->defined[s]) def = false;
-      if (!ctx->in_buffer[s]) all_local = false;
-    }
-    if (!def) return 0;
-    return uint16_t(def_bit | (all_local ? 0 : carry_bit));
-  };
-
-  auto flag_draw = [&]() {
-    uint16_t f = 0;
-    f |= group_bits(kRtRequired0, kRtRequiredN, kCtxDrawRtDef, kCtxDrawRtCarried);
-    f |= group_bits(kVportFirst, kVportN, kCtxDrawVportDef, kCtxDrawVportCarried);
-    f |= group_bits(kSlotMode, 1, kCtxDrawModeDef, kCtxDrawModeCarried);
-    if (ctx->vs.valid && ctx->ps.valid) {
-      f |= kCtxDrawShadersDef;
-      if (!ctx->vs_in_buffer || !ctx->ps_in_buffer) f |= kCtxDrawShadersCarried;
-    }
-    if (ctx->defined[kSlotMode] && (ctx->values[kSlotMode] & 0x7) == 6) {
-      f |= kCtxDrawCopy;
-    }
-    if (nflags < max_draws) draw_flags[nflags++] = f;
-  };
-
-  for (uint32_t j = 0; j < dwords;) {
-    const uint32_t hdr = BE32(raw, j);
-    // ExecutePacket's first test: a zero dword is a one-dword no-op.
-    if (!hdr) {
-      ++stats->nop0;
-      ++j;
-      continue;
-    }
-    const uint32_t ty = hdr >> 30;
-    cur_dw = j;
-    cur_hdr = hdr;
-    cur_arg = (j + 1 < dwords) ? BE32(raw, j + 1) : 0;
-    if (ty == 0) {
-      const uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
-      const uint32_t base = hdr & 0x7FFF;
-      const bool one_reg = (hdr >> 15) & 1;
-      for (uint32_t m = 0; m < cnt && j + 1 + m < dwords; ++m) {
-        write_reg(one_reg ? base : base + m, BE32(raw, j + 1 + m));
-      }
-      j += 1 + cnt;
-    } else if (ty == 1) {
-      if (j + 2 < dwords) {
-        write_reg(hdr & 0x7FF, BE32(raw, j + 1));
-        write_reg((hdr >> 11) & 0x7FF, BE32(raw, j + 2));
-      }
-      j += 3;
-    } else if (ty == 2) {
-      ++j;
-    } else {
-      const uint32_t op = (hdr >> 8) & 0x7F;
-      const uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
-      // Predicate bit: the command processor skips the whole packet when no
-      // selected bin passes the mask. Mirror it before decoding anything --
-      // a predicated-out packet writes nothing and a predicated-out draw does
-      // not execute, so it gets no flags word either.
-      if (CtxPredicatedOut(bin, hdr)) {
-        ++stats->pred_skipped;
-        if (op == 0x22) ++stats->pred_draws;
-        j += 1 + cnt;
-        continue;
-      }
-      if (hdr & 1) {
-        if (op == 0x22) ++stats->pred_draws_run;
-      }
-      if (op == 0x22) {
-        ++stats->draws22;
-        flag_draw();
-      } else if (op == 0x27 && cnt >= 2 && j + 2 < dwords) {
-        // IM_LOAD: pointer-based shader load.
-        const uint32_t addr_type = BE32(raw, j + 1);
-        const uint32_t start_size = BE32(raw, j + 2);
-        ShaderRef ref;
-        ref.addr = (addr_type & ~3u) & 0x1FFFFFFF;
-        ref.size_dwords = start_size & 0xFFFF;
-        ref.immediate = 0;
-        ref.valid = 1;
-        if ((addr_type & 0x3) == 0) {
-          ctx->vs = ref;
-          ctx->vs_in_buffer = 1;
-        } else {
-          ctx->ps = ref;
-          ctx->ps_in_buffer = 1;
-        }
-        ++stats->im_loads;
-        if (shader_fn) shader_fn(shader_user, ref);
-      } else if (op == 0x2B && cnt >= 3 && j + 2 < dwords) {
-        // IM_LOAD_IMMEDIATE: ucode inline after the two header dwords.
-        const uint32_t type = BE32(raw, j + 1);
-        const uint32_t start_size = BE32(raw, j + 2);
-        ShaderRef ref;
-        ref.addr = ((buffer_phys & 0x1FFFFFFF) + (j + 3) * 4);
-        ref.size_dwords = start_size & 0xFFFF;
-        ref.immediate = 1;
-        ref.valid = 1;
-        if (type == 0) {
-          ctx->vs = ref;
-          ctx->vs_in_buffer = 1;
-        } else {
-          ctx->ps = ref;
-          ctx->ps_in_buffer = 1;
-        }
-        ++stats->im_load_imms;
-        if (shader_fn) shader_fn(shader_user, ref);
-      } else if (op == 0x2D && cnt >= 2 && j + 1 < dwords) {
-        // SET_CONSTANT: typed offset, values inline. Type 4 = registers.
-        const uint32_t offset_type = BE32(raw, j + 1);
-        if (((offset_type >> 16) & 0xFF) == 4) {
-          const uint32_t base = 0x2000 + (offset_type & 0x7FF);
-          for (uint32_t m = 0; m + 1 < cnt && j + 2 + m < dwords; ++m) {
-            write_reg(base + m, BE32(raw, j + 2 + m));
-          }
-        }
-      } else if (CtxApplyBinPacket(
-                     &bin, op, (j + 1 < dwords) ? BE32(raw, j + 1) : 0,
-                     (j + 2 < dwords) ? BE32(raw, j + 2) : 0)) {
-        // SET_BIN_MASK / SET_BIN_SELECT (and the LO/HI halves): which of the
-        // following predicated blocks this pass executes.
-        ++stats->bin_pkts;
-      } else if ((op == 0x55 || op == 0x56) && cnt >= 2 && j + 1 < dwords) {
-        // SET_CONSTANT2 / SET_SHADER_CONSTANTS: RAW register index, values
-        // inline (ExecutePacketType3_SET_CONSTANT2 / _SET_SHADER_CONSTANTS ->
-        // WriteRegisterRangeFromRing with no typed base).
-        const uint32_t base = BE32(raw, j + 1) & 0xFFFF;
-        ++stats->set_const2;
-        for (uint32_t m = 0; m + 1 < cnt && j + 2 + m < dwords; ++m) {
-          write_reg(base + m, BE32(raw, j + 2 + m));
-        }
-      } else if (op == 0x2F && cnt >= 3 && j + 3 < dwords) {
-        // LOAD_ALU_CONSTANT: typed offset, values in guest memory.
-        const uint32_t address = BE32(raw, j + 1) & 0x1FFFFFFF;
-        const uint32_t offset_type = BE32(raw, j + 2);
-        const uint32_t size_dwords = BE32(raw, j + 3) & 0xFFF;
-        if (((offset_type >> 16) & 0xFF) == 4) {
-          const uint32_t base = 0x2000 + (offset_type & 0x7FF);
-          for (uint32_t m = 0; m < size_dwords; ++m) {
-            const int32_t s = CtxSlot(base + m);
-            if (s < 0) continue;
-            if (mem_read) {
-              write_reg(base + m, mem_read(mem_user, address + m * 4));
-              ++stats->mem_loads;
-            } else {
-              ctx->defined[s] = 0;
-              ctx->in_buffer[s] = 0;
-              ++stats->mem_poisoned;
-            }
-          }
-        }
-      }
-      j += 1 + cnt;
-    }
-  }
-  return nflags;
+                           uint64_t bin_mask, CtxRegWriteFn reg_fn,
+                           void* reg_user, CtxDrawFn draw_fn,
+                           void* draw_user) {
+  CtxWalker w;
+  CtxWalkBegin(&w, raw, dwords, buffer_phys, ctx, draw_flags, max_draws, stats,
+               mem_read, mem_user, shader_fn, shader_user, watch_fn, watch_user,
+               bin_select, bin_mask, reg_fn, reg_user, draw_fn, draw_user);
+  return CtxWalkFinish(&w);
 }
 
 }  // namespace nr

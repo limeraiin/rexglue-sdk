@@ -23,6 +23,9 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     nr_buffer_cache.cpp
     nr_state_walk.cpp
     nr_context.cpp
+    nr_regfile.cpp
+    nr_resource.cpp
+    nr_shader_db.cpp
     trace_writer.cpp
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp

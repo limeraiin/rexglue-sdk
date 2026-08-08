@@ -103,10 +103,12 @@ class CommandProcessor {
   // the parse thread mid-capture (draws are deferred) -- so the replay fields are
   // touched by a single thread.
   Shader* active_vertex_shader() const {
+    if (nr_issue_shaders_active_) return nr_issue_vertex_shader_;
     return precord_replay_shaders_active_ ? precord_replay_active_vertex_shader_
                                           : active_vertex_shader_;
   }
   Shader* active_pixel_shader() const {
+    if (nr_issue_shaders_active_) return nr_issue_pixel_shader_;
     return precord_replay_shaders_active_ ? precord_replay_active_pixel_shader_
                                           : active_pixel_shader_;
   }
@@ -229,8 +231,12 @@ class CommandProcessor {
                                           uint32_t count);
   virtual bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count);
+  // [NR-DRAW] `draw_opcode` (0x22 or 0x36) is passed rather than inferred from
+  // opcode_name: increment 4c advances a walk in lockstep with execution and
+  // has to agree with the executor about WHICH draw packet is running.
   bool ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet, const char* opcode_name,
-                              uint32_t viz_query_condition, uint32_t count_remaining);
+                              uint32_t draw_opcode, uint32_t viz_query_condition,
+                              uint32_t count_remaining);
   bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
@@ -319,6 +325,28 @@ class CommandProcessor {
   bool precord_replay_shaders_active_ = false;
   Shader* precord_replay_active_vertex_shader_ = nullptr;
   Shader* precord_replay_active_pixel_shader_ = nullptr;
+
+  // [NR-ISSUE] Increment 4d: the arm/disarm handshake between the base
+  // executor and the backend's IssueDraw. At a lockstep draw stop the base
+  // composes the 4c shadow with the live file (RegShadowCompose), resolves the
+  // walk's own shader refs through LoadShader, and arms; the backend copies
+  // nr_issue_values_ into a private RegisterFile, repoints every draw-path
+  // holder at it (the proven precord SetRegisterFile machinery), issues, and
+  // restores. The base disarms unconditionally right after IssueDraw returns.
+  // All on the CP thread; unsupported alongside precord capture (backend falls
+  // through to the normal path and counts it).
+  //
+  // The shader fields have their own gate rather than riding the precord
+  // replay fields: those belong to the precord worker's lifecycle, and sharing
+  // them would make two default-off features corrupt each other when combined.
+  bool nr_issue_armed_ = false;
+  const uint32_t* nr_issue_values_ = nullptr;  // RegisterFile::kRegisterCount
+  bool nr_issue_shaders_active_ = false;
+  Shader* nr_issue_vertex_shader_ = nullptr;
+  Shader* nr_issue_pixel_shader_ = nullptr;
+  // Written by the backend, reported (and cleared per window) by the base.
+  uint64_t nr_issue_issued_ = 0;
+  uint64_t nr_issue_precord_skips_ = 0;
 
   bool paused_ = false;
 

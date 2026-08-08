@@ -355,6 +355,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   // the log (rewinding the register file to the segment snapshot) by calling this.
   bool IssueDrawImpl(xenos::PrimitiveType primitive_type, uint32_t index_count,
                      IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
+  // [NR-ISSUE] Increment 4d: issue one draw from the composed shadow register
+  // file the base executor armed (nr_issue_values_). Copies it into a private
+  // RegisterFile, repoints every draw-path holder at it (the proven 1b-1a/1b-1b
+  // SetRegisterFile machinery), runs IssueDrawImpl, restores. The active
+  // shaders come from the walk via the base's nr_issue_* accessor gate. No
+  // ForceFullDrawStateReemit: this is the SAME draw at the SAME moment, so the
+  // deferred list's dirty tracking stays valid whether or not the values match
+  // (dirty state compares against internal shadows, not the register file).
+  bool NrIssueDrawFromShadow(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                             IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
   // Replay the pending captured segment into the current deferred command list,
   // in original write/draw order, then clear it. No-op if no segment is open or
   // already replaying (reentrancy guard). Dispatches to the shared-rewind (1b-0),
@@ -674,6 +684,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // register_file_ (default; no behavior change). A worker points this at its
   // per-segment local register file while replaying that segment's draws.
   const RegisterFile* active_draw_register_file_ = nullptr;
+  // [NR-ISSUE] Increment 4d: the private RegisterFile a shadow-issued draw
+  // runs against. Lazily allocated on the first armed draw; CP-thread-only
+  // (shadow issue is unsupported alongside precord capture).
+  std::unique_ptr<RegisterFile> nr_issue_regfile_;
   // [GPU-PRECORD] Phase 1b-1b worker (Model C). The parse thread posts the captured
   // segment and blocks until the worker has replayed it (no overlap yet), so while
   // the worker runs PrecordReplayLocal the parse thread is idle ⇒ the precord_*

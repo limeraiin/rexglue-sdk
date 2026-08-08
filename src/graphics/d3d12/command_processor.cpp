@@ -3004,6 +3004,17 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
+  // [NR-ISSUE] Increment 4d: the base executor armed this draw to be issued
+  // from the composed shadow register file. Unsupported alongside precord
+  // capture (both default off): fall through to the normal path there, but
+  // count it so a silent misconfiguration shows on the [nr-issue] line.
+  if (nr_issue_armed_) {
+    if (!g_precord_capture) {
+      return NrIssueDrawFromShadow(primitive_type, index_count, index_buffer_info,
+                                   major_mode_explicit);
+    }
+    ++nr_issue_precord_skips_;
+  }
   // [GPU-PRECORD] Phase 1b-0 capture wrapper. When capturing (and not already
   // replaying a captured segment), defer this draw into the current segment's
   // event log instead of recording it now; PrecordFlush replays the log later.
@@ -3062,6 +3073,45 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     PrecordFlush(/*from_segment_boundary=*/true);
   }
   return true;
+}
+
+bool D3D12CommandProcessor::NrIssueDrawFromShadow(xenos::PrimitiveType primitive_type,
+                                                  uint32_t index_count,
+                                                  IndexBufferInfo* index_buffer_info,
+                                                  bool major_mode_explicit) {
+  // [NR-ISSUE] Increment 4d: one draw, issued end to end from walk-recovered
+  // state. The repoint/restore pair is PrecordReplayLocal's, proven
+  // pixel-identical by the 1b-1b A/B; the file's contents are the difference:
+  // the 4c shadow's decoded values on every register the stream has written,
+  // live's on the rest (the four named externs, the two ports, dead registers
+  // -- RegShadowCompose in the base). Everything runs inline on the CP thread,
+  // between two packets of the same draw, so no other reader can observe the
+  // repointed holders.
+  if (!nr_issue_regfile_) {
+    nr_issue_regfile_ = std::make_unique<RegisterFile>();
+  }
+  RegisterFile* local = nr_issue_regfile_.get();
+  std::memcpy(local->values, nr_issue_values_,
+              RegisterFile::kRegisterCount * sizeof(uint32_t));
+
+  RegisterFile* shared = register_file_;
+  active_draw_register_file_ = local;
+  primitive_processor_->SetRegisterFile(local);
+  render_target_cache_->SetRegisterFile(local);
+  texture_cache_->SetRegisterFile(local);
+  pipeline_cache_->SetRegisterFile(local);
+
+  const bool draw_succeeded =
+      IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+
+  active_draw_register_file_ = nullptr;
+  primitive_processor_->SetRegisterFile(shared);
+  render_target_cache_->SetRegisterFile(shared);
+  texture_cache_->SetRegisterFile(shared);
+  pipeline_cache_->SetRegisterFile(shared);
+
+  ++nr_issue_issued_;
+  return draw_succeeded;
 }
 
 bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, uint32_t index_count,

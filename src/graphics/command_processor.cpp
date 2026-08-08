@@ -31,6 +31,9 @@
 #include <rex/graphics/nr_draw_cache.h>
 #include <rex/graphics/nr_state_walk.h>
 #include <rex/graphics/nr_draw_registry.h>
+#include <rex/graphics/nr_regfile.h>
+#include <rex/graphics/nr_resource.h>
+#include <rex/graphics/nr_shader_db.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -142,6 +145,92 @@ REXCVAR_DEFINE_BOOL(gpu_nr_ctx, false, "GPU",
                     "Diagnostic [nr-ctx]: carried state context across executed "
                     "indirect buffers, with register-file ground-truth validation. "
                     "Implies gpu_nr_cache. Off by default.");
+
+// [NR-RES] Increment 4b-3: the resource census. 4b-1 closed the input model
+// and 4b-2 the shader question; what a draw still needs is its RESOURCES,
+// and that half has never been measured. Mirrors the ALU/fetch/bool/loop
+// constant files off the same context walk, validates the mirror against the
+// live register file at buffer entry, and splits every write by whether it
+// arrived inline in the packet or by reference to guest memory.
+REXCVAR_DEFINE_BOOL(gpu_nr_res, false, "GPU",
+                    "Diagnostic [nr-res]: vertex/texture fetch and constant "
+                    "state recovered from the buffer stream, with "
+                    "register-file ground truth. Implies gpu_nr_ctx. "
+                    "Off by default.");
+
+// [NR-DRAW] Increment 4c: the shadow register file, compared AT EACH DRAW.
+//
+// Every earlier increment mirrored a hand-picked slice of state and gated it.
+// This mirrors the WHOLE register file from the same walk and asks the same
+// question over all of it, which does two things no slice can:
+//
+//   - it removes the choosing. A draw issued from a complete shadow that
+//     equals the live file is identical to the emulated draw whatever it
+//     reads, so no enumeration of "which registers matter" has to be right.
+//   - its failures ARE the port scope. A register the live file has that the
+//     stream never wrote must come from the D3D9 hook layer instead, and the
+//     named list of those has only ever been reasoned about, never measured.
+//
+// It also puts the walk in LOCKSTEP with execution (CtxWalkNextDraw), which
+// is the only way to read per-draw state honestly: the whole-buffer walk runs
+// at buffer entry, so anything asked afterwards sees the buffer's END state.
+// That is a real correction, not a refinement -- 4b-3's per-draw coverage
+// check ran at execution time and therefore read each fetch slot's LAST type
+// in the buffer rather than the type in effect at the draw.
+REXCVAR_DEFINE_BOOL(gpu_nr_draw, false, "GPU",
+                    "Diagnostic [nr-draw]: full shadow register file walked in "
+                    "lockstep with execution and compared against the live "
+                    "register file at every draw. Implies gpu_nr_ctx. "
+                    "Off by default.");
+
+// [NR-ISSUE] Increment 4d: ISSUE the draw from the shadow instead of merely
+// comparing it. 4c closed the input model (diverge=0 over the whole register
+// file at full city load); this is the first step that consumes it. At each
+// lockstep stop the shadow is composed with the live file (defined registers
+// from the walk's own decoded values, everything else -- the four named
+// externs, the two side-effect ports, dead registers -- from live, i.e. "read
+// it once"), the walk's shader refs are resolved through LoadShader exactly as
+// IM_LOAD does, and the backend issues the draw against that private file
+// through the real pipeline/texture/render-target caches via the precord
+// SetRegisterFile machinery. If the frame is unchanged, the recovered state is
+// sufficient END TO END, not just as numbers.
+REXCVAR_DEFINE_BOOL(gpu_nr_issue, false, "GPU",
+                    "[nr-issue]: issue draws from the increment-4c shadow "
+                    "register file (walk-recovered state) instead of the live "
+                    "one. Implies gpu_nr_draw. D3D12 only (other backends arm "
+                    "but never issue). Off by default.");
+
+// Bisection: a mismatch found with everything shadow-issued is narrowed by
+// halving the ordinal range. Ordinals count lockstep geometry stops since
+// boot and are printed on the [nr-issue] line.
+REXCVAR_DEFINE_INT32(gpu_nr_issue_from, 0, "GPU",
+                     "[nr-issue]: first shadow-issue ordinal (lockstep draw "
+                     "stops since boot). Draws before it use the live path.");
+REXCVAR_DEFINE_INT32(gpu_nr_issue_count, -1, "GPU",
+                     "[nr-issue]: number of draws to shadow-issue from "
+                     "gpu_nr_issue_from on; -1 = unbounded.");
+
+// [NR-SDB] Increment 4b-2: the shader-database probe. The offline census
+// proved the whole 3,320-shader corpus in xeshader.sdb translates, and the
+// index keys each blob by the runtime's own shader key -- but "the corpus
+// translates" only becomes "the corpus can be translated ahead of time" if
+// the shaders the game LOADS are in it under that same key. This measures
+// exactly that, and splits every miss into "same shader, different declared
+// length" (a key problem) and "not in the corpus at all" (a corpus problem).
+// Independent of the ledger: it hooks the shader-load packets, not the walk.
+REXCVAR_DEFINE_BOOL(gpu_nr_shaderdb, false, "GPU",
+                    "Diagnostic [nr-sdb]: check every shader the game loads "
+                    "against the offline shader database, keyed by the "
+                    "runtime's own shader hash. Off by default.");
+
+REXCVAR_DEFINE_STRING(gpu_nr_shaderdb_path, "", "GPU",
+                      "Shader database for [nr-sdb]. Empty resolves to "
+                      "<game_data_root>/xeshader.sdb.");
+
+REXCVAR_DEFINE_STRING(gpu_nr_shaderdb_dump, "", "GPU",
+                      "File for [nr-sdb] to write the raw ucode of every "
+                      "distinct shader MISSING from the database, so its "
+                      "real source can be found offline. Empty disables.");
 
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
                     "Write the ring-buffer read pointer back to the guest incrementally "
@@ -537,6 +626,8 @@ uint8_t g_nrs_flags[kNrbMaxPkts];
 // like everything else here) plus the window counters. The context is NOT
 // reset per window -- it is the persistent thing being measured.
 bool g_nr_ctx = false;
+bool g_nr_res = false;   // [NR-RES] increment 4b-3
+bool g_nr_draw = false;  // [NR-DRAW] increment 4c
 nr::StateContext g_ctx_state;
 uint16_t g_ctx_flags[kNrbMaxPkts];
 uint64_t g_ctx_execs = 0;   // depth-1 buffers walked into the context
@@ -566,9 +657,16 @@ constexpr uint32_t kCtxDivSamples = 4;
 CtxDivSample g_ctx_div_samp[kCtxDivSamples];
 uint32_t g_ctx_div_samp_n = 0;
 // Distinct shaders this window: open-addressed set keyed on (addr, size,
-// immediate). Sizes increment 4b's live translation cache (offline corpus
-// caps the honest answer at 3,320 unique).
-constexpr uint32_t kCtxShaderSetSize = 4096;  // power of two
+// immediate). Sizes the corpus a native replay must have translated (the
+// offline database caps the honest answer at 3,320 unique).
+//
+// 4b-1's city run OVERFLOWED this at 4,096 slots (set_ovf 179-480/s, 0 in
+// the menu), so its distinct count was an undercount and could only be
+// quoted as ">= 2,634". At ~3.3k distinct per second against a 16-probe
+// give-up, a 4,096-slot table is already at 80% load. 65,536 slots keeps the
+// load under 6% (512 KB, cleared once per window) so the number can be read
+// literally.
+constexpr uint32_t kCtxShaderSetSize = 65536;  // power of two
 uint64_t g_ctx_shader_set[kCtxShaderSetSize];
 uint64_t g_ctx_sh_distinct = 0, g_ctx_sh_set_ovf = 0;
 // [NR-RING] Increment 4b-0: out-of-stream writes captured into the context
@@ -736,6 +834,422 @@ void CountBufferDraws(const uint8_t* raw, uint32_t dwords, uint32_t* out_draw_in
   *out_draw_indx2 = d2;
 }
 
+// [NR-DRAW] Increment 4c: the shadow register file and the lockstep walk.
+//
+// The walker is a single global because it is only ever driven at IB depth 1
+// on the command-processor thread, exactly like every other g_ctx_* here. A
+// nested execution does not touch it (and is counted, not absorbed).
+static_assert(nr::kRegShadowCount == RegisterFile::kRegisterCount,
+              "the shadow must be the same shape as the register file it "
+              "mirrors -- increment 4c issues a draw by copying one into the "
+              "other");
+nr::RegShadow g_reg_shadow;
+nr::RegShadowStats g_reg_stats;
+nr::CtxWalker g_ctx_walker;
+nr::CtxWalkStats g_ctx_walk_stats;
+// A walk is in progress and must be finished at the end of the buffer.
+bool g_ctx_walk_active = false;
+// ... and is still in step with the executor, so a stop can be trusted. These
+// are separate on purpose: a desync must stop the COMPARING without
+// abandoning the walk, or the running context would be left half-applied and
+// the next buffer would start from a state no replay would ever have.
+bool g_ctx_walk_lockstep = false;
+// Lockstep integrity. A stop whose opcode is not the one the executor is
+// running, or a draw the walk has already run out of, means the two decoders
+// disagree about which packets execute -- which would make every value read
+// at the next stop come from the wrong moment. Counted, and comparing stops
+// for the rest of that buffer rather than reporting from a desynced walk.
+uint64_t g_nrd_stops = 0, g_nrd_desync = 0, g_nrd_skipped_depth = 0;
+uint64_t g_nrd_buffers = 0;
+// Findings, tallied by register: the deliverable is a NAMED list, not a rate.
+struct NrdReg {
+  uint32_t reg;
+  uint64_t count;
+  uint32_t last_ours, last_live;
+};
+constexpr uint32_t kNrdTop = 16;
+NrdReg g_nrd_div_top[kNrdTop] = {};
+NrdReg g_nrd_ext_top[kNrdTop] = {};
+
+void NrdTally(NrdReg* top, uint32_t reg, uint32_t ours, uint32_t live) {
+  for (uint32_t i = 0; i < kNrdTop; ++i) {
+    if (top[i].count && top[i].reg == reg) {
+      ++top[i].count;
+      top[i].last_ours = ours;
+      top[i].last_live = live;
+      return;
+    }
+    if (!top[i].count) {
+      top[i] = {reg, 1, ours, live};
+      return;
+    }
+  }
+}
+
+// ★ The THIRD category, found by the first menu run and confirmed against the
+// executor's own code rather than assumed. These registers are not state the
+// stream carries; they are ports the EXECUTOR itself writes as a side effect
+// of executing, so the shadow holding the packet's value while the live file
+// holds something else is correct behaviour on both sides:
+//
+//   COHER_STATUS_HOST  WriteRegister ORs in bit 31 on every write, and
+//                      MakeCoherent clears the status once it has acted. Live
+//                      is a CONSUMED value: a coherency handshake, not a
+//                      value a draw reads. (command_processor.cpp, the
+//                      XE_GPU_REG_COHER_STATUS_HOST case.)
+//   DC_LUT_RW_INDEX    the gamma-ramp upload AUTO-INCREMENTS it through a
+//                      nested WriteRegister after each entry, so live runs
+//                      ahead of whatever the packet set. A write cursor.
+//
+// Counted apart rather than suppressed, and still named on the report, so
+// that `diverge` means "the walk decoded something wrong" and a NEW register
+// appearing in the city cannot hide inside an exemption.
+bool NrdSideEffectReg(uint32_t reg) {
+  return reg == 0x0A31 /* COHER_STATUS_HOST */ ||
+         reg == 0x1922 /* DC_LUT_RW_INDEX */;
+}
+uint64_t g_nrd_sfx = 0;
+NrdReg g_nrd_sfx_top[kNrdTop] = {};
+
+void NrdFinding(void*, nr::RegShadowFinding what, uint32_t reg, uint32_t ours,
+                uint32_t live) {
+  if (what == nr::kRegShadowDiverge && NrdSideEffectReg(reg)) {
+    ++g_nrd_sfx;
+    NrdTally(g_nrd_sfx_top, reg, ours, live);
+    return;
+  }
+  NrdTally(what == nr::kRegShadowDiverge ? g_nrd_div_top : g_nrd_ext_top, reg,
+           ours, live);
+}
+
+// [NR-ISSUE] Increment 4d. CP-thread-only, like everything else here.
+bool g_nr_issue = false;
+int64_t g_nri_from = 0;
+int64_t g_nri_count = -1;
+uint64_t g_nri_ordinal = 0;      // lockstep geometry stops since boot (cumulative)
+uint64_t g_nri_armed = 0;        // window: draws armed for the backend
+uint64_t g_nri_copy_live = 0;    // window: kCopy draws left on the live path
+                                 // (IssueCopy is not repointed by 1b-1a)
+uint64_t g_nri_sh_invalid = 0;   // window: walk shader refs not yet valid
+uint64_t g_nri_sh_mismatch = 0;  // window: walk-resolved shader != live active
+                                 // (issued from the walk's anyway -- that IS
+                                 // the recovered path; nonzero names a 4b-2
+                                 // tracking hole)
+// The composed file the backend copies from. Static rather than stack: 80 KB.
+uint32_t g_nri_compose[RegisterFile::kRegisterCount];
+
+// Applies whatever is left of the buffer and folds the walk's per-draw flags
+// and stats into the window counters. Called at buffer entry when the shadow
+// is off (the pre-4c whole-buffer behaviour) and after execution when it is
+// on, so the two modes tally identically.
+void CtxFinishWalk() {
+  const uint32_t nf = nr::CtxWalkFinish(&g_ctx_walker);
+  const nr::CtxWalkStats& cst = g_ctx_walk_stats;
+  ++g_ctx_execs;
+  g_ctx_nop0 += cst.nop0;
+  g_ctx_sc2 += cst.set_const2;
+  g_ctx_pred += cst.pred_skipped;
+  g_ctx_pred_draws += cst.pred_draws;
+  g_ctx_pred_draws_run += cst.pred_draws_run;
+  g_ctx_bin_pkts += cst.bin_pkts;
+  if (cst.draws22 > nf) ++g_ctx_flags_ovf;
+  g_ctx_mem_loads += cst.mem_loads;
+  g_ctx_poisoned += cst.mem_poisoned;
+  g_ctx_im_loads += cst.im_loads;
+  g_ctx_im_imms += cst.im_load_imms;
+  g_ctx_draws += nf;
+  for (uint32_t i = 0; i < nf; ++i) {
+    const uint16_t f = g_ctx_flags[i];
+    const bool rt = f & nr::kCtxDrawRtDef;
+    const bool vp = f & nr::kCtxDrawVportDef;
+    const bool md = f & nr::kCtxDrawModeDef;
+    const bool sh = f & nr::kCtxDrawShadersDef;
+    if (rt) ++g_ctx_rt_def;
+    if (vp) ++g_ctx_vp_def;
+    if (md) ++g_ctx_mode_def;
+    if (sh) ++g_ctx_sh_def;
+    if (rt && vp && md && sh) ++g_ctx_full;
+    if (f & nr::kCtxDrawCopy) ++g_ctx_copy;
+    if (f & nr::kCtxDrawRtCarried) ++g_ctx_rt_carry;
+    if (f & nr::kCtxDrawVportCarried) ++g_ctx_vp_carry;
+    if (f & nr::kCtxDrawModeCarried) ++g_ctx_mode_carry;
+    if (f & nr::kCtxDrawShadersCarried) ++g_ctx_sh_carry;
+  }
+}
+
+// Registers compared per draw. The file is 20,483 registers and the city
+// issues ~200k draws a second, so a full compare per draw would cost more
+// than the thing being measured; a rolling slice sweeps the whole file
+// thousands of times a second instead. A divergence persists until the
+// register is rewritten, so this catches one within a fraction of a
+// millisecond rather than instantly -- which is the honest trade and is
+// stated on the report line as sweeps/s.
+constexpr uint32_t kNrdSweepPerDraw = 256;
+
+// [NR-RES] Increment 4b-3: the resource census. Rides the increment-4a
+// context walk (one decoder, per the 4b-1 lesson) and mirrors the four
+// constant files a draw's resources live in. Ground truth is the same gate
+// that settled 4a and 4b-1: at buffer entry the mirror must equal the live
+// register file.
+nr::ResourceContext g_res_state;
+nr::ResStats g_res_stats;
+constexpr uint32_t kResDivSamples = 6;
+nr::ResDivergence g_res_div_samp[kResDivSamples];
+uint32_t g_res_div_samp_n = 0;
+// Distinct fetch base addresses seen at draw time this window: how many
+// distinct buffers a replay would have to bind.
+constexpr uint32_t kResAddrSetSize = 8192;
+uint32_t g_res_addr_set[kResAddrSetSize];
+uint64_t g_res_addr_distinct = 0, g_res_addr_ovf = 0;
+
+// [NR-RES]/[NR-DRAW] Every register write the ONE walk decodes, fanned out to
+// whichever censuses are on. Both consume the same stream by design: a second
+// decoder is the drift 4b-1 had to repair across four walkers.
+void NrWalkRegWrite(void*, uint32_t reg, uint32_t value, bool from_memory) {
+  if (g_nr_res) {
+    nr::ResApplyWrite(&g_res_state, &g_res_stats, reg, value, from_memory);
+  }
+  if (g_nr_draw) {
+    nr::RegShadowApplyWrite(&g_reg_shadow, &g_reg_stats, reg, value);
+  }
+}
+
+void ResAddrSeen(uint32_t addr) {
+  if (!addr) return;
+  uint32_t i = (addr * 2654435761u) >> 15;
+  for (uint32_t probe = 0; probe < 8; ++probe) {
+    uint32_t& slot = g_res_addr_set[(i + probe) & (kResAddrSetSize - 1)];
+    if (slot == addr) return;
+    if (!slot) {
+      slot = addr;
+      ++g_res_addr_distinct;
+      return;
+    }
+  }
+  ++g_res_addr_ovf;
+}
+
+void NrResDraw(void*) {
+  nr::ResObserveDraw(&g_res_state, &g_res_stats);
+  // Only the constants that are actually live vertex fetches, straight off
+  // the mask: at ~200k draws/s a full scan per draw would be probe cost, not
+  // measurement.
+  for (uint32_t w = 0; w < 3; ++w) {
+    uint32_t mask = g_res_state.vfetch_live_mask[w];
+    while (mask) {
+      const uint32_t bit = uint32_t(__builtin_ctz(mask));
+      mask &= mask - 1;
+      ResAddrSeen(
+          nr::ResDecodeVertexFetch(&g_res_state, w * 32 + bit).base);
+    }
+  }
+}
+
+uint32_t ResReadLive(void* user, uint32_t reg) {
+  return static_cast<const RegisterFile*>(user)->values[reg];
+}
+
+// [NR-RES] Coverage: of the fetch constants a draw's own shaders reference,
+// how many are recoverable from the walk-derived mirror? This is the strict
+// question the occupancy counters cannot answer, and it is the last input a
+// native draw needs. Counted at EXECUTION time, right after IssueDraw, for
+// two reasons: the shaders are analyzed by then (analysis happens inside it),
+// and no packet has run since the draw, so the mirror still holds exactly
+// that draw's state.
+uint64_t g_res_cov_draws = 0, g_res_cov_full = 0, g_res_cov_unanalyzed = 0;
+uint64_t g_res_vref = 0, g_res_vref_undef = 0, g_res_vref_type = 0;
+uint64_t g_res_tref = 0, g_res_tref_undef = 0, g_res_tref_type = 0;
+struct ResCovSample {
+  uint32_t slot;
+  uint32_t dword0;  // the constant's first dword, VERBATIM
+  uint8_t texture;  // 0 = vertex view, 1 = texture view
+  uint8_t pixel;    // which shader referenced it
+  uint8_t reason;   // nr::ResCoverage
+};
+constexpr uint32_t kResCovSamples = 6;
+ResCovSample g_res_cov_samp[kResCovSamples];
+uint32_t g_res_cov_samp_n = 0;
+// ⚠ Samples are capped at 6 a window and taken in binding order, so they can
+// suggest "it is always slot 0" without ever having measured it. That caveat
+// was written down last session and then reasoned from anyway. A full
+// histogram costs one increment per failure and settles it.
+uint64_t g_res_vref_fail_slot[nr::kResFetchVertexSlots] = {};
+uint64_t g_res_tref_fail_slot[nr::kResFetchTextureSlots] = {};
+
+void ResCoverShader(const Shader* shader, bool pixel, bool* all_covered) {
+  if (!shader || !shader->is_ucode_analyzed()) return;
+  for (const auto& vb : shader->vertex_bindings()) {
+    const nr::ResCoverage c =
+        nr::ResVertexFetchCoverage(&g_res_state, vb.fetch_constant);
+    ++g_res_vref;
+    if (c == nr::kResCoverLive) continue;
+    *all_covered = false;
+    (c == nr::kResCoverUndefined ? g_res_vref_undef : g_res_vref_type)++;
+    if (vb.fetch_constant < nr::kResFetchVertexSlots) {
+      ++g_res_vref_fail_slot[vb.fetch_constant];
+    }
+    if (g_res_cov_samp_n < kResCovSamples) {
+      g_res_cov_samp[g_res_cov_samp_n++] = {
+          vb.fetch_constant,
+          nr::ResFetchDword0(&g_res_state, vb.fetch_constant, false), 0,
+          uint8_t(pixel), uint8_t(c)};
+    }
+  }
+  for (const auto& tb : shader->texture_bindings()) {
+    const nr::ResCoverage c =
+        nr::ResTextureFetchCoverage(&g_res_state, tb.fetch_constant);
+    ++g_res_tref;
+    if (c == nr::kResCoverLive) continue;
+    *all_covered = false;
+    (c == nr::kResCoverUndefined ? g_res_tref_undef : g_res_tref_type)++;
+    if (tb.fetch_constant < nr::kResFetchTextureSlots) {
+      ++g_res_tref_fail_slot[tb.fetch_constant];
+    }
+    if (g_res_cov_samp_n < kResCovSamples) {
+      g_res_cov_samp[g_res_cov_samp_n++] = {
+          tb.fetch_constant,
+          nr::ResFetchDword0(&g_res_state, tb.fetch_constant, true), 1,
+          uint8_t(pixel), uint8_t(c)};
+    }
+  }
+}
+
+// [NR-SDB] Increment 4b-2: the shader-database probe.
+//
+// The offline index keys every container by XXH3-64 over its raw big-endian
+// ucode, which is what PipelineCache::LoadShader computes for a shader read
+// from guest memory -- provided the guest declares the same length the
+// container stores. The whole AOT-translation plan rests on that "provided",
+// and it has never been measured against a running game, so nothing is built
+// on the key until this probe answers: of the shaders the game actually
+// loads, how many are in the database, under the SAME key?
+//
+// A miss is not one thing, so the probe splits it. `prefix` = the database
+// holds a blob agreeing with this one over their common length: the same
+// shader under a different declared size, which an AOT cache keyed by the
+// container hash would miss even though it holds the shader (fixable by
+// keying on the common prefix). `absent` = the corpus genuinely does not
+// hold this shader, which would mean shaders arrive from somewhere other
+// than xeshader.sdb and the corpus is not closed. The two demand opposite
+// responses, so a single "miss%" would be useless.
+//
+// Distinct accounting is the headline: per-load rates are dominated by
+// whichever shaders the current scene rebinds most, while the corpus
+// question is about the SET.
+nr::ShaderDbIndex* g_sdb_index = nullptr;
+bool g_sdb_ready = false, g_sdb_failed = false;
+uint64_t g_sdb_loads = 0, g_sdb_hits = 0, g_sdb_misses = 0;
+uint64_t g_sdb_distinct = 0, g_sdb_distinct_hit = 0;
+uint64_t g_sdb_distinct_prefix = 0, g_sdb_distinct_absent = 0;
+uint64_t g_sdb_stage_mismatch = 0, g_sdb_set_ovf = 0, g_sdb_zero = 0;
+// Distinct-blob set over the whole session (NOT per window): the corpus
+// question is cumulative, and clearing it each second would re-count the
+// same shaders forever. 65,536 slots against a 3,320-shader corpus.
+constexpr uint32_t kSdbSeenSize = 65536;
+uint64_t g_sdb_seen[kSdbSeenSize];
+struct SdbMissSample {
+  uint64_t hash;
+  uint32_t dwords;
+  uint32_t guest_addr;
+  uint32_t db_bytes;
+  uint32_t equal_bytes;
+  bool pixel;
+  bool prefix;
+};
+constexpr uint32_t kSdbMissSamples = 6;
+SdbMissSample g_sdb_miss_samp[kSdbMissSamples];
+uint32_t g_sdb_miss_samp_n = 0;
+// Raw-ucode dump of the misses. A miss that is "absent" says the corpus is
+// not closed but says nothing about where the shader DID come from, and the
+// address alone cannot answer that after the process exits -- so the bytes
+// go to disk, where they can be searched for in the XEX, the AI2C module and
+// the BigFile. Record: {'NRSD', bytes, hash, stage} then the raw big-endian
+// ucode, so the file is self-describing and appendable.
+FILE* g_sdb_dump = nullptr;
+uint32_t g_sdb_dumped = 0;
+constexpr uint32_t kSdbDumpMax = 4096;
+
+void SdbDumpMiss(uint64_t hash, bool pixel, const uint8_t* ucode,
+                 uint32_t bytes) {
+  if (!g_sdb_dump || g_sdb_dumped >= kSdbDumpMax) return;
+  const uint32_t tag = 0x4E525344u;  // 'NRSD'
+  const uint32_t stage = pixel ? 1u : 0u;
+  fwrite(&tag, 4, 1, g_sdb_dump);
+  fwrite(&bytes, 4, 1, g_sdb_dump);
+  fwrite(&hash, 8, 1, g_sdb_dump);
+  fwrite(&stage, 4, 1, g_sdb_dump);
+  fwrite(ucode, 1, bytes, g_sdb_dump);
+  ++g_sdb_dumped;
+  // Flushed per record: the probe is normally ended by killing the process,
+  // and a buffered dump would lose exactly the tail that motivated the run.
+  fflush(g_sdb_dump);
+}
+
+// True when `hash` had not been seen before (the caller then classifies it).
+bool SdbSeenFirstTime(uint64_t hash) {
+  uint64_t key = hash ? hash : 1;
+  uint32_t i = uint32_t((key * 2654435761ull) >> 16) & (kSdbSeenSize - 1);
+  for (uint32_t probe = 0; probe < 16; ++probe) {
+    uint64_t& slot = g_sdb_seen[(i + probe) & (kSdbSeenSize - 1)];
+    if (slot == key) return false;
+    if (!slot) {
+      slot = key;
+      return true;
+    }
+  }
+  ++g_sdb_set_ovf;
+  return false;
+}
+
+// Called for every shader the executor loads (both IM_LOAD forms), on the
+// command-processor thread. `host_address` is the guest ucode in place: the
+// SAME bytes and the SAME length the pipeline cache is about to hash, so the
+// probe cannot drift from the key it is validating.
+void NrSdbObserve(xenos::ShaderType shader_type, uint32_t guest_address,
+                  const uint32_t* host_address, uint32_t dword_count) {
+  if (!g_sdb_ready || !host_address) return;
+  if (!dword_count) {
+    ++g_sdb_zero;
+    return;
+  }
+  const uint8_t* ucode = reinterpret_cast<const uint8_t*>(host_address);
+  const uint32_t bytes = dword_count * 4;
+  const uint64_t hash = nr::HashUcode(ucode, bytes);
+  const bool pixel = shader_type == xenos::ShaderType::kPixel;
+
+  ++g_sdb_loads;
+  const nr::ShaderDbIndex::Entry* entry = g_sdb_index->Lookup(hash);
+  if (entry) {
+    ++g_sdb_hits;
+  } else {
+    ++g_sdb_misses;
+  }
+  if (!SdbSeenFirstTime(hash)) return;
+
+  ++g_sdb_distinct;
+  if (entry) {
+    ++g_sdb_distinct_hit;
+    // The runtime's map is keyed by the hash ALONE, so a blob the database
+    // files under the other stage would translate as the wrong stage.
+    if (entry->pixel != pixel) ++g_sdb_stage_mismatch;
+    return;
+  }
+  const nr::ShaderDbIndex::PrefixMatch pm =
+      g_sdb_index->FindByPrefix(ucode, bytes);
+  if (pm.found) {
+    ++g_sdb_distinct_prefix;
+  } else {
+    ++g_sdb_distinct_absent;
+  }
+  SdbDumpMiss(hash, pixel, ucode, bytes);
+  if (g_sdb_miss_samp_n < kSdbMissSamples) {
+    g_sdb_miss_samp[g_sdb_miss_samp_n++] = {hash,       dword_count,
+                                            guest_address, pm.db_bytes,
+                                            pm.equal_bytes, pixel,
+                                            pm.found};
+  }
+}
+
 }  // namespace
 
 void CommandProcessor::WorkerThreadMain() {
@@ -765,8 +1279,55 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_bufcache = kNrBuf;
   const bool kNrState = REXCVAR_GET(gpu_nr_state);
   g_nr_state = kNrState;
-  const bool kNrCtx = REXCVAR_GET(gpu_nr_ctx);
+  // [NR-RES] rides the 4a context walk, so it implies it.
+  const bool kNrRes = REXCVAR_GET(gpu_nr_res);
+  g_nr_res = kNrRes;
+  // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
+  const bool kNrIssue = REXCVAR_GET(gpu_nr_issue);
+  g_nr_issue = kNrIssue;
+  g_nri_from = REXCVAR_GET(gpu_nr_issue_from);
+  g_nri_count = REXCVAR_GET(gpu_nr_issue_count);
+  // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
+  const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue;
+  g_nr_draw = kNrDraw;
+  const bool kNrCtx = REXCVAR_GET(gpu_nr_ctx) || kNrRes || kNrDraw;
   g_nr_ctx = kNrCtx;
+  // [NR-SDB] Load the shader database once, here, on the thread that will
+  // query it -- never lazily inside the packet handler, where a 6 MB read
+  // would land in the middle of a measured frame.
+  const bool kNrSdb = REXCVAR_GET(gpu_nr_shaderdb);
+  if (kNrSdb && !g_sdb_ready && !g_sdb_failed) {
+    std::string sdb_path = REXCVAR_GET(gpu_nr_shaderdb_path);
+    if (sdb_path.empty()) {
+      const std::string root = rex::cvar::Query<std::string>("game_data_root");
+      if (!root.empty()) sdb_path = root + "/xeshader.sdb";
+    }
+    g_sdb_index = new nr::ShaderDbIndex();
+    if (!sdb_path.empty() && g_sdb_index->LoadFile(sdb_path.c_str())) {
+      g_sdb_ready = true;
+      const std::string dump_path = REXCVAR_GET(gpu_nr_shaderdb_dump);
+      if (!dump_path.empty()) {
+        g_sdb_dump = fopen(dump_path.c_str(), "wb");
+        REXGPU_INFO("[nr-sdb] miss ucode dump -> {} ({})", dump_path,
+                    g_sdb_dump ? "open" : "FAILED TO OPEN");
+      }
+      REXGPU_INFO(
+          "[nr-sdb] loaded {} ({} bytes): {} containers, {} unique blobs "
+          "(pixel={} vertex={}, bad-bounds={})",
+          sdb_path, g_sdb_index->file_bytes(), g_sdb_index->stats().containers,
+          g_sdb_index->unique_count(), g_sdb_index->stats().pixel,
+          g_sdb_index->stats().vertex, g_sdb_index->stats().bad_ucode_bounds);
+    } else {
+      // A probe that silently measures nothing is worse than no probe.
+      g_sdb_failed = true;
+      delete g_sdb_index;
+      g_sdb_index = nullptr;
+      REXGPU_ERROR(
+          "[nr-sdb] cannot read shader database '{}' - probe disabled (set "
+          "gpu_nr_shaderdb_path)",
+          sdb_path.empty() ? "<unset>" : sdb_path);
+    }
+  }
   const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState || kNrCtx;
   g_nr_cache = kNrCache;
   const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger) || kNrCache;  // [NR-IBL] record/replay gate
@@ -854,7 +1415,7 @@ void CommandProcessor::WorkerThreadMain() {
     }
 
     // [GPU-WORKER-PROFILE] / [GPU-SPLIT] / [PM4-CENSUS] ~1s wall-time report.
-    if (kProfile || kSplit || kCensus || kIbLedger) {
+    if (kProfile || kSplit || kCensus || kIbLedger || kNrSdb) {
       auto now = prof_clock::now();
       uint64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              now - prof_last_report).count();
@@ -1236,12 +1797,231 @@ void CommandProcessor::WorkerThreadMain() {
             }
             g_ctx_sh_distinct = g_ctx_sh_set_ovf = 0;
           }
+          // [NR-RES] The resource verdict. diverge is the gate (must be ~0,
+          // same meaning as 4a's): nonzero means resource state reaches a
+          // draw from somewhere this buffer stream does not carry, and the
+          // sample names the register and file. by_mem% is the design
+          // number: constants that arrive by reference to guest memory
+          // cannot be baked into a per-buffer translation, because buffers
+          // are replayed for many frames after they are recorded.
+          if (g_nr_res && g_res_stats.draws) {
+            const nr::ResStats& r = g_res_stats;
+            const double dp = 100.0 / double(r.draws);
+            const double wp = r.writes ? 100.0 / double(r.writes) : 0.0;
+            REXGPU_INFO(
+                "[nr-res] draws={} writes={} by_mem={:.1f}% | per-file "
+                "alu={} fetch={} bool={} loop={} | by_mem alu={} fetch={}",
+                r.draws, r.writes, r.writes_from_memory * wp,
+                r.writes_by_file[nr::kResFileAlu],
+                r.writes_by_file[nr::kResFileFetch],
+                r.writes_by_file[nr::kResFileBool],
+                r.writes_by_file[nr::kResFileLoop],
+                r.writes_from_memory_by_file[nr::kResFileAlu],
+                r.writes_from_memory_by_file[nr::kResFileFetch]);
+            REXGPU_INFO(
+                "[nr-res]   per draw: vfetch={:.1f}/{} carried={:.1f} | "
+                "tfetch={:.1f}/{} carried={:.1f} | alu_def={:.0f}/{} "
+                "all_alu_carried={:.1f}% | addrs={} addr_ovf={}",
+                double(r.vfetch_live) / double(r.draws),
+                nr::kResFetchVertexSlots,
+                double(r.vfetch_carried) / double(r.draws),
+                double(r.tfetch_live) / double(r.draws),
+                nr::kResFetchTextureSlots,
+                double(r.tfetch_carried) / double(r.draws),
+                double(r.alu_defined_at_draw) / double(r.draws),
+                nr::kResAluCount, r.draws_all_alu_carried * dp,
+                g_res_addr_distinct, g_res_addr_ovf);
+            REXGPU_INFO(
+                "[nr-res]   checks={} diverge={} | by file alu={} fetch={} "
+                "bool={} loop={}",
+                r.checks, r.diverge, r.diverge_by_file[nr::kResFileAlu],
+                r.diverge_by_file[nr::kResFileFetch],
+                r.diverge_by_file[nr::kResFileBool],
+                r.diverge_by_file[nr::kResFileLoop]);
+            for (uint32_t s = 0; s < g_res_div_samp_n; ++s) {
+              const nr::ResDivergence& d = g_res_div_samp[s];
+              REXGPU_INFO(
+                  "[nr-res]   DIVERGE reg={:04X} ({}) ours={:08X} live={:08X}",
+                  d.reg, nr::ResFileName(nr::ResSlotFile(
+                             uint32_t(nr::ResSlot(d.reg)))),
+                  d.ours, d.live);
+            }
+            // Coverage: the strict per-draw question. cov% must be ~100 for
+            // the resource inputs of a native draw to be considered closed.
+            if (g_res_cov_draws) {
+              const double cp = 100.0 / double(g_res_cov_draws);
+              // lockstep= says WHEN the mirror was read, and it changes what
+              // the numbers mean. Off, the walk has already consumed the whole
+              // buffer, so a fetch slot reports its LAST type in that buffer
+              // rather than the one in effect at this draw: `undef` still
+              // holds (definedness is sticky and cross-buffer) but
+              // `wrongtype` is measuring the wrong moment. On (gpu_nr_draw),
+              // the walk stops at each draw and the numbers are per-draw.
+              REXGPU_INFO(
+                  "[nr-res]   cover draws={} full={:.2f}% unanalyzed={} | "
+                  "vref={} undef={} wrongtype={} | tref={} undef={} "
+                  "wrongtype={} | lockstep={}",
+                  g_res_cov_draws, g_res_cov_full * cp, g_res_cov_unanalyzed,
+                  g_res_vref, g_res_vref_undef, g_res_vref_type, g_res_tref,
+                  g_res_tref_undef, g_res_tref_type, kNrDraw ? 1 : 0);
+              // Which slots actually fail, counted rather than sampled.
+              std::string vslots, tslots;
+              for (uint32_t i = 0; i < nr::kResFetchVertexSlots; ++i) {
+                if (g_res_vref_fail_slot[i]) {
+                  vslots += fmt::format("{}:{} ", i, g_res_vref_fail_slot[i]);
+                }
+              }
+              for (uint32_t i = 0; i < nr::kResFetchTextureSlots; ++i) {
+                if (g_res_tref_fail_slot[i]) {
+                  tslots += fmt::format("{}:{} ", i, g_res_tref_fail_slot[i]);
+                }
+              }
+              if (!vslots.empty() || !tslots.empty()) {
+                REXGPU_INFO("[nr-res]   fail-by-slot vfetch[{}] tfetch[{}]",
+                            vslots.empty() ? "-" : vslots.c_str(),
+                            tslots.empty() ? "-" : tslots.c_str());
+              }
+              for (uint32_t s = 0; s < g_res_cov_samp_n; ++s) {
+                const ResCovSample& c = g_res_cov_samp[s];
+                REXGPU_INFO(
+                    "[nr-res]   MISS {} slot={} from {} ({}) dword0={:08X} "
+                    "type={}",
+                    c.texture ? "tfetch" : "vfetch", c.slot,
+                    c.pixel ? "ps" : "vs",
+                    c.reason == nr::kResCoverUndefined ? "undefined"
+                                                       : "wrong type",
+                    c.dword0, c.dword0 & 3u);
+              }
+            }
+            g_res_cov_draws = g_res_cov_full = g_res_cov_unanalyzed = 0;
+            g_res_vref = g_res_vref_undef = g_res_vref_type = 0;
+            g_res_tref = g_res_tref_undef = g_res_tref_type = 0;
+            g_res_cov_samp_n = 0;
+            for (uint32_t i = 0; i < nr::kResFetchVertexSlots; ++i) {
+              g_res_vref_fail_slot[i] = 0;
+            }
+            for (uint32_t i = 0; i < nr::kResFetchTextureSlots; ++i) {
+              g_res_tref_fail_slot[i] = 0;
+            }
+            g_res_stats = nr::ResStats{};
+            g_res_div_samp_n = 0;
+            for (uint32_t i = 0; i < kResAddrSetSize; ++i) {
+              g_res_addr_set[i] = 0;
+            }
+            g_res_addr_distinct = g_res_addr_ovf = 0;
+          }
           // Clear for the next window. Addresses are re-walked when they
           // reappear, which is what keeps a stale draw count from surviving a
           // buffer being re-recorded at the same address with different content.
           for (uint32_t i = 0; i < kIbLedgerSize; ++i) g_ib_ledger_tab[i] = IbLedgerEntry{};
           g_ib_ledger_used = 0;
           g_ib_ledger_evictions = 0;
+        }
+        // [NR-SDB] The corpus verdict. Per-load hit% says how often a bind
+        // resolves against the database; the DISTINCT line is the one the
+        // AOT plan rests on -- of every distinct blob loaded this session,
+        // how many the database holds under the runtime's own key, and for
+        // the rest whether the shader is there under another length
+        // (prefix) or not there at all (absent). Samples name the miss.
+        if (kNrSdb && g_sdb_ready && g_sdb_loads) {
+          const double lp = 100.0 / double(g_sdb_loads);
+          const double dp = g_sdb_distinct ? 100.0 / double(g_sdb_distinct) : 0.0;
+          REXGPU_INFO(
+              "[nr-sdb] loads={} hit={:.2f}% miss={} | distinct={} "
+              "hit={:.2f}% prefix={} absent={} | corpus={}/{} dumped={} "
+              "stage_mismatch={} zero={} set_ovf={}",
+              g_sdb_loads, g_sdb_hits * lp, g_sdb_misses, g_sdb_distinct,
+              g_sdb_distinct_hit * dp, g_sdb_distinct_prefix,
+              g_sdb_distinct_absent, g_sdb_distinct_hit,
+              g_sdb_index->unique_count(), g_sdb_dumped, g_sdb_stage_mismatch,
+              g_sdb_zero, g_sdb_set_ovf);
+          for (uint32_t s = 0; s < g_sdb_miss_samp_n; ++s) {
+            const SdbMissSample& m = g_sdb_miss_samp[s];
+            REXGPU_INFO(
+                "[nr-sdb]   MISS {} hash={:016X} dwords={} addr={:08X} | {}",
+                m.pixel ? "ps" : "vs", m.hash, m.dwords, m.guest_addr,
+                m.prefix ? fmt::format("prefix db_bytes={} equal={}",
+                                       m.db_bytes, m.equal_bytes)
+                         : std::string("absent"));
+          }
+          // Per-load counters are per-window; the distinct set and its
+          // classification are cumulative on purpose (see the set comment),
+          // so they are NOT cleared here. Samples are one-shot per session
+          // for the same reason: a repeated miss is not new evidence.
+          g_sdb_loads = g_sdb_hits = g_sdb_misses = 0;
+        }
+        // [NR-DRAW] Increment 4c. Two numbers carry the verdict and they are
+        // not the same kind of thing:
+        //   diverge  the walk wrote a register and holds the wrong value.
+        //            A decoder bug. Must be 0, like every gate before it.
+        //   extern   the live file has a register the stream never wrote.
+        //            NOT a bug: the boundary of the input model, and directly
+        //            the list of D3D9 hooks a native replay needs instead.
+        // Both are reported as named registers rather than rates, because a
+        // rate here would be unactionable and the names are the deliverable.
+        if (kNrDraw && g_nrd_stops) {
+          const nr::RegShadowStats& r = g_reg_stats;
+          REXGPU_INFO(
+              "[nr-draw] stops={} buffers={} desync={} depth_skip={} | "
+              "defined={} writes={}/{}ign | checks={} sweeps={} | "
+              "diverge={} sfx={} extern={}",
+              g_nrd_stops, g_nrd_buffers, g_nrd_desync, g_nrd_skipped_depth,
+              r.defined_count, r.writes, r.writes_ignored, r.checks, r.sweeps,
+              r.diverge - g_nrd_sfx, g_nrd_sfx, r.externs);
+          for (uint32_t i = 0; i < kNrdTop && g_nrd_sfx_top[i].count; ++i) {
+            const NrdReg& d = g_nrd_sfx_top[i];
+            const RegisterInfo* info = RegisterFile::GetRegisterInfo(d.reg);
+            REXGPU_INFO(
+                "[nr-draw]   SFX     reg={:04X} ({}) x{} ours={:08X} "
+                "live={:08X}",
+                d.reg, info ? info->name : "?", d.count, d.last_ours,
+                d.last_live);
+          }
+          for (uint32_t i = 0; i < kNrdTop && g_nrd_div_top[i].count; ++i) {
+            const NrdReg& d = g_nrd_div_top[i];
+            const RegisterInfo* info = RegisterFile::GetRegisterInfo(d.reg);
+            REXGPU_INFO(
+                "[nr-draw]   DIVERGE reg={:04X} ({}) x{} ours={:08X} "
+                "live={:08X}",
+                d.reg, info ? info->name : "?", d.count, d.last_ours,
+                d.last_live);
+          }
+          for (uint32_t i = 0; i < kNrdTop && g_nrd_ext_top[i].count; ++i) {
+            const NrdReg& e = g_nrd_ext_top[i];
+            const RegisterInfo* info = RegisterFile::GetRegisterInfo(e.reg);
+            REXGPU_INFO("[nr-draw]   EXTERN  reg={:04X} ({}) x{} live={:08X}",
+                        e.reg, info ? info->name : "?", e.count, e.last_live);
+          }
+          // Per-window counters clear; the SHADOW does not. It is the
+          // persistent thing being measured, exactly like the 4a context.
+          g_reg_stats.checks = g_reg_stats.diverge = g_reg_stats.externs = 0;
+          g_reg_stats.sweeps = g_reg_stats.compares = 0;
+          g_reg_stats.writes = g_reg_stats.writes_ignored = 0;
+          g_nrd_stops = g_nrd_desync = g_nrd_skipped_depth = 0;
+          g_nrd_buffers = g_nrd_sfx = 0;
+          for (uint32_t i = 0; i < kNrdTop; ++i) {
+            g_nrd_div_top[i] = NrdReg{};
+            g_nrd_ext_top[i] = NrdReg{};
+            g_nrd_sfx_top[i] = NrdReg{};
+          }
+        }
+        // [NR-ISSUE] Increment 4d. `issued` is the backend's count of draws
+        // actually recorded from the composed shadow file; `armed` is the
+        // base's. They must match (precord off); `precord_skip` is the named
+        // reason when they do not. `ordinal` is cumulative for bisection via
+        // gpu_nr_issue_from/count. sh_mismatch must be 0: the walk's resolved
+        // shaders and the executor's actives are the same ucode or 4b-2's
+        // tracking has a hole.
+        if (kNrIssue && (g_nri_ordinal || g_nri_armed)) {
+          REXGPU_INFO(
+              "[nr-issue] issued={} armed={} copy_live={} sh_invalid={} "
+              "sh_mismatch={} precord_skip={} ordinal={}",
+              nr_issue_issued_, g_nri_armed, g_nri_copy_live, g_nri_sh_invalid,
+              g_nri_sh_mismatch, nr_issue_precord_skips_, g_nri_ordinal);
+          nr_issue_issued_ = 0;
+          nr_issue_precord_skips_ = 0;
+          g_nri_armed = g_nri_copy_live = 0;
+          g_nri_sh_invalid = g_nri_sh_mismatch = 0;
         }
         prof_last_report = now;
         last_type0_split_ns = g_type0_split_ns;
@@ -1774,41 +2554,39 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           }
         }
       }
-      nr::CtxWalkStats cst;
+      // [NR-RES] Increment 4b-3: the resource half, on the SAME walk. Its
+      // ground-truth compare runs here for the same reason the recovery one
+      // does -- before the buffer executes, the live file holds exactly the
+      // carried state a ring-order replay would have.
+      if (g_nr_res) {
+        nr::ResDivergence rsamp[kResDivSamples];
+        const uint32_t rn = nr::ResCompareLive(
+            &g_res_state, &g_res_stats, ResReadLive, register_file_,
+            g_res_div_samp_n < kResDivSamples ? rsamp : nullptr,
+            kResDivSamples - g_res_div_samp_n);
+        for (uint32_t i = 0; i < rn && g_res_div_samp_n < kResDivSamples; ++i) {
+          g_res_div_samp[g_res_div_samp_n++] = rsamp[i];
+        }
+        nr::ResBeginBuffer(&g_res_state);
+      }
       g_nr_walk_buf = ptr;
-      const uint32_t nf = nr::WalkBufferContext(
-          memory_->TranslatePhysical(ptr), count, ptr, &g_ctx_state,
-          g_ctx_flags, kNrbMaxPkts, &cst, CtxMemRead, memory_, CtxShaderSeen,
-          nullptr, NrCtxWatch, nullptr, bin_select_, bin_mask_);
-      ++g_ctx_execs;
-      g_ctx_nop0 += cst.nop0;
-      g_ctx_sc2 += cst.set_const2;
-      g_ctx_pred += cst.pred_skipped;
-      g_ctx_pred_draws += cst.pred_draws;
-      g_ctx_pred_draws_run += cst.pred_draws_run;
-      g_ctx_bin_pkts += cst.bin_pkts;
-      if (cst.draws22 > nf) ++g_ctx_flags_ovf;
-      g_ctx_mem_loads += cst.mem_loads;
-      g_ctx_poisoned += cst.mem_poisoned;
-      g_ctx_im_loads += cst.im_loads;
-      g_ctx_im_imms += cst.im_load_imms;
-      g_ctx_draws += nf;
-      for (uint32_t i = 0; i < nf; ++i) {
-        const uint16_t f = g_ctx_flags[i];
-        const bool rt = f & nr::kCtxDrawRtDef;
-        const bool vp = f & nr::kCtxDrawVportDef;
-        const bool md = f & nr::kCtxDrawModeDef;
-        const bool sh = f & nr::kCtxDrawShadersDef;
-        if (rt) ++g_ctx_rt_def;
-        if (vp) ++g_ctx_vp_def;
-        if (md) ++g_ctx_mode_def;
-        if (sh) ++g_ctx_sh_def;
-        if (rt && vp && md && sh) ++g_ctx_full;
-        if (f & nr::kCtxDrawCopy) ++g_ctx_copy;
-        if (f & nr::kCtxDrawRtCarried) ++g_ctx_rt_carry;
-        if (f & nr::kCtxDrawVportCarried) ++g_ctx_vp_carry;
-        if (f & nr::kCtxDrawModeCarried) ++g_ctx_mode_carry;
-        if (f & nr::kCtxDrawShadersCarried) ++g_ctx_sh_carry;
+      const bool has_reg_fn = g_nr_res || g_nr_draw;
+      nr::CtxWalkBegin(&g_ctx_walker, memory_->TranslatePhysical(ptr), count,
+                       ptr, &g_ctx_state, g_ctx_flags, kNrbMaxPkts,
+                       &g_ctx_walk_stats, CtxMemRead, memory_, CtxShaderSeen,
+                       nullptr, NrCtxWatch, nullptr, bin_select_, bin_mask_,
+                       has_reg_fn ? NrWalkRegWrite : nullptr, nullptr,
+                       g_nr_res ? NrResDraw : nullptr, nullptr);
+      // [NR-DRAW] Increment 4c: with the shadow on, the walk advances one draw
+      // at a time from the execution path below, so that every per-draw
+      // question is asked at that draw's moment instead of at the buffer's
+      // end. Without it, finish here and keep the pre-4c behaviour exactly.
+      if (g_nr_draw) {
+        g_ctx_walk_active = true;
+        g_ctx_walk_lockstep = true;
+        ++g_nrd_buffers;
+      } else {
+        CtxFinishWalk();
       }
     }
   }
@@ -2179,6 +2957,16 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+
+  // [NR-DRAW] The lockstep walk ends where the buffer does: apply whatever
+  // trailing state follows the last draw, then tally. Guarded on the flag
+  // rather than on g_nr_draw so a mid-buffer cvar flip cannot finish a walk
+  // that was never begun.
+  if (g_ctx_walk_active && g_pm4_ib_depth == 1) {
+    g_ctx_walk_active = false;
+    g_ctx_walk_lockstep = false;
+    CtxFinishWalk();
+  }
 
   --g_pm4_ib_depth;
 
@@ -2921,7 +3709,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
 }
 
 bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,
-                                              const char* opcode_name, uint32_t viz_query_condition,
+                                              const char* opcode_name, uint32_t draw_opcode,
+                                              uint32_t viz_query_condition,
                                               uint32_t count_remaining) {
   // if viz_query_condition != 0, this is a conditional draw based on viz query.
   // This ID matches the one issued in PM4_VIZ_QUERY
@@ -3018,15 +3807,112 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
       // [GPU-EXEC-PROFILE]/[GPU-SPLIT] time the host backend draw recording
       // specifically (clean: ~330k brackets/s). Fires for either profile.
+      // [NR-DRAW] Increment 4c: advance the walk to THIS draw and compare the
+      // shadow against the live register file, both read at the same moment.
+      // Before IssueDraw rather than after, because the executor has by now
+      // applied every register write preceding the draw and nothing else has
+      // run: the two sides are looking at the same state or the walk is wrong.
+      // Depth-1 only, for the same reason the walk itself is: a nested buffer
+      // is not walked, so its draws must not advance the outer walk.
+      if (g_ctx_walk_lockstep && g_pm4_ib_depth == 1) {
+        nr::CtxDrawStop stop;
+        if (!nr::CtxWalkNextDraw(&g_ctx_walker, &stop) ||
+            stop.opcode != draw_opcode) {
+          // The walk and the executor disagree about which packets run. Every
+          // value read from here on would be from the wrong moment, so stop
+          // COMPARING -- but keep the walk itself alive, so the buffer's state
+          // still reaches the running context and the next buffer starts from
+          // the truth rather than from a half-applied one.
+          ++g_nrd_desync;
+          g_ctx_walk_lockstep = false;
+        } else {
+          ++g_nrd_stops;
+          nr::RegShadowSweep(&g_reg_shadow, &g_reg_stats, kNrdSweepPerDraw,
+                             register_file_->values, NrdFinding, nullptr);
+          // [NR-ISSUE] Increment 4d: arm this draw to be issued from the
+          // shadow. Copy-mode draws stay on the live path (they route to
+          // IssueCopy, which 1b-1a never decoupled), as do draws whose walk
+          // shader refs are not yet valid (boot moments before carry is
+          // established): a partially recovered issue would blur what an A/B
+          // mismatch means.
+          if (g_nr_issue) {
+            const uint64_t ord = g_nri_ordinal++;
+            if (ord >= uint64_t(g_nri_from) &&
+                (g_nri_count < 0 ||
+                 ord < uint64_t(g_nri_from) + uint64_t(g_nri_count))) {
+              if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode ==
+                  xenos::EdramMode::kCopy) {
+                ++g_nri_copy_live;
+              } else if (!g_ctx_state.vs.valid || !g_ctx_state.ps.valid) {
+                ++g_nri_sh_invalid;
+              } else {
+                // Resolve the walk's own shader refs exactly as IM_LOAD does.
+                // An immediate shader's ref addresses the ucode inside the
+                // buffer itself, which TranslatePhysical reaches the same way.
+                // Same bytes => same hash => the same Shader* the live path
+                // holds, unless the walk's shader tracking is wrong -- counted
+                // apart, and the walk's shaders are used either way: that IS
+                // the recovered path, and it exercises the 4b-2 result.
+                Shader* vs = LoadShader(
+                    xenos::ShaderType::kVertex, g_ctx_state.vs.addr,
+                    memory_->TranslatePhysical<uint32_t*>(g_ctx_state.vs.addr),
+                    g_ctx_state.vs.size_dwords);
+                Shader* ps = LoadShader(
+                    xenos::ShaderType::kPixel, g_ctx_state.ps.addr,
+                    memory_->TranslatePhysical<uint32_t*>(g_ctx_state.ps.addr),
+                    g_ctx_state.ps.size_dwords);
+                if (vs != active_vertex_shader_ ||
+                    ps != active_pixel_shader_) {
+                  ++g_nri_sh_mismatch;
+                }
+                nr::RegShadowCompose(&g_reg_shadow, register_file_->values,
+                                     g_nri_compose);
+                nr_issue_values_ = g_nri_compose;
+                nr_issue_vertex_shader_ = vs;
+                nr_issue_pixel_shader_ = ps;
+                nr_issue_shaders_active_ = true;
+                nr_issue_armed_ = true;
+                ++g_nri_armed;
+              }
+            }
+          }
+        }
+      } else if (g_nr_draw && g_pm4_ib_depth != 1) {
+        ++g_nrd_skipped_depth;
+      }
       const bool kTimeDraw = g_exec_prof || g_split_prof;
       const auto draw_t0 = kTimeDraw ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      // [NR-ISSUE] Disarm unconditionally: the handshake is one draw wide.
+      if (nr_issue_armed_ || nr_issue_shaders_active_) {
+        nr_issue_armed_ = false;
+        nr_issue_shaders_active_ = false;
+        nr_issue_values_ = nullptr;
+        nr_issue_vertex_shader_ = nullptr;
+        nr_issue_pixel_shader_ = nullptr;
+      }
       if (kTimeDraw) {
         g_issuedraw_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now() - draw_t0).count();
         g_draw_cnt++;
+      }
+      // [NR-RES] Coverage of this draw's own shader references. Here rather
+      // than in the walk: the shaders are analyzed only once IssueDraw has
+      // run, and nothing has written state since the draw.
+      if (g_nr_res) {
+        const Shader* vs = active_vertex_shader();
+        const Shader* ps = active_pixel_shader();
+        if ((vs && vs->is_ucode_analyzed()) || (ps && ps->is_ucode_analyzed())) {
+          bool covered = true;
+          ++g_res_cov_draws;
+          ResCoverShader(vs, false, &covered);
+          ResCoverShader(ps, true, &covered);
+          if (covered) ++g_res_cov_full;
+        } else {
+          ++g_res_cov_unanalyzed;
+        }
       }
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
@@ -3064,7 +3950,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
   }
   uint32_t viz_query_condition = reader->ReadAndSwap<uint32_t>();
   --count_remaining;
-  return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX", viz_query_condition,
+  return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX", 0x22, viz_query_condition,
                                 count_remaining);
 }
 
@@ -3073,7 +3959,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader
   // "draw using supplied indices in packet"
   // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
   // No viz query token.
-  return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX_2", 0, count);
+  return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX_2", 0x36, 0, count);
 }
 
 bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet,
@@ -3178,6 +4064,9 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   assert_true(start == 0);
 
   trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
+  // [NR-SDB] Same pointer and length the pipeline cache is about to hash.
+  NrSdbObserve(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr),
+               size_dwords);
   auto shader =
       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
   switch (shader_type) {
@@ -3208,6 +4097,9 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
   assert_true(start == 0);
   assert_true(reader->read_count() >= size_dwords * 4);
   assert_true(count - 2 >= size_dwords);
+  // [NR-SDB] Inline ucode: the same bytes, addressed in the packet stream.
+  NrSdbObserve(shader_type, uint32_t(reader->read_ptr()),
+               reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
   auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
   switch (shader_type) {
