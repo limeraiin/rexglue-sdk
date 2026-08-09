@@ -36,6 +36,7 @@
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/dxbc.h>
+#include <rex/graphics/nr_native_pso.h>
 #include <rex/graphics/nr_pipeline_state.h>
 #include <rex/graphics/nr_shader_cache.h>
 #include <rex/graphics/pipeline_util.h>
@@ -99,6 +100,25 @@ REXCVAR_DEFINE_UINT32(gpu_nr_shadercache_entries, 8192, "GPU",
 REXCVAR_DEFINE_UINT32(gpu_nr_shadercache_mb, 256, "GPU",
                       "[nr-sc] Budget in megabytes for the translated shader binaries the native "
                       "shader cache holds.");
+
+// [NR-NPSO] Phase 5-3a: the first peel. 5-1 settled the description and 5-2
+// the shader binaries; this builds the D3D12 pipeline object out of both, with
+// its own description->API mapping, and compares the filled
+// D3D12_GRAPHICS_PIPELINE_STATE_DESC against the emulated one built from the
+// same runtime description at the same moment. The second cvar is the actual
+// swap: bind ours for the draw instead of the emulated cache's.
+REXCVAR_DEFINE_BOOL(gpu_nr_native_pso, false, "GPU",
+                    "Diagnostic [nr-npso]: build and create the native renderer's own D3D12 "
+                    "pipeline object for each draw and compare its description against the "
+                    "emulated pipeline cache's. Off by default.");
+REXCVAR_DEFINE_BOOL(gpu_nr_native_pso_bind, false, "GPU",
+                    "[nr-npso] Bind the native renderer's own pipeline object for the draw "
+                    "instead of the emulated pipeline cache's. Implies gpu_nr_native_pso. Off "
+                    "by default.");
+REXCVAR_DEFINE_UINT32(gpu_nr_native_pso_entries, 4096, "GPU",
+                      "[nr-npso] Maximum number of distinct pipeline descriptions the native "
+                      "pipeline cache holds. Beyond it, descriptions are refused and counted, "
+                      "never evicted -- a released pipeline could still be bound.");
 
 namespace rex::graphics::d3d12 {
 
@@ -1572,8 +1592,7 @@ bool PipelineCache::NrShaderTranslate(void* ctx, uint32_t stage, uint64_t ucode_
   return true;
 }
 
-void PipelineCache::NrShaderCacheCheck(const D3D12Shader::D3D12Translation* vertex_shader,
-                                       const D3D12Shader::D3D12Translation* pixel_shader) {
+void PipelineCache::NrShaderCacheEnsure() {
   if (!nr_shader_translator_) {
     // Constructed with the same parameters as the emulated translator: those
     // parameters are part of the translation's identity (vendor workarounds,
@@ -1598,10 +1617,30 @@ void PipelineCache::NrShaderCacheCheck(const D3D12Shader::D3D12Translation* vert
     nr::NrShaderCacheReset();
     g_nr_sc_theirs_invalid = 0;
   }
+}
+
+void PipelineCache::NrShaderCacheCheck(const D3D12Shader::D3D12Translation* vertex_shader,
+                                       const D3D12Shader::D3D12Translation* pixel_shader) {
+  NrShaderCacheEnsure();
   NrShaderCacheCheckOne(vertex_shader, nr::kNrShaderStageVertex);
   if (pixel_shader) {
     NrShaderCacheCheckOne(pixel_shader, nr::kNrShaderStagePixel);
   }
+}
+
+const std::vector<uint8_t>* PipelineCache::NrShaderCacheBinary(
+    const D3D12Shader::D3D12Translation* translation, uint32_t stage) {
+  if (!translation) {
+    return nullptr;
+  }
+  const Shader& shader = translation->shader();
+  nr::NrShaderEntry* ours =
+      nr::NrShaderCacheLookup(stage, shader.ucode_data_hash(), shader.ucode_data().data(),
+                              uint32_t(shader.ucode_dword_count()), translation->modification());
+  if (!ours || !ours->valid || ours->dxbc.empty()) {
+    return nullptr;
+  }
+  return &ours->dxbc;
 }
 
 void PipelineCache::NrShaderCacheCheckOne(const D3D12Shader::D3D12Translation* translation,
@@ -1670,6 +1709,170 @@ void PipelineCache::NrShaderCacheReportIfDue() {
         st.first_ne_ours_size, st.first_ne_theirs_size);
   }
   nr::NrShaderCacheEndWindow();
+}
+
+ID3D12PipelineState* PipelineCache::NrNativePsoCreate(
+    void* ctx, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+  PipelineCache* self = static_cast<PipelineCache*>(ctx);
+  ID3D12Device* device = self->command_processor_.GetD3D12Provider().GetDevice();
+  ID3D12PipelineState* state = nullptr;
+  if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&state)))) {
+    return nullptr;
+  }
+  return state;
+}
+
+void PipelineCache::NrNativePsoRelease(void* ctx, ID3D12PipelineState* state) {
+  (void)ctx;
+  if (state) {
+    state->Release();
+  }
+}
+
+ID3D12PipelineState* PipelineCache::NrNativePipeline(void* pipeline_handle,
+                                                     ID3D12RootSignature* root_signature) {
+  Pipeline* pipeline = reinterpret_cast<Pipeline*>(pipeline_handle);
+  if (!pipeline) {
+    return nullptr;
+  }
+  const PipelineRuntimeDescription& runtime_description = pipeline->description;
+
+  NrShaderCacheEnsure();
+  if (!nr_native_pso_configured_) {
+    nr::NrNpsoCacheConfigure(&PipelineCache::NrNativePsoCreate, &PipelineCache::NrNativePsoRelease,
+                             this, REXCVAR_GET(gpu_nr_native_pso_entries));
+    nr_native_pso_configured_ = true;
+  }
+
+  // Device-level facts. Constant for the life of the device, which is why they
+  // are not part of the key -- a device reset reconfigures and empties the
+  // cache.
+  nr::NrNpsoEnv env;
+  env.edram_rov_used =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  env.msaa_2x_supported = render_target_cache_.msaa_2x_supported();
+  env.gamma_render_target_as_unorm16 = render_target_cache_.gamma_render_target_as_unorm16();
+  env.depth_float24_convert_in_pixel_shader =
+      render_target_cache_.depth_float24_convert_in_pixel_shader();
+  env.depth_float24_round = render_target_cache_.depth_float24_round();
+  env.draw_resolution_scale_x = render_target_cache_.draw_resolution_scale_x();
+  env.draw_resolution_scale_y = render_target_cache_.draw_resolution_scale_y();
+
+  // The bytes. The two guest shaders are OURS: translated by the native
+  // shader cache from the ucode alone, which is what makes a pipeline built
+  // here a pipeline a native renderer could have built. Everything else is a
+  // host object this increment delegates: the root signature (a function of
+  // the shaders' binding layouts, which the binding peel owns), the
+  // synthesized geometry shader, and the prebuilt depth-conversion shaders.
+  nr::NrNpsoBlobs blobs;
+  std::memset(&blobs, 0, sizeof(blobs));
+  blobs.root_signature = root_signature;
+  const std::vector<uint8_t>* vs =
+      NrShaderCacheBinary(runtime_description.vertex_shader, nr::kNrShaderStageVertex);
+  if (vs) {
+    blobs.vs = vs->data();
+    blobs.vs_size = vs->size();
+  }
+  if (runtime_description.pixel_shader) {
+    const std::vector<uint8_t>* ps =
+        NrShaderCacheBinary(runtime_description.pixel_shader, nr::kNrShaderStagePixel);
+    if (ps) {
+      blobs.ps = ps->data();
+      blobs.ps_size = ps->size();
+    } else {
+      // A pixel shader we could not translate is not the same draw as one
+      // with no pixel shader at all, so refuse rather than silently building
+      // a depth-only pipeline.
+      blobs.vs = nullptr;
+      blobs.vs_size = 0;
+    }
+  }
+  if (runtime_description.geometry_shader) {
+    blobs.gs = runtime_description.geometry_shader->data();
+    blobs.gs_size = runtime_description.geometry_shader->size() * sizeof(uint32_t);
+  }
+  blobs.depth_only_ps = depth_only_pixel_shader_.data();
+  blobs.depth_only_ps_size = depth_only_pixel_shader_.size();
+  blobs.float24_round_ps = shaders::float24_round_ps;
+  blobs.float24_round_ps_size = sizeof(shaders::float24_round_ps);
+  blobs.float24_truncate_ps = shaders::float24_truncate_ps;
+  blobs.float24_truncate_ps_size = sizeof(shaders::float24_truncate_ps);
+
+  // The description is taken as given: it is the same 64 bytes 5-1 derives
+  // independently and compares per draw (mismatch=0 over 190 city windows),
+  // so this increment measures the mapping from those bytes to Direct3D, not
+  // the derivation again. Leave gpu_nr_pso on to keep proving the first half.
+  static_assert(sizeof(nr::NrPsoDesc) == sizeof(PipelineDescription),
+                "the native description layout drifted from the back end's");
+  nr::NrPsoDesc desc;
+  std::memcpy(&desc, &runtime_description.description, sizeof(desc));
+
+  nr::NrNpsoEntry* ours = nr::NrNpsoCacheLookup(desc, env, blobs);
+  if (!ours) {
+    return nullptr;
+  }
+  if (!ours->verified) {
+    // Settle the comparison once per pipeline. Both sides are built here, on
+    // this thread, from this same runtime description -- the only arrangement
+    // in which a difference can only be the mapping.
+    const bool translations_ready =
+        runtime_description.vertex_shader && runtime_description.vertex_shader->is_translated() &&
+        (!runtime_description.pixel_shader || runtime_description.pixel_shader->is_translated());
+    if (translations_ready) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC theirs;
+      if (BuildD3D12PipelineStateDesc(runtime_description, theirs)) {
+        nr::NrNpsoVerify(ours, theirs);
+      }
+    }
+  }
+  return ours->status == nr::kNrNpsoOk ? ours->state : nullptr;
+}
+
+void PipelineCache::NrNativePsoReportIfDue() {
+  if (!REXCVAR_GET(gpu_nr_native_pso)) {
+    return;
+  }
+  static auto last_report = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_report < std::chrono::seconds(1)) {
+    return;
+  }
+  last_report = now;
+  const nr::NrNpsoStats& st = nr::NrNpsoGetStats();
+  if (!st.requests) {
+    return;
+  }
+  // `psos` is the population: distinct pipeline descriptions, which is the
+  // same key the emulated cache uses, so the two counts are comparable.
+  // `bound` is the only line that says whether the swap is actually running.
+  REXGPU_INFO(
+      "[nr-npso] req={} hit={:.2f}% miss={} | psos={} ok={} created={} fail={} "
+      "avg={}us max={}us refused={} ovf={} | verify checked={} agreed={} desc_ne={} | "
+      "bound ours={} theirs={} fallback={}",
+      st.requests, st.requests ? 100.0 * double(st.hits) / double(st.requests) : 0.0, st.misses,
+      st.entries, st.entries_ok, st.created, st.create_fail,
+      st.created ? (st.create_ns_total / st.created) / 1000 : uint64_t(0),
+      st.create_ns_max / 1000, st.refused, st.probe_ovf, st.verified, st.agreed, st.desc_ne,
+      nr::NrNpsoBoundOurs(), nr::NrNpsoBoundTheirs(), st.fallbacks);
+  // Name every reason a draw did not get one of our pipelines. Silence here
+  // would be the one thing that could hide a peel that is quietly not running.
+  for (uint32_t reason = 0; reason < nr::kNrNpsoStatusCount; ++reason) {
+    if (st.fallback_reason[reason]) {
+      REXGPU_INFO("[nr-npso]   fallback {}={}", nr::NrNpsoStatusName(reason),
+                  st.fallback_reason[reason]);
+    }
+  }
+  if (st.have_first_ne) {
+    char field[128];
+    nr::NrNpsoFieldName(st.first_ne_offset, field, sizeof(field));
+    static const char* const kStageNames[5] = {"vs", "ps", "ds", "hs", "gs"};
+    REXGPU_INFO(
+        "[nr-npso]   FIRST DIFFERENCE verdict={} stage={} field={} offset={} "
+        "vs={:016X} ps={:016X}",
+        st.first_ne_verdict, kStageNames[st.first_ne_stage % 5], field, st.first_ne_offset,
+        st.first_ne_vs_hash, st.first_ne_ps_hash);
+  }
+  nr::NrNpsoEndWindow();
 }
 
 bool PipelineCache::GetCurrentStateDescription(
@@ -3115,20 +3318,18 @@ const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey 
   return geometry_shaders_.emplace(key, std::move(shader)).first->second;
 }
 
-ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
-    const PipelineRuntimeDescription& runtime_description) {
+// [NR-NPSO] Phase 5-3a: the pipeline-description -> D3D12 pipeline state
+// description mapping, extracted verbatim out of CreateD3D12Pipeline so the
+// native renderer's own mapping (nr_native_pso, which shares no code with it)
+// can be compared against it at the one moment both are built from the same
+// runtime description on the same thread. Reads the runtime description and
+// the render target cache's device-level properties; writes only state_desc,
+// which it zeroes first so two builds are byte-comparable.
+bool PipelineCache::BuildD3D12PipelineStateDesc(
+    const PipelineRuntimeDescription& runtime_description,
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC& state_desc) {
   const PipelineDescription& description = runtime_description.description;
 
-  if (runtime_description.pixel_shader != nullptr) {
-    REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}, PS {:016X}",
-                 runtime_description.vertex_shader->shader().ucode_data_hash(),
-                 runtime_description.pixel_shader->shader().ucode_data_hash());
-  } else {
-    REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}",
-                 runtime_description.vertex_shader->shader().ucode_data_hash());
-  }
-
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
   std::memset(&state_desc, 0, sizeof(state_desc));
 
   bool edram_rov_used =
@@ -3155,7 +3356,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     REXGPU_ERROR("Vertex shader {:016X} not translated",
                  runtime_description.vertex_shader->shader().ucode_data_hash());
     assert_always();
-    return nullptr;
+    return false;
   }
   Shader::HostVertexShaderType host_vertex_shader_type =
       DxbcShaderTranslator::Modification(runtime_description.vertex_shader->modification())
@@ -3192,7 +3393,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
             break;
           default:
             assert_unhandled_case(host_vertex_shader_type);
-            return nullptr;
+            return false;
         }
         break;
       case xenos::TessellationMode::kContinuous:
@@ -3215,7 +3416,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
             break;
           default:
             assert_unhandled_case(host_vertex_shader_type);
-            return nullptr;
+            return false;
         }
         break;
       case xenos::TessellationMode::kAdaptive:
@@ -3230,12 +3431,12 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
             break;
           default:
             assert_unhandled_case(host_vertex_shader_type);
-            return nullptr;
+            return false;
         }
         break;
       default:
         assert_unhandled_case(tessellation_mode);
-        return nullptr;
+        return false;
     }
     state_desc.DS.pShaderBytecode = runtime_description.vertex_shader->translated_binary().data();
     state_desc.DS.BytecodeLength = runtime_description.vertex_shader->translated_binary().size();
@@ -3243,7 +3444,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     assert_true(host_vertex_shader_type == Shader::HostVertexShaderType::kVertex);
     if (host_vertex_shader_type != Shader::HostVertexShaderType::kVertex) {
       // Fallback vertex shaders are not needed on Direct3D 12.
-      return nullptr;
+      return false;
     }
     state_desc.VS.pShaderBytecode = runtime_description.vertex_shader->translated_binary().data();
     state_desc.VS.BytecodeLength = runtime_description.vertex_shader->translated_binary().size();
@@ -3261,7 +3462,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         break;
       default:
         assert_unhandled_case(primitive_topology_type);
-        return nullptr;
+        return false;
     }
   }
 
@@ -3271,7 +3472,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       REXGPU_ERROR("Pixel shader {:016X} not translated",
                    runtime_description.pixel_shader->shader().ucode_data_hash());
       assert_always();
-      return nullptr;
+      return false;
     }
     state_desc.PS.pShaderBytecode = runtime_description.pixel_shader->translated_binary().data();
     state_desc.PS.BytecodeLength = runtime_description.pixel_shader->translated_binary().size();
@@ -3336,7 +3537,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     // programmable sample positions).
     assert_true(msaa_sample_count == 1 || msaa_sample_count == 4);
     if (msaa_sample_count != 1 && msaa_sample_count != 4) {
-      return nullptr;
+      return false;
     }
     state_desc.RasterizerState.ForcedSampleCount = uint32_t(1)
                                                    << uint32_t(description.host_msaa_samples);
@@ -3350,7 +3551,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   } else {
     assert_true(msaa_sample_count <= 4);
     if (msaa_sample_count > 4) {
-      return nullptr;
+      return false;
     }
     if (msaa_sample_count == 2 && !render_target_cache_.msaa_2x_supported()) {
       // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
@@ -3429,7 +3630,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       state_desc.RTVFormats[i] = render_target_cache_.GetColorDrawDXGIFormat(rt.format);
       if (state_desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) {
         assert_always();
-        return nullptr;
+        return false;
       }
       D3D12_RENDER_TARGET_BLEND_DESC& blend_desc = state_desc.BlendState.RenderTarget[i];
       if (rt.src_blend != PipelineBlendFactor::kOne ||
@@ -3464,6 +3665,25 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     state_desc.PS.BytecodeLength = 0;
     state_desc.DepthStencilState.DepthEnable = FALSE;
     state_desc.DepthStencilState.StencilEnable = FALSE;
+  }
+
+  return true;
+}
+
+ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
+    const PipelineRuntimeDescription& runtime_description) {
+  if (runtime_description.pixel_shader != nullptr) {
+    REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}, PS {:016X}",
+                 runtime_description.vertex_shader->shader().ucode_data_hash(),
+                 runtime_description.pixel_shader->shader().ucode_data_hash());
+  } else {
+    REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}",
+                 runtime_description.vertex_shader->shader().ucode_data_hash());
+  }
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
+  if (!BuildD3D12PipelineStateDesc(runtime_description, state_desc)) {
+    return nullptr;
   }
 
   // Create the D3D12 pipeline state object.

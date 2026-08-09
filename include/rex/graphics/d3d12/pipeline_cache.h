@@ -112,6 +112,19 @@ class PipelineCache {
   // from the same place and for the same reason.
   void NrShaderCacheReportIfDue();
 
+  // [NR-NPSO] Phase 5-3a: the native renderer's own D3D12 pipeline object for
+  // the pipeline the emulated cache just selected -- built from that
+  // pipeline's description (5-1's gate is what makes those bytes ours) and our
+  // own shader binaries (5-2's), created by us, cached by us. Returns null
+  // when this draw cannot have one, always with a counted reason; the caller
+  // then binds the emulated pipeline. Called from the draw path AFTER the
+  // async-creation check, so the root signature handed in is final and both
+  // translations exist.
+  ID3D12PipelineState* NrNativePipeline(void* pipeline_handle,
+                                        ID3D12RootSignature* root_signature);
+  // [NR-NPSO] Phase 5-3a: emit the native-pipeline verdict once a second.
+  void NrNativePsoReportIfDue();
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -325,6 +338,13 @@ class PipelineCache {
   void NrShaderCacheCheck(const D3D12Shader::D3D12Translation* vertex_shader,
                           const D3D12Shader::D3D12Translation* pixel_shader);
   void NrShaderCacheCheckOne(const D3D12Shader::D3D12Translation* translation, uint32_t stage);
+  // Creates the native translator and configures the cache on first use.
+  // Shared by the 5-2 probe and the 5-3 pipeline builder, which both need our
+  // DXBC and must not each configure a cache.
+  void NrShaderCacheEnsure();
+  // Our DXBC for a translation, or nullptr if we have none for it.
+  const std::vector<uint8_t>* NrShaderCacheBinary(
+      const D3D12Shader::D3D12Translation* translation, uint32_t stage);
   // Translation callback handed to the cache. Builds a Shader from the ucode
   // dwords alone -- none of this class's shader bookkeeping -- which is what
   // makes byte equality with `translation.translated_binary()` mean that a
@@ -339,6 +359,16 @@ class PipelineCache {
                                    GeometryShaderKey& key_out);
   static void CreateDxbcGeometryShader(GeometryShaderKey key, std::vector<uint32_t>& shader_out);
   const std::vector<uint32_t>& GetGeometryShader(GeometryShaderKey key);
+
+  // [NR-NPSO] Phase 5-3a: extracted out of CreateD3D12Pipeline so the same
+  // mapping can be run for comparison without creating anything.
+  bool BuildD3D12PipelineStateDesc(const PipelineRuntimeDescription& runtime_description,
+                                   D3D12_GRAPHICS_PIPELINE_STATE_DESC& state_desc);
+  // [NR-NPSO] Phase 5-3a: the two callbacks the native pipeline cache reaches
+  // Direct3D through, so that the module itself holds no device.
+  static ID3D12PipelineState* NrNativePsoCreate(void* ctx,
+                                                const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc);
+  static void NrNativePsoRelease(void* ctx, ID3D12PipelineState* state);
 
   ID3D12PipelineState* CreateD3D12Pipeline(const PipelineRuntimeDescription& runtime_description);
   bool PrepareRuntimeDescriptionForQueuedCreation(Pipeline* pipeline,
@@ -362,6 +392,10 @@ class PipelineCache {
   // first use, only when the probe is on.
   std::unique_ptr<DxbcShaderTranslator> nr_shader_translator_;
   string::StringBuffer nr_ucode_disasm_buffer_;
+
+  // [NR-NPSO] Phase 5-3a. Set once the native pipeline cache has been given
+  // this object's device callbacks.
+  bool nr_native_pso_configured_ = false;
 
   // Command processor thread DXIL conversion/disassembly interfaces, if DXIL
   // disassembly is enabled.

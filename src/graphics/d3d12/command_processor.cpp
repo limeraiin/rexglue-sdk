@@ -26,6 +26,7 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/nr_native_pso.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -165,6 +166,10 @@ REXCVAR_DEFINE_BOOL(gpu_instance, true, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .always_persist();
 
+// [NR-NPSO] Phase 5-3a. Defined with the mapping, in pipeline_cache.cpp.
+REXCVAR_DECLARE(bool, gpu_nr_native_pso);
+REXCVAR_DECLARE(bool, gpu_nr_native_pso_bind);
+
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -244,6 +249,12 @@ bool g_instance = false;
 bool g_instance_dirty = true;
 uint64_t g_instance_draws_in = 0;
 uint64_t g_instance_draws_out = 0;
+
+// [NR-NPSO] Phase 5-3a: latched once a frame beside the others, so the draw
+// path never reads a cvar. g_nr_native_pso builds and checks our own pipeline
+// object; g_nr_native_pso_bind is the swap, and implies the first.
+bool g_nr_native_pso = false;
+bool g_nr_native_pso_bind = false;
 
 // Per-{geometry+shader} batch key: how many draws share it, and which float
 // constant registers ever differ across those draws (= the per-instance data a
@@ -2567,7 +2578,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     pipeline_cache_->NrPsoReportIfDue();
     // [NR-SC] Phase 5-2: the shader cache's verdict, from the same place.
     pipeline_cache_->NrShaderCacheReportIfDue();
+    // [NR-NPSO] Phase 5-3a: the native pipeline object's verdict, likewise.
+    pipeline_cache_->NrNativePsoReportIfDue();
   }
+  // [NR-NPSO] Phase 5-3a: latch the two cvars once a frame, so the per-draw
+  // path reads a plain bool. Binding implies building.
+  g_nr_native_pso_bind = REXCVAR_GET(gpu_nr_native_pso_bind);
+  g_nr_native_pso = REXCVAR_GET(gpu_nr_native_pso) || g_nr_native_pso_bind;
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);
@@ -3384,9 +3401,30 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   texture_cache_->RequestTextures(used_texture_mask);
   if (g_draw_prof) g_draw_ns[3] += prof_ns_since(_dp_tex0);
 
+  // [NR-NPSO] Phase 5-3a: the first peel. Ask the native renderer for its own
+  // pipeline object for this draw -- our description mapping over our shader
+  // binaries -- and, when the bind cvar is on, record the draw with it instead
+  // of the emulated cache's. Compare-only by default: the object is still
+  // built, created and checked against theirs, but theirs is what draws, so a
+  // mapping difference is reported before it can be seen.
+  ID3D12PipelineState* nr_native_pipeline = nullptr;
+  if (g_nr_native_pso) {
+    nr_native_pipeline = pipeline_cache_->NrNativePipeline(pipeline_handle, root_signature);
+    if (g_nr_native_pso_bind) {
+      nr::NrNpsoCountBind(nr_native_pipeline != nullptr);
+    }
+  }
+
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
-  if (current_guest_pipeline_ != pipeline_handle) {
+  if (nr_native_pipeline && g_nr_native_pso_bind) {
+    // Ours rides the same path the render target cache's own passes use.
+    // current_guest_pipeline_ is cleared because the emulated pipeline is no
+    // longer what is bound, so a later draw that does fall back must re-emit
+    // it.
+    SetExternalPipeline(nr_native_pipeline);
+    current_guest_pipeline_ = nullptr;
+  } else if (current_guest_pipeline_ != pipeline_handle) {
     deferred_command_list_.SetPipelineStateHandle(reinterpret_cast<void*>(pipeline_handle));
     current_guest_pipeline_ = pipeline_handle;
     current_external_pipeline_ = nullptr;
