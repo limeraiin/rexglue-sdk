@@ -27,6 +27,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
+#include <rex/graphics/nr_sys_constants.h>
 #include <rex/graphics/nr_native_pso.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -181,6 +182,15 @@ REXCVAR_DEFINE_BOOL(gpu_nr_bindings, false, "GPU/D3D12",
                     "'[nr-bnd]' once/sec. Diagnostic only, off by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [NR-SYS] Phase 5-3b-1: the system-constants mirror's gate.
+REXCVAR_DEFINE_BOOL(gpu_nr_sysconst, false, "GPU/D3D12",
+                    "[NR-SYS] Phase 5-3b-1 system-constants mirror: re-derive the system "
+                    "constants (UpdateSystemConstantValues) from the draw register file "
+                    "with the native renderer's own transcription and byte-compare the "
+                    "whole struct against the emulated one after every update. Reports "
+                    "'[nr-sys]' once/sec. Diagnostic only, off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -329,6 +339,74 @@ void NrBindReportIfDue() {
       double(p.tex_p - s_prev.tex_p) / per_draw,
       double(p.smp_p - s_prev.smp_p) / per_draw);
   s_prev = p;
+}
+
+// [NR-SYS] Phase 5-3b-1: latched once a frame beside the others; counters are
+// cmd-proc-thread-only => plain globals. mismatch is the cumulative must-be-0
+// gate (a check whose struct memcmp differs); refused_rov counts derivations
+// declined because the ROV path is out of the mirror's scope (must stay 0
+// outside unit tests in this game); the cover_* counters say which conditional
+// branches the run actually exercised, so a clean verdict can be quoted with
+// its coverage instead of over-claimed (the 5-1 distinct_state lesson).
+bool g_nr_sysconst = false;
+struct NrSysProbe {
+  uint64_t checks = 0;
+  uint64_t mismatch = 0;
+  uint64_t refused_rov = 0;
+  uint64_t reseeds = 0;
+  uint64_t cover_clip = 0;    // draws with user clip planes packed
+  uint64_t cover_point = 0;   // point-list draws (point size fields written)
+  uint64_t cover_atest = 0;   // alpha test enabled
+  uint64_t cover_a2m = 0;     // alpha to mask enabled
+  uint64_t cover_gamma = 0;   // draws with any gamma-convert flag set
+  uint64_t cover_tex = 0;     // used-texture slots visited (signs RMW'd)
+};
+NrSysProbe g_nr_sys{};
+// The persistent mirror. The emulated system_constants_ member is never
+// initialized and many of its fields are written conditionally (sticky), so
+// the mirror is SEEDED from it once when the gate arms; from that moment on
+// every field the derivation writes is ours. Re-armed => re-seeded (the
+// emulated struct kept evolving while the gate was off).
+rex::graphics::nr::NrSysConstants g_nr_sys_state;
+bool g_nr_sys_seeded = false;
+// FIRST DIFFERENCE lines are capped per report window so a systematic
+// mismatch cannot flood the log.
+uint32_t g_nr_sys_samples_this_window = 0;
+constexpr uint32_t kNrSysMaxSamplesPerWindow = 6;
+
+// [NR-SYS] The texture-cache queries, reached through callbacks so the
+// derivation module stays SDK-free.
+uint8_t NrSysTextureSigns(void* ctx, uint32_t fetch_constant_index) {
+  return static_cast<const TextureCache*>(ctx)->GetActiveTextureSwizzledSigns(
+      fetch_constant_index);
+}
+bool NrSysTextureResScaled(void* ctx, uint32_t fetch_constant_index) {
+  return static_cast<const TextureCache*>(ctx)->IsActiveTextureResolutionScaled(
+      fetch_constant_index);
+}
+
+// [NR-SYS] The 1Hz verdict line, emitted from the per-frame probe block.
+void NrSysReportIfDue() {
+  if (!g_nr_sysconst || !g_nr_sys.checks) {
+    return;
+  }
+  static auto s_last = std::chrono::steady_clock::now();
+  static NrSysProbe s_prev{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) {
+    return;
+  }
+  s_last = now;
+  const NrSysProbe& p = g_nr_sys;
+  REXGPU_INFO(
+      "[nr-sys] checks={} | mismatch={} refused_rov={} reseeds={} | cover "
+      "clip={} point={} atest={} a2m={} gammart={} tex={}",
+      p.checks - s_prev.checks, p.mismatch, p.refused_rov, p.reseeds,
+      p.cover_clip - s_prev.cover_clip, p.cover_point - s_prev.cover_point,
+      p.cover_atest - s_prev.cover_atest, p.cover_a2m - s_prev.cover_a2m,
+      p.cover_gamma - s_prev.cover_gamma, p.cover_tex - s_prev.cover_tex);
+  s_prev = p;
+  g_nr_sys_samples_this_window = 0;
 }
 
 // Per-{geometry+shader} batch key: how many draws share it, and which float
@@ -2663,6 +2741,17 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // [NR-BND] Phase 5-3b-0: the bindings mirror's verdict + latch, same shape.
   NrBindReportIfDue();
   g_nr_bindings = REXCVAR_GET(gpu_nr_bindings);
+  // [NR-SYS] Phase 5-3b-1: verdict + latch. A rising edge re-seeds the mirror
+  // from the emulated struct (it kept evolving while the gate was off, and
+  // its sticky never-derived fields are only knowable by seeding).
+  NrSysReportIfDue();
+  {
+    const bool nr_sys_now = REXCVAR_GET(gpu_nr_sysconst);
+    if (nr_sys_now && !g_nr_sysconst) {
+      g_nr_sys_seeded = false;
+    }
+    g_nr_sysconst = nr_sys_now;
+  }
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);
@@ -6116,6 +6205,109 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   cbuffer_binding_system_.up_to_date &= !dirty;
+
+  // [NR-SYS] Phase 5-3b-1: the system-constants mirror's gate. Runs HERE, at
+  // the end of the emulated derivation, because this is the only moment both
+  // derivations provably see the same register file and the same subsystem
+  // state ([[probe-reads-the-wrong-moment]]). Our persistent mirror gets the
+  // same inputs, applies its own transcription, and the two structs are
+  // byte-compared whole. The mirror's layout is pinned to the real struct
+  // here, at the compare site.
+  if (g_nr_sysconst) {
+    using TheirSys = DxbcShaderTranslator::SystemConstants;
+    static_assert(sizeof(nr::NrSysConstants) == sizeof(TheirSys),
+                  "[NR-SYS] mirror size drifted from SystemConstants");
+    static_assert(offsetof(TheirSys, flags) == 0);
+    static_assert(offsetof(TheirSys, line_loop_closing_index) == 12);
+    static_assert(offsetof(TheirSys, user_clip_planes) == 32);
+    static_assert(offsetof(TheirSys, ndc_scale) == 128);
+    static_assert(offsetof(TheirSys, texture_swizzled_signs) == 176);
+    static_assert(offsetof(TheirSys, alpha_to_mask) == 224);
+    static_assert(offsetof(TheirSys, color_exp_bias) == 240);
+    static_assert(offsetof(TheirSys, edram_rt_clamp) == 336);
+    static_assert(offsetof(TheirSys, edram_blend_constant) == 448);
+    if (edram_rov_used) {
+      ++g_nr_sys.refused_rov;
+    } else {
+      if (!g_nr_sys_seeded) {
+        std::memcpy(&g_nr_sys_state, &system_constants_, sizeof(g_nr_sys_state));
+        g_nr_sys_seeded = true;
+        ++g_nr_sys.reseeds;
+      }
+      nr::NrSysInputs nr_in;
+      nr_in.regs = &regs[0];
+      nr_in.shared_memory_is_uav = shared_memory_is_uav;
+      nr_in.primitive_polygonal = primitive_polygonal;
+      nr_in.line_loop_closing_index = line_loop_closing_index;
+      nr_in.index_endian = uint32_t(index_endian);
+      for (uint32_t i = 0; i < 3; ++i) {
+        nr_in.ndc_scale[i] = viewport_info.ndc_scale[i];
+        nr_in.ndc_offset[i] = viewport_info.ndc_offset[i];
+      }
+      nr_in.xy_extent[0] = viewport_info.xy_extent[0];
+      nr_in.xy_extent[1] = viewport_info.xy_extent[1];
+      nr_in.used_texture_mask = used_texture_mask;
+      nr_in.edram_rov_used = false;
+      nr_in.color_exp_bias_host_remap =
+          render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+          !render_target_cache_->IsFixed16TruncatedToMinus1To1();
+      nr_in.gamma_render_target_as_unorm16 =
+          render_target_cache_->gamma_render_target_as_unorm16();
+      nr_in.draw_resolution_scale_x = draw_resolution_scale_x;
+      nr_in.draw_resolution_scale_y = draw_resolution_scale_y;
+      nr_in.texture_signs_fn = NrSysTextureSigns;
+      nr_in.texture_res_scaled_fn = NrSysTextureResScaled;
+      nr_in.texture_ctx = static_cast<TextureCache*>(texture_cache_.get());
+      if (nr::NrSysUpdate(nr_in, &g_nr_sys_state)) {
+        ++g_nr_sys.checks;
+        // Branch coverage, from the same inputs the derivation read.
+        if (!pa_cl_clip_cntl.clip_disable && pa_cl_clip_cntl.ucp_ena) {
+          ++g_nr_sys.cover_clip;
+        }
+        if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
+          ++g_nr_sys.cover_point;
+        }
+        if (rb_colorcontrol.alpha_test_enable) {
+          ++g_nr_sys.cover_atest;
+        }
+        if (rb_colorcontrol.alpha_to_mask_enable) {
+          ++g_nr_sys.cover_a2m;
+        }
+        if (g_nr_sys_state.flags & (0xFu * nr::kNrSysFlagConvertColor0ToGamma)) {
+          ++g_nr_sys.cover_gamma;
+        }
+        g_nr_sys.cover_tex += uint64_t(rex::bit_count(used_texture_mask));
+        if (std::memcmp(&g_nr_sys_state, &system_constants_,
+                        sizeof(g_nr_sys_state)) != 0) {
+          ++g_nr_sys.mismatch;
+          if (g_nr_sys_samples_this_window < kNrSysMaxSamplesPerWindow) {
+            ++g_nr_sys_samples_this_window;
+            const uint32_t diff_dword = nr::NrSysFirstDifference(
+                g_nr_sys_state, &system_constants_);
+            char field_name[64];
+            nr::NrSysDwordName(diff_dword, field_name, sizeof(field_name));
+            const uint32_t* ours_dwords =
+                reinterpret_cast<const uint32_t*>(&g_nr_sys_state);
+            const uint32_t* theirs_dwords =
+                reinterpret_cast<const uint32_t*>(&system_constants_);
+            REXGPU_WARN(
+                "[nr-sys] FIRST DIFFERENCE dword={} ({}) ours={:08X} "
+                "theirs={:08X}",
+                diff_dword, field_name,
+                diff_dword < nr::kNrSysConstantsDwords ? ours_dwords[diff_dword]
+                                                       : 0u,
+                diff_dword < nr::kNrSysConstantsDwords
+                    ? theirs_dwords[diff_dword]
+                    : 0u);
+          }
+          // Re-sync so one divergence names itself once, not on every draw
+          // until the field is next rewritten.
+          std::memcpy(&g_nr_sys_state, &system_constants_,
+                      sizeof(g_nr_sys_state));
+        }
+      }
+    }
+  }
 }
 
 bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
