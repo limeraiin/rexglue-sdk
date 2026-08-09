@@ -229,6 +229,23 @@ REXCVAR_DEFINE_BOOL(gpu_nr_walk_effects, false, "GPU",
                     "stream, in addition to the executor's own (idempotent). "
                     "Implies gpu_nr_draw. Off by default.");
 
+// [NR-PKT] Phase 5-4-1: the non-draw packet census. Before 5-4-2 can skip the
+// executor for a depth-1 buffer, every packet class the executor handles that
+// is neither a register write nor a draw must be either transcribed into the
+// walk or made a per-buffer REFUSE class. This measures which classes actually
+// occur, at what rate, in how many depth-1 buffer executions, and whether
+// those buffers carry draws (a class confined to draw-less buffers costs the
+// skip nothing). Census first; the list is measured, not guessed. Also counts
+// type-0/type-1 register writes that hit the STATEFUL ports (scratch writeback
+// / COHER_STATUS_HOST RMW / the DC_LUT gamma machine -- the precord
+// must-not-defer set): their WriteRegister behavior is not idempotent and not
+// walk-reproducible, so a skipped buffer containing one must refuse.
+REXCVAR_DEFINE_BOOL(gpu_nr_pkt_census, false, "GPU",
+                    "[nr-pkt] Phase 5-4-1: census of every packet class the "
+                    "executor dispatches inside depth-1 indirect buffers, "
+                    "split stream/non-stream/stateful, with per-class buffer "
+                    "and draw-buffer counts. Diagnostic only, off by default.");
+
 // [NR-SDB] Increment 4b-2: the shader-database probe. The offline census
 // proved the whole 3,320-shader corpus in xeshader.sdb translates, and the
 // index keys each blob by the runtime's own shader key -- but "the corpus
@@ -947,6 +964,146 @@ void NrdFinding(void*, nr::RegShadowFinding what, uint32_t reg, uint32_t ours,
 // to the effects they count.
 bool g_nr_walk_fx = false;
 
+// [NR-PKT] Phase 5-4-1: the non-draw packet census. CP-thread-only. Counted
+// at the executor's own dispatch, AFTER its predicate skip, so the tallies
+// are execution truth (a predicated-out packet never runs and is not listed
+// -- the same rule the 4b-1 walkers and the join list obey).
+bool g_nr_pkt = false;
+uint64_t g_pkt_op[128];            // type-3 dispatches inside depth-1 IBs
+uint64_t g_pkt_op_bufs[128];       // depth-1 executions containing the op
+uint64_t g_pkt_op_drawbufs[128];   // ...that also executed a draw
+uint64_t g_pkt_t0_pkts = 0, g_pkt_t0_regs = 0, g_pkt_t1_pkts = 0,
+         g_pkt_t2_pkts = 0;
+// Stateful-port register writes (0 scratch / 1 COHER_STATUS_HOST / 2 DC_LUT),
+// the precord must-not-defer enumeration: WriteRegister behavior beyond the
+// value store that is NOT idempotent (memory writeback / RMW / a write
+// cursor), so the walk cannot re-fire it and a skipped buffer cannot carry it.
+uint64_t g_pkt_sfx_writes[3] = {};
+uint64_t g_pkt_sfx_bufs[3] = {};
+uint64_t g_pkt_sfx_drawbufs[3] = {};
+uint64_t g_pkt_bufs = 0, g_pkt_drawbufs = 0;
+// Current depth-1 buffer execution.
+uint64_t g_pkt_buf_ops[2] = {};    // 128-bit op-presence set
+uint32_t g_pkt_buf_sfx = 0;        // 3-bit class-presence set
+bool g_pkt_buf_draw = false;
+bool g_pkt_buf_open = false;
+
+void NrPktBufBegin() {
+  g_pkt_buf_ops[0] = g_pkt_buf_ops[1] = 0;
+  g_pkt_buf_sfx = 0;
+  g_pkt_buf_draw = false;
+  g_pkt_buf_open = true;
+}
+
+void NrPktBufEnd() {
+  if (!g_pkt_buf_open) return;
+  g_pkt_buf_open = false;
+  ++g_pkt_bufs;
+  if (g_pkt_buf_draw) ++g_pkt_drawbufs;
+  for (uint32_t w = 0; w < 2; ++w) {
+    uint64_t bits = g_pkt_buf_ops[w];
+    while (bits) {
+      const uint32_t b = static_cast<uint32_t>(__builtin_ctzll(bits));
+      bits &= bits - 1;
+      const uint32_t op = w * 64 + b;
+      ++g_pkt_op_bufs[op];
+      if (g_pkt_buf_draw) ++g_pkt_op_drawbufs[op];
+    }
+  }
+  for (uint32_t c = 0; c < 3; ++c) {
+    if (g_pkt_buf_sfx & (1u << c)) {
+      ++g_pkt_sfx_bufs[c];
+      if (g_pkt_buf_draw) ++g_pkt_sfx_drawbufs[c];
+    }
+  }
+}
+
+// Classify the register writes of a type-0/type-1 packet against the three
+// stateful classes. `writes` is how many stores land on each register in
+// [lo, hi] (a one-reg type-0 packet stores `count` times to one register --
+// the DC_LUT gamma machine advances per STORE, so the multiplicity matters).
+void NrPktRegRange(uint32_t lo, uint32_t hi, uint64_t writes) {
+  auto hit = [&](uint32_t rlo, uint32_t rhi) -> uint64_t {
+    if (lo > rhi || hi < rlo) return 0;
+    return (std::min(hi, rhi) - std::max(lo, rlo) + 1) * writes;
+  };
+  uint64_t n;
+  if ((n = hit(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7)) != 0) {
+    g_pkt_sfx_writes[0] += n;
+    g_pkt_buf_sfx |= 1u << 0;
+  }
+  if ((n = hit(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST)) != 0) {
+    g_pkt_sfx_writes[1] += n;
+    g_pkt_buf_sfx |= 1u << 1;
+  }
+  n = hit(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_RW_INDEX) +
+      hit(XE_GPU_REG_DC_LUT_SEQ_COLOR, XE_GPU_REG_DC_LUT_SEQ_COLOR) +
+      hit(XE_GPU_REG_DC_LUT_PWL_DATA, XE_GPU_REG_DC_LUT_PWL_DATA) +
+      hit(XE_GPU_REG_DC_LUT_30_COLOR, XE_GPU_REG_DC_LUT_30_COLOR);
+  if (n) {
+    g_pkt_sfx_writes[2] += n;
+    g_pkt_buf_sfx |= 1u << 2;
+  }
+}
+
+// The walk-transcribed set: packet classes the 4a-4c decoder already applies
+// (constants, shader loads, draws, the bin family, and the one-dword/NOP
+// skips). Everything else on the report is a transcribe-or-refuse decision.
+bool NrPktStreamOp(uint32_t op) {
+  switch (op) {
+    case PM4_NOP:                  // 0x10
+    case PM4_DRAW_INDX:            // 0x22
+    case PM4_DRAW_INDX_2:          // 0x36
+    case PM4_IM_LOAD:              // 0x27
+    case PM4_IM_LOAD_IMMEDIATE:    // 0x2b
+    case PM4_SET_CONSTANT:         // 0x2d
+    case PM4_LOAD_ALU_CONSTANT:    // 0x2f
+    case PM4_SET_CONSTANT2:        // 0x55
+    case PM4_SET_SHADER_CONSTANTS: // 0x56
+    case PM4_SET_BIN_MASK:         // 0x50
+    case PM4_SET_BIN_SELECT:       // 0x51
+    case PM4_SET_BIN_MASK_LO:      // 0x60
+    case PM4_SET_BIN_MASK_HI:      // 0x61
+    case PM4_SET_BIN_SELECT_LO:    // 0x62
+    case PM4_SET_BIN_SELECT_HI:    // 0x63
+      return true;
+    default:
+      return false;
+  }
+}
+
+const char* NrPktOpName(uint32_t op) {
+  switch (op) {
+    case PM4_ME_INIT: return "ME_INIT";
+    case PM4_INTERRUPT: return "INTERRUPT";
+    case PM4_XE_SWAP: return "XE_SWAP";
+    case PM4_INDIRECT_BUFFER: return "INDIRECT_BUFFER";
+    case PM4_INDIRECT_BUFFER_PFD: return "INDIRECT_BUFFER_PFD";
+    case PM4_WAIT_REG_MEM: return "WAIT_REG_MEM";
+    case PM4_WAIT_FOR_IDLE: return "WAIT_FOR_IDLE";
+    case PM4_REG_RMW: return "REG_RMW";
+    case PM4_REG_TO_MEM: return "REG_TO_MEM";
+    case PM4_MEM_WRITE: return "MEM_WRITE";
+    case PM4_COND_WRITE: return "COND_WRITE";
+    case PM4_COND_EXEC: return "COND_EXEC";
+    case PM4_EVENT_WRITE: return "EVENT_WRITE";
+    case PM4_EVENT_WRITE_SHD: return "EVENT_WRITE_SHD";
+    case PM4_EVENT_WRITE_CFL: return "EVENT_WRITE_CFL";
+    case PM4_EVENT_WRITE_EXT: return "EVENT_WRITE_EXT";
+    case PM4_EVENT_WRITE_ZPD: return "EVENT_WRITE_ZPD";
+    case PM4_VIZ_QUERY: return "VIZ_QUERY";
+    case PM4_INVALIDATE_STATE: return "INVALIDATE_STATE";
+    case PM4_CONTEXT_UPDATE: return "CONTEXT_UPDATE";
+    case PM4_SET_STATE: return "SET_STATE";
+    case PM4_LOAD_CONSTANT_CONTEXT: return "LOAD_CONSTANT_CONTEXT";
+    case PM4_IM_STORE: return "IM_STORE";
+    case PM4_MEM_WRITE_CNTR: return "MEM_WRITE_CNTR";
+    case PM4_DRAW_INDX_BIN: return "DRAW_INDX_BIN";
+    case PM4_DRAW_INDX_2_BIN: return "DRAW_INDX_2_BIN";
+    default: return "?";
+  }
+}
+
 // [NR-ISSUE] Increment 4d. CP-thread-only, like everything else here.
 bool g_nr_issue = false;
 int64_t g_nri_from = 0;
@@ -1357,6 +1514,9 @@ void CommandProcessor::WorkerThreadMain() {
   // executor and over-invalidate (correct output, inflated rebuilds).
   const bool kNrWalkFx = REXCVAR_GET(gpu_nr_walk_effects);
   g_nr_walk_fx = kNrWalkFx;
+  // [NR-PKT] 5-4-1: executor-side census, independent of the walk.
+  const bool kNrPkt = REXCVAR_GET(gpu_nr_pkt_census);
+  g_nr_pkt = kNrPkt;
   // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
   const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue || kNrWalkFx;
   g_nr_draw = kNrDraw;
@@ -2094,6 +2254,48 @@ void CommandProcessor::WorkerThreadMain() {
           g_nri_armed = g_nri_copy_armed = 0;
           g_nri_sh_invalid = g_nri_sh_mismatch = 0;
         }
+        // [NR-PKT] Phase 5-4-1. The header carries the buffer split and the
+        // stateful-port classes; one sub-line per NON-STREAM op actually
+        // seen, with how many buffer executions carry it and how many of
+        // those draw -- the transcribe-or-refuse decision needs exactly
+        // those two numbers. Stream-op totals are folded into one line as a
+        // cross-check against the walk's own stats.
+        if (kNrPkt && g_pkt_bufs) {
+          REXGPU_INFO(
+              "[nr-pkt] bufs={} drawbufs={} | t0={}pkts/{}regs t1={} t2={} | "
+              "sfx scratch={}/{}b/{}db coher={}/{}b/{}db dclut={}/{}b/{}db",
+              g_pkt_bufs, g_pkt_drawbufs, g_pkt_t0_pkts, g_pkt_t0_regs,
+              g_pkt_t1_pkts, g_pkt_t2_pkts, g_pkt_sfx_writes[0],
+              g_pkt_sfx_bufs[0], g_pkt_sfx_drawbufs[0], g_pkt_sfx_writes[1],
+              g_pkt_sfx_bufs[1], g_pkt_sfx_drawbufs[1], g_pkt_sfx_writes[2],
+              g_pkt_sfx_bufs[2], g_pkt_sfx_drawbufs[2]);
+          REXGPU_INFO(
+              "[nr-pkt]   stream nop={} draw22={} draw36={} setc={} setc2={} "
+              "shc={} ldalu={} im={} imm={} bin={}",
+              g_pkt_op[PM4_NOP], g_pkt_op[PM4_DRAW_INDX],
+              g_pkt_op[PM4_DRAW_INDX_2], g_pkt_op[PM4_SET_CONSTANT],
+              g_pkt_op[PM4_SET_CONSTANT2], g_pkt_op[PM4_SET_SHADER_CONSTANTS],
+              g_pkt_op[PM4_LOAD_ALU_CONSTANT], g_pkt_op[PM4_IM_LOAD],
+              g_pkt_op[PM4_IM_LOAD_IMMEDIATE],
+              g_pkt_op[PM4_SET_BIN_MASK] + g_pkt_op[PM4_SET_BIN_SELECT] +
+                  g_pkt_op[PM4_SET_BIN_MASK_LO] + g_pkt_op[PM4_SET_BIN_MASK_HI] +
+                  g_pkt_op[PM4_SET_BIN_SELECT_LO] +
+                  g_pkt_op[PM4_SET_BIN_SELECT_HI]);
+          for (uint32_t op = 0; op < 128; ++op) {
+            if (!g_pkt_op[op] || NrPktStreamOp(op)) continue;
+            REXGPU_INFO("[nr-pkt]   OP 0x{:02X} {} n={} bufs={} drawbufs={}",
+                        op, NrPktOpName(op), g_pkt_op[op], g_pkt_op_bufs[op],
+                        g_pkt_op_drawbufs[op]);
+          }
+          for (uint32_t op = 0; op < 128; ++op) {
+            g_pkt_op[op] = g_pkt_op_bufs[op] = g_pkt_op_drawbufs[op] = 0;
+          }
+          for (uint32_t c = 0; c < 3; ++c) {
+            g_pkt_sfx_writes[c] = g_pkt_sfx_bufs[c] = g_pkt_sfx_drawbufs[c] = 0;
+          }
+          g_pkt_t0_pkts = g_pkt_t0_regs = g_pkt_t1_pkts = g_pkt_t2_pkts = 0;
+          g_pkt_bufs = g_pkt_drawbufs = 0;
+        }
         prof_last_report = now;
         last_type0_split_ns = g_type0_split_ns;
         last_spin_ns = prof_spin_ns;
@@ -2587,6 +2789,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // -> ExecutePacketType3) will see g_pm4_ib_depth > 0 and count as "indirect".
   ++g_pm4_ib_depth;
   if (g_pm4_census) { ++g_pm4_ib_count; g_pm4_ib_dwords += count; }
+  // [NR-PKT] 5-4-1: open the per-execution census record for depth-1 buffers.
+  if (g_nr_pkt && g_pm4_ib_depth == 1) NrPktBufBegin();
 
   // [NR-CTX] Increment 4a: update the RUNNING state context, in execution
   // order, for EVERY top-level buffer -- state-only buffers carry state the
@@ -3041,6 +3245,9 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     CtxFinishWalk();
   }
 
+  // [NR-PKT] 5-4-1: fold this execution's op/class sets into the tallies.
+  if (g_nr_pkt && g_pm4_ib_depth == 1) NrPktBufEnd();
+
   --g_pm4_ib_depth;
 
   trace_writer_.WriteIndirectBufferEnd();
@@ -3138,6 +3345,18 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  // [NR-PKT] 5-4-1: type-0 register writes inside depth-1 buffers -- packet
+  // count, register-store count, and the stateful-port classification. A
+  // one-reg packet stores `count` times to ONE register (multiplicity kept).
+  if (g_nr_pkt && g_pm4_ib_depth == 1) {
+    ++g_pkt_t0_pkts;
+    g_pkt_t0_regs += count;
+    if (write_one_reg) {
+      NrPktRegRange(base_index, base_index, count);
+    } else {
+      NrPktRegRange(base_index, base_index + count - 1, 1);
+    }
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -3158,6 +3377,12 @@ bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t p
   trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 3);
   uint32_t reg_index_1 = packet & 0x7FF;
   uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
+  // [NR-PKT] 5-4-1: type-1 writes inside depth-1 buffers.
+  if (g_nr_pkt && g_pm4_ib_depth == 1) {
+    ++g_pkt_t1_pkts;
+    NrPktRegRange(reg_index_1, reg_index_1, 1);
+    NrPktRegRange(reg_index_2, reg_index_2, 1);
+  }
   uint32_t reg_data_1 = reader->ReadAndSwap<uint32_t>();
   uint32_t reg_data_2 = reader->ReadAndSwap<uint32_t>();
   WriteRegister(reg_index_1, reg_data_1);
@@ -3169,6 +3394,8 @@ bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t p
 bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet) {
   // Type-2 packet.
   // No-op. Do nothing.
+  // [NR-PKT] 5-4-1: counted so the census is exhaustive over packet types.
+  if (g_nr_pkt && g_pm4_ib_depth == 1) ++g_pkt_t2_pkts;
   trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1);
   trace_writer_.WritePacketEnd();
   return true;
@@ -3212,6 +3439,15 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       trace_writer_.WritePacketEnd();
       return true;
     }
+  }
+
+  // [NR-PKT] 5-4-1: census at the dispatch, after the predicate skip above,
+  // so only packets that actually execute are tallied.
+  if (g_nr_pkt && g_pm4_ib_depth == 1) {
+    const uint32_t op7 = opcode & 0x7F;
+    ++g_pkt_op[op7];
+    g_pkt_buf_ops[op7 >> 6] |= 1ull << (op7 & 63);
+    if (op7 == PM4_DRAW_INDX || op7 == PM4_DRAW_INDX_2) g_pkt_buf_draw = true;
   }
 
   bool result = false;
