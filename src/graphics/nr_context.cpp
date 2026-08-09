@@ -242,9 +242,43 @@ void CtxApplyDrawPayload(CtxWalker* w, uint32_t op, uint32_t j, uint32_t cnt) {
   if (++p < end && p < w->dwords) CtxWriteReg(w, kRegVgtDmaSize, BE32(w->raw, p));
 }
 
+// [NR-SKP] The packet classes this walk decodes (or skips as pure no-ops)
+// itself. Everything OUTSIDE this set is a delegate stop when the caller
+// walks via CtxWalkNextStop: the executor's own handler runs the packet.
+// INVALIDATE_STATE (0x3B) is native because the executor's implementation is
+// read-and-ignore; PM4_NOP (0x10) skips by count exactly as the executor
+// does. Keep in sync with the decode chain in CtxWalkStep below and with
+// NrPktStreamOp (command_processor.cpp) minus the draws, which stop anyway.
+bool CtxNativeOp(uint32_t op) {
+  switch (op) {
+    case 0x10:  // NOP
+    case 0x22:  // DRAW_INDX        (draw stop)
+    case 0x36:  // DRAW_INDX_2      (draw stop)
+    case 0x27:  // IM_LOAD
+    case 0x2B:  // IM_LOAD_IMMEDIATE
+    case 0x2D:  // SET_CONSTANT
+    case 0x2F:  // LOAD_ALU_CONSTANT
+    case 0x3B:  // INVALIDATE_STATE (executor reads and ignores)
+    case 0x50:  // SET_BIN_MASK
+    case 0x51:  // SET_BIN_SELECT
+    case 0x55:  // SET_CONSTANT2
+    case 0x56:  // SET_SHADER_CONSTANTS
+    case 0x60:  // SET_BIN_MASK_LO
+    case 0x61:  // SET_BIN_MASK_HI
+    case 0x62:  // SET_BIN_SELECT_LO
+    case 0x63:  // SET_BIN_SELECT_HI
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Decodes exactly one packet at the cursor, advancing it past that packet.
 // Returns true when the packet was an EXECUTED draw, filling `stop`.
-bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop) {
+// [NR-SKP] With `delegate_stops` set (CtxWalkNextStop), also returns true --
+// WITHOUT advancing the cursor -- for an executed type-3 packet outside the
+// native set, so the caller can run the executor's handler on it.
+bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
   const uint8_t* raw = w->raw;
   const uint32_t dwords = w->dwords;
   const uint32_t j = w->cursor;
@@ -297,6 +331,20 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop) {
   if (hdr & 1) {
     if (op == 0x22) ++w->stats->pred_draws_run;
   }
+  // [NR-SKP] Delegate stop: an executed type-3 packet this walk does not
+  // decode. After the predicate check (a predicated-out packet never runs and
+  // is skipped natively above), before any decode. The cursor stays AT the
+  // header for the executor's dispatch; CtxWalkSkipDelegated resumes past it.
+  if (delegate_stops && stop && !CtxNativeOp(op)) {
+    w->cursor = j;
+    ++w->stats->delegate_stops;
+    stop->opcode = op;
+    stop->dword = j;
+    stop->flags = 0;
+    stop->index = 0;
+    stop->delegate = 1;
+    return true;
+  }
   if (op == 0x22 || op == 0x36) {
     uint16_t f = 0;
     uint32_t index = 0;
@@ -318,6 +366,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop) {
       stop->dword = j;
       stop->flags = f;
       stop->index = index;
+      stop->delegate = 0;
     }
     return true;
   }
@@ -457,6 +506,20 @@ bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop) {
     if (CtxWalkStep(w, stop)) return true;
   }
   return false;
+}
+
+bool CtxWalkNextStop(CtxWalker* w, CtxDrawStop* stop) {
+  while (w->cursor < w->dwords) {
+    if (CtxWalkStep(w, stop, /*delegate_stops=*/true)) return true;
+  }
+  return false;
+}
+
+void CtxWalkSkipDelegated(CtxWalker* w) {
+  if (w->cursor >= w->dwords) return;
+  const uint32_t hdr = BE32(w->raw, w->cursor);
+  // Delegate stops are always type-3 packets (header + count payload dwords).
+  w->cursor += 1 + (((hdr >> 16) & 0x3FFF) + 1);
 }
 
 uint32_t CtxWalkFinish(CtxWalker* w) {

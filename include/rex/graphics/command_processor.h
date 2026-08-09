@@ -173,6 +173,15 @@ class CommandProcessor {
   // Public because the walk's write hook is a file-scope function.
   virtual void NrWalkWriteEffects(uint32_t index) { (void)index; }
 
+  // [NR-SKP] Phase 5-4-2: the skip mode's register apply -- the walk's decoded
+  // write stream routed through the FULL virtual WriteRegister (value store,
+  // dirty tail, stateful ports, instancing/dedupe semantics), because under
+  // the skip the executor's own apply never runs. Public for the same reason
+  // as NrWalkWriteEffects: the walk hook is a file-scope function.
+  void NrSkipApplyRegWrite(uint32_t index, uint32_t value) {
+    WriteRegister(index, value);
+  }
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
@@ -216,6 +225,16 @@ class CommandProcessor {
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
+  // [NR-SKP] Phase 5-4-2: backend veto for the skip mode (precord capture and
+  // non-D3D12 backends refuse). Base default false keeps every backend that
+  // has not opted in on the executor path.
+  virtual bool NrSkipBackendEligible() const { return false; }
+  // [NR-SKP] Runs one eligible depth-1 indirect buffer with the walk as the
+  // ONLY decoder: native packets applied through NrSkipApplyRegWrite, draws
+  // and the 5-4-1 delegate list dispatched to the executor's own handlers at
+  // the walk cursor. Called from ExecuteIndirectBuffer instead of the packet
+  // loop; the walker must already be begun for this buffer.
+  void NrSkipExecuteBuffer(uint32_t ptr, uint32_t count);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);

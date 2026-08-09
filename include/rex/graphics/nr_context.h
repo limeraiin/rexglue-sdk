@@ -176,6 +176,8 @@ struct CtxWalkStats {
   uint32_t bin_pkts;        // SET_BIN_MASK/SELECT packets seen inside the
                             // buffer (0 => bin state only ever arrives from
                             // outside, i.e. per-tile replay of one buffer)
+  uint32_t delegate_stops;  // [NR-SKP] non-native type-3 packets surfaced as
+                            // delegate stops by CtxWalkNextStop
 };
 
 // Optional reader for LOAD_ALU_CONSTANT values (they live in guest memory,
@@ -280,14 +282,19 @@ uint32_t WalkBufferContext(const uint8_t* raw, uint32_t dwords,
 // way to ask a per-draw question and the shape the native replay needs, since
 // a replay walks and issues in one order.
 
-// Where a CtxWalkNextDraw stop landed.
+// Where a CtxWalkNextDraw / CtxWalkNextStop stop landed.
 struct CtxDrawStop {
-  uint32_t opcode;  // 0x22 DRAW_INDX or 0x36 DRAW_INDX_2
+  uint32_t opcode;  // 0x22 DRAW_INDX or 0x36 DRAW_INDX_2 (draw stops); the
+                    // packet's type-3 opcode for a delegate stop
   uint32_t dword;   // the header's dword index within the buffer
-  uint16_t flags;   // the draw's flags word (0x22 only; 0 for 0x36)
+  uint16_t flags;   // the draw's flags word (0x22 only; 0 for 0x36/delegate)
   uint32_t index;   // ordinal among EXECUTED 0x22 draws, 0-based (0x22 only),
                     // so it is index-aligned with the join list exactly as the
                     // whole-buffer flags array is
+  uint8_t delegate; // [NR-SKP] 1 = a type-3 packet the walk does not decode
+                    // (CtxWalkNextStop only). The cursor is left AT the
+                    // packet header so the caller can hand it to the
+                    // executor's own dispatch, then CtxWalkSkipDelegated.
 };
 
 // Decoder state. Zero-initialize through CtxWalkBegin, never by hand.
@@ -337,6 +344,25 @@ void CtxWalkBegin(CtxWalker* w, const uint8_t* raw, uint32_t dwords,
 // Only 0x22 emits a flags word and fires draw_fn, so every existing consumer
 // sees what it saw before.
 bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop);
+
+// [NR-SKP] Phase 5-4-2: like CtxWalkNextDraw, but ALSO stops at every
+// executed type-3 packet the walk does not natively decode (the 5-4-1
+// delegate list: WAIT_REG_MEM, the EVENT_WRITE family, REG_RMW, MEM_WRITE,
+// COND_WRITE, INTERRUPT, XE_SWAP, nested INDIRECT_BUFFER, and anything
+// unknown -- the set is defined by inversion, so a new opcode can never be
+// silently mis-walked). For a delegate stop (stop->delegate == 1) the cursor
+// is left AT the packet header: the caller runs the executor's own dispatch
+// on that packet, then calls CtxWalkSkipDelegated to resume the walk past
+// it. Predicated-out packets of every kind are still skipped natively, per
+// the executor's own rule. Draw stops behave exactly as in CtxWalkNextDraw
+// (payload applied, flags word emitted, cursor past the packet).
+bool CtxWalkNextStop(CtxWalker* w, CtxDrawStop* stop);
+
+// Advances the cursor past the delegated packet CtxWalkNextStop stopped at.
+// The caller may have let the executor change the bin members meanwhile
+// (a nested indirect buffer can contain SET_BIN packets); it is the caller's
+// job to write those back into w->bin before the next CtxWalkNextStop.
+void CtxWalkSkipDelegated(CtxWalker* w);
 
 // Applies the rest of the buffer. Returns the total flags words written.
 uint32_t CtxWalkFinish(CtxWalker* w);

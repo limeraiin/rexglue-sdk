@@ -237,6 +237,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // constant ranges, fired from the lockstep walk's decoded write stream. No
   // value store, no dedupe. Keep in sync with WriteRegister / PrecordApplyWrite.
   void NrWalkWriteEffects(uint32_t index) override;
+  // [NR-SKP] Phase 5-4-2: this backend supports walk-only buffer execution
+  // unless precord capture owns the draw path (same exclusion as the
+  // gpu_nr_issue seam, counted there as precord_skip).
+  bool NrSkipBackendEligible() const override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
 

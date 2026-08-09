@@ -5835,6 +5835,14 @@ void D3D12CommandProcessor::NrWalkWriteEffects(uint32_t index) {
   }
 }
 
+bool D3D12CommandProcessor::NrSkipBackendEligible() const {
+  // [NR-SKP] Phase 5-4-2: precord capture defers draws into segments and
+  // replays them against rewound state -- the skip's walk-only apply and the
+  // capture's write log cannot both own WriteRegister's effects. Same
+  // exclusion the gpu_nr_issue seam already enforces per draw.
+  return !g_precord_capture;
+}
+
 void D3D12CommandProcessor::PrecordApplyWrite(RegisterFile* file, uint32_t index, uint32_t value) {
   // [GPU-PRECORD] Phase 1b-1c Inc 1: the replay-time equivalent of a single
   // WriteRegister for a DEFERRABLE register, applied against `file` (the per-segment

@@ -246,6 +246,26 @@ REXCVAR_DEFINE_BOOL(gpu_nr_pkt_census, false, "GPU",
                     "split stream/non-stream/stateful, with per-class buffer "
                     "and draw-buffer counts. Diagnostic only, off by default.");
 
+// [NR-SKP] Phase 5-4-2: the skip -- the first increment that can MOVE fps.
+// For eligible depth-1 indirect buffers the walk becomes the ONLY decoder:
+// every packet it understands (the register/constant stream, shader loads,
+// bins, no-ops, INVALIDATE_STATE) is applied through the full virtual
+// WriteRegister from the walk's decoded write stream, and every packet it
+// does not (draws + the 5-4-1 closed delegate list, ~4% of dispatches at
+// city load) is dispatched to the executor's own handler at the walk cursor
+// via a span reader. Draws therefore still run ExecutePacketType3Draw ->
+// IssueDraw with the lockstep arm (shadow file + walk-resolved shaders, the
+// proven gpu_nr_issue seam); the executor's per-packet framing for the other
+// ~96% of dispatches never runs. Eligibility: D3D12, no precord capture, no
+// open trace, no gpu_nr_issue_from/count bisection window.
+REXCVAR_DEFINE_BOOL(gpu_nr_skip, false, "GPU",
+                    "[nr-skp] Phase 5-4-2: for eligible depth-1 indirect "
+                    "buffers, skip the executor's packet loop and run the "
+                    "lockstep walk as the only decoder (draws + non-stream "
+                    "packets delegated to the executor's own handlers). "
+                    "Implies gpu_nr_issue and gpu_nr_walk_effects. Off by "
+                    "default.");
+
 // [NR-SDB] Increment 4b-2: the shader-database probe. The offline census
 // proved the whole 3,320-shader corpus in xeshader.sdb translates, and the
 // index keys each blob by the runtime's own shader key -- but "the corpus
@@ -964,6 +984,27 @@ void NrdFinding(void*, nr::RegShadowFinding what, uint32_t reg, uint32_t ours,
 // to the effects they count.
 bool g_nr_walk_fx = false;
 
+// [NR-SKP] Phase 5-4-2. CP-thread-only, like everything else here.
+// g_nr_skip_bufactive is true exactly while NrSkipExecuteBuffer drives the
+// walker for the current buffer: NrWalkRegWrite then routes every decoded
+// write through the FULL virtual WriteRegister (the executor's apply never
+// runs), instead of 5-4-0's effects-only firing.
+bool g_nr_skip = false;
+bool g_nr_skip_bufactive = false;
+// The draw handshake: at a draw stop the skip loop stores the stop and
+// delegates the draw packet; ExecutePacketType3Draw consumes it instead of
+// advancing the walk (which already sits past this draw).
+bool g_nr_skip_draw_pending = false;
+nr::CtxDrawStop g_nr_skip_stop = {};
+// Window counters for the [nr-skp] 1Hz line.
+uint64_t g_skp_bufs = 0;         // skip-driven depth-1 buffer executions
+uint64_t g_skp_fb = 0;           // cvar on but buffer refused (trace/backend)
+uint64_t g_skp_draws = 0;        // draw packets delegated
+uint64_t g_skp_deleg = 0;        // non-draw packets delegated
+uint64_t g_skp_exec_fail = 0;    // delegated dispatch returned false
+uint64_t g_skp_arm_orphan = 0;   // draw stop the handler never consumed
+uint64_t g_skp_deleg_op[128] = {};
+
 // [NR-PKT] Phase 5-4-1: the non-draw packet census. CP-thread-only. Counted
 // at the executor's own dispatch, AFTER its predicate skip, so the tallies
 // are execution truth (a predicated-out packet never runs and is not listed
@@ -1220,6 +1261,16 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   // the shadow: out-of-range is dropped, never clamped onto a real register.
   if (g_nr_issue && g_nri_seeded && reg < RegisterFile::kRegisterCount) {
     g_nri_file.values[reg] = value;
+  }
+  // [NR-SKP] Phase 5-4-2: while the skip loop drives this buffer, the
+  // executor's apply never runs, so the walk's decoded write goes through the
+  // FULL virtual WriteRegister -- value store, dirty tail, the stateful
+  // scratch/COHER/DC_LUT machines, and the instancing/dedupe semantics, all
+  // identical to the executor's by construction. NrWalkWriteEffects is NOT
+  // fired on top (WriteRegister's own tail already ran).
+  if (g_nr_skip_bufactive && user) {
+    static_cast<CommandProcessor*>(user)->NrSkipApplyRegWrite(reg, value);
+    return;
   }
   // [NR-FX] Phase 5-4-0: additionally fire the backend's dirty-tracking tail
   // for this write. The walk is in lockstep (gpu_nr_walk_effects implies
@@ -1501,8 +1552,13 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-RES] rides the 4a context walk, so it implies it.
   const bool kNrRes = REXCVAR_GET(gpu_nr_res);
   g_nr_res = kNrRes;
+  // [NR-SKP] 5-4-2: the skip is the consumer of BOTH the issue seam and the
+  // walk-driven effects, so it implies them (and through them the lockstep
+  // walk and the running context).
+  const bool kNrSkip = REXCVAR_GET(gpu_nr_skip);
+  g_nr_skip = kNrSkip;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
-  const bool kNrIssue = REXCVAR_GET(gpu_nr_issue);
+  const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
   g_nri_from = REXCVAR_GET(gpu_nr_issue_from);
   g_nri_count = REXCVAR_GET(gpu_nr_issue_count);
@@ -1512,7 +1568,7 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-FX] 5-4-0: walk-driven side effects REQUIRE the lockstep walk --
   // fired from a buffer-entry whole-buffer walk they would run ahead of the
   // executor and over-invalidate (correct output, inflated rebuilds).
-  const bool kNrWalkFx = REXCVAR_GET(gpu_nr_walk_effects);
+  const bool kNrWalkFx = REXCVAR_GET(gpu_nr_walk_effects) || kNrSkip;
   g_nr_walk_fx = kNrWalkFx;
   // [NR-PKT] 5-4-1: executor-side census, independent of the walk.
   const bool kNrPkt = REXCVAR_GET(gpu_nr_pkt_census);
@@ -2254,6 +2310,39 @@ void CommandProcessor::WorkerThreadMain() {
           g_nri_armed = g_nri_copy_armed = 0;
           g_nri_sh_invalid = g_nri_sh_mismatch = 0;
         }
+        // [NR-SKP] Phase 5-4-2. bufs = skip-driven depth-1 buffer executions
+        // this window; fb = buffers refused with the cvar on (trace open /
+        // backend veto / bisection window); draws + deleg = packets handed to
+        // the executor's own handlers (everything else was walked natively);
+        // exec_fail and orphan must stay 0. Top delegated ops are named so
+        // the 5-4-1 closed list stays checkable live.
+        if (kNrSkip && (g_skp_bufs || g_skp_fb)) {
+          char ops[160];
+          int n = 0;
+          for (uint32_t pass = 0; pass < 6; ++pass) {
+            uint64_t best = 0;
+            uint32_t best_op = 0;
+            for (uint32_t op = 0; op < 128; ++op) {
+              if (g_skp_deleg_op[op] > best) {
+                best = g_skp_deleg_op[op];
+                best_op = op;
+              }
+            }
+            if (!best) break;
+            n += snprintf(ops + n, sizeof(ops) - n, " %s=%llu",
+                          NrPktOpName(best_op), (unsigned long long)best);
+            g_skp_deleg_op[best_op] = 0;
+            if (n >= int(sizeof(ops)) - 24) break;
+          }
+          REXGPU_INFO(
+              "[nr-skp] bufs={} fb={} draws={} deleg={} exec_fail={} "
+              "orphan={} |{}",
+              g_skp_bufs, g_skp_fb, g_skp_draws, g_skp_deleg, g_skp_exec_fail,
+              g_skp_arm_orphan, n ? ops : " deleg none");
+          g_skp_bufs = g_skp_fb = g_skp_draws = g_skp_deleg = 0;
+          g_skp_exec_fail = g_skp_arm_orphan = 0;
+          for (uint32_t op = 0; op < 128; ++op) g_skp_deleg_op[op] = 0;
+        }
         // [NR-PKT] Phase 5-4-1. The header carries the buffer split and the
         // stateful-port classes; one sub-line per NON-STREAM op actually
         // seen, with how many buffer executions carry it and how many of
@@ -2792,6 +2881,11 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // [NR-PKT] 5-4-1: open the per-execution census record for depth-1 buffers.
   if (g_nr_pkt && g_pm4_ib_depth == 1) NrPktBufBegin();
 
+  // [NR-SKP] 5-4-2: set inside the [NR-CTX] depth-1 branch below when this
+  // buffer execution runs walk-only; consumed where the executor loop would
+  // otherwise run.
+  bool nr_skip_buf = false;
+
   // [NR-CTX] Increment 4a: update the RUNNING state context, in execution
   // order, for EVERY top-level buffer -- state-only buffers carry state the
   // next buffer's draws depend on, so this cannot ride the ledger's
@@ -2854,11 +2948,30 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                        nullptr, NrCtxWatch, nullptr, bin_select_, bin_mask_,
                        has_reg_fn ? NrWalkRegWrite : nullptr, this,
                        g_nr_res ? NrResDraw : nullptr, nullptr);
+      // [NR-SKP] 5-4-2: the skip decision, per buffer. The walk (begun above)
+      // becomes the ONLY decoder; the executor's packet loop below is
+      // replaced by NrSkipExecuteBuffer. Refusals are counted, never silent:
+      // an open trace needs the executor's per-packet trace events, a
+      // bisection window (gpu_nr_issue_from/count) would leave unarmed draws
+      // running with stale active shaders, and the backend vetoes precord
+      // capture / non-D3D12.
+      if (g_nr_skip) {
+        if (g_nri_from == 0 && g_nri_count < 0 && !trace_writer_.is_open() &&
+            NrSkipBackendEligible()) {
+          nr_skip_buf = true;
+        } else {
+          ++g_skp_fb;
+        }
+      }
       // [NR-DRAW] Increment 4c: with the shadow on, the walk advances one draw
       // at a time from the execution path below, so that every per-draw
       // question is asked at that draw's moment instead of at the buffer's
       // end. Without it, finish here and keep the pre-4c behaviour exactly.
-      if (g_nr_draw) {
+      // Under the skip the lockstep flags stay CLEAR: the skip loop owns the
+      // walker and hands each draw stop over explicitly.
+      if (nr_skip_buf) {
+        ++g_nrd_buffers;
+      } else if (g_nr_draw) {
         g_ctx_walk_active = true;
         g_ctx_walk_lockstep = true;
         ++g_nrd_buffers;
@@ -3224,16 +3337,22 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   }
 
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
-  reader.set_write_offset(count * sizeof(uint32_t));
-  do {
-    if (!ExecutePacket(&reader)) {
-      // Return up a level if we encounter a bad packet.
-      REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
-      assert_always();
-      break;
-    }
-  } while (reader.read_count());
+  if (nr_skip_buf) {
+    // [NR-SKP] 5-4-2: walk-only execution -- the executor loop below never
+    // runs for this buffer.
+    NrSkipExecuteBuffer(ptr, count);
+  } else {
+    memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+    reader.set_write_offset(count * sizeof(uint32_t));
+    do {
+      if (!ExecutePacket(&reader)) {
+        // Return up a level if we encounter a bad packet.
+        REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
+        assert_always();
+        break;
+      }
+    } while (reader.read_count());
+  }
 
   // [NR-DRAW] The lockstep walk ends where the buffer does: apply whatever
   // trailing state follows the last draw, then tally. Guarded on the flag
@@ -3251,6 +3370,83 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   --g_pm4_ib_depth;
 
   trace_writer_.WriteIndirectBufferEnd();
+}
+
+// [NR-SKP] Phase 5-4-2: one eligible depth-1 buffer, walk-only. The walker
+// (already begun by ExecuteIndirectBuffer) decodes the register/constant
+// stream, shader loads, bins and no-ops natively -- every decoded write
+// reaches the full virtual WriteRegister through NrWalkRegWrite while
+// g_nr_skip_bufactive is set -- and surfaces everything else as a stop:
+// draws are handed to ExecutePacketType3Draw via the pending-stop handshake
+// (the proven lockstep arm + gpu_nr_issue seam run unchanged), delegate
+// packets (the 5-4-1 closed list plus anything unknown) run the executor's
+// own handler at the walk cursor through a span reader.
+void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
+  ++g_skp_bufs;
+  g_nr_skip_bufactive = true;
+  const uint8_t* raw = memory_->TranslatePhysical(ptr);
+  nr::CtxDrawStop stop;
+  bool aborted = false;
+  while (nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
+    // The delegated dispatch re-checks the predicate against the CP's own
+    // bin members (including the predicated-XE_SWAP rule), and a delegated
+    // nested buffer executes against them: they must hold the walk's CURRENT
+    // bin state, not the buffer-entry one.
+    bin_select_ = g_ctx_walker.bin.select;
+    bin_mask_ = g_ctx_walker.bin.mask;
+    if (!stop.delegate) {
+      // Draw stop: the walk already sits past this draw's packet, so the
+      // handler must consume THIS stop instead of advancing the walk.
+      g_nr_skip_stop = stop;
+      g_nr_skip_draw_pending = true;
+      ++g_skp_draws;
+    } else {
+      ++g_skp_deleg;
+      ++g_skp_deleg_op[stop.opcode & 0x7F];
+    }
+    // One packet through the executor's own dispatch. The reader spans from
+    // the packet header to the buffer's end; ExecutePacket consumes exactly
+    // header + count dwords of it.
+    const uint32_t span_bytes = (count - stop.dword) * uint32_t(sizeof(uint32_t));
+    memory::RingBuffer reader(
+        const_cast<uint8_t*>(raw) + stop.dword * sizeof(uint32_t), span_bytes);
+    reader.set_write_offset(span_bytes);
+    const bool ok = ExecutePacket(&reader);
+    if (g_nr_skip_draw_pending) {
+      // The handler returned before reaching the lockstep block (short
+      // packet / invalid source select). The draw did not run in either
+      // model; drop the stop so it cannot leak onto a later draw.
+      g_nr_skip_draw_pending = false;
+      ++g_skp_arm_orphan;
+    }
+    if (!ok) {
+      ++g_skp_exec_fail;
+      // Mirror the executor loop's abort: the rest of the buffer does not
+      // run, so the walk must not apply it either -- the mirror and the
+      // (aborted) live state stay the same thing. A false return during
+      // shutdown (WAIT_REG_MEM short-circuit) is expected and quiet.
+      if (worker_running_) {
+        REXGPU_ERROR("**** NR-SKIP: Failed to execute delegated packet.");
+        assert_always();
+      }
+      aborted = true;
+      break;
+    }
+    if (stop.delegate) {
+      nr::CtxWalkSkipDelegated(&g_ctx_walker);
+      // The delegate may have changed the bin members (SET_BIN inside a
+      // nested indirect buffer); resume the walk from the executor's truth.
+      g_ctx_walker.bin = nr::CtxBinState{bin_select_, bin_mask_};
+    }
+  }
+  if (aborted) g_ctx_walker.cursor = g_ctx_walker.dwords;
+  // Fold this buffer's stats/flags exactly as the lockstep path does, and
+  // leave the CP's bin members holding the walk's end state (an in-buffer
+  // SET_BIN would otherwise be lost to the packets that follow).
+  CtxFinishWalk();
+  bin_select_ = g_ctx_walker.bin.select;
+  bin_mask_ = g_ctx_walker.bin.mask;
+  g_nr_skip_bufactive = false;
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
@@ -4123,10 +4319,21 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       // run: the two sides are looking at the same state or the walk is wrong.
       // Depth-1 only, for the same reason the walk itself is: a nested buffer
       // is not walked, so its draws must not advance the outer walk.
-      if (g_ctx_walk_lockstep && g_pm4_ib_depth == 1) {
+      // [NR-SKP] 5-4-2: under the skip this handler runs as a DELEGATED
+      // packet -- the walk already stopped at exactly this draw and sits past
+      // it, so the pre-made stop is consumed instead of advancing the walk.
+      const bool nr_skip_draw = g_nr_skip_draw_pending;
+      if ((g_ctx_walk_lockstep || nr_skip_draw) && g_pm4_ib_depth == 1) {
         nr::CtxDrawStop stop;
-        if (!nr::CtxWalkNextDraw(&g_ctx_walker, &stop) ||
-            stop.opcode != draw_opcode) {
+        bool have_stop;
+        if (nr_skip_draw) {
+          stop = g_nr_skip_stop;
+          g_nr_skip_draw_pending = false;
+          have_stop = true;
+        } else {
+          have_stop = nr::CtxWalkNextDraw(&g_ctx_walker, &stop);
+        }
+        if (!have_stop || stop.opcode != draw_opcode) {
           // The walk and the executor disagree about which packets run. Every
           // value read from here on would be from the wrong moment, so stop
           // COMPARING -- but keep the walk itself alive, so the buffer's state
@@ -4173,8 +4380,17 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
                     xenos::ShaderType::kPixel, g_ctx_state.ps.addr,
                     memory_->TranslatePhysical<uint32_t*>(g_ctx_state.ps.addr),
                     g_ctx_state.ps.size_dwords);
-                if (vs != active_vertex_shader_ ||
-                    ps != active_pixel_shader_) {
+                // [NR-SKP] Under the skip the executor never sees IM_LOAD, so
+                // the active members hold the previous draw's shaders: the
+                // compare would count real shader changes as mismatches.
+                // Instead the walk IS the truth -- converge the members to
+                // what the last walked IM_LOAD would have set, so any
+                // fallback path that follows reads coherent state.
+                if (nr_skip_draw) {
+                  active_vertex_shader_ = vs;
+                  active_pixel_shader_ = ps;
+                } else if (vs != active_vertex_shader_ ||
+                           ps != active_pixel_shader_) {
                   ++g_nri_sh_mismatch;
                 }
                 // [NR-ISSUE] Increment 4e: seed the replay file ONCE (the
