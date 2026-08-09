@@ -27,6 +27,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
+#include <rex/graphics/nr_descriptors.h>
 #include <rex/graphics/nr_sys_constants.h>
 #include <rex/graphics/nr_native_pso.h>
 #include <rex/graphics/registers.h>
@@ -189,6 +190,17 @@ REXCVAR_DEFINE_BOOL(gpu_nr_sysconst, false, "GPU/D3D12",
                     "with the native renderer's own transcription and byte-compare the "
                     "whole struct against the emulated one after every update. Reports "
                     "'[nr-sys]' once/sec. Diagnostic only, off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [NR-DSC] Phase 5-3b-2: the descriptor/sampler mirror's gate.
+REXCVAR_DEFINE_BOOL(gpu_nr_desc, false, "GPU/D3D12",
+                    "[NR-DSC] Phase 5-3b-2 descriptor/sampler mirror: re-derive sampler "
+                    "parameters and texture SRV keys from the draw register file with "
+                    "the native renderer's own transcription, mirror the bindless "
+                    "sampler-heap index map, and byte-compare our compose of the "
+                    "descriptor-indices constant buffers against every emulated rebuild "
+                    "inside UpdateBindings. Reports '[nr-dsc]' once/sec. Diagnostic "
+                    "only, off by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
@@ -407,6 +419,174 @@ void NrSysReportIfDue() {
       p.cover_gamma - s_prev.cover_gamma, p.cover_tex - s_prev.cover_tex);
   s_prev = p;
   g_nr_sys_samples_this_window = 0;
+}
+
+// [NR-DSC] Phase 5-3b-2: latched once a frame beside the others; counters are
+// cmd-proc-thread-only => plain globals. The *_ne counters are cumulative
+// must-be-0 gates; volume counters are per-second deltas on the 1Hz line.
+// Coverage split: smp_* = per-draw SamplerParameters derivations, key_* =
+// per-draw texture SRV key derivations, smap_* = the bindless sampler-heap
+// index mirror (seeded entries = allocated before the gate armed, like the
+// 5-3b-1 seed; fresh = allocation index PREDICTED while armed), dc_* = the
+// descriptor-indices cbuffer byte compares (vertex/pixel rebuilds).
+bool g_nr_desc = false;
+struct NrDescProbe {
+  uint64_t smp_checks = 0, smp_ne = 0;
+  uint64_t key_checks = 0, key_ne = 0;
+  uint64_t key_invalid = 0;  // null-binding keys observed (coverage)
+  uint64_t smap_match = 0, smap_fresh = 0, smap_seeded = 0, smap_ne = 0,
+           smap_ovf = 0;
+  uint64_t heap_switches = 0;  // bindless sampler heap overflowed + swapped
+  uint64_t dc_v = 0, dc_p = 0, dc_ne_v = 0, dc_ne_p = 0;
+  uint64_t dc_refused = 0;  // compose refusals (capacity/slot) - must stay 0
+  uint64_t layout_bad = 0;  // one-shot bit-layout self-check failures
+};
+NrDescProbe g_nr_desc_probe{};
+// The bindless sampler-heap mirror (params -> heap index + allocation
+// counter). Reset + re-seeded on every rising edge of the gate and on a heap
+// switch; entries then learn (seeded) or predict (fresh) per observation.
+rex::graphics::nr::DescSamplerMap g_nr_desc_smap;
+// Staging for the descriptor-indices compare: the emulated rebuild writes
+// here instead of the upload heap and one memcpy publishes, so the compare
+// never reads write-combined memory ([[upload-heap-readback-trap]]).
+// 1024 dwords >> any shader's texture+sampler binding count.
+constexpr uint32_t kNrDescStagingDwords = 1024;
+uint32_t g_nr_desc_staging[kNrDescStagingDwords];
+uint32_t g_nr_desc_ours[kNrDescStagingDwords];
+// Scratch (slot, value) pair arrays for our compose (CP-thread-only).
+uint32_t g_nr_desc_tex_slots[kNrDescStagingDwords];
+uint32_t g_nr_desc_tex_vals[kNrDescStagingDwords];
+uint32_t g_nr_desc_smp_slots[kNrDescStagingDwords];
+uint32_t g_nr_desc_smp_vals[kNrDescStagingDwords];
+// FIRST DIFFERENCE lines are capped per report window.
+uint32_t g_nr_desc_samples_this_window = 0;
+constexpr uint32_t kNrDescMaxSamplesPerWindow = 6;
+
+// The module transcribes the xenos enum values as plain constants; pin them.
+static_assert(uint32_t(xenos::FetchConstantType::kInvalidTexture) ==
+              nr::kDescFetchTypeInvalidTexture);
+static_assert(uint32_t(xenos::FetchConstantType::kTexture) ==
+              nr::kDescFetchTypeTexture);
+static_assert(uint32_t(xenos::DataDimension::k1D) == nr::kDescDim1D);
+static_assert(uint32_t(xenos::DataDimension::k2DOrStacked) ==
+              nr::kDescDim2DOrStacked);
+static_assert(uint32_t(xenos::DataDimension::k3D) == nr::kDescDim3D);
+static_assert(uint32_t(xenos::DataDimension::kCube) == nr::kDescDimCube);
+static_assert(uint32_t(xenos::ClampMode::kClampToEdge) == nr::kDescClampToEdge);
+static_assert(uint32_t(xenos::ClampMode::kClampToHalfway) ==
+              nr::kDescClampToHalfway);
+static_assert(uint32_t(xenos::ClampMode::kMirrorClampToEdge) ==
+              nr::kDescMirrorClampToEdge);
+static_assert(uint32_t(xenos::ClampMode::kMirrorClampToHalfway) ==
+              nr::kDescMirrorClampToHalfway);
+static_assert(uint32_t(xenos::ClampMode::kClampToBorder) ==
+              nr::kDescClampToBorder);
+static_assert(uint32_t(xenos::ClampMode::kMirrorClampToBorder) ==
+              nr::kDescMirrorClampToBorder);
+static_assert(uint32_t(xenos::TextureFilter::kPoint) == nr::kDescFilterPoint);
+static_assert(uint32_t(xenos::TextureFilter::kLinear) == nr::kDescFilterLinear);
+static_assert(uint32_t(xenos::TextureFilter::kBaseMap) ==
+              nr::kDescFilterBaseMap);
+static_assert(uint32_t(xenos::TextureFilter::kUseFetchConst) ==
+              nr::kDescFilterUseFetchConst);
+static_assert(uint32_t(xenos::AnisoFilter::kDisabled) == nr::kDescAnisoDisabled);
+static_assert(uint32_t(xenos::AnisoFilter::kMax_16_1) == nr::kDescAnisoMax16);
+static_assert(uint32_t(xenos::AnisoFilter::kUseFetchConst) ==
+              nr::kDescAnisoUseFetchConst);
+static_assert(uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0000) ==
+              nr::kDescHostSwizzle0000);
+static_assert(xenos::kTexture2DCubeMaxWidthHeight == nr::kDescMaxWidthHeight2D);
+static_assert(sizeof(D3D12TextureCache::SamplerParameters) == sizeof(uint32_t));
+
+// [NR-DSC] The host-format swizzle query, reached through a callback so the
+// derivation module stays SDK-free (static config of the D3D12 backend).
+uint32_t NrDescHostFormatSwizzle(void*, uint32_t base_format) {
+  return D3D12TextureCache::NrHostFormatSwizzle(base_format);
+}
+
+// [NR-DSC] One-shot bit-LAYOUT self-check, run at every gate arm: pokes known
+// values into the emulated bitfield structs and checks the packed dwords land
+// where the module's shift transcription says they do (a static_assert cannot
+// see bitfield placement). A failure refuses nothing but counts layout_bad,
+// which must stay 0 - every byte compare after it would name itself anyway.
+void NrDescLayoutSelfCheck() {
+  {
+    D3D12TextureCache::SamplerParameters sp{};
+    sp.clamp_x = xenos::ClampMode(5);
+    sp.clamp_y = xenos::ClampMode(3);
+    sp.clamp_z = xenos::ClampMode(6);
+    sp.border_color = xenos::BorderColor(2);
+    sp.mag_linear = 1;
+    sp.mip_linear = 1;
+    sp.aniso_filter = xenos::AnisoFilter(3);
+    sp.mip_min_level = 9;
+    sp.mip_base_map = 1;
+    const uint32_t expected = 5u | 3u << 3 | 6u << 6 | 2u << 9 | 1u << 11 |
+                              1u << 13 | 3u << 14 | 9u << 17 | 1u << 21;
+    if (sp.value != expected) {
+      ++g_nr_desc_probe.layout_bad;
+      REXGPU_ERROR("[nr-dsc] LAYOUT SamplerParameters value={:#x} expected={:#x}",
+                   sp.value, expected);
+    }
+  }
+  {
+    D3D12TextureCache::TextureSRVKey k{};
+    k.key.base_page = 0x1ABCD;
+    k.key.dimension = xenos::DataDimension(3);
+    k.key.width_minus_1 = 0x1F0F;
+    k.key.height_minus_1 = 0x1234;
+    k.key.tiled = 1;
+    k.key.mip_page = 0x155AA;
+    k.key.depth_or_array_size_minus_1 = 0x3F5;
+    k.key.pitch = 0x1A5;
+    k.key.mip_max_level = 0xB;
+    k.key.format = xenos::TextureFormat(0x2A);
+    k.key.endianness = xenos::Endian(1);
+    k.key.is_valid = 1;
+    uint32_t got[4];
+    static_assert(sizeof(k.key) == sizeof(got));
+    std::memcpy(got, &k.key, sizeof(got));
+    const uint32_t expect[4] = {
+        0x1ABCDu | 3u << 17 | 0x1F0Fu << 19,
+        0x1234u | 1u << 13 | 0x155AAu << 15,
+        0x3F5u | 0x1A5u << 10 | 0xBu << 19 | 0x2Au << 23 | 1u << 29,
+        1u << 1};
+    if (std::memcmp(got, expect, sizeof(got)) != 0) {
+      ++g_nr_desc_probe.layout_bad;
+      REXGPU_ERROR(
+          "[nr-dsc] LAYOUT TextureKey got={:08x} {:08x} {:08x} {:08x} "
+          "expected={:08x} {:08x} {:08x} {:08x}",
+          got[0], got[1], got[2], got[3], expect[0], expect[1], expect[2],
+          expect[3]);
+    }
+  }
+}
+
+// [NR-DSC] The 1Hz verdict line, emitted from the per-frame probe block.
+void NrDescReportIfDue() {
+  if (!g_nr_desc || !(g_nr_desc_probe.smp_checks + g_nr_desc_probe.key_checks)) {
+    return;
+  }
+  static auto s_last = std::chrono::steady_clock::now();
+  static NrDescProbe s_prev{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) {
+    return;
+  }
+  s_last = now;
+  const NrDescProbe& p = g_nr_desc_probe;
+  REXGPU_INFO(
+      "[nr-dsc] smp checks={} ne={} | key checks={} ne={} inv={} | smap "
+      "match={} fresh={} seeded={} ne={} ovf={} heapswitch={} | dc v={} p={} "
+      "ne={}/{} refused={} | layout_bad={}",
+      p.smp_checks - s_prev.smp_checks, p.smp_ne,
+      p.key_checks - s_prev.key_checks, p.key_ne,
+      p.key_invalid - s_prev.key_invalid, p.smap_match - s_prev.smap_match,
+      p.smap_fresh, p.smap_seeded, p.smap_ne, p.smap_ovf, p.heap_switches,
+      p.dc_v - s_prev.dc_v, p.dc_p - s_prev.dc_p, p.dc_ne_v, p.dc_ne_p,
+      p.dc_refused, p.layout_bad);
+  s_prev = p;
+  g_nr_desc_samples_this_window = 0;
 }
 
 // Per-{geometry+shader} batch key: how many draws share it, and which float
@@ -2751,6 +2931,19 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       g_nr_sys_seeded = false;
     }
     g_nr_sysconst = nr_sys_now;
+  }
+  // [NR-DSC] Phase 5-3b-2: verdict + latch. A rising edge re-seeds the
+  // sampler-heap mirror from the emulated allocation counter (entries
+  // allocated while the gate was off are then learned as 'seeded') and
+  // re-runs the one-shot bit-layout self-check.
+  NrDescReportIfDue();
+  {
+    const bool nr_desc_now = REXCVAR_GET(gpu_nr_desc);
+    if (nr_desc_now && !g_nr_desc) {
+      nr::DescSamplerMapReset(&g_nr_desc_smap, sampler_bindless_heap_allocated_);
+      NrDescLayoutSelfCheck();
+    }
+    g_nr_desc = nr_desc_now;
   }
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
@@ -6330,6 +6523,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   if (g_nr_bindings) {
     ++g_nr_bind.draws;
   }
+  // [NR-DSC] Phase 5-3b-2: the cvar the emulated GetSamplerParameters reads
+  // per call, latched once per UpdateBindings so our per-sampler derivations
+  // use the same value theirs does within this call.
+  const int32_t nr_dsc_aniso =
+      g_nr_desc ? REXCVAR_GET(anisotropic_override) : -1;
 
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -6611,6 +6809,27 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     for (size_t i = 0; i < sampler_count_vertex; ++i) {
       D3D12TextureCache::SamplerParameters parameters =
           texture_cache_->GetSamplerParameters(samplers_vertex[i]);
+      // [NR-DSC] Our SamplerParameters from the raw fetch dwords, against
+      // theirs at the moment it is derived (same thread, same file).
+      if (g_nr_desc) {
+        ++g_nr_desc_probe.smp_checks;
+        const uint32_t nr_dsc_ours = nr::DescSamplerParams(
+            &nr_bnd_rf[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                       samplers_vertex[i].fetch_constant * 6],
+            uint32_t(samplers_vertex[i].mag_filter),
+            uint32_t(samplers_vertex[i].min_filter),
+            uint32_t(samplers_vertex[i].mip_filter),
+            uint32_t(samplers_vertex[i].aniso_filter), nr_dsc_aniso);
+        if (nr_dsc_ours != parameters.value) {
+          ++g_nr_desc_probe.smp_ne;
+          if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+            ++g_nr_desc_samples_this_window;
+            REXGPU_WARN("[nr-dsc] SMP DIFF v fc={} ours={:#x} theirs={:#x}",
+                        samplers_vertex[i].fetch_constant, nr_dsc_ours,
+                        parameters.value);
+          }
+        }
+      }
       if (current_samplers_vertex_[i] != parameters) {
         cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
         bindful_samplers_written_vertex_ = false;
@@ -6643,6 +6862,26 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
         D3D12TextureCache::SamplerParameters parameters =
             texture_cache_->GetSamplerParameters((*samplers_pixel)[i]);
+        // [NR-DSC] The pixel half of the SamplerParameters gate.
+        if (g_nr_desc) {
+          ++g_nr_desc_probe.smp_checks;
+          const uint32_t nr_dsc_ours = nr::DescSamplerParams(
+              &nr_bnd_rf[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                         (*samplers_pixel)[i].fetch_constant * 6],
+              uint32_t((*samplers_pixel)[i].mag_filter),
+              uint32_t((*samplers_pixel)[i].min_filter),
+              uint32_t((*samplers_pixel)[i].mip_filter),
+              uint32_t((*samplers_pixel)[i].aniso_filter), nr_dsc_aniso);
+          if (nr_dsc_ours != parameters.value) {
+            ++g_nr_desc_probe.smp_ne;
+            if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+              ++g_nr_desc_samples_this_window;
+              REXGPU_WARN("[nr-dsc] SMP DIFF p fc={} ours={:#x} theirs={:#x}",
+                          (*samplers_pixel)[i].fetch_constant, nr_dsc_ours,
+                          parameters.value);
+            }
+          }
+        }
         if (current_samplers_pixel_[i] != parameters) {
           current_samplers_pixel_[i] = parameters;
           cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
@@ -6695,6 +6934,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                                                           texture_count_pixel))) {
       cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
     }
+
+    // [NR-DSC] The heap identity before the resolution block: a change across
+    // it means the block overflowed + switched heaps (the emulated map was
+    // cleared and every index re-allocated from zero), so the mirror resets.
+    ID3D12DescriptorHeap* nr_dsc_heap_before = sampler_bindless_heap_current_;
 
     // Get sampler descriptor indices, write new samplers, and handle sampler
     // heap overflow if it happens.
@@ -6801,9 +7045,66 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
     }
 
+    // [NR-DSC] Replay the sampler-index resolutions the emulated block just
+    // performed, in its own order (vertex then pixel, ascending), against the
+    // mirror map: known params must agree; new params either PREDICT the
+    // allocation counter (fresh) or are learned as pre-arm entries (seeded).
+    // "The loop ran" == (count && !up_to_date) evaluated HERE: the flags only
+    // flip true at the cbuffer builds below, and an overflow inside the block
+    // clears both, so this condition survives the retry path too.
+    if (g_nr_desc) {
+      if (sampler_bindless_heap_current_ != nr_dsc_heap_before) {
+        ++g_nr_desc_probe.heap_switches;
+        nr::DescSamplerMapReset(&g_nr_desc_smap, 0);
+      }
+      for (uint32_t nr_dsc_pass = 0; nr_dsc_pass < 2; ++nr_dsc_pass) {
+        const size_t nr_dsc_count =
+            nr_dsc_pass ? sampler_count_pixel : sampler_count_vertex;
+        const bool nr_dsc_ran =
+            nr_dsc_count &&
+            !(nr_dsc_pass ? cbuffer_binding_descriptor_indices_pixel_.up_to_date
+                          : cbuffer_binding_descriptor_indices_vertex_.up_to_date);
+        if (!nr_dsc_ran) {
+          continue;
+        }
+        for (size_t j = 0; j < nr_dsc_count; ++j) {
+          const uint32_t nr_dsc_params =
+              (nr_dsc_pass ? current_samplers_pixel_[j]
+                           : current_samplers_vertex_[j])
+                  .value;
+          const uint32_t nr_dsc_their_index =
+              nr_dsc_pass ? current_sampler_bindless_indices_pixel_[j]
+                          : current_sampler_bindless_indices_vertex_[j];
+          switch (nr::DescSamplerMapObserve(&g_nr_desc_smap, nr_dsc_params,
+                                            nr_dsc_their_index)) {
+            case nr::kDescSamplerMatch:
+              ++g_nr_desc_probe.smap_match;
+              break;
+            case nr::kDescSamplerFresh:
+              ++g_nr_desc_probe.smap_fresh;
+              break;
+            case nr::kDescSamplerSeeded:
+              ++g_nr_desc_probe.smap_seeded;
+              break;
+            case nr::kDescSamplerOverflow:
+              ++g_nr_desc_probe.smap_ovf;
+              break;
+            default:
+              ++g_nr_desc_probe.smap_ne;
+              if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+                ++g_nr_desc_samples_this_window;
+                REXGPU_WARN("[nr-dsc] SMAP DIFF {} j={} params={:#x} theirs={}",
+                            nr_dsc_pass ? "p" : "v", j, nr_dsc_params,
+                            nr_dsc_their_index);
+              }
+              break;
+          }
+        }
+      }
+    }
+
     if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
-      // [NR-BND] Rebuild rate only; contents (texture cache queries) are a
-      // later peel.
+      // [NR-BND] Rebuild rate; [NR-DSC] (5-3b-2) checks the contents.
       if (g_nr_bindings) {
         ++g_nr_bind.div_up;
       }
@@ -6814,6 +7115,35 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
           &cbuffer_binding_descriptor_indices_vertex_.address));
       if (!descriptor_indices) {
         return false;
+      }
+      // [NR-DSC] Stage the rebuild in cached memory; published + compared
+      // below (the pool is an upload heap - never read it back,
+      // [[upload-heap-readback-trap]]). The SPAN is max_slot+1, NOT the
+      // requested tex+smp size: the slot space is 1-BASED (the translator
+      // emplaces a binding before assigning it GetBindlessResourceCount(),
+      // which then includes the binding itself), so slots run 1..n and the
+      // emulated slot-n write lands one dword past the request, in the
+      // 256-byte pool alignment slack. The publish must carry that dword or
+      // the redirect DROPS a write the shader reads.
+      uint32_t nr_dsc_span_v =
+          uint32_t(texture_count_vertex + sampler_count_vertex);
+      uint32_t* nr_dsc_dst_v = nullptr;
+      if (g_nr_desc) {
+        for (size_t i = 0; i < texture_count_vertex; ++i) {
+          nr_dsc_span_v = std::max(
+              nr_dsc_span_v, textures_vertex[i].bindless_descriptor_index + 1);
+        }
+        for (size_t i = 0; i < sampler_count_vertex; ++i) {
+          nr_dsc_span_v = std::max(
+              nr_dsc_span_v, samplers_vertex[i].bindless_descriptor_index + 1);
+        }
+        if (nr_dsc_span_v <= kNrDescStagingDwords) {
+          nr_dsc_dst_v = descriptor_indices;
+          std::memset(g_nr_desc_staging, 0, nr_dsc_span_v * sizeof(uint32_t));
+          descriptor_indices = g_nr_desc_staging;
+        } else {
+          ++g_nr_desc_probe.dc_refused;
+        }
       }
       for (size_t i = 0; i < texture_count_vertex; ++i) {
         const D3D12Shader::TextureBinding& texture = textures_vertex[i];
@@ -6833,12 +7163,79 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         descriptor_indices[samplers_vertex[i].bindless_descriptor_index] =
             current_sampler_bindless_indices_vertex_[i];
       }
+      // [NR-DSC] Publish the staged bytes, then compose our own buffer and
+      // byte-compare. Texture SRV index VALUES are pass-through queries (warm
+      // - the loop above just resolved them); the placement, the
+      // unbounded-SRV base offset and the sampler indices from the mirror
+      // are this project's own.
+      if (nr_dsc_dst_v) {
+        std::memcpy(nr_dsc_dst_v, g_nr_desc_staging,
+                    nr_dsc_span_v * sizeof(uint32_t));
+        descriptor_indices = nr_dsc_dst_v;
+        ++g_nr_desc_probe.dc_v;
+        bool nr_dsc_have_smp = true;
+        for (size_t i = 0; i < texture_count_vertex; ++i) {
+          const D3D12Shader::TextureBinding& texture = textures_vertex[i];
+          g_nr_desc_tex_slots[i] = texture.bindless_descriptor_index;
+          g_nr_desc_tex_vals[i] =
+              texture_cache_->GetActiveTextureBindlessSRVIndex(texture) -
+              uint32_t(SystemBindlessView::kUnboundedSRVsStart);
+        }
+        for (size_t i = 0; i < sampler_count_vertex; ++i) {
+          g_nr_desc_smp_slots[i] = samplers_vertex[i].bindless_descriptor_index;
+          if (!nr::DescSamplerMapLookup(&g_nr_desc_smap,
+                                        current_samplers_vertex_[i].value,
+                                        &g_nr_desc_smp_vals[i])) {
+            if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+              ++g_nr_desc_samples_this_window;
+              REXGPU_WARN(
+                  "[nr-dsc] DC REFUSE v smp i={} params={:#x} (map count={})",
+                  i, current_samplers_vertex_[i].value, g_nr_desc_smap.count);
+            }
+            nr_dsc_have_smp = false;
+            break;
+          }
+        }
+        if (!nr_dsc_have_smp) {
+          ++g_nr_desc_probe.dc_refused;
+        } else {
+          const uint32_t nr_dsc_composed = nr::DescComposeIndices(
+              g_nr_desc_tex_slots, g_nr_desc_tex_vals,
+              uint32_t(texture_count_vertex), g_nr_desc_smp_slots,
+              g_nr_desc_smp_vals, uint32_t(sampler_count_vertex),
+              nr_dsc_span_v, g_nr_desc_ours, kNrDescStagingDwords);
+          if (nr_dsc_composed == UINT32_MAX) {
+            ++g_nr_desc_probe.dc_refused;
+            if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+              ++g_nr_desc_samples_this_window;
+              REXGPU_WARN(
+                  "[nr-dsc] DC REFUSE v compose span={} tex={} smp={}",
+                  nr_dsc_span_v, texture_count_vertex, sampler_count_vertex);
+            }
+          } else if (nr_dsc_span_v &&
+                     std::memcmp(g_nr_desc_ours, g_nr_desc_staging,
+                                 nr_dsc_span_v * sizeof(uint32_t)) != 0) {
+            ++g_nr_desc_probe.dc_ne_v;
+            if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+              ++g_nr_desc_samples_this_window;
+              for (uint32_t d = 0; d < nr_dsc_span_v; ++d) {
+                if (g_nr_desc_ours[d] != g_nr_desc_staging[d]) {
+                  REXGPU_WARN(
+                      "[nr-dsc] DC DIFF v dword={}/{} ours={:#x} theirs={:#x}",
+                      d, nr_dsc_span_v, g_nr_desc_ours[d], g_nr_desc_staging[d]);
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
       cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
       current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesVertex);
     }
 
     if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
-      // [NR-BND] Rebuild rate only, as above.
+      // [NR-BND] Rebuild rate; [NR-DSC] (5-3b-2) checks the contents.
       if (g_nr_bindings) {
         ++g_nr_bind.dip_up;
       }
@@ -6849,6 +7246,28 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
           &cbuffer_binding_descriptor_indices_pixel_.address));
       if (!descriptor_indices) {
         return false;
+      }
+      // [NR-DSC] Same staging redirect + compare as the vertex block (same
+      // 1-based-slot SPAN rule; see there).
+      uint32_t nr_dsc_span_p =
+          uint32_t(texture_count_pixel + sampler_count_pixel);
+      uint32_t* nr_dsc_dst_p = nullptr;
+      if (g_nr_desc) {
+        for (size_t i = 0; i < texture_count_pixel; ++i) {
+          nr_dsc_span_p = std::max(
+              nr_dsc_span_p, (*textures_pixel)[i].bindless_descriptor_index + 1);
+        }
+        for (size_t i = 0; i < sampler_count_pixel; ++i) {
+          nr_dsc_span_p = std::max(
+              nr_dsc_span_p, (*samplers_pixel)[i].bindless_descriptor_index + 1);
+        }
+        if (nr_dsc_span_p <= kNrDescStagingDwords) {
+          nr_dsc_dst_p = descriptor_indices;
+          std::memset(g_nr_desc_staging, 0, nr_dsc_span_p * sizeof(uint32_t));
+          descriptor_indices = g_nr_desc_staging;
+        } else {
+          ++g_nr_desc_probe.dc_refused;
+        }
       }
       for (size_t i = 0; i < texture_count_pixel; ++i) {
         const D3D12Shader::TextureBinding& texture = (*textures_pixel)[i];
@@ -6868,8 +7287,133 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         descriptor_indices[(*samplers_pixel)[i].bindless_descriptor_index] =
             current_sampler_bindless_indices_pixel_[i];
       }
+      if (nr_dsc_dst_p) {
+        std::memcpy(nr_dsc_dst_p, g_nr_desc_staging,
+                    nr_dsc_span_p * sizeof(uint32_t));
+        descriptor_indices = nr_dsc_dst_p;
+        ++g_nr_desc_probe.dc_p;
+        bool nr_dsc_have_smp = true;
+        for (size_t i = 0; i < texture_count_pixel; ++i) {
+          const D3D12Shader::TextureBinding& texture = (*textures_pixel)[i];
+          g_nr_desc_tex_slots[i] = texture.bindless_descriptor_index;
+          g_nr_desc_tex_vals[i] =
+              texture_cache_->GetActiveTextureBindlessSRVIndex(texture) -
+              uint32_t(SystemBindlessView::kUnboundedSRVsStart);
+        }
+        for (size_t i = 0; i < sampler_count_pixel; ++i) {
+          g_nr_desc_smp_slots[i] =
+              (*samplers_pixel)[i].bindless_descriptor_index;
+          if (!nr::DescSamplerMapLookup(&g_nr_desc_smap,
+                                        current_samplers_pixel_[i].value,
+                                        &g_nr_desc_smp_vals[i])) {
+            if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+              ++g_nr_desc_samples_this_window;
+              REXGPU_WARN(
+                  "[nr-dsc] DC REFUSE p smp i={} params={:#x} (map count={})",
+                  i, current_samplers_pixel_[i].value, g_nr_desc_smap.count);
+            }
+            nr_dsc_have_smp = false;
+            break;
+          }
+        }
+        if (!nr_dsc_have_smp) {
+          ++g_nr_desc_probe.dc_refused;
+        } else {
+          const uint32_t nr_dsc_composed = nr::DescComposeIndices(
+              g_nr_desc_tex_slots, g_nr_desc_tex_vals,
+              uint32_t(texture_count_pixel), g_nr_desc_smp_slots,
+              g_nr_desc_smp_vals, uint32_t(sampler_count_pixel),
+              nr_dsc_span_p, g_nr_desc_ours, kNrDescStagingDwords);
+          if (nr_dsc_composed == UINT32_MAX) {
+            ++g_nr_desc_probe.dc_refused;
+            if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+              ++g_nr_desc_samples_this_window;
+              REXGPU_WARN(
+                  "[nr-dsc] DC REFUSE p compose span={} tex={} smp={}",
+                  nr_dsc_span_p, texture_count_pixel, sampler_count_pixel);
+            }
+          } else if (nr_dsc_span_p &&
+                     std::memcmp(g_nr_desc_ours, g_nr_desc_staging,
+                                 nr_dsc_span_p * sizeof(uint32_t)) != 0) {
+            ++g_nr_desc_probe.dc_ne_p;
+            if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+              ++g_nr_desc_samples_this_window;
+              for (uint32_t d = 0; d < nr_dsc_span_p; ++d) {
+                if (g_nr_desc_ours[d] != g_nr_desc_staging[d]) {
+                  REXGPU_WARN(
+                      "[nr-dsc] DC DIFF p dword={}/{} ours={:#x} theirs={:#x}",
+                      d, nr_dsc_span_p, g_nr_desc_ours[d], g_nr_desc_staging[d]);
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
       cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
       current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
+    }
+
+    // [NR-DSC] Our texture SRV keys from the raw fetch dwords, against the
+    // stored keys - which at this point provably equal the live binding
+    // state (a stale or reordered set forces the rebuild above, which
+    // rewrites them). Covers the whole fetch->TextureKey decode, the
+    // host-swizzle merge (host format table = declared query) and the
+    // swizzled-signs derivation, per draw per binding.
+    if (g_nr_desc) {
+      const bool nr_dsc_allow_invalid =
+          REXCVAR_GET(gpu_allow_invalid_fetch_constants);
+      for (uint32_t nr_dsc_pass = 0; nr_dsc_pass < 2; ++nr_dsc_pass) {
+        const size_t nr_dsc_count =
+            nr_dsc_pass ? texture_count_pixel : texture_count_vertex;
+        if (!nr_dsc_count) {
+          continue;
+        }
+        const std::vector<D3D12Shader::TextureBinding>& nr_dsc_bindings =
+            nr_dsc_pass ? *textures_pixel : textures_vertex;
+        const auto& nr_dsc_stored = nr_dsc_pass ? current_texture_srv_keys_pixel_
+                                                : current_texture_srv_keys_vertex_;
+        for (size_t i = 0; i < nr_dsc_count; ++i) {
+          ++g_nr_desc_probe.key_checks;
+          nr::DescTexSrvKey nr_dsc_ours;
+          nr::DescTextureSrvKey(
+              &nr_bnd_rf[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                         nr_dsc_bindings[i].fetch_constant * 6],
+              nr_dsc_allow_invalid, NrDescHostFormatSwizzle, nullptr,
+              &nr_dsc_ours);
+          if (!(nr_dsc_ours.key[3] & (1u << 1))) {
+            ++g_nr_desc_probe.key_invalid;
+          }
+          const auto& nr_dsc_theirs = nr_dsc_stored[i];
+          static_assert(sizeof(nr_dsc_theirs.key) == sizeof(nr_dsc_ours.key));
+          if (std::memcmp(&nr_dsc_theirs.key, nr_dsc_ours.key,
+                          sizeof(nr_dsc_ours.key)) != 0 ||
+              nr_dsc_theirs.host_swizzle != nr_dsc_ours.host_swizzle ||
+              nr_dsc_theirs.swizzled_signs != nr_dsc_ours.swizzled_signs) {
+            ++g_nr_desc_probe.key_ne;
+            if (g_nr_desc_samples_this_window < kNrDescMaxSamplesPerWindow) {
+              ++g_nr_desc_samples_this_window;
+              uint32_t nr_dsc_tk[4];
+              std::memcpy(nr_dsc_tk, &nr_dsc_theirs.key, sizeof(nr_dsc_tk));
+              const uint32_t* nr_dsc_fd =
+                  &nr_bnd_rf[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                             nr_dsc_bindings[i].fetch_constant * 6];
+              REXGPU_WARN(
+                  "[nr-dsc] KEY DIFF {} fc={} fetch={:08x} {:08x} {:08x} "
+                  "{:08x} {:08x} {:08x} ours={:08x} {:08x} {:08x} {:08x} "
+                  "sw={:03x} sg={:02x} theirs={:08x} {:08x} {:08x} {:08x} "
+                  "sw={:03x} sg={:02x}",
+                  nr_dsc_pass ? "p" : "v", nr_dsc_bindings[i].fetch_constant,
+                  nr_dsc_fd[0], nr_dsc_fd[1], nr_dsc_fd[2], nr_dsc_fd[3],
+                  nr_dsc_fd[4], nr_dsc_fd[5], nr_dsc_ours.key[0],
+                  nr_dsc_ours.key[1], nr_dsc_ours.key[2], nr_dsc_ours.key[3],
+                  nr_dsc_ours.host_swizzle, nr_dsc_ours.swizzled_signs,
+                  nr_dsc_tk[0], nr_dsc_tk[1], nr_dsc_tk[2], nr_dsc_tk[3],
+                  nr_dsc_theirs.host_swizzle, nr_dsc_theirs.swizzled_signs);
+            }
+          }
+        }
+      }
     }
   } else {
     //

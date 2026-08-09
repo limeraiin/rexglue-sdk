@@ -116,6 +116,14 @@ class D3D12TextureCache final : public TextureCache {
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
+  // [NR-DSC] Phase 5-3b-2: the host-format swizzle table as a plain static
+  // query for the native renderer's SRV-key gate. Static config of this
+  // backend - a declared input of the mirror until the format peel owns it.
+  static uint32_t NrHostFormatSwizzle(uint32_t base_format) {
+    return base_format < 64 ? uint32_t(host_formats_[base_format].swizzle)
+                            : uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0000);
+  }
+
   // Returns whether the actual scale is not smaller than the requested one.
   static bool ClampDrawResolutionScaleToMaxSupported(uint32_t& scale_x, uint32_t& scale_y,
                                                      const ui::d3d12::D3D12Provider& provider);
