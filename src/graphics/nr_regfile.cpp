@@ -53,6 +53,27 @@ void RegShadowApplyWrite(RegShadow* s, RegShadowStats* stats, uint32_t reg,
   s->values[reg] = value;
 }
 
+void RegShadowApplyRange(RegShadow* s, RegShadowStats* stats, uint32_t base,
+                         const uint32_t* values, uint32_t n) {
+  if (base >= kRegShadowCount) {
+    stats->writes_ignored += n;
+    return;
+  }
+  uint32_t in = n;
+  if (base + n > kRegShadowCount) {
+    in = kRegShadowCount - base;
+    stats->writes_ignored += n - in;
+  }
+  stats->writes += in;
+  for (uint32_t i = 0; i < in; ++i) {
+    if (!s->defined[base + i]) {
+      s->defined[base + i] = 1;
+      ++stats->defined_count;
+    }
+    s->values[base + i] = values[i];
+  }
+}
+
 void RegShadowSweep(RegShadow* s, RegShadowStats* stats, uint32_t count,
                     const uint32_t* live, RegShadowFindFn find,
                     void* find_user) {

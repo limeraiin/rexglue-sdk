@@ -168,6 +168,14 @@ void ResBeginBuffer(ResourceContext* ctx);
 void ResApplyWrite(ResourceContext* ctx, ResStats* stats, uint32_t reg,
                    uint32_t value, bool from_memory);
 
+// [NR-SKP] 5-4-3: n contiguous writes at once, HOST-order values. Equivalent
+// by construction to n ResApplyWrite calls: a range wholly inside ONE file
+// takes a tight-loop fast path (fetch liveness recomputed once per touched
+// constant over the final values -- the same masks the per-dword recompute
+// ends on); any other range falls back to the per-dword apply.
+void ResApplyRange(ResourceContext* ctx, ResStats* stats, uint32_t base,
+                   const uint32_t* values, uint32_t n, bool from_memory);
+
 // Records the resource state a draw would see. Call per executed draw.
 void ResObserveDraw(const ResourceContext* ctx, ResStats* stats);
 

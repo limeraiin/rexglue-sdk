@@ -182,6 +182,20 @@ class CommandProcessor {
     WriteRegister(index, value);
   }
 
+  // [NR-SKP] Phase 5-4-3: the skip mode's RANGE apply -- a walk-decoded
+  // contiguous constant range routed through the virtual WriteRegistersFromMem
+  // (the executor's own bulk path for SET_CONSTANT/LOAD_ALU_CONSTANT: one
+  // value copy_and_swap + ONE dirty-tail evaluation per range, per-constant
+  // fetch hooks preserved inside it), then the probe mirrors fed from the
+  // stored host-order values in tight loops. `values_be` = big-endian dwords
+  // (inline packet data), or nullptr for a by-reference range whose values
+  // live in guest memory at physical `phys`. Returns false (range not
+  // applied) only when the caller should fall back to the per-dword path.
+  // Public for the same reason as NrSkipApplyRegWrite; defined in
+  // command_processor.cpp next to the probe state it feeds.
+  bool NrSkipApplyRegRange(uint32_t base, const uint32_t* values_be,
+                           uint32_t n, uint32_t phys, bool from_memory);
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;

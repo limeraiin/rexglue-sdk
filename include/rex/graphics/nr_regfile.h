@@ -93,6 +93,14 @@ struct RegShadowStats {
 void RegShadowApplyWrite(RegShadow* s, RegShadowStats* stats, uint32_t reg,
                          uint32_t value);
 
+// [NR-SKP] 5-4-3: n contiguous writes at once, HOST-order values. Equivalent
+// to n RegShadowApplyWrite calls (same stores, same stats, same out-of-range
+// count-and-drop) minus n function calls -- the skip's range apply feeds the
+// shadow through this so the bulk path stores exactly what the per-dword path
+// would have.
+void RegShadowApplyRange(RegShadow* s, RegShadowStats* stats, uint32_t base,
+                         const uint32_t* values, uint32_t n);
+
 enum RegShadowFinding : uint8_t {
   kRegShadowDiverge,
   kRegShadowExtern,

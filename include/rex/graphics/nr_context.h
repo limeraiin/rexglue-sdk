@@ -225,6 +225,22 @@ using CtxRegWriteFn = void (*)(void* user, uint32_t reg, uint32_t value,
 // this draw, which end-of-buffer state cannot answer.
 using CtxDrawFn = void (*)(void* user);
 
+// [NR-SKP] Phase 5-4-3: bulk range delivery. When set (a plain field write
+// after CtxWalkBegin -- the begin signature stays put), a contiguous decoded
+// register range that touches NO mirrored slot is offered here INSTEAD of one
+// reg_fn call per dword; the only walker work a consumed range skips is
+// exactly those reg_fn calls (mirror and watch_fn updates never applied to
+// such a range in the first place). `values_be` points at the n big-endian
+// dwords inside the buffer for inline packets (type-0, SET_CONSTANT,
+// SET_CONSTANT2/SET_SHADER_CONSTANTS); for LOAD_ALU_CONSTANT it is nullptr
+// and the values live in guest memory at physical address `phys`
+// (from_memory=true, same meaning as CtxRegWriteFn's flag). Return true =
+// consumed in bulk; false = the walker falls back to the per-dword path,
+// bit-identically to a walk with no range_fn at all.
+using CtxRegRangeFn = bool (*)(void* user, uint32_t base_reg,
+                               const uint32_t* values_be, uint32_t n,
+                               uint32_t phys, bool from_memory);
+
 // Walk one executed indirect buffer (big-endian PM4, `dwords` long) at
 // physical address `buffer_phys`, updating `ctx` and emitting one flags word
 // per EXECUTED DRAW_INDX (0x22) into draw_flags, packet order, up to
@@ -316,6 +332,10 @@ struct CtxWalker {
   void* reg_user;
   CtxDrawFn draw_fn;
   void* draw_user;
+  // [NR-SKP] 5-4-3: optional bulk range consumer. Zeroed by CtxWalkBegin;
+  // the caller sets both fields afterwards when it wants ranges as ranges.
+  CtxRegRangeFn range_fn;
+  void* range_user;
 
   CtxBinState bin;
   uint32_t cursor;   // next dword to decode

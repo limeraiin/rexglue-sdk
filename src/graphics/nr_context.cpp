@@ -195,6 +195,15 @@ void CtxWriteReg(CtxWalker* w, uint32_t reg, uint32_t value,
   }
 }
 
+// [NR-SKP] 5-4-3: a range may be offered in bulk only when it cannot touch
+// the 27-reg recovery mirror (every mirrored slot lives in [0x2000, 0x2322)).
+// For such a range, per-dword CtxWriteReg would have done nothing but the
+// reg_fn call (mirror store and watch_fn both fire only for mirrored slots),
+// so a consumed range skips exactly the reg_fn calls and nothing else.
+inline bool CtxRangeOfferable(const CtxWalker* w, uint32_t base, uint32_t n) {
+  return w->range_fn && n != 0 && (base >= 0x2322u || base + n <= 0x2000u);
+}
+
 uint16_t CtxGroupBits(const StateContext* ctx, uint32_t first, uint32_t n,
                       uint16_t def_bit, uint16_t carry_bit) {
   bool def = true, all_local = true;
@@ -297,6 +306,17 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     const uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
     const uint32_t base = hdr & 0x7FFF;
     const bool one_reg = (hdr >> 15) & 1;
+    // [NR-SKP] 5-4-3: a full-fit multi-register packet goes out as ONE range.
+    // A one-reg packet stores cnt times to a single register (multiplicity a
+    // bulk store cannot express) and a truncated packet keeps the per-dword
+    // path's exact partial-apply behavior, so neither is offered.
+    if (!one_reg && j + 1 + cnt <= dwords && CtxRangeOfferable(w, base, cnt) &&
+        w->range_fn(w->range_user, base,
+                    (const uint32_t*)(raw + (j + 1) * 4), cnt,
+                    w->buffer_phys + (j + 1) * 4, /*from_memory=*/false)) {
+      w->cursor = j + 1 + cnt;
+      return false;
+    }
     for (uint32_t m = 0; m < cnt && j + 1 + m < dwords; ++m) {
       CtxWriteReg(w, one_reg ? base : base + m, BE32(raw, j + 1 + m));
     }
@@ -416,6 +436,13 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     const uint32_t offset_type = BE32(raw, j + 1);
     const uint32_t base = CtxConstantBase(offset_type);
     if (base != kCtxNoBase) {
+      // [NR-SKP] 5-4-3: full-fit constant payload as one range.
+      if (j + 1 + cnt <= dwords && CtxRangeOfferable(w, base, cnt - 1) &&
+          w->range_fn(w->range_user, base,
+                      (const uint32_t*)(raw + (j + 2) * 4), cnt - 1,
+                      w->buffer_phys + (j + 2) * 4, /*from_memory=*/false)) {
+        return false;
+      }
       for (uint32_t m = 0; m + 1 < cnt && j + 2 + m < dwords; ++m) {
         CtxWriteReg(w, base + m, BE32(raw, j + 2 + m));
       }
@@ -432,6 +459,13 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     // WriteRegisterRangeFromRing with no typed base).
     const uint32_t base = BE32(raw, j + 1) & 0xFFFF;
     ++w->stats->set_const2;
+    // [NR-SKP] 5-4-3: same range shape as SET_CONSTANT, raw register base.
+    if (j + 1 + cnt <= dwords && CtxRangeOfferable(w, base, cnt - 1) &&
+        w->range_fn(w->range_user, base,
+                    (const uint32_t*)(raw + (j + 2) * 4), cnt - 1,
+                    w->buffer_phys + (j + 2) * 4, /*from_memory=*/false)) {
+      return false;
+    }
     for (uint32_t m = 0; m + 1 < cnt && j + 2 + m < dwords; ++m) {
       CtxWriteReg(w, base + m, BE32(raw, j + 2 + m));
     }
@@ -443,6 +477,15 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     const uint32_t size_dwords = BE32(raw, j + 3) & 0xFFF;
     const uint32_t base = CtxConstantBase(offset_type);
     if (base != kCtxNoBase) {
+      // [NR-SKP] 5-4-3: by-reference range -- no inline values, the consumer
+      // reads guest memory at `address` itself. Only offered when a memory
+      // reader exists, so the no-reader poison semantics stay untouched.
+      if (w->mem_read && CtxRangeOfferable(w, base, size_dwords) &&
+          w->range_fn(w->range_user, base, nullptr, size_dwords, address,
+                      /*from_memory=*/true)) {
+        w->stats->mem_loads += size_dwords;
+        return false;
+      }
       for (uint32_t m = 0; m < size_dwords; ++m) {
         const int32_t s = CtxSlot(base + m);
         // A non-mirrored register still has to reach reg_fn: the resource

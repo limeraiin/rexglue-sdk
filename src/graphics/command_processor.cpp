@@ -1004,6 +1004,13 @@ uint64_t g_skp_deleg = 0;        // non-draw packets delegated
 uint64_t g_skp_exec_fail = 0;    // delegated dispatch returned false
 uint64_t g_skp_arm_orphan = 0;   // draw stop the handler never consumed
 uint64_t g_skp_deleg_op[128] = {};
+// [NR-SKP] Phase 5-4-3: the range-level apply. rng counts constant ranges
+// bulk-applied through NrSkipApplyRegRange (rng_dw their dwords); pdw counts
+// the residual decoded writes still taking the per-dword virtual
+// WriteRegister under the skip. The fps hypothesis is rng_dw >> pdw at city.
+uint64_t g_skp_rng = 0;
+uint64_t g_skp_rng_dw = 0;
+uint64_t g_skp_pdw = 0;
 
 // [NR-PKT] Phase 5-4-1: the non-draw packet census. CP-thread-only. Counted
 // at the executor's own dispatch, AFTER its predicate skip, so the tallies
@@ -1269,6 +1276,7 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   // identical to the executor's by construction. NrWalkWriteEffects is NOT
   // fired on top (WriteRegister's own tail already ran).
   if (g_nr_skip_bufactive && user) {
+    ++g_skp_pdw;
     static_cast<CommandProcessor*>(user)->NrSkipApplyRegWrite(reg, value);
     return;
   }
@@ -1282,6 +1290,30 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   if (g_nr_walk_fx && user) {
     static_cast<CommandProcessor*>(user)->NrWalkWriteEffects(reg);
   }
+}
+
+// [NR-SKP] Phase 5-4-3: the walker's bulk range consumer, active ONLY while
+// the skip loop drives the buffer (every other mode returns false and the
+// walker's per-dword path runs bit-identically to a walk with no range_fn).
+// Accepts a range only when it sits wholly inside ONE of the three pure
+// constant windows -- exactly the windows the D3D12 WriteRegistersFromMem
+// override bulk-handles with one dirty-tail evaluation per range. Everything
+// else (the REGISTERS file, stateful ports, mixed ranges) refuses here and
+// keeps the per-dword virtual WriteRegister, COHER's OR-write included.
+bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
+                    uint32_t n, uint32_t phys, bool from_memory) {
+  if (!g_nr_skip_bufactive || !user || !n) return false;
+  const uint32_t end = base + n - 1;
+  if (!((base >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+         end <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+        (base >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+         end <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+        (base >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+         end <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
+    return false;
+  }
+  return static_cast<CommandProcessor*>(user)->NrSkipApplyRegRange(
+      base, values_be, n, phys, from_memory);
 }
 
 void ResAddrSeen(uint32_t addr) {
@@ -2336,11 +2368,13 @@ void CommandProcessor::WorkerThreadMain() {
           }
           REXGPU_INFO(
               "[nr-skp] bufs={} fb={} draws={} deleg={} exec_fail={} "
-              "orphan={} |{}",
+              "orphan={} rng={}/{}dw pdw={} |{}",
               g_skp_bufs, g_skp_fb, g_skp_draws, g_skp_deleg, g_skp_exec_fail,
-              g_skp_arm_orphan, n ? ops : " deleg none");
+              g_skp_arm_orphan, g_skp_rng, g_skp_rng_dw, g_skp_pdw,
+              n ? ops : " deleg none");
           g_skp_bufs = g_skp_fb = g_skp_draws = g_skp_deleg = 0;
           g_skp_exec_fail = g_skp_arm_orphan = 0;
+          g_skp_rng = g_skp_rng_dw = g_skp_pdw = 0;
           for (uint32_t op = 0; op < 128; ++op) g_skp_deleg_op[op] = 0;
         }
         // [NR-PKT] Phase 5-4-1. The header carries the buffer split and the
@@ -2959,6 +2993,11 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         if (g_nri_from == 0 && g_nri_count < 0 && !trace_writer_.is_open() &&
             NrSkipBackendEligible()) {
           nr_skip_buf = true;
+          // [NR-SKP] 5-4-3: only a skip-driven buffer gets the bulk range
+          // consumer (set after CtxWalkBegin zeroed the fields); every other
+          // mode keeps the walker's per-dword path bit-identically.
+          g_ctx_walker.range_fn = NrWalkRegRange;
+          g_ctx_walker.range_user = this;
         } else {
           ++g_skp_fb;
         }
@@ -3447,6 +3486,46 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   bin_select_ = g_ctx_walker.bin.select;
   bin_mask_ = g_ctx_walker.bin.mask;
   g_nr_skip_bufactive = false;
+}
+
+// [NR-SKP] Phase 5-4-3: one walk-decoded constant range, applied at range
+// level. The virtual WriteRegistersFromMem is the executor's own proven bulk
+// path (SET_CONSTANT/LOAD_ALU_CONSTANT ride it in every non-skip run): the
+// D3D12 override does one copy_and_swap value store and ONE dirty-tail
+// evaluation for the whole range -- the float check against the ACTIVE shader
+// constant maps is sound once per range because the maps only change at
+// draws, and a range never crosses a draw; the fetch window keeps
+// per-CONSTANT granularity inside TextureFetchConstantsWritten /
+// InvalidateVertexBufferResidencyRange (the 5-3b-3 residency mirror hook
+// funnels through the per-slot invalidation) -- instead of a virtual
+// WriteRegister per dword. Probe mirrors are then fed from the stored
+// host-order values in tight loops, storing exactly what the per-dword
+// NrWalkRegWrite feeds would have. Precord capture cannot be live here
+// (NrSkipBackendEligible vetoes it), so WriteRegistersFromMem's segment
+// branch is dead by construction.
+bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
+                                           const uint32_t* values_be,
+                                           uint32_t n, uint32_t phys,
+                                           bool from_memory) {
+  uint32_t* be = const_cast<uint32_t*>(values_be);
+  if (!be) {
+    be = memory_->TranslatePhysical<uint32_t*>(phys);
+    if (!be) return false;
+  }
+  WriteRegistersFromMem(base, be, n);
+  const uint32_t* host = &register_file_->values[base];
+  if (g_nr_res) {
+    nr::ResApplyRange(&g_res_state, &g_res_stats, base, host, n, from_memory);
+  }
+  if (g_nr_draw) {
+    nr::RegShadowApplyRange(&g_reg_shadow, &g_reg_stats, base, host, n);
+  }
+  if (g_nr_issue && g_nri_seeded) {
+    std::memcpy(&g_nri_file.values[base], host, n * sizeof(uint32_t));
+  }
+  ++g_skp_rng;
+  g_skp_rng_dw += n;
+  return true;
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {

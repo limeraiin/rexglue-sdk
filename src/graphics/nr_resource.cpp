@@ -163,6 +163,85 @@ void ResApplyWrite(ResourceContext* ctx, ResStats* stats, uint32_t reg,
   }
 }
 
+void ResApplyRange(ResourceContext* ctx, ResStats* stats, uint32_t base,
+                   const uint32_t* values, uint32_t n, bool from_memory) {
+  if (!n) return;
+  const int32_t s0 = ResSlot(base);
+  const int32_t s1 = ResSlot(base + n - 1);
+  // Fast path only for a range wholly inside one file (slots contiguous by
+  // construction when both ends land in the same file). Everything else --
+  // spanning a file boundary or reaching outside the files -- replays the
+  // per-dword apply so the two paths cannot disagree.
+  if (s0 < 0 || s1 < 0 || uint32_t(s1) != uint32_t(s0) + (n - 1) ||
+      ResSlotFile(uint32_t(s1)) != ResSlotFile(uint32_t(s0))) {
+    for (uint32_t i = 0; i < n; ++i) {
+      ResApplyWrite(ctx, stats, base + i, values[i], from_memory);
+    }
+    return;
+  }
+  const uint32_t slot0 = uint32_t(s0);
+  const ResFile file = ResSlotFile(slot0);
+  const uint8_t fm = from_memory ? 1 : 0;
+  if (file == kResFileAlu) {
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t slot = slot0 + i;
+      ctx->values[slot] = values[i];
+      if (!ctx->defined[slot]) {
+        ctx->defined[slot] = 1;
+        ++ctx->alu_defined_count;
+      }
+      ctx->in_buffer[slot] = 1;
+      ctx->from_memory[slot] = fm;
+    }
+    ctx->alu_any_in_buffer = 1;
+  } else if (file == kResFileFetch) {
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t slot = slot0 + i;
+      ctx->values[slot] = values[i];
+      ctx->defined[slot] = 1;
+      ctx->in_buffer[slot] = 1;
+      ctx->from_memory[slot] = fm;
+    }
+    // Liveness over the FINAL values, once per touched constant in each
+    // aliased view -- the state the per-dword recompute ends on.
+    const uint32_t d0 = slot0 - kFetchSlot0;
+    const uint32_t d1 = d0 + n - 1;
+    for (uint32_t v = d0 / kResFetchVertexDwords;
+         v <= d1 / kResFetchVertexDwords; ++v) {
+      ctx->vfetch_in_buffer_mask[v >> 5] |= 1u << (v & 31);
+      SetBit(ctx->vfetch_live_mask, v,
+             ConstantLive(ctx, v * kResFetchVertexDwords, kResFetchVertexDwords,
+                          kResFetchVertex));
+    }
+    for (uint32_t t = d0 / kResFetchTextureDwords;
+         t <= d1 / kResFetchTextureDwords; ++t) {
+      ctx->tfetch_in_buffer_mask |= 1u << t;
+      if (ConstantLive(ctx, t * kResFetchTextureDwords, kResFetchTextureDwords,
+                       kResFetchTexture)) {
+        ctx->tfetch_live_mask |= 1u << t;
+      } else {
+        ctx->tfetch_live_mask &= ~(1u << t);
+      }
+    }
+  } else {
+    // Bool / loop: value + flag stores only.
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t slot = slot0 + i;
+      ctx->values[slot] = values[i];
+      ctx->defined[slot] = 1;
+      ctx->in_buffer[slot] = 1;
+      ctx->from_memory[slot] = fm;
+    }
+  }
+  if (!stats) return;
+  stats->writes += n;
+  stats->writes_by_file[file] += n;
+  if (from_memory) {
+    stats->writes_from_memory += n;
+    stats->writes_from_memory_by_file[file] += n;
+  }
+}
+
 ResFetchType ResFetchTypeAt(const ResourceContext* ctx, uint32_t slot) {
   if (slot >= kResFetchVertexSlots) return kResFetchInvalidTexture;
   return ResFetchType(
