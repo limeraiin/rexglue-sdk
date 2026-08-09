@@ -288,6 +288,15 @@ struct NrBindProbe {
   rex::graphics::nr::BindCensus layout_census;  // distinct layout-UID tuples
 };
 NrBindProbe g_nr_bind{};
+// [NR-BND] Staging for the float-constant gate. The constant pool is an
+// UPLOAD heap mapped with an empty read range: reading it back is
+// write-combined-memory poison (~100x a cached read) and the first city run
+// (naruto_335) measured exactly that -- the CP thread lost ~2/3 of its
+// throughput to the memcmps. Under the gate the emulated pack loop writes
+// HERE instead and one memcpy publishes to the heap, so the uploaded bytes
+// are these bytes by construction and the compare never touches WC memory.
+// CP-thread-only, and the two float blocks run sequentially, so one buffer.
+alignas(16) uint8_t g_nr_bnd_staging[rex::graphics::nr::kBindFloatMaxBytes];
 
 // [NR-BND] The 1Hz verdict line, emitted from the per-frame probe block so no
 // clock is read on the draw path.
@@ -6237,6 +6246,14 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     if (float_constants == nullptr) {
       return false;
     }
+    // [NR-BND] Under the gate the pack loop below writes cached staging, not
+    // the upload heap: reading WC memory back for the compare cost the CP
+    // thread ~2/3 of its throughput (naruto_335). Publish + compare after.
+    uint8_t* nr_bnd_fv_dst = nullptr;
+    if (g_nr_bindings) {
+      nr_bnd_fv_dst = float_constants;
+      float_constants = g_nr_bnd_staging;
+    }
     const uint8_t* nr_bnd_fv_start = float_constants;
     for (uint32_t i = 0; i < 4; ++i) {
       uint64_t float_constant_map_entry = float_constant_map_vertex.float_bitmap[i];
@@ -6250,14 +6267,17 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         float_constants += 4 * sizeof(float);
       }
     }
-    // [NR-BND] Our packing of the same map vs the bytes just uploaded.
+    // [NR-BND] Our packing of the same map vs the bytes just packed; then the
+    // staged bytes become the uploaded bytes by construction.
     if (g_nr_bindings) {
+      const uint32_t nr_written = uint32_t(float_constants - nr_bnd_fv_start);
+      std::memcpy(nr_bnd_fv_dst, nr_bnd_fv_start, nr_written);
       ++g_nr_bind.fv_up;
       alignas(16) uint8_t nr_ours[nr::kBindFloatMaxBytes];
       const uint32_t nr_size =
           nr::BindComposeFloats(nr_bnd_rf, nr::kBindFloatVertexBase,
                                 float_constant_map_vertex.float_bitmap, nr_ours, sizeof(nr_ours));
-      if (nr_size != uint32_t(float_constants - nr_bnd_fv_start)) {
+      if (nr_size != nr_written) {
         ++g_nr_bind.fv_size_ne;
       } else if (nr_size != 0 && std::memcmp(nr_ours, nr_bnd_fv_start, nr_size) != 0) {
         ++g_nr_bind.fv_ne;
@@ -6273,6 +6293,12 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         &cbuffer_binding_float_pixel_.address);
     if (float_constants == nullptr) {
       return false;
+    }
+    // [NR-BND] Same staging redirect as the vertex block (WC-read trap).
+    uint8_t* nr_bnd_fp_dst = nullptr;
+    if (g_nr_bindings) {
+      nr_bnd_fp_dst = float_constants;
+      float_constants = g_nr_bnd_staging;
     }
     const uint8_t* nr_bnd_fp_start = float_constants;
     if (pixel_shader != nullptr) {
@@ -6292,8 +6318,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
     }
     // [NR-BND] Same gate for the pixel half; a null pixel shader must compose
-    // to zero bytes on our side too.
+    // to zero bytes on our side too. Publish staging, then compare.
     if (g_nr_bindings) {
+      const uint32_t nr_written = uint32_t(float_constants - nr_bnd_fp_start);
+      std::memcpy(nr_bnd_fp_dst, nr_bnd_fp_start, nr_written);
       ++g_nr_bind.fp_up;
       alignas(16) uint8_t nr_ours[nr::kBindFloatMaxBytes];
       const uint64_t nr_zero_bitmap[4] = {0, 0, 0, 0};
@@ -6301,7 +6329,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
           nr_bnd_rf, nr::kBindFloatPixelBase,
           pixel_shader ? pixel_shader->constant_register_map().float_bitmap : nr_zero_bitmap,
           nr_ours, sizeof(nr_ours));
-      if (nr_size != uint32_t(float_constants - nr_bnd_fp_start)) {
+      if (nr_size != nr_written) {
         ++g_nr_bind.fp_size_ne;
       } else if (nr_size != 0 && std::memcmp(nr_ours, nr_bnd_fp_start, nr_size) != 0) {
         ++g_nr_bind.fp_ne;
@@ -6320,13 +6348,16 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
     std::memcpy(bool_loop_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
                 kBoolLoopConstantsSize);
-    // [NR-BND] Verbatim window: proves our base + size transcription.
+    // [NR-BND] Verbatim window: proves our base + size transcription against
+    // the SOURCE the upload memcpy'd (the heap bytes equal it by that memcpy;
+    // reading the upload heap back is the WC trap, never do it).
     if (g_nr_bindings) {
       ++g_nr_bind.bl_up;
       uint8_t nr_ours[nr::kBindBoolLoopBytes];
       static_assert(sizeof(nr_ours) == kBoolLoopConstantsSize);
       nr::BindComposeBoolLoop(nr_bnd_rf, nr_ours, sizeof(nr_ours));
-      if (std::memcmp(nr_ours, bool_loop_constants, sizeof(nr_ours)) != 0) {
+      if (std::memcmp(nr_ours, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+                      sizeof(nr_ours)) != 0) {
         ++g_nr_bind.bl_ne;
       }
     }
@@ -6342,13 +6373,14 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
-    // [NR-BND] Verbatim window: proves our base + size transcription.
+    // [NR-BND] Verbatim window, same source-compare rule as bool/loop.
     if (g_nr_bindings) {
       ++g_nr_bind.fx_up;
       uint8_t nr_ours[nr::kBindFetchBytes];
       static_assert(sizeof(nr_ours) == kFetchConstantsSize);
       nr::BindComposeFetch(nr_bnd_rf, nr_ours, sizeof(nr_ours));
-      if (std::memcmp(nr_ours, fetch_constants, sizeof(nr_ours)) != 0) {
+      if (std::memcmp(nr_ours, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                      sizeof(nr_ours)) != 0) {
         ++g_nr_bind.fx_ne;
       }
     }
