@@ -204,6 +204,17 @@ REXCVAR_DEFINE_BOOL(gpu_nr_desc, false, "GPU/D3D12",
                     "only, off by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [NR-SWP] Phase 5-3b swap: our own UpdateBindings for eligible draws.
+REXCVAR_DEFINE_BOOL(gpu_nr_bindings_swap, false, "GPU/D3D12",
+                    "[NR-SWP] Phase 5-3b swap: assemble each draw's bindings with the "
+                    "native renderer's own UpdateBindings (system constants from the "
+                    "5-3b-1 mirror, guest cbuffers via the 5-3b-0 packers, samplers via "
+                    "the 5-3b-2 derivation, SRV index values via the 5-3b-3 maps, root "
+                    "parameters transcribed) instead of the emulated one; per-draw "
+                    "fallback, counted. Requires gpu_nr_sysconst and gpu_nr_residency. "
+                    "Reports '[nr-swp]' once/sec. Off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // [NR-RSY] Phase 5-3b-3: the residency + descriptor-allocation mirror's gate.
 REXCVAR_DEFINE_BOOL(gpu_nr_residency, false, "GPU/D3D12",
                     "[NR-RSY] Phase 5-3b-3 residency mirror: predict every vertex/index "
@@ -770,6 +781,40 @@ void NrResReportIfDue() {
       p.layout_bad);
   s_prev = p;
   g_nr_res_samples_this_window = 0;
+}
+
+// [NR-SWP] Phase 5-3b swap: latched once a frame; counters cmd-proc-thread-only.
+// swapped = draws whose bindings OUR UpdateBindings assembled; fallback =
+// eligible-mode draws refused mid-way (sampler-heap overflow - the emulated
+// path then redoes the work on the same coherent state machine); srv_query =
+// per-VALUE fallbacks to the emulated warm query inside our descriptor-indices
+// compose (special view / unmapped texture - counted, never silent).
+bool g_nr_swap = false;
+struct NrSwapProbe {
+  uint64_t swapped = 0, fallback = 0, srv_query = 0;
+  uint64_t di_v = 0, di_p = 0;  // descriptor-indices rebuilds ours performed
+  uint64_t smp_alloc = 0;       // sampler-heap slots OUR resolution allocated
+};
+NrSwapProbe g_nr_swap_probe{};
+
+// [NR-SWP] The 1Hz verdict line.
+void NrSwapReportIfDue() {
+  if (!g_nr_swap || !(g_nr_swap_probe.swapped + g_nr_swap_probe.fallback)) {
+    return;
+  }
+  static auto s_last = std::chrono::steady_clock::now();
+  static NrSwapProbe s_prev{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) {
+    return;
+  }
+  s_last = now;
+  const NrSwapProbe& p = g_nr_swap_probe;
+  REXGPU_INFO(
+      "[nr-swp] swapped={} fallback={} srv_query={} | di v={} p={} smp_alloc={}",
+      p.swapped - s_prev.swapped, p.fallback, p.srv_query, p.di_v - s_prev.di_v,
+      p.di_p - s_prev.di_p, p.smp_alloc);
+  s_prev = p;
 }
 
 // [NR-RSY] The primitive processor's index-request observer (installed while
@@ -3355,6 +3400,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     g_nr_res = nr_res_now;
   }
+  // [NR-SWP] Phase 5-3b swap: verdict + latch. Eligibility is evaluated here
+  // once a frame: bindless only, and the mirrors the swap assembles from
+  // must be armed and warm - the 5-3b-1 system-constants mirror (seeded,
+  // still byte-checked by the sysconst gate every draw) and the 5-3b-3
+  // texture-descriptor map (kept warm by the FindOrCreate hook).
+  NrSwapReportIfDue();
+  g_nr_swap = REXCVAR_GET(gpu_nr_bindings_swap) && bindless_resources_used_ &&
+              g_nr_sysconst && g_nr_sys_seeded && g_nr_res;
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);
@@ -4342,7 +4395,24 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // Update constant buffers, descriptors and root parameters.
   auto _dp_bind0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-  bool _dp_bind_ok = UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used);
+  // [NR-SWP] Phase 5-3b swap: assemble the bindings with OUR UpdateBindings
+  // when armed; a refusal (sampler-heap overflow) falls back to the emulated
+  // one on the same coherent state machine, counted.
+  bool _dp_bind_ok;
+  if (g_nr_swap) {
+    bool nr_swp_refused = false;
+    _dp_bind_ok =
+        NrUpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used,
+                         &nr_swp_refused);
+    if (nr_swp_refused) {
+      ++g_nr_swap_probe.fallback;
+      _dp_bind_ok = UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used);
+    } else {
+      ++g_nr_swap_probe.swapped;
+    }
+  } else {
+    _dp_bind_ok = UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used);
+  }
   if (g_draw_prof) g_draw_ns[4] += prof_ns_since(_dp_bind0);
   if (!_dp_bind_ok) {
     return false;
@@ -8296,6 +8366,452 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                                                                gpu_handle_samplers_vertex_);
       current_graphics_root_up_to_date_ |= 1u << extra_index;
     }
+  }
+
+  return true;
+}
+
+bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
+                                             const D3D12Shader* pixel_shader,
+                                             ID3D12RootSignature* root_signature,
+                                             bool shared_memory_is_uav, bool* refused_out) {
+  // [NR-SWP] Phase 5-3b swap: this project's own UpdateBindings, bindless
+  // path only, operating on the SAME member state machine as the emulated
+  // one (dirty flags, constant pool, sampler allocator, root-parameter
+  // mask), so per-draw fallback stays coherent. Every byte it publishes
+  // comes from a derivation this project byte-proved at city load:
+  //   system constants   the 5-3b-1 mirror (checked against the emulated
+  //                      derivation at the end of every
+  //                      UpdateSystemConstantValues call, which still runs)
+  //   guest cbuffers     the 5-3b-0 packers (BindCompose*)
+  //   sampler params     the 5-3b-2 derivation (DescSamplerParams)
+  //   SRV index values   the 5-3b-3 maps + decision tree (per-value
+  //                      fallback to the emulated warm query, counted)
+  //   root parameters    transcribed from the emulated tail
+  // Declared (cache-owned): WriteSampler's params->desc conversion, the
+  // SRV-key up-to-date bookkeeping, LoadActiveTextures (runs earlier).
+  // The ONLY mid-function refusal is sampler-heap overflow (the heap-switch
+  // machinery stays emulated); everything mutated before a refusal is state
+  // the emulated retry reads coherently.
+  *refused_out = false;
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  const RegisterFile& regs = GetActiveDrawRegisterFile();
+  const uint32_t* nr_rf = &regs[0];
+
+  // Set the new root signature.
+  if (current_graphics_root_signature_ != root_signature) {
+    current_graphics_root_signature_ = root_signature;
+    // Changing the root signature invalidates all bindings.
+    current_graphics_root_up_to_date_ = 0;
+    deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
+  }
+
+  // Check if the float constant layout is still the same and get the counts.
+  const Shader::ConstantRegisterMap& float_constant_map_vertex =
+      vertex_shader->constant_register_map();
+  uint32_t float_constant_count_vertex = float_constant_map_vertex.float_count;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (current_float_constant_map_vertex_[i] != float_constant_map_vertex.float_bitmap[i]) {
+      current_float_constant_map_vertex_[i] = float_constant_map_vertex.float_bitmap[i];
+      if (float_constant_count_vertex) {
+        cbuffer_binding_float_vertex_.up_to_date = false;
+      }
+    }
+  }
+  uint32_t float_constant_count_pixel = 0;
+  if (pixel_shader != nullptr) {
+    const Shader::ConstantRegisterMap& float_constant_map_pixel =
+        pixel_shader->constant_register_map();
+    float_constant_count_pixel = float_constant_map_pixel.float_count;
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (current_float_constant_map_pixel_[i] != float_constant_map_pixel.float_bitmap[i]) {
+        current_float_constant_map_pixel_[i] = float_constant_map_pixel.float_bitmap[i];
+        if (float_constant_count_pixel) {
+          cbuffer_binding_float_pixel_.up_to_date = false;
+        }
+      }
+    }
+  } else {
+    std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
+  }
+
+  // Write the constant buffer data - ours. (Direct writes into the upload
+  // pointer are fine: sequential stores, never read back.)
+  if (!cbuffer_binding_system_.up_to_date) {
+    uint8_t* system_constants = constant_buffer_pool_->Request(
+        frame_current_, sizeof(g_nr_sys_state), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+        nullptr, nullptr, &cbuffer_binding_system_.address);
+    if (system_constants == nullptr) {
+      return false;
+    }
+    std::memcpy(system_constants, &g_nr_sys_state, sizeof(g_nr_sys_state));
+    cbuffer_binding_system_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SystemConstants);
+  }
+  if (!cbuffer_binding_float_vertex_.up_to_date) {
+    const uint32_t float_vertex_size =
+        uint32_t(sizeof(float)) * 4 * std::max(float_constant_count_vertex, uint32_t(1));
+    uint8_t* float_constants = constant_buffer_pool_->Request(
+        frame_current_, float_vertex_size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr,
+        nullptr, &cbuffer_binding_float_vertex_.address);
+    if (float_constants == nullptr) {
+      return false;
+    }
+    nr::BindComposeFloats(nr_rf, nr::kBindFloatVertexBase, float_constant_map_vertex.float_bitmap,
+                          float_constants, float_vertex_size);
+    cbuffer_binding_float_vertex_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsVertex);
+  }
+  if (!cbuffer_binding_float_pixel_.up_to_date) {
+    const uint32_t float_pixel_size =
+        uint32_t(sizeof(float)) * 4 * std::max(float_constant_count_pixel, uint32_t(1));
+    uint8_t* float_constants = constant_buffer_pool_->Request(
+        frame_current_, float_pixel_size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr,
+        nullptr, &cbuffer_binding_float_pixel_.address);
+    if (float_constants == nullptr) {
+      return false;
+    }
+    const uint64_t nr_zero_bitmap[4] = {0, 0, 0, 0};
+    nr::BindComposeFloats(
+        nr_rf, nr::kBindFloatPixelBase,
+        pixel_shader ? pixel_shader->constant_register_map().float_bitmap : nr_zero_bitmap,
+        float_constants, float_pixel_size);
+    cbuffer_binding_float_pixel_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsPixel);
+  }
+  if (!cbuffer_binding_bool_loop_.up_to_date) {
+    uint8_t* bool_loop_constants = constant_buffer_pool_->Request(
+        frame_current_, nr::kBindBoolLoopBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+        nullptr, nullptr, &cbuffer_binding_bool_loop_.address);
+    if (bool_loop_constants == nullptr) {
+      return false;
+    }
+    nr::BindComposeBoolLoop(nr_rf, bool_loop_constants, nr::kBindBoolLoopBytes);
+    cbuffer_binding_bool_loop_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_BoolLoopConstants);
+  }
+  if (!cbuffer_binding_fetch_.up_to_date) {
+    uint8_t* fetch_constants = constant_buffer_pool_->Request(
+        frame_current_, nr::kBindFetchBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+        nullptr, nullptr, &cbuffer_binding_fetch_.address);
+    if (fetch_constants == nullptr) {
+      return false;
+    }
+    nr::BindComposeFetch(nr_rf, fetch_constants, nr::kBindFetchBytes);
+    cbuffer_binding_fetch_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FetchConstants);
+  }
+
+  // The shared-memory binding flavor.
+  if (!current_shared_memory_binding_is_uav_.has_value() ||
+      current_shared_memory_binding_is_uav_.value() != shared_memory_is_uav) {
+    current_shared_memory_binding_is_uav_ = shared_memory_is_uav;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SharedMemory);
+  }
+
+  // Sampler parameters - our derivation, same dirty machine.
+  const int32_t nr_swp_aniso = REXCVAR_GET(anisotropic_override);
+  size_t texture_layout_uid_vertex = vertex_shader->GetTextureBindingLayoutUserUID();
+  size_t sampler_layout_uid_vertex = vertex_shader->GetSamplerBindingLayoutUserUID();
+  const std::vector<D3D12Shader::TextureBinding>& textures_vertex =
+      vertex_shader->GetTextureBindingsAfterTranslation();
+  const std::vector<D3D12Shader::SamplerBinding>& samplers_vertex =
+      vertex_shader->GetSamplerBindingsAfterTranslation();
+  size_t texture_count_vertex = textures_vertex.size();
+  size_t sampler_count_vertex = samplers_vertex.size();
+  if (sampler_count_vertex) {
+    if (current_sampler_layout_uid_vertex_ != sampler_layout_uid_vertex) {
+      current_sampler_layout_uid_vertex_ = sampler_layout_uid_vertex;
+      cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+      bindful_samplers_written_vertex_ = false;
+    }
+    current_samplers_vertex_.resize(
+        std::max(current_samplers_vertex_.size(), sampler_count_vertex));
+    for (size_t i = 0; i < sampler_count_vertex; ++i) {
+      D3D12TextureCache::SamplerParameters parameters;
+      parameters.value = nr::DescSamplerParams(
+          &nr_rf[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + samplers_vertex[i].fetch_constant * 6],
+          uint32_t(samplers_vertex[i].mag_filter), uint32_t(samplers_vertex[i].min_filter),
+          uint32_t(samplers_vertex[i].mip_filter), uint32_t(samplers_vertex[i].aniso_filter),
+          nr_swp_aniso);
+      if (current_samplers_vertex_[i] != parameters) {
+        cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+        bindful_samplers_written_vertex_ = false;
+        current_samplers_vertex_[i] = parameters;
+      }
+    }
+  }
+  size_t texture_layout_uid_pixel, sampler_layout_uid_pixel;
+  const std::vector<D3D12Shader::TextureBinding>* textures_pixel;
+  const std::vector<D3D12Shader::SamplerBinding>* samplers_pixel;
+  size_t texture_count_pixel, sampler_count_pixel;
+  if (pixel_shader != nullptr) {
+    texture_layout_uid_pixel = pixel_shader->GetTextureBindingLayoutUserUID();
+    sampler_layout_uid_pixel = pixel_shader->GetSamplerBindingLayoutUserUID();
+    textures_pixel = &pixel_shader->GetTextureBindingsAfterTranslation();
+    texture_count_pixel = textures_pixel->size();
+    samplers_pixel = &pixel_shader->GetSamplerBindingsAfterTranslation();
+    sampler_count_pixel = samplers_pixel->size();
+    if (sampler_count_pixel) {
+      if (current_sampler_layout_uid_pixel_ != sampler_layout_uid_pixel) {
+        current_sampler_layout_uid_pixel_ = sampler_layout_uid_pixel;
+        cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+        bindful_samplers_written_pixel_ = false;
+      }
+      current_samplers_pixel_.resize(
+          std::max(current_samplers_pixel_.size(), size_t(sampler_count_pixel)));
+      for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
+        D3D12TextureCache::SamplerParameters parameters;
+        parameters.value = nr::DescSamplerParams(
+            &nr_rf[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                   (*samplers_pixel)[i].fetch_constant * 6],
+            uint32_t((*samplers_pixel)[i].mag_filter), uint32_t((*samplers_pixel)[i].min_filter),
+            uint32_t((*samplers_pixel)[i].mip_filter), uint32_t((*samplers_pixel)[i].aniso_filter),
+            nr_swp_aniso);
+        if (current_samplers_pixel_[i] != parameters) {
+          current_samplers_pixel_[i] = parameters;
+          cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+          bindful_samplers_written_pixel_ = false;
+        }
+      }
+    }
+  } else {
+    texture_layout_uid_pixel = PipelineCache::kLayoutUIDEmpty;
+    sampler_layout_uid_pixel = PipelineCache::kLayoutUIDEmpty;
+    textures_pixel = nullptr;
+    texture_count_pixel = 0;
+    samplers_pixel = nullptr;
+    sampler_count_pixel = 0;
+  }
+
+  // Texture-key freshness (cache bookkeeping over keys the 5-3b-2 gate
+  // proved equal to our derivation).
+  if (texture_count_vertex && cbuffer_binding_descriptor_indices_vertex_.up_to_date &&
+      (current_texture_layout_uid_vertex_ != texture_layout_uid_vertex ||
+       !texture_cache_->AreActiveTextureSRVKeysUpToDate(current_texture_srv_keys_vertex_.data(),
+                                                        textures_vertex.data(),
+                                                        texture_count_vertex))) {
+    cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+  }
+  if (texture_count_pixel && cbuffer_binding_descriptor_indices_pixel_.up_to_date &&
+      (current_texture_layout_uid_pixel_ != texture_layout_uid_pixel ||
+       !texture_cache_->AreActiveTextureSRVKeysUpToDate(current_texture_srv_keys_pixel_.data(),
+                                                        textures_pixel->data(),
+                                                        texture_count_pixel))) {
+    cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+  }
+
+  // Sampler heap indices: the shared find-or-allocate; overflow refuses to
+  // the emulated path (which owns the heap-switch machinery). Everything
+  // allocated up to a refusal stays valid for the retry.
+  if ((sampler_count_vertex && !cbuffer_binding_descriptor_indices_vertex_.up_to_date) ||
+      (sampler_count_pixel && !cbuffer_binding_descriptor_indices_pixel_.up_to_date)) {
+    if (sampler_count_vertex && !cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
+      current_sampler_bindless_indices_vertex_.resize(std::max(
+          current_sampler_bindless_indices_vertex_.size(), size_t(sampler_count_vertex)));
+      for (uint32_t j = 0; j < sampler_count_vertex; ++j) {
+        D3D12TextureCache::SamplerParameters sampler_parameters = current_samplers_vertex_[j];
+        uint32_t sampler_index;
+        auto it = texture_cache_bindless_sampler_map_.find(sampler_parameters.value);
+        if (it != texture_cache_bindless_sampler_map_.end()) {
+          sampler_index = it->second;
+        } else {
+          if (sampler_bindless_heap_allocated_ >= kSamplerHeapSize) {
+            *refused_out = true;
+            return true;
+          }
+          sampler_index = sampler_bindless_heap_allocated_++;
+          texture_cache_->WriteSampler(sampler_parameters,
+                                       provider.OffsetSamplerDescriptor(
+                                           sampler_bindless_heap_cpu_start_, sampler_index));
+          texture_cache_bindless_sampler_map_.emplace(sampler_parameters.value, sampler_index);
+          ++g_nr_swap_probe.smp_alloc;
+        }
+        current_sampler_bindless_indices_vertex_[j] = sampler_index;
+      }
+    }
+    if (sampler_count_pixel && !cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
+      current_sampler_bindless_indices_pixel_.resize(std::max(
+          current_sampler_bindless_indices_pixel_.size(), size_t(sampler_count_pixel)));
+      for (uint32_t j = 0; j < sampler_count_pixel; ++j) {
+        D3D12TextureCache::SamplerParameters sampler_parameters = current_samplers_pixel_[j];
+        uint32_t sampler_index;
+        auto it = texture_cache_bindless_sampler_map_.find(sampler_parameters.value);
+        if (it != texture_cache_bindless_sampler_map_.end()) {
+          sampler_index = it->second;
+        } else {
+          if (sampler_bindless_heap_allocated_ >= kSamplerHeapSize) {
+            *refused_out = true;
+            return true;
+          }
+          sampler_index = sampler_bindless_heap_allocated_++;
+          texture_cache_->WriteSampler(sampler_parameters,
+                                       provider.OffsetSamplerDescriptor(
+                                           sampler_bindless_heap_cpu_start_, sampler_index));
+          texture_cache_bindless_sampler_map_.emplace(sampler_parameters.value, sampler_index);
+          ++g_nr_swap_probe.smp_alloc;
+        }
+        current_sampler_bindless_indices_pixel_[j] = sampler_index;
+      }
+    }
+  }
+
+  // Our texture SRV index value for one binding (5-3b-3's map + decision
+  // tree; the emulated warm query only as a counted per-value fallback).
+  const auto nr_swp_srv_value = [this](const D3D12Shader::TextureBinding& binding) -> uint32_t {
+    nr::ResSrvBindingFacts facts;
+    texture_cache_->NrDescribeActiveBinding(binding.fetch_constant, &facts);
+    uint32_t ours = 0;
+    const nr::ResSrvOutcome outcome = nr::ResSrvIndexForBinding(
+        &g_nr_res_tmap, &facts, uint32_t(binding.dimension), binding.is_signed,
+        uint32_t(SystemBindlessView::kNullTexture2DArray),
+        uint32_t(SystemBindlessView::kNullTexture3D),
+        uint32_t(SystemBindlessView::kNullTextureCube), &ours);
+    if (outcome == nr::kResSrvValue || outcome == nr::kResSrvNull) {
+      return ours;
+    }
+    ++g_nr_swap_probe.srv_query;
+    return texture_cache_->GetActiveTextureBindlessSRVIndex(binding);
+  };
+
+  // Descriptor-indices constant buffers - ours, sized by the 1-BASED slot
+  // rule (max_slot + 1, never tex+smp: [[descriptor-slots-one-based]]).
+  if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
+    uint32_t span = 0;
+    for (size_t i = 0; i < texture_count_vertex; ++i) {
+      span = std::max(span, textures_vertex[i].bindless_descriptor_index + 1);
+    }
+    for (size_t i = 0; i < sampler_count_vertex; ++i) {
+      span = std::max(span, samplers_vertex[i].bindless_descriptor_index + 1);
+    }
+    const uint32_t span_alloc = std::max(span, uint32_t(1));
+    uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+        frame_current_, span_alloc * sizeof(uint32_t),
+        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
+        &cbuffer_binding_descriptor_indices_vertex_.address));
+    if (!descriptor_indices) {
+      return false;
+    }
+    std::memset(descriptor_indices, 0, span_alloc * sizeof(uint32_t));
+    for (size_t i = 0; i < texture_count_vertex; ++i) {
+      const D3D12Shader::TextureBinding& texture = textures_vertex[i];
+      descriptor_indices[texture.bindless_descriptor_index] =
+          nr_swp_srv_value(texture) - uint32_t(SystemBindlessView::kUnboundedSRVsStart);
+    }
+    for (size_t i = 0; i < sampler_count_vertex; ++i) {
+      descriptor_indices[samplers_vertex[i].bindless_descriptor_index] =
+          current_sampler_bindless_indices_vertex_[i];
+    }
+    ++g_nr_swap_probe.di_v;
+    current_texture_layout_uid_vertex_ = texture_layout_uid_vertex;
+    if (texture_count_vertex) {
+      current_texture_srv_keys_vertex_.resize(
+          std::max(current_texture_srv_keys_vertex_.size(), size_t(texture_count_vertex)));
+      texture_cache_->WriteActiveTextureSRVKeys(current_texture_srv_keys_vertex_.data(),
+                                                textures_vertex.data(), texture_count_vertex);
+    }
+    cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesVertex);
+  }
+  if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
+    uint32_t span = 0;
+    for (size_t i = 0; i < texture_count_pixel; ++i) {
+      span = std::max(span, (*textures_pixel)[i].bindless_descriptor_index + 1);
+    }
+    for (size_t i = 0; i < sampler_count_pixel; ++i) {
+      span = std::max(span, (*samplers_pixel)[i].bindless_descriptor_index + 1);
+    }
+    const uint32_t span_alloc = std::max(span, uint32_t(1));
+    uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+        frame_current_, span_alloc * sizeof(uint32_t),
+        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
+        &cbuffer_binding_descriptor_indices_pixel_.address));
+    if (!descriptor_indices) {
+      return false;
+    }
+    std::memset(descriptor_indices, 0, span_alloc * sizeof(uint32_t));
+    for (size_t i = 0; i < texture_count_pixel; ++i) {
+      const D3D12Shader::TextureBinding& texture = (*textures_pixel)[i];
+      descriptor_indices[texture.bindless_descriptor_index] =
+          nr_swp_srv_value(texture) - uint32_t(SystemBindlessView::kUnboundedSRVsStart);
+    }
+    for (size_t i = 0; i < sampler_count_pixel; ++i) {
+      descriptor_indices[(*samplers_pixel)[i].bindless_descriptor_index] =
+          current_sampler_bindless_indices_pixel_[i];
+    }
+    ++g_nr_swap_probe.di_p;
+    current_texture_layout_uid_pixel_ = texture_layout_uid_pixel;
+    if (texture_count_pixel) {
+      current_texture_srv_keys_pixel_.resize(
+          std::max(current_texture_srv_keys_pixel_.size(), size_t(texture_count_pixel)));
+      texture_cache_->WriteActiveTextureSRVKeys(current_texture_srv_keys_pixel_.data(),
+                                                textures_pixel->data(), texture_count_pixel);
+    }
+    cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
+  }
+
+  // Update the root parameters (the transcribed bindless tail).
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_FetchConstants))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_FetchConstants, cbuffer_binding_fetch_.address);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_FetchConstants;
+  }
+  if (!(current_graphics_root_up_to_date_ &
+        (1u << kRootParameter_Bindless_FloatConstantsVertex))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_FloatConstantsVertex, cbuffer_binding_float_vertex_.address);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_FloatConstantsVertex;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_FloatConstantsPixel))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_FloatConstantsPixel, cbuffer_binding_float_pixel_.address);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_FloatConstantsPixel;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_SystemConstants))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_SystemConstants, cbuffer_binding_system_.address);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SystemConstants;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_BoolLoopConstants))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_BoolLoopConstants, cbuffer_binding_bool_loop_.address);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_BoolLoopConstants;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_SharedMemory))) {
+    assert_true(current_shared_memory_binding_is_uav_.has_value());
+    deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
+        kRootParameter_Bindless_SharedMemory,
+        provider.OffsetViewDescriptor(
+            view_bindless_heap_gpu_start_,
+            uint32_t(current_shared_memory_binding_is_uav_.value()
+                         ? SystemBindlessView::kNullRawSRVAndSharedMemoryRawUAVStart
+                         : SystemBindlessView::kSharedMemoryRawSRVAndNullRawUAVStart)));
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SharedMemory;
+  }
+  if (!(current_graphics_root_up_to_date_ &
+        (1u << kRootParameter_Bindless_DescriptorIndicesPixel))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_DescriptorIndicesPixel,
+        cbuffer_binding_descriptor_indices_pixel_.address);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_DescriptorIndicesPixel;
+  }
+  if (!(current_graphics_root_up_to_date_ &
+        (1u << kRootParameter_Bindless_DescriptorIndicesVertex))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_DescriptorIndicesVertex,
+        cbuffer_binding_descriptor_indices_vertex_.address);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_DescriptorIndicesVertex;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_SamplerHeap))) {
+    deferred_command_list_.D3DSetGraphicsRootDescriptorTable(kRootParameter_Bindless_SamplerHeap,
+                                                             sampler_bindless_heap_gpu_start_);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SamplerHeap;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_ViewHeap))) {
+    deferred_command_list_.D3DSetGraphicsRootDescriptorTable(kRootParameter_Bindless_ViewHeap,
+                                                             view_bindless_heap_gpu_start_);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_ViewHeap;
   }
 
   return true;

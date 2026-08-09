@@ -529,6 +529,12 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   uint32_t normalized_color_mask);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
+  // [NR-SWP] Phase 5-3b swap: this project's own UpdateBindings (bindless
+  // only, same member state machine). *refused_out = fall back to the
+  // emulated function for this draw (counted by the caller).
+  bool NrUpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
+                        ID3D12RootSignature* root_signature, bool shared_memory_is_uav,
+                        bool* refused_out);
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
