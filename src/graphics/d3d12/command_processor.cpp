@@ -817,6 +817,34 @@ void NrSwapReportIfDue() {
   s_prev = p;
 }
 
+// [NR-FX] Phase 5-4-0: walk-driven side-effect counters (CP thread only).
+// Window deltas per class; the classes are the same three constant ranges the
+// WriteRegister tail dispatches on. A zero line with the cvar on means the
+// walk decoded no constant writes (menu idle), not a broken hook -- the
+// executor's own write rates on the other [nr-*] lines say which.
+struct NrFxProbe {
+  uint64_t fl = 0, bl = 0, fetch = 0;
+};
+NrFxProbe g_nr_fx_probe{};
+
+// [NR-FX] The 1Hz line.
+void NrFxReportIfDue() {
+  const NrFxProbe& p = g_nr_fx_probe;
+  if (!(p.fl | p.bl | p.fetch)) {
+    return;
+  }
+  static auto s_last = std::chrono::steady_clock::now();
+  static NrFxProbe s_prev{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) {
+    return;
+  }
+  s_last = now;
+  REXGPU_INFO("[nr-fx] float={} bl={} fetch={}", p.fl - s_prev.fl,
+              p.bl - s_prev.bl, p.fetch - s_prev.fetch);
+  s_prev = p;
+}
+
 // [NR-RSY] The primitive processor's index-request observer (installed while
 // the gate is armed; the CP thread is the only caller of Process here).
 void NrResIndexObserverThunk(void*, uint32_t base, uint32_t length, bool result) {
@@ -3408,6 +3436,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   NrSwapReportIfDue();
   g_nr_swap = REXCVAR_GET(gpu_nr_bindings_swap) && bindless_resources_used_ &&
               g_nr_sysconst && g_nr_sys_seeded && g_nr_res;
+  // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
+  // gate itself is latched base-side (WorkerThreadMain), not here.
+  NrFxReportIfDue();
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);
@@ -5757,6 +5788,50 @@ void D3D12CommandProcessor::PrecordReplayEvents(RegisterFile* local_target) {
         break;
       }
     }
+  }
+}
+
+void D3D12CommandProcessor::NrWalkWriteEffects(uint32_t index) {
+  // [NR-FX] Phase 5-4-0: the dirty-tracking tail of WriteRegister for the
+  // three constant ranges, WITHOUT the value store (the executor still owns
+  // the live file while both run) and WITHOUT the dedupe check -- by the time
+  // the lockstep walk fires, the executor has already stored this value, so a
+  // value compare here would be vacuously equal and skip every effect; with
+  // gpu_dedupe_constants off (the shipped default) the executor fires the
+  // tail for every write, which is exactly what this reproduces. Stateful
+  // registers (scratch/COHER/DC_LUT) are deliberately absent: their effects
+  // are not idempotent and belong to the 5-4-1 census. Keep in sync with
+  // WriteRegister / PrecordApplyWrite.
+  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    ++g_nr_fx_probe.fl;
+    if (frame_open_) {
+      uint32_t float_constant_index = (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      if (float_constant_index >= 256) {
+        float_constant_index -= 256;
+        if (current_float_constant_map_pixel_[float_constant_index >> 6] &
+            (1ull << (float_constant_index & 63))) {
+          cbuffer_binding_float_pixel_.up_to_date = false;
+        }
+      } else {
+        if (current_float_constant_map_vertex_[float_constant_index >> 6] &
+            (1ull << (float_constant_index & 63))) {
+          cbuffer_binding_float_vertex_.up_to_date = false;
+        }
+      }
+    }
+  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+             index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    ++g_nr_fx_probe.bl;
+    cbuffer_binding_bool_loop_.up_to_date = false;
+  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+             index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    ++g_nr_fx_probe.fetch;
+    cbuffer_binding_fetch_.up_to_date = false;
+    if (texture_cache_ != nullptr) {
+      texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
+                                                  6);
+    }
+    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
 

@@ -210,6 +210,25 @@ REXCVAR_DEFINE_INT32(gpu_nr_issue_count, -1, "GPU",
                      "[nr-issue]: number of draws to shadow-issue from "
                      "gpu_nr_issue_from on; -1 = unbounded.");
 
+// [NR-FX] Phase 5-4-0: the first rung of "the walk replaces the executor".
+// The walk has maintained every register VALUE since 4c; what the executor
+// still owns is WriteRegister's dirty-tracking TAIL (float cbuffer dirty
+// gated on the active shader's constant map, bool/loop dirty, fetch: cbuffer
+// dirty + texture-cache fetch notification + vertex-residency invalidation).
+// Skipping the executor without reproducing that tail would leave every
+// rebuilt binding stale-but-plausible, so before anything is skipped the walk
+// proves it can DRIVE the subsystems: its decoded write stream fires the same
+// tail while the executor still runs. Every effect is idempotent with the
+// executor's own firing (the walk is in lockstep, so both fire between the
+// same two draws under the same active-shader maps), which makes the gate
+// "everything unchanged": pixel-identical, all [nr-*] gates unmoved, and
+// rebuild rates NOT inflated -- over-invalidation would show there.
+REXCVAR_DEFINE_BOOL(gpu_nr_walk_effects, false, "GPU",
+                    "[nr-fx] Phase 5-4-0: fire WriteRegister's dirty-tracking "
+                    "side effects from the lockstep walk's decoded write "
+                    "stream, in addition to the executor's own (idempotent). "
+                    "Implies gpu_nr_draw. Off by default.");
+
 // [NR-SDB] Increment 4b-2: the shader-database probe. The offline census
 // proved the whole 3,320-shader corpus in xeshader.sdb translates, and the
 // index keys each blob by the runtime's own shader key -- but "the corpus
@@ -922,6 +941,12 @@ void NrdFinding(void*, nr::RegShadowFinding what, uint32_t reg, uint32_t ours,
            ours, live);
 }
 
+// [NR-FX] Phase 5-4-0. CP-thread-only. When on, NrWalkRegWrite forwards every
+// decoded write to the backend's NrWalkWriteEffects (the WriteRegister dirty
+// tail, no value store). Counters + the [nr-fx] line live backend-side, next
+// to the effects they count.
+bool g_nr_walk_fx = false;
+
 // [NR-ISSUE] Increment 4d. CP-thread-only, like everything else here.
 bool g_nr_issue = false;
 int64_t g_nri_from = 0;
@@ -1026,7 +1051,7 @@ uint64_t g_res_addr_distinct = 0, g_res_addr_ovf = 0;
 // [NR-RES]/[NR-DRAW] Every register write the ONE walk decodes, fanned out to
 // whichever censuses are on. Both consume the same stream by design: a second
 // decoder is the drift 4b-1 had to repair across four walkers.
-void NrWalkRegWrite(void*, uint32_t reg, uint32_t value, bool from_memory) {
+void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) {
   if (g_nr_res) {
     nr::ResApplyWrite(&g_res_state, &g_res_stats, reg, value, from_memory);
   }
@@ -1038,6 +1063,16 @@ void NrWalkRegWrite(void*, uint32_t reg, uint32_t value, bool from_memory) {
   // the shadow: out-of-range is dropped, never clamped onto a real register.
   if (g_nr_issue && g_nri_seeded && reg < RegisterFile::kRegisterCount) {
     g_nri_file.values[reg] = value;
+  }
+  // [NR-FX] Phase 5-4-0: additionally fire the backend's dirty-tracking tail
+  // for this write. The walk is in lockstep (gpu_nr_walk_effects implies
+  // gpu_nr_draw), so the executor has ALREADY applied this exact write and
+  // fired the same effects between the same two draws; re-firing marks the
+  // same bindings dirty before the same draw, which is what makes this a
+  // strict no-op to validate. `user` is the command processor that began the
+  // walk (reg_user at CtxWalkBegin).
+  if (g_nr_walk_fx && user) {
+    static_cast<CommandProcessor*>(user)->NrWalkWriteEffects(reg);
   }
 }
 
@@ -1317,8 +1352,13 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-ISSUE] Increment 4e: while issue is off the replay file receives no
   // writes, so a later enable must reseed rather than trust a stale file.
   if (!kNrIssue) g_nri_seeded = false;
+  // [NR-FX] 5-4-0: walk-driven side effects REQUIRE the lockstep walk --
+  // fired from a buffer-entry whole-buffer walk they would run ahead of the
+  // executor and over-invalidate (correct output, inflated rebuilds).
+  const bool kNrWalkFx = REXCVAR_GET(gpu_nr_walk_effects);
+  g_nr_walk_fx = kNrWalkFx;
   // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
-  const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue;
+  const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue || kNrWalkFx;
   g_nr_draw = kNrDraw;
   const bool kNrCtx = REXCVAR_GET(gpu_nr_ctx) || kNrRes || kNrDraw;
   g_nr_ctx = kNrCtx;
@@ -2601,12 +2641,14 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         nr::ResBeginBuffer(&g_res_state);
       }
       g_nr_walk_buf = ptr;
-      const bool has_reg_fn = g_nr_res || g_nr_draw;
+      // [NR-FX] 5-4-0: `this` rides as reg_user so the walk's write stream can
+      // reach the backend's NrWalkWriteEffects; unused by the other consumers.
+      const bool has_reg_fn = g_nr_res || g_nr_draw || g_nr_walk_fx;
       nr::CtxWalkBegin(&g_ctx_walker, memory_->TranslatePhysical(ptr), count,
                        ptr, &g_ctx_state, g_ctx_flags, kNrbMaxPkts,
                        &g_ctx_walk_stats, CtxMemRead, memory_, CtxShaderSeen,
                        nullptr, NrCtxWatch, nullptr, bin_select_, bin_mask_,
-                       has_reg_fn ? NrWalkRegWrite : nullptr, nullptr,
+                       has_reg_fn ? NrWalkRegWrite : nullptr, this,
                        g_nr_res ? NrResDraw : nullptr, nullptr);
       // [NR-DRAW] Increment 4c: with the shadow on, the walk advances one draw
       // at a time from the execution path below, so that every per-draw

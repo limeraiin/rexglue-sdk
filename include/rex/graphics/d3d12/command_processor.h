@@ -233,6 +233,10 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  // [NR-FX] Phase 5-4-0: WriteRegister's dirty-tracking tail for the three
+  // constant ranges, fired from the lockstep walk's decoded write stream. No
+  // value store, no dedupe. Keep in sync with WriteRegister / PrecordApplyWrite.
+  void NrWalkWriteEffects(uint32_t index) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
 

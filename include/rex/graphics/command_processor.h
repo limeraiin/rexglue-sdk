@@ -165,6 +165,14 @@ class CommandProcessor {
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
 
+  // [NR-FX] Phase 5-4-0: fired by the lockstep walk (NrWalkRegWrite) for every
+  // decoded register write while gpu_nr_walk_effects is on. A backend override
+  // runs WriteRegister's dirty-tracking tail (cbuffer/texture/vertex-residency
+  // invalidation) WITHOUT the value store, so the walk can drive the draw-path
+  // subsystems. Idempotent with the executor's own firing while both run.
+  // Public because the walk's write hook is a file-scope function.
+  virtual void NrWalkWriteEffects(uint32_t index) { (void)index; }
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
