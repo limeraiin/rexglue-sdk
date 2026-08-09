@@ -26,6 +26,7 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/nr_bindings.h>
 #include <rex/graphics/nr_native_pso.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -170,6 +171,16 @@ REXCVAR_DEFINE_BOOL(gpu_instance, true, "GPU/D3D12",
 REXCVAR_DECLARE(bool, gpu_nr_native_pso);
 REXCVAR_DECLARE(bool, gpu_nr_native_pso_bind);
 
+// [NR-BND] Phase 5-3b-0: the bindings mirror's gate.
+REXCVAR_DEFINE_BOOL(gpu_nr_bindings, false, "GPU/D3D12",
+                    "[NR-BND] Phase 5-3b-0 bindings mirror: recompose the guest constant "
+                    "buffers (float VS/PS, bool/loop, fetch) from the draw register file "
+                    "with the native renderer's own transcription and byte-compare them "
+                    "against every emulated upload inside UpdateBindings; check the "
+                    "root-signature selection; census the binding-layout UIDs. Reports "
+                    "'[nr-bnd]' once/sec. Diagnostic only, off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -255,6 +266,61 @@ uint64_t g_instance_draws_out = 0;
 // object; g_nr_native_pso_bind is the swap, and implies the first.
 bool g_nr_native_pso = false;
 bool g_nr_native_pso_bind = false;
+
+// [NR-BND] Phase 5-3b-0: latched once a frame beside the others; counters are
+// cmd-proc-thread-only => plain globals. The *_ne counters are cumulative
+// must-be-0 gates; volume counters are reported as per-second deltas by the
+// 1Hz line. What each pair means: *_ne = the uploaded bytes differ from our
+// recomposition; *_size_ne = the two sides disagree about how MANY bytes the
+// shader's constant map packs (checked against the emulated write cursor, so
+// it also catches a bitmap-iteration transcription slip).
+bool g_nr_bindings = false;
+struct NrBindProbe {
+  uint64_t draws = 0;  // UpdateBindings calls observed under the gate
+  uint64_t fv_up = 0, fv_size_ne = 0, fv_ne = 0;  // float VS uploads
+  uint64_t fp_up = 0, fp_size_ne = 0, fp_ne = 0;  // float PS uploads
+  uint64_t bl_up = 0, bl_ne = 0;                  // bool/loop uploads
+  uint64_t fx_up = 0, fx_ne = 0;                  // fetch uploads
+  uint64_t sys_up = 0;  // system-constant uploads (contents = a later peel)
+  uint64_t div_up = 0, dip_up = 0;  // bindless descriptor-indices rebuilds
+  uint64_t rs_checks = 0, rs_ne = 0, rs_tess = 0, rs_bindful = 0;
+  uint64_t tex_v = 0, smp_v = 0, tex_p = 0, smp_p = 0;  // bindings, summed
+  rex::graphics::nr::BindCensus layout_census;  // distinct layout-UID tuples
+};
+NrBindProbe g_nr_bind{};
+
+// [NR-BND] The 1Hz verdict line, emitted from the per-frame probe block so no
+// clock is read on the draw path.
+void NrBindReportIfDue() {
+  if (!g_nr_bindings || !g_nr_bind.draws) {
+    return;
+  }
+  static auto s_last = std::chrono::steady_clock::now();
+  static NrBindProbe s_prev{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) {
+    return;
+  }
+  s_last = now;
+  const NrBindProbe& p = g_nr_bind;
+  const uint64_t d = p.draws - s_prev.draws;
+  const double per_draw = d ? double(d) : 1.0;
+  REXGPU_INFO(
+      "[nr-bnd] draws={} | up floatv={} floatp={} boolloop={} fetch={} sys={} "
+      "idxv={} idxp={} | ne floatv={}/{} floatp={}/{} boolloop={} fetch={} | "
+      "rootsig checks={} ne={} tess={} bindful={} | layouts={} ovf={} | "
+      "bind/draw texv={:.1f} smpv={:.1f} texp={:.1f} smpp={:.1f}",
+      d, p.fv_up - s_prev.fv_up, p.fp_up - s_prev.fp_up, p.bl_up - s_prev.bl_up,
+      p.fx_up - s_prev.fx_up, p.sys_up - s_prev.sys_up, p.div_up - s_prev.div_up,
+      p.dip_up - s_prev.dip_up, p.fv_ne, p.fv_size_ne, p.fp_ne, p.fp_size_ne,
+      p.bl_ne, p.fx_ne, p.rs_checks - s_prev.rs_checks, p.rs_ne, p.rs_tess,
+      p.rs_bindful, p.layout_census.count, p.layout_census.ovf,
+      double(p.tex_v - s_prev.tex_v) / per_draw,
+      double(p.smp_v - s_prev.smp_v) / per_draw,
+      double(p.tex_p - s_prev.tex_p) / per_draw,
+      double(p.smp_p - s_prev.smp_p) / per_draw);
+  s_prev = p;
+}
 
 // Per-{geometry+shader} batch key: how many draws share it, and which float
 // constant registers ever differ across those draws (= the per-instance data a
@@ -2585,6 +2651,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // path reads a plain bool. Binding implies building.
   g_nr_native_pso_bind = REXCVAR_GET(gpu_nr_native_pso_bind);
   g_nr_native_pso = REXCVAR_GET(gpu_nr_native_pso) || g_nr_native_pso_bind;
+  // [NR-BND] Phase 5-3b-0: the bindings mirror's verdict + latch, same shape.
+  NrBindReportIfDue();
+  g_nr_bindings = REXCVAR_GET(gpu_nr_bindings);
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);
@@ -3484,6 +3553,37 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
   if (g_draw_prof) g_draw_ns[8] += prof_ns_since(_dp_ff0);
+
+  // [NR-BND] Phase 5-3b-0: the root-signature selection, ours against the one
+  // the pipeline description carries. Bindless (this machine): one of two
+  // static objects picked by tessellation alone. Bindful: our transcribed
+  // count-packed index must resolve to the same cached object.
+  if (g_nr_bindings) {
+    ++g_nr_bind.rs_checks;
+    const bool nr_tessellated = primitive_processing_result.IsTessellated();
+    if (nr_tessellated) {
+      ++g_nr_bind.rs_tess;
+    }
+    ID3D12RootSignature* nr_predicted = nullptr;
+    if (bindless_resources_used_) {
+      nr_predicted = nr_tessellated ? root_signature_bindless_ds_ : root_signature_bindless_vs_;
+    } else {
+      ++g_nr_bind.rs_bindful;
+      const uint32_t nr_index = nr::BindRootSigBindfulIndex(
+          pixel_shader ? uint32_t(pixel_shader->GetTextureBindingsAfterTranslation().size()) : 0,
+          pixel_shader ? uint32_t(pixel_shader->GetSamplerBindingsAfterTranslation().size()) : 0,
+          uint32_t(vertex_shader->GetTextureBindingsAfterTranslation().size()),
+          uint32_t(vertex_shader->GetSamplerBindingsAfterTranslation().size()), nr_tessellated,
+          D3D12Shader::kMaxTextureBindingIndexBits, D3D12Shader::kMaxSamplerBindingIndexBits);
+      auto nr_it = root_signatures_bindful_.find(nr_index);
+      if (nr_it != root_signatures_bindful_.end()) {
+        nr_predicted = nr_it->second;
+      }
+    }
+    if (nr_predicted != root_signature) {
+      ++g_nr_bind.rs_ne;
+    }
+  }
 
   // Update constant buffers, descriptors and root parameters.
   auto _dp_bind0 = g_draw_prof ? std::chrono::steady_clock::now()
@@ -6017,6 +6117,19 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   ID3D12Device* device = provider.GetDevice();
   const RegisterFile& regs = GetActiveDrawRegisterFile();
 
+  // [NR-BND] Phase 5-3b-0: our recompositions below run against this same
+  // `regs` inside each upload block, right after the emulated write, on this
+  // thread -- the only moment both derivations provably read the same file
+  // ([[probe-reads-the-wrong-moment]]).
+  const uint32_t* nr_bnd_rf = &regs[0];
+  static_assert(nr::kBindFloatVertexBase == XE_GPU_REG_SHADER_CONSTANT_000_X);
+  static_assert(nr::kBindFloatPixelBase == XE_GPU_REG_SHADER_CONSTANT_256_X);
+  static_assert(nr::kBindBoolLoopBase == XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031);
+  static_assert(nr::kBindFetchBase == XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0);
+  if (g_nr_bindings) {
+    ++g_nr_bind.draws;
+  }
+
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -6104,6 +6217,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     std::memcpy(system_constants, &system_constants_, sizeof(system_constants_));
+    // [NR-BND] Counted only: the system-constants DERIVATION
+    // (UpdateSystemConstantValues) is its own later increment.
+    if (g_nr_bindings) {
+      ++g_nr_bind.sys_up;
+    }
     cbuffer_binding_system_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_system_constants);
   }
@@ -6119,6 +6237,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     if (float_constants == nullptr) {
       return false;
     }
+    const uint8_t* nr_bnd_fv_start = float_constants;
     for (uint32_t i = 0; i < 4; ++i) {
       uint64_t float_constant_map_entry = float_constant_map_vertex.float_bitmap[i];
       uint32_t float_constant_index;
@@ -6129,6 +6248,19 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
             &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
             4 * sizeof(float));
         float_constants += 4 * sizeof(float);
+      }
+    }
+    // [NR-BND] Our packing of the same map vs the bytes just uploaded.
+    if (g_nr_bindings) {
+      ++g_nr_bind.fv_up;
+      alignas(16) uint8_t nr_ours[nr::kBindFloatMaxBytes];
+      const uint32_t nr_size =
+          nr::BindComposeFloats(nr_bnd_rf, nr::kBindFloatVertexBase,
+                                float_constant_map_vertex.float_bitmap, nr_ours, sizeof(nr_ours));
+      if (nr_size != uint32_t(float_constants - nr_bnd_fv_start)) {
+        ++g_nr_bind.fv_size_ne;
+      } else if (nr_size != 0 && std::memcmp(nr_ours, nr_bnd_fv_start, nr_size) != 0) {
+        ++g_nr_bind.fv_ne;
       }
     }
     cbuffer_binding_float_vertex_.up_to_date = true;
@@ -6142,6 +6274,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     if (float_constants == nullptr) {
       return false;
     }
+    const uint8_t* nr_bnd_fp_start = float_constants;
     if (pixel_shader != nullptr) {
       const Shader::ConstantRegisterMap& float_constant_map_pixel =
           pixel_shader->constant_register_map();
@@ -6158,6 +6291,22 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         }
       }
     }
+    // [NR-BND] Same gate for the pixel half; a null pixel shader must compose
+    // to zero bytes on our side too.
+    if (g_nr_bindings) {
+      ++g_nr_bind.fp_up;
+      alignas(16) uint8_t nr_ours[nr::kBindFloatMaxBytes];
+      const uint64_t nr_zero_bitmap[4] = {0, 0, 0, 0};
+      const uint32_t nr_size = nr::BindComposeFloats(
+          nr_bnd_rf, nr::kBindFloatPixelBase,
+          pixel_shader ? pixel_shader->constant_register_map().float_bitmap : nr_zero_bitmap,
+          nr_ours, sizeof(nr_ours));
+      if (nr_size != uint32_t(float_constants - nr_bnd_fp_start)) {
+        ++g_nr_bind.fp_size_ne;
+      } else if (nr_size != 0 && std::memcmp(nr_ours, nr_bnd_fp_start, nr_size) != 0) {
+        ++g_nr_bind.fp_ne;
+      }
+    }
     cbuffer_binding_float_pixel_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_pixel);
   }
@@ -6171,6 +6320,16 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
     std::memcpy(bool_loop_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
                 kBoolLoopConstantsSize);
+    // [NR-BND] Verbatim window: proves our base + size transcription.
+    if (g_nr_bindings) {
+      ++g_nr_bind.bl_up;
+      uint8_t nr_ours[nr::kBindBoolLoopBytes];
+      static_assert(sizeof(nr_ours) == kBoolLoopConstantsSize);
+      nr::BindComposeBoolLoop(nr_bnd_rf, nr_ours, sizeof(nr_ours));
+      if (std::memcmp(nr_ours, bool_loop_constants, sizeof(nr_ours)) != 0) {
+        ++g_nr_bind.bl_ne;
+      }
+    }
     cbuffer_binding_bool_loop_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_bool_loop_constants);
   }
@@ -6183,6 +6342,16 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+    // [NR-BND] Verbatim window: proves our base + size transcription.
+    if (g_nr_bindings) {
+      ++g_nr_bind.fx_up;
+      uint8_t nr_ours[nr::kBindFetchBytes];
+      static_assert(sizeof(nr_ours) == kFetchConstantsSize);
+      nr::BindComposeFetch(nr_bnd_rf, nr_ours, sizeof(nr_ours));
+      if (std::memcmp(nr_ours, fetch_constants, sizeof(nr_ours)) != 0) {
+        ++g_nr_bind.fx_ne;
+      }
+    }
     cbuffer_binding_fetch_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_fetch_constants);
   }
@@ -6264,6 +6433,19 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     texture_count_pixel = 0;
     samplers_pixel = nullptr;
     sampler_count_pixel = 0;
+  }
+
+  // [NR-BND] Census the binding-layout tuple (the bookkeeping a native
+  // UpdateBindings must own: descriptor layouts are keyed by the UIDs the
+  // pipeline cache assigns per translation) and the per-draw binding volumes.
+  if (g_nr_bindings) {
+    nr::BindCensusAdd(&g_nr_bind.layout_census,
+                      nr::BindLayoutKey(texture_layout_uid_vertex, sampler_layout_uid_vertex,
+                                        texture_layout_uid_pixel, sampler_layout_uid_pixel));
+    g_nr_bind.tex_v += texture_count_vertex;
+    g_nr_bind.smp_v += sampler_count_vertex;
+    g_nr_bind.tex_p += texture_count_pixel;
+    g_nr_bind.smp_p += sampler_count_pixel;
   }
 
   assert_true(sampler_count_vertex + sampler_count_pixel <= kSamplerHeapSize);
@@ -6396,6 +6578,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
 
     if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
+      // [NR-BND] Rebuild rate only; contents (texture cache queries) are a
+      // later peel.
+      if (g_nr_bindings) {
+        ++g_nr_bind.div_up;
+      }
       uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
           frame_current_,
           std::max(texture_count_vertex + sampler_count_vertex, size_t(1)) * sizeof(uint32_t),
@@ -6427,6 +6614,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
 
     if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
+      // [NR-BND] Rebuild rate only, as above.
+      if (g_nr_bindings) {
+        ++g_nr_bind.dip_up;
+      }
       uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
           frame_current_,
           std::max(texture_count_pixel + sampler_count_pixel, size_t(1)) * sizeof(uint32_t),
