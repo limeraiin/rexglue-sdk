@@ -23,6 +23,7 @@
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/nr_residency.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
@@ -875,6 +876,38 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
     device->CopyDescriptorsSimple(1, handle, source_handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   }
+}
+
+uint32_t D3D12TextureCache::NrResPackSrvKey(bool is_signed, uint32_t host_swizzle,
+                                            uint32_t dimension) {
+  D3D12Texture::SRVDescriptorKey key;
+  key.key = 0;
+  key.is_signed = uint32_t(is_signed);
+  key.host_swizzle = host_swizzle;
+  key.dimension = dimension;
+  return key.key;
+}
+
+void D3D12TextureCache::NrDescribeActiveBinding(uint32_t fetch_constant_index,
+                                                nr::ResSrvBindingFacts* facts_out) const {
+  // [NR-RSY] Phase 5-3b-3: declared inputs only - the cache's resolved
+  // binding state, verbatim. host_swizzle/swizzled_signs are byte-proven
+  // equal to the gate's own derivation since 5-3b-2.
+  std::memset(facts_out, 0, sizeof(*facts_out));
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return;
+  }
+  facts_out->has_binding = 1;
+  facts_out->binding_dimension = uint8_t(uint32_t(binding->key.dimension));
+  facts_out->signed_separate = IsSignedVersionSeparateForFormat(binding->key) ? 1 : 0;
+  facts_out->any_sign_signed = texture_util::IsAnySignSigned(binding->swizzled_signs) ? 1 : 0;
+  facts_out->any_sign_not_signed =
+      texture_util::IsAnySignNotSigned(binding->swizzled_signs) ? 1 : 0;
+  facts_out->host_swizzle = binding->host_swizzle;
+  facts_out->texture_handle = uint64_t(reinterpret_cast<uintptr_t>(binding->texture));
+  facts_out->texture_signed_handle =
+      uint64_t(reinterpret_cast<uintptr_t>(binding->texture_signed));
 }
 
 uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
@@ -2036,6 +2069,30 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
 uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
                                                           xenos::DataDimension dimension,
                                                           bool is_signed, uint32_t host_swizzle) {
+  // [NR-RSY] Phase 5-3b-3: while the residency gate is armed, report every
+  // find-or-create with its hit/miss and result so the gate's per-texture
+  // descriptor map can predict (miss = an allocation the pool mirror checks)
+  // or learn (hit on a pre-arm entry). Unarmed = the plain impl call.
+  if (!command_processor_.NrResArmed()) {
+    return FindOrCreateTextureDescriptorImpl(texture, dimension, is_signed, host_swizzle);
+  }
+  D3D12Texture::SRVDescriptorKey nr_res_key;
+  nr_res_key.key = 0;
+  nr_res_key.is_signed = uint32_t(is_signed);
+  nr_res_key.host_swizzle = host_swizzle;
+  nr_res_key.dimension = uint32_t(dimension);
+  const bool nr_res_hit = texture.GetSRVDescriptorIndex(nr_res_key) != UINT32_MAX;
+  const uint32_t nr_res_result =
+      FindOrCreateTextureDescriptorImpl(texture, dimension, is_signed, host_swizzle);
+  command_processor_.NrResObserveTexDescriptor(&texture, nr_res_key.key, nr_res_hit,
+                                               nr_res_result);
+  return nr_res_result;
+}
+
+uint32_t D3D12TextureCache::FindOrCreateTextureDescriptorImpl(D3D12Texture& texture,
+                                                              xenos::DataDimension dimension,
+                                                              bool is_signed,
+                                                              uint32_t host_swizzle) {
   D3D12Texture::SRVDescriptorKey descriptor_key;
   descriptor_key.key = 0;
   descriptor_key.is_signed = uint32_t(is_signed);
@@ -2170,6 +2227,10 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
 
 void D3D12TextureCache::ReleaseTextureDescriptor(uint32_t descriptor_index) {
   if (bindless_resources_used_) {
+    // [NR-RSY] Phase 5-3b-3: evict the gate's map entries for this index
+    // before the pool can hand it out again (the pool mirror itself follows
+    // the release inside ReleaseViewBindlessDescriptorImmediately).
+    command_processor_.NrResObserveTexDescriptorRelease(descriptor_index);
     command_processor_.ReleaseViewBindlessDescriptorImmediately(descriptor_index);
   } else {
     srv_descriptor_cache_free_.push_back(descriptor_index);

@@ -28,6 +28,10 @@
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 
+namespace rex::graphics::nr {
+struct ResSrvBindingFacts;
+}  // namespace rex::graphics::nr
+
 namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor;
@@ -122,6 +126,20 @@ class D3D12TextureCache final : public TextureCache {
   static uint32_t NrHostFormatSwizzle(uint32_t base_format) {
     return base_format < 64 ? uint32_t(host_formats_[base_format].swizzle)
                             : uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0000);
+  }
+
+  // [NR-RSY] Phase 5-3b-3: declared-input extraction for the SRV index-value
+  // gate. Reports which texture objects the cache resolved this fetch
+  // constant to and the binding facts the emulated decision tree reads (the
+  // derivation itself is the gate's own).
+  void NrDescribeActiveBinding(uint32_t fetch_constant_index,
+                               nr::ResSrvBindingFacts* facts_out) const;
+  // [NR-RSY] Layout/behavior pins for the gate's one-shot self-check (the
+  // SRVDescriptorKey union and AreDimensionsCompatible are private).
+  static uint32_t NrResPackSrvKey(bool is_signed, uint32_t host_swizzle, uint32_t dimension);
+  static bool NrResDimensionsCompatible(uint32_t fetch_op_dimension, uint32_t data_dimension) {
+    return AreDimensionsCompatible(xenos::FetchOpDimension(fetch_op_dimension),
+                                   xenos::DataDimension(data_dimension));
   }
 
   // Returns whether the actual scale is not smaller than the requested one.
@@ -410,6 +428,10 @@ class D3D12TextureCache final : public TextureCache {
   // or UINT32_MAX if failed to create.
   uint32_t FindOrCreateTextureDescriptor(D3D12Texture& texture, xenos::DataDimension dimension,
                                          bool is_signed, uint32_t host_swizzle);
+  // [NR-RSY] The unobserved body (the public wrapper reports to the 5-3b-3
+  // residency gate while it is armed).
+  uint32_t FindOrCreateTextureDescriptorImpl(D3D12Texture& texture, xenos::DataDimension dimension,
+                                             bool is_signed, uint32_t host_swizzle);
   void ReleaseTextureDescriptor(uint32_t descriptor_index);
   D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(uint32_t descriptor_index) const;
 

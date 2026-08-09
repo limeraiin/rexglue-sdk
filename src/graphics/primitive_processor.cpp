@@ -927,7 +927,14 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
-    if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes)) {
+    bool index_range_requested =
+        shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes);
+    // [NR-RSY] Phase 5-3b-3: report the actual request to the residency gate.
+    if (nr_index_request_observer_) {
+      nr_index_request_observer_(nr_index_request_observer_ctx_, guest_index_base,
+                                 guest_index_buffer_needed_bytes, index_range_requested);
+    }
+    if (!index_range_requested) {
       REXGPU_ERROR(
           "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "
           "bytes needed, in the shared memory",

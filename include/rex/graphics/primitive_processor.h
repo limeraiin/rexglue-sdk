@@ -210,6 +210,18 @@ class PrimitiveProcessor {
   // off-thread segment replay (Phase 1b-1b).
   void SetRegisterFile(const RegisterFile* register_file) { register_file_ = register_file; }
 
+  // [NR-RSY] Phase 5-3b-3: optional observer of the guest index-buffer
+  // residency request (fires exactly when Process requests the index range in
+  // the shared memory, with the actual arguments and result). Installed by
+  // the D3D12 command processor while the residency gate is armed; a null
+  // observer costs one branch.
+  typedef void (*NrIndexRequestObserverFn)(void* ctx, uint32_t base,
+                                           uint32_t length, bool result);
+  void SetNrIndexRequestObserver(NrIndexRequestObserverFn fn, void* ctx) {
+    nr_index_request_observer_ = fn;
+    nr_index_request_observer_ctx_ = ctx;
+  }
+
  protected:
 
   // Call from the backend-specific initialization function.
@@ -640,6 +652,10 @@ class PrimitiveProcessor {
   memory::Memory& memory_;
   TraceWriter& trace_writer_;
   SharedMemory& shared_memory_;
+
+  // [NR-RSY] Phase 5-3b-3 index-request observer (see SetNrIndexRequestObserver).
+  NrIndexRequestObserverFn nr_index_request_observer_ = nullptr;
+  void* nr_index_request_observer_ctx_ = nullptr;
 
   bool full_32bit_vertex_indices_used_ = false;
   bool convert_triangle_fans_to_lists_ = false;

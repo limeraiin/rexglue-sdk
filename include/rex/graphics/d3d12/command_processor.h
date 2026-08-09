@@ -143,6 +143,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // work on Nvidia Fermi (root signature creation will fail)!
   bool RequestOneUseSingleViewDescriptors(uint32_t count,
                                           ui::d3d12::util::DescriptorCpuGpuHandlePair* handles_out);
+  // [NR-RSY] Phase 5-3b-3: residency/descriptor-allocation gate observers,
+  // called by the texture cache (implemented beside the gate state in
+  // command_processor.cpp; all no-ops while the gate is off).
+  bool NrResArmed() const;
+  void NrResObserveTexDescriptor(const void* texture, uint32_t srv_key, bool hit, uint32_t index);
+  void NrResObserveTexDescriptorRelease(uint32_t index);
   // These are needed often, so they are always allocated.
   enum class SystemBindlessView : uint32_t {
     // Both may be bound as one root parameter.
@@ -573,6 +579,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
+
+  // [NR-RSY] Phase 5-3b-3 internals (implemented beside the gate state):
+  // reseed the pool mirror from the emulated allocator, follow an allocation
+  // or a release, and close a draw's vertex-residency compare.
+  void NrResPoolReseed();
+  void NrResPoolObserveAlloc(uint32_t actual_index);
+  void NrResPoolObserveRelease(uint32_t index);
+  void NrResVfetchSeedFromEmulated();
+  void NrResVfetchFinishDraw(uint32_t abort_reason);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 

@@ -31,6 +31,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     nr_bindings.cpp
     nr_sys_constants.cpp
     nr_descriptors.cpp
+    nr_residency.cpp
     trace_writer.cpp
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp

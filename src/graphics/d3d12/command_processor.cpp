@@ -28,6 +28,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
 #include <rex/graphics/nr_descriptors.h>
+#include <rex/graphics/nr_residency.h>
 #include <rex/graphics/nr_sys_constants.h>
 #include <rex/graphics/nr_native_pso.h>
 #include <rex/graphics/registers.h>
@@ -201,6 +202,17 @@ REXCVAR_DEFINE_BOOL(gpu_nr_desc, false, "GPU/D3D12",
                     "descriptor-indices constant buffers against every emulated rebuild "
                     "inside UpdateBindings. Reports '[nr-dsc]' once/sec. Diagnostic "
                     "only, off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [NR-RSY] Phase 5-3b-3: the residency + descriptor-allocation mirror's gate.
+REXCVAR_DEFINE_BOOL(gpu_nr_residency, false, "GPU/D3D12",
+                    "[NR-RSY] Phase 5-3b-3 residency mirror: predict every vertex/index "
+                    "buffer shared-memory residency request from the draw register file "
+                    "with the native renderer's own transcription of the sync-state "
+                    "machine, mirror the bindless view-descriptor pool and the "
+                    "per-texture SRV descriptor maps, and compare the texture SRV index "
+                    "values against every emulated descriptor-indices rebuild. Reports "
+                    "'[nr-rsy]' once/sec. Diagnostic only, off by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
@@ -589,6 +601,186 @@ void NrDescReportIfDue() {
   g_nr_desc_samples_this_window = 0;
 }
 
+// [NR-RSY] Phase 5-3b-3: latched once a frame beside the others; counters are
+// cmd-proc-thread-only => plain globals. The *_ne counters are cumulative
+// must-be-0 gates; volume counters are per-second deltas on the 1Hz line.
+// Coverage split: vf_* = the per-draw vertex-buffer residency walk (predicted
+// RequestRange list + post-loop state memcmp), ib_* = the index-buffer
+// request derivation (the primitive processor's convert-vs-DMA decision is a
+// declared input, counted by outcome), mx = memexport draws (ranges pass
+// through uncompared - refused class, must stay 0), pool_* = the bindless
+// view-descriptor allocator mirror (every persistent + one-use allocation
+// PREDICTED), tmap_* = the per-texture SRV descriptor map mirror (fresh =
+// find-or-create predicted while armed, seeded = pre-arm entries learned),
+// srv_* = the texture SRV index VALUES in every descriptor-indices rebuild.
+bool g_nr_res = false;
+struct NrResProbe {
+  uint64_t vf_draws = 0, vf_req = 0, vf_ne = 0, vf_state_ne = 0;
+  uint64_t vf_abort_type = 0, vf_req_fail = 0, vf_pred_ovf = 0;
+  uint64_t ib_checks = 0, ib_match = 0, ib_ne = 0;
+  uint64_t ib_conv = 0, ib_auto = 0, ib_unexpected = 0;
+  uint64_t mx_draws = 0;
+  uint64_t pool_alloc = 0, pool_oneuse = 0, pool_release = 0, pool_ne = 0;
+  uint64_t pool_refused = 0, pool_reseeds = 0;
+  uint64_t tmap_match = 0, tmap_fresh = 0, tmap_seeded = 0, tmap_ne = 0,
+           tmap_ovf = 0, tmap_evict = 0, tmap_invalid = 0;
+  uint64_t srv_checks = 0, srv_ne = 0, srv_null = 0, srv_special = 0,
+           srv_unknown = 0;
+  uint64_t layout_bad = 0;
+};
+NrResProbe g_nr_res_probe{};
+nr::ResVfetchMirror g_nr_res_vf;
+nr::ResViewPool g_nr_res_pool;
+nr::ResTexDescMap g_nr_res_tmap;
+// Per-draw scratch (CP-thread-only). 128 > the 96-slot maximum.
+constexpr uint32_t kNrResMaxRequests = 128;
+nr::ResRange g_nr_res_vf_pred[kNrResMaxRequests];
+uint32_t g_nr_res_vf_pred_count = 0;
+nr::ResVfetchStatus g_nr_res_vf_pred_status = nr::kResVfetchOk;
+nr::ResRange g_nr_res_vf_obs[kNrResMaxRequests];
+uint32_t g_nr_res_vf_obs_count = 0;
+uint32_t g_nr_res_vf_obs_ok = 0;
+bool g_nr_res_vf_active = false;
+bool g_nr_res_vf_allow = false;
+uint32_t g_nr_res_vf_bitmap[3] = {0, 0, 0};
+const uint32_t* g_nr_res_vf_fetch_regs = nullptr;
+// The index-request observation for the current Process call.
+bool g_nr_res_ib_seen = false;
+uint32_t g_nr_res_ib_base = 0;
+uint32_t g_nr_res_ib_len = 0;
+bool g_nr_res_ib_result = false;
+uint32_t g_nr_res_samples_this_window = 0;
+constexpr uint32_t kNrResMaxSamplesPerWindow = 6;
+
+// The module transcribes the raw values; pin them against the SDK enums.
+static_assert(uint32_t(xenos::FetchConstantType::kInvalidVertex) ==
+              nr::kResFetchTypeInvalidVertex);
+static_assert(uint32_t(xenos::FetchConstantType::kVertex) ==
+              nr::kResFetchTypeVertex);
+static_assert(uint32_t(xenos::SourceSelect::kDMA) == nr::kResSourceSelectDma);
+static_assert(uint32_t(xenos::IndexFormat::kInt16) == nr::kResIndexFormatInt16);
+static_assert(uint32_t(xenos::IndexFormat::kInt32) == nr::kResIndexFormatInt32);
+static_assert(uint32_t(xenos::FetchOpDimension::k1D) == nr::kResFetchDim1D);
+static_assert(uint32_t(xenos::FetchOpDimension::k2D) == nr::kResFetchDim2D);
+static_assert(uint32_t(xenos::FetchOpDimension::k3DOrStacked) ==
+              nr::kResFetchDim3DOrStacked);
+static_assert(uint32_t(xenos::FetchOpDimension::kCube) == nr::kResFetchDimCube);
+static_assert(uint32_t(xenos::DataDimension::k1D) == nr::kResDataDim1D);
+static_assert(uint32_t(xenos::DataDimension::k2DOrStacked) ==
+              nr::kResDataDim2DOrStacked);
+static_assert(uint32_t(xenos::DataDimension::k3D) == nr::kResDataDim3D);
+static_assert(uint32_t(xenos::DataDimension::kCube) == nr::kResDataDimCube);
+static_assert(xenos::kVertexFetchConstantCount == nr::kResVfetchSlots);
+
+// [NR-RSY] One-shot bit-LAYOUT self-check, run at every gate arm (a
+// static_assert cannot see bitfield placement). A failure counts layout_bad,
+// which must stay 0.
+void NrResLayoutSelfCheck() {
+  {
+    xenos::xe_gpu_vertex_fetch_t vf;
+    vf.dword_0 = 0;
+    vf.dword_1 = 0;
+    vf.type = xenos::FetchConstantType::kVertex;
+    vf.address = 0x2ABCDE1;
+    vf.endian = xenos::Endian(2);
+    vf.size = 0x123456;
+    const uint32_t expect_0 = 3u | 0x2ABCDE1u << 2;
+    const uint32_t expect_1 = 2u | 0x123456u << 2;
+    if (vf.dword_0 != expect_0 || vf.dword_1 != expect_1) {
+      ++g_nr_res_probe.layout_bad;
+      REXGPU_ERROR("[nr-rsy] LAYOUT vertex_fetch {:08x} {:08x} expected {:08x} {:08x}",
+                   vf.dword_0, vf.dword_1, expect_0, expect_1);
+    }
+  }
+  {
+    reg::VGT_DRAW_INITIATOR di;
+    di.value = 0;
+    di.prim_type = xenos::PrimitiveType(4);
+    di.source_select = xenos::SourceSelect::kAutoIndex;
+    di.index_size = xenos::IndexFormat::kInt32;
+    di.num_indices = 0x1234;
+    const uint32_t expect = 4u | 2u << 6 | 1u << 11 | 0x1234u << 16;
+    if (di.value != expect) {
+      ++g_nr_res_probe.layout_bad;
+      REXGPU_ERROR("[nr-rsy] LAYOUT VGT_DRAW_INITIATOR {:08x} expected {:08x}", di.value,
+                   expect);
+    }
+  }
+  {
+    reg::VGT_DMA_SIZE ds;
+    ds.value = 0;
+    ds.num_words = 0x123456;
+    ds.swap_mode = xenos::Endian(1);
+    const uint32_t expect = 0x123456u | 1u << 30;
+    if (ds.value != expect) {
+      ++g_nr_res_probe.layout_bad;
+      REXGPU_ERROR("[nr-rsy] LAYOUT VGT_DMA_SIZE {:08x} expected {:08x}", ds.value, expect);
+    }
+  }
+  {
+    const uint32_t theirs = D3D12TextureCache::NrResPackSrvKey(true, 0xABC, 2);
+    const uint32_t expect = nr::ResSrvDescriptorKey(true, 0xABC, 2);
+    if (theirs != expect) {
+      ++g_nr_res_probe.layout_bad;
+      REXGPU_ERROR("[nr-rsy] LAYOUT SRVDescriptorKey {:08x} expected {:08x}", theirs, expect);
+    }
+  }
+  for (uint32_t fetch_dim = 0; fetch_dim < 4; ++fetch_dim) {
+    for (uint32_t data_dim = 0; data_dim < 4; ++data_dim) {
+      const bool theirs = D3D12TextureCache::NrResDimensionsCompatible(fetch_dim, data_dim);
+      if (nr::ResDimensionsCompatible(fetch_dim, data_dim) != theirs) {
+        ++g_nr_res_probe.layout_bad;
+        REXGPU_ERROR("[nr-rsy] LAYOUT DimensionsCompatible({}, {}) diverges", fetch_dim,
+                     data_dim);
+      }
+    }
+  }
+}
+
+// [NR-RSY] The 1Hz verdict line, emitted from the per-frame probe block.
+void NrResReportIfDue() {
+  if (!g_nr_res || !(g_nr_res_probe.vf_draws + g_nr_res_probe.ib_checks)) {
+    return;
+  }
+  static auto s_last = std::chrono::steady_clock::now();
+  static NrResProbe s_prev{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) {
+    return;
+  }
+  s_last = now;
+  const NrResProbe& p = g_nr_res_probe;
+  REXGPU_INFO(
+      "[nr-rsy] vf draws={} req={} ne={} state_ne={} abort={} fail={} ovf={} | "
+      "ib checks={} match={} ne={} conv={} auto={} unexp={} | mx={} | pool "
+      "alloc={} oneuse={} rel={} ne={} refuse={} reseeds={} | tmap match={} "
+      "fresh={} seeded={} inv={} ne={} evict={} ovf={} | srv checks={} ne={} "
+      "null={} spec={} unk={} | layout_bad={}",
+      p.vf_draws - s_prev.vf_draws, p.vf_req - s_prev.vf_req, p.vf_ne,
+      p.vf_state_ne, p.vf_abort_type, p.vf_req_fail, p.vf_pred_ovf,
+      p.ib_checks - s_prev.ib_checks, p.ib_match - s_prev.ib_match, p.ib_ne,
+      p.ib_conv - s_prev.ib_conv, p.ib_auto - s_prev.ib_auto, p.ib_unexpected,
+      p.mx_draws, p.pool_alloc - s_prev.pool_alloc,
+      p.pool_oneuse - s_prev.pool_oneuse, p.pool_release - s_prev.pool_release,
+      p.pool_ne, p.pool_refused, p.pool_reseeds,
+      p.tmap_match - s_prev.tmap_match, p.tmap_fresh, p.tmap_seeded,
+      p.tmap_invalid, p.tmap_ne, p.tmap_evict, p.tmap_ovf,
+      p.srv_checks - s_prev.srv_checks, p.srv_ne,
+      p.srv_null - s_prev.srv_null, p.srv_special, p.srv_unknown,
+      p.layout_bad);
+  s_prev = p;
+  g_nr_res_samples_this_window = 0;
+}
+
+// [NR-RSY] The primitive processor's index-request observer (installed while
+// the gate is armed; the CP thread is the only caller of Process here).
+void NrResIndexObserverThunk(void*, uint32_t base, uint32_t length, bool result) {
+  g_nr_res_ib_seen = true;
+  g_nr_res_ib_base = base;
+  g_nr_res_ib_len = length;
+  g_nr_res_ib_result = result;
+}
+
 // Per-{geometry+shader} batch key: how many draws share it, and which float
 // constant registers ever differ across those draws (= the per-instance data a
 // GPU-instanced draw would have to stream). A clean instancing candidate has a
@@ -864,6 +1056,10 @@ void D3D12CommandProcessor::InvalidateAllVertexBufferResidency() {
     state.address = UINT32_MAX;
     state.size = UINT32_MAX;
   }
+  // [NR-RSY] Phase 5-3b-3: the mirror transcribes the same invalidation.
+  if (g_nr_res) {
+    nr::ResVfetchInvalidateAll(&g_nr_res_vf);
+  }
 }
 
 void D3D12CommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_index) {
@@ -871,6 +1067,11 @@ void D3D12CommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_inde
     return;
   }
   vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
+  // [NR-RSY] Phase 5-3b-3: per-slot invalidation, transcribed. (The range
+  // form funnels through here, so this is the only per-slot hook needed.)
+  if (g_nr_res) {
+    nr::ResVfetchInvalidateOne(&g_nr_res_vf, vfetch_index);
+  }
 }
 
 void D3D12CommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_vfetch,
@@ -1297,20 +1498,199 @@ uint64_t D3D12CommandProcessor::RequestViewBindfulDescriptors(
 
 uint32_t D3D12CommandProcessor::RequestPersistentViewBindlessDescriptor() {
   assert_true(bindless_resources_used_);
+  uint32_t descriptor_index;
   if (!view_bindless_heap_free_.empty()) {
-    uint32_t descriptor_index = view_bindless_heap_free_.back();
+    descriptor_index = view_bindless_heap_free_.back();
     view_bindless_heap_free_.pop_back();
-    return descriptor_index;
+  } else if (view_bindless_heap_allocated_ >= kViewBindlessHeapSize) {
+    descriptor_index = UINT32_MAX;
+  } else {
+    descriptor_index = view_bindless_heap_allocated_++;
   }
-  if (view_bindless_heap_allocated_ >= kViewBindlessHeapSize) {
-    return UINT32_MAX;
+  // [NR-RSY] Phase 5-3b-3: every persistent view allocation is predicted by
+  // the pool mirror.
+  if (g_nr_res) {
+    ++g_nr_res_probe.pool_alloc;
+    NrResPoolObserveAlloc(descriptor_index);
   }
-  return view_bindless_heap_allocated_++;
+  return descriptor_index;
 }
 
 void D3D12CommandProcessor::ReleaseViewBindlessDescriptorImmediately(uint32_t descriptor_index) {
   assert_true(bindless_resources_used_);
+  // [NR-RSY] Phase 5-3b-3: the pool mirror follows every release.
+  if (g_nr_res) {
+    ++g_nr_res_probe.pool_release;
+    NrResPoolObserveRelease(descriptor_index);
+  }
   view_bindless_heap_free_.push_back(descriptor_index);
+}
+
+bool D3D12CommandProcessor::NrResArmed() const { return g_nr_res; }
+
+void D3D12CommandProcessor::NrResObserveTexDescriptor(const void* texture, uint32_t srv_key,
+                                                      bool hit, uint32_t index) {
+  if (!g_nr_res) {
+    return;
+  }
+  switch (nr::ResTexDescObserve(&g_nr_res_tmap,
+                                uint64_t(reinterpret_cast<uintptr_t>(texture)), srv_key, hit,
+                                index)) {
+    case nr::kResTexDescMatch:
+      ++g_nr_res_probe.tmap_match;
+      break;
+    case nr::kResTexDescFresh:
+      // A refused creation (unsupported format/exhaustion) is learned so
+      // lookups resolve it to the null fallback, but counted apart.
+      if (index == UINT32_MAX) {
+        ++g_nr_res_probe.tmap_invalid;
+      } else {
+        ++g_nr_res_probe.tmap_fresh;
+      }
+      break;
+    case nr::kResTexDescSeeded:
+      ++g_nr_res_probe.tmap_seeded;
+      break;
+    case nr::kResTexDescOverflow:
+      ++g_nr_res_probe.tmap_ovf;
+      break;
+    default:
+      ++g_nr_res_probe.tmap_ne;
+      if (g_nr_res_samples_this_window < kNrResMaxSamplesPerWindow) {
+        ++g_nr_res_samples_this_window;
+        REXGPU_WARN("[nr-rsy] TMAP DIFF tex={:#x} key={:#x} hit={} theirs={}",
+                    uint64_t(reinterpret_cast<uintptr_t>(texture)), srv_key, hit, index);
+      }
+      break;
+  }
+}
+
+void D3D12CommandProcessor::NrResObserveTexDescriptorRelease(uint32_t index) {
+  if (!g_nr_res) {
+    return;
+  }
+  ++g_nr_res_probe.tmap_evict;
+  nr::ResTexDescEvictIndex(&g_nr_res_tmap, index);
+}
+
+void D3D12CommandProcessor::NrResPoolReseed() {
+  ++g_nr_res_probe.pool_reseeds;
+  nr::ResViewPoolReset(&g_nr_res_pool, view_bindless_heap_allocated_,
+                       view_bindless_heap_free_.data(),
+                       uint32_t(view_bindless_heap_free_.size()), kViewBindlessHeapSize);
+  if (g_nr_res_pool.refused) {
+    ++g_nr_res_probe.pool_refused;
+  }
+}
+
+void D3D12CommandProcessor::NrResPoolObserveAlloc(uint32_t actual_index) {
+  if (g_nr_res_pool.refused) {
+    ++g_nr_res_probe.pool_refused;
+    return;
+  }
+  if (!nr::ResViewPoolObserveAlloc(&g_nr_res_pool, actual_index)) {
+    ++g_nr_res_probe.pool_ne;
+    if (g_nr_res_samples_this_window < kNrResMaxSamplesPerWindow) {
+      ++g_nr_res_samples_this_window;
+      uint32_t predicted = UINT32_MAX;
+      nr::ResViewPoolPredictAlloc(&g_nr_res_pool, &predicted);
+      REXGPU_WARN("[nr-rsy] POOL DIFF alloc ours={} theirs={} (free={} allocated={})", predicted,
+                  actual_index, g_nr_res_pool.free_count, g_nr_res_pool.allocated);
+    }
+    // Re-sync so one divergence names itself once.
+    NrResPoolReseed();
+  }
+}
+
+void D3D12CommandProcessor::NrResPoolObserveRelease(uint32_t index) {
+  nr::ResViewPoolObserveRelease(&g_nr_res_pool, index);
+  if (g_nr_res_pool.refused) {
+    ++g_nr_res_probe.pool_refused;
+  }
+}
+
+void D3D12CommandProcessor::NrResVfetchSeedFromEmulated() {
+  g_nr_res_vf.in_sync[0] = vertex_buffers_in_sync_[0];
+  g_nr_res_vf.in_sync[1] = vertex_buffers_in_sync_[1];
+  for (uint32_t i = 0; i < nr::kResVfetchSlots; ++i) {
+    g_nr_res_vf.state_address[i] = vertex_buffer_states_[i].address;
+    g_nr_res_vf.state_size[i] = vertex_buffer_states_[i].size;
+  }
+}
+
+void D3D12CommandProcessor::NrResVfetchFinishDraw(uint32_t abort_reason) {
+  // abort_reason: 0 = the loop completed, 1 = invalid fetch type, 2 = a
+  // RequestRange failed (the emulated loop returned false).
+  if (!g_nr_res_vf_active) {
+    return;
+  }
+  g_nr_res_vf_active = false;
+  ++g_nr_res_probe.vf_draws;
+  g_nr_res_probe.vf_req += g_nr_res_vf_obs_count;
+  bool ne = false;
+  if (g_nr_res_vf_pred_count > kNrResMaxRequests) {
+    ++g_nr_res_probe.vf_pred_ovf;  // cannot compare - impossible for 96 slots
+  } else {
+    const uint32_t pred_n = g_nr_res_vf_pred_count;
+    const uint32_t obs_n = g_nr_res_vf_obs_count;
+    const bool pred_abort = g_nr_res_vf_pred_status == nr::kResVfetchAbortInvalidType;
+    switch (abort_reason) {
+      case 0:
+        ne = pred_abort || obs_n != pred_n;
+        break;
+      case 1:
+        ne = !pred_abort || obs_n != pred_n;
+        break;
+      default:  // a failed request: an observed prefix of the prediction
+        ne = obs_n > pred_n;
+        break;
+    }
+    const uint32_t cmp_n = obs_n < pred_n ? obs_n : pred_n;
+    for (uint32_t i = 0; i < cmp_n && !ne; ++i) {
+      if (g_nr_res_vf_obs[i].start != g_nr_res_vf_pred[i].start ||
+          g_nr_res_vf_obs[i].length != g_nr_res_vf_pred[i].length) {
+        ne = true;
+      }
+    }
+    if (ne) {
+      ++g_nr_res_probe.vf_ne;
+      if (g_nr_res_samples_this_window < kNrResMaxSamplesPerWindow) {
+        ++g_nr_res_samples_this_window;
+        REXGPU_WARN(
+            "[nr-rsy] VF DIFF reason={} pred_n={} obs_n={} pred_abort={} first_pred={:08X}+{:X} "
+            "first_obs={:08X}+{:X}",
+            abort_reason, pred_n, obs_n, pred_abort,
+            pred_n ? g_nr_res_vf_pred[0].start : 0, pred_n ? g_nr_res_vf_pred[0].length : 0,
+            obs_n ? g_nr_res_vf_obs[0].start : 0, obs_n ? g_nr_res_vf_obs[0].length : 0);
+      }
+    }
+  }
+  // Apply the walk's mutations, then the mirror must equal the emulated
+  // arrays bit for bit.
+  nr::ResVfetchApply(&g_nr_res_vf, g_nr_res_vf_bitmap, g_nr_res_vf_fetch_regs,
+                     g_nr_res_vf_allow, g_nr_res_vf_obs_ok);
+  bool state_ne = g_nr_res_vf.in_sync[0] != vertex_buffers_in_sync_[0] ||
+                  g_nr_res_vf.in_sync[1] != vertex_buffers_in_sync_[1];
+  if (!state_ne) {
+    for (uint32_t i = 0; i < nr::kResVfetchSlots; ++i) {
+      if (g_nr_res_vf.state_address[i] != vertex_buffer_states_[i].address ||
+          g_nr_res_vf.state_size[i] != vertex_buffer_states_[i].size) {
+        state_ne = true;
+        break;
+      }
+    }
+  }
+  if (state_ne) {
+    ++g_nr_res_probe.vf_state_ne;
+    if (g_nr_res_samples_this_window < kNrResMaxSamplesPerWindow) {
+      ++g_nr_res_samples_this_window;
+      REXGPU_WARN("[nr-rsy] VF STATE DIFF in_sync ours={:016X}/{:016X} theirs={:016X}/{:016X}",
+                  g_nr_res_vf.in_sync[0], g_nr_res_vf.in_sync[1], vertex_buffers_in_sync_[0],
+                  vertex_buffers_in_sync_[1]);
+    }
+    // Re-sync so one divergence names itself once.
+    NrResVfetchSeedFromEmulated();
+  }
 }
 
 bool D3D12CommandProcessor::RequestOneUseSingleViewDescriptors(
@@ -1335,6 +1715,12 @@ bool D3D12CommandProcessor::RequestOneUseSingleViewDescriptors(
         view_bindless_heap_free_.pop_back();
       } else {
         descriptor_index = view_bindless_heap_allocated_++;
+      }
+      // [NR-RSY] Phase 5-3b-3: one-use views draw from the same pool -
+      // predicted too.
+      if (g_nr_res) {
+        ++g_nr_res_probe.pool_oneuse;
+        NrResPoolObserveAlloc(descriptor_index);
       }
       view_bindless_one_use_descriptors_.push_back(
           std::make_pair(descriptor_index, submission_current_));
@@ -2945,6 +3331,30 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     g_nr_desc = nr_desc_now;
   }
+  // [NR-RSY] Phase 5-3b-3: verdict + latch. A rising edge seeds the vfetch
+  // mirror and the view-pool mirror from the emulated state, resets the
+  // per-texture descriptor map (pre-existing descriptors are then learned as
+  // 'seeded'), installs the primitive processor's index-request observer and
+  // re-runs the one-shot layout self-check. Bindless-only, like every gate
+  // it feeds.
+  NrResReportIfDue();
+  {
+    const bool nr_res_now = REXCVAR_GET(gpu_nr_residency) && bindless_resources_used_;
+    if (nr_res_now && !g_nr_res) {
+      NrResVfetchSeedFromEmulated();
+      NrResPoolReseed();
+      nr::ResTexDescMapReset(&g_nr_res_tmap);
+      if (primitive_processor_) {
+        primitive_processor_->SetNrIndexRequestObserver(&NrResIndexObserverThunk, nullptr);
+      }
+      NrResLayoutSelfCheck();
+    } else if (!nr_res_now && g_nr_res) {
+      if (primitive_processor_) {
+        primitive_processor_->SetNrIndexRequestObserver(nullptr, nullptr);
+      }
+    }
+    g_nr_res = nr_res_now;
+  }
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);
@@ -3000,6 +3410,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+  // [NR-RSY] Phase 5-3b-3: the swap clears the sync bits ONLY (per-slot
+  // {address, size} survive) - transcribed.
+  if (g_nr_res) {
+    nr::ResVfetchClearSyncBits(&g_nr_res_vf);
+  }
 
   if (!graphics_system_)
     return;
@@ -3648,6 +4063,11 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   }
 
   // Process primitives.
+  // [NR-RSY] Phase 5-3b-3: watch the index-buffer residency request this
+  // Process call makes (the installed observer records the actual call).
+  if (g_nr_res) {
+    g_nr_res_ib_seen = false;
+  }
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   auto _dp_prim0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
@@ -3655,6 +4075,49 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_draw_prof) g_draw_ns[0] += prof_ns_since(_dp_prim0);
   if (!_dp_prim_ok) {
     return false;
+  }
+  // [NR-RSY] Phase 5-3b-3: our index-request derivation vs the observed call.
+  // WHETHER the guest buffer is requested is the primitive processor's
+  // convert-vs-DMA decision (declared, counted by outcome); the ARGUMENTS of
+  // a request that does happen must equal ours.
+  if (g_nr_res) {
+    ++g_nr_res_probe.ib_checks;
+    nr::ResIndexPrediction nr_res_ibp;
+    nr::ResIndexPredict(regs[XE_GPU_REG_VGT_DRAW_INITIATOR], regs[XE_GPU_REG_VGT_DMA_SIZE],
+                        regs[XE_GPU_REG_VGT_DMA_BASE], SharedMemory::kBufferSize, &nr_res_ibp);
+    const PrimitiveProcessor::ProcessedIndexBufferType nr_res_ibt =
+        primitive_processing_result.index_buffer_type;
+    if (nr_res_ibt == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+        nr_res_ibt == PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA) {
+      if (g_nr_res_ib_seen && nr_res_ibp.dma && !nr_res_ibp.out_of_bounds &&
+          g_nr_res_ib_base == nr_res_ibp.base && g_nr_res_ib_len == nr_res_ibp.length) {
+        ++g_nr_res_probe.ib_match;
+      } else {
+        ++g_nr_res_probe.ib_ne;
+        if (g_nr_res_samples_this_window < kNrResMaxSamplesPerWindow) {
+          ++g_nr_res_samples_this_window;
+          REXGPU_WARN(
+              "[nr-rsy] IB DIFF type={} seen={} ours dma={} oob={} {:08X}+{:X} theirs "
+              "{:08X}+{:X}",
+              uint32_t(nr_res_ibt), g_nr_res_ib_seen, nr_res_ibp.dma, nr_res_ibp.out_of_bounds,
+              nr_res_ibp.base, nr_res_ibp.length, g_nr_res_ib_base, g_nr_res_ib_len);
+        }
+      }
+    } else {
+      if (nr_res_ibt == PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted) {
+        ++g_nr_res_probe.ib_conv;
+      } else {
+        ++g_nr_res_probe.ib_auto;
+      }
+      if (g_nr_res_ib_seen) {
+        ++g_nr_res_probe.ib_unexpected;
+        if (g_nr_res_samples_this_window < kNrResMaxSamplesPerWindow) {
+          ++g_nr_res_samples_this_window;
+          REXGPU_WARN("[nr-rsy] IB UNEXPECTED type={} theirs {:08X}+{:X}", uint32_t(nr_res_ibt),
+                      g_nr_res_ib_base, g_nr_res_ib_len);
+        }
+      }
+    }
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
@@ -3890,6 +4353,24 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
 
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+  // [NR-RSY] Phase 5-3b-3: predict this draw's residency request list from
+  // the same file the loop below reads, before the loop runs; the loop then
+  // reports every actual RequestRange and its result, and the finish call at
+  // each exit compares the lists, applies the walk to the mirror and checks
+  // the mirror equals the emulated sync state bit for bit.
+  if (g_nr_res) {
+    g_nr_res_vf_bitmap[0] = constant_map_vertex.vertex_fetch_bitmap[0];
+    g_nr_res_vf_bitmap[1] = constant_map_vertex.vertex_fetch_bitmap[1];
+    g_nr_res_vf_bitmap[2] = constant_map_vertex.vertex_fetch_bitmap[2];
+    g_nr_res_vf_fetch_regs = &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+    g_nr_res_vf_allow = REXCVAR_GET(gpu_allow_invalid_fetch_constants);
+    g_nr_res_vf_pred_status = nr::ResVfetchPredict(
+        &g_nr_res_vf, g_nr_res_vf_bitmap, g_nr_res_vf_fetch_regs, g_nr_res_vf_allow,
+        g_nr_res_vf_pred, kNrResMaxRequests, &g_nr_res_vf_pred_count);
+    g_nr_res_vf_obs_count = 0;
+    g_nr_res_vf_obs_ok = 0;
+    g_nr_res_vf_active = true;
+  }
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
     uint32_t j;
@@ -3913,10 +4394,18 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
               "This is incorrect behavior, but you can try bypassing this by "
               "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+          if (g_nr_res) {
+            ++g_nr_res_probe.vf_abort_type;
+            NrResVfetchFinishDraw(1);
+          }
           return false;
         default:
           REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+          if (g_nr_res) {
+            ++g_nr_res_probe.vf_abort_type;
+            NrResVfetchFinishDraw(1);
+          }
           return false;
       }
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
@@ -3924,17 +4413,38 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+      const bool nr_res_range_ok =
+          shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2);
+      if (g_nr_res && g_nr_res_vf_active) {
+        if (g_nr_res_vf_obs_count < kNrResMaxRequests) {
+          g_nr_res_vf_obs[g_nr_res_vf_obs_count].start = vfetch_constant.address << 2;
+          g_nr_res_vf_obs[g_nr_res_vf_obs_count].length = vfetch_constant.size << 2;
+        }
+        ++g_nr_res_vf_obs_count;
+        if (nr_res_range_ok) {
+          ++g_nr_res_vf_obs_ok;
+        } else {
+          ++g_nr_res_probe.vf_req_fail;
+        }
+      }
+      if (!nr_res_range_ok) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
             vfetch_constant.address << 2, vfetch_constant.size << 2);
+        if (g_nr_res) {
+          NrResVfetchFinishDraw(2);
+        }
         return false;
       }
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
+  }
+  // [NR-RSY] The loop completed: close this draw's residency compare.
+  if (g_nr_res) {
+    NrResVfetchFinishDraw(0);
   }
 
   // [GPU-DRAW-DUMP] Native-renderer R&D (Ch.9 path B): emit this draw's full
@@ -3989,6 +4499,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // Gather memexport ranges and ensure the heaps for them are resident, and
   // also load the data surrounding the export and to fill the regions that
   // won't be modified by the shaders.
+  // [NR-RSY] Phase 5-3b-3: memexport residency is NOT transcribed (refused
+  // class, like 5-3b-1's ROV) - its requests pass through uncompared and the
+  // draw is counted. mx must stay 0 in this game.
+  if (g_nr_res && memexport_used) {
+    ++g_nr_res_probe.mx_draws;
+  }
   memexport_ranges_.clear();
   if (memexport_used_vertex) {
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
@@ -7151,6 +7667,45 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
             texture_cache_->GetActiveTextureBindlessSRVIndex(texture) -
             uint32_t(SystemBindlessView::kUnboundedSRVsStart);
       }
+      // [NR-RSY] Phase 5-3b-3: the texture SRV index VALUES this rebuild just
+      // wrote, ours (map mirror + decision-tree transcription over declared
+      // binding facts) vs theirs, per binding.
+      if (g_nr_res) {
+        for (size_t i = 0; i < texture_count_vertex; ++i) {
+          const D3D12Shader::TextureBinding& nr_res_tb = textures_vertex[i];
+          ++g_nr_res_probe.srv_checks;
+          nr::ResSrvBindingFacts nr_res_facts;
+          texture_cache_->NrDescribeActiveBinding(nr_res_tb.fetch_constant, &nr_res_facts);
+          uint32_t nr_res_ours = 0;
+          const nr::ResSrvOutcome nr_res_out = nr::ResSrvIndexForBinding(
+              &g_nr_res_tmap, &nr_res_facts, uint32_t(nr_res_tb.dimension), nr_res_tb.is_signed,
+              uint32_t(SystemBindlessView::kNullTexture2DArray),
+              uint32_t(SystemBindlessView::kNullTexture3D),
+              uint32_t(SystemBindlessView::kNullTextureCube), &nr_res_ours);
+          if (nr_res_out == nr::kResSrvRefuseSpecialView) {
+            ++g_nr_res_probe.srv_special;
+            continue;
+          }
+          if (nr_res_out == nr::kResSrvRefuseUnknown) {
+            ++g_nr_res_probe.srv_unknown;
+            continue;
+          }
+          if (nr_res_out == nr::kResSrvNull) {
+            ++g_nr_res_probe.srv_null;
+          }
+          const uint32_t nr_res_theirs =
+              texture_cache_->GetActiveTextureBindlessSRVIndex(nr_res_tb);
+          if (nr_res_ours != nr_res_theirs) {
+            ++g_nr_res_probe.srv_ne;
+            if (g_nr_res_samples_this_window < kNrResMaxSamplesPerWindow) {
+              ++g_nr_res_samples_this_window;
+              REXGPU_WARN("[nr-rsy] SRV DIFF v i={} fc={} outcome={} ours={} theirs={}", i,
+                          nr_res_tb.fetch_constant, uint32_t(nr_res_out), nr_res_ours,
+                          nr_res_theirs);
+            }
+          }
+        }
+      }
       current_texture_layout_uid_vertex_ = texture_layout_uid_vertex;
       if (texture_count_vertex) {
         current_texture_srv_keys_vertex_.resize(
@@ -7274,6 +7829,44 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         descriptor_indices[texture.bindless_descriptor_index] =
             texture_cache_->GetActiveTextureBindlessSRVIndex(texture) -
             uint32_t(SystemBindlessView::kUnboundedSRVsStart);
+      }
+      // [NR-RSY] The pixel half of the SRV index-value gate (see the vertex
+      // block).
+      if (g_nr_res) {
+        for (size_t i = 0; i < texture_count_pixel; ++i) {
+          const D3D12Shader::TextureBinding& nr_res_tb = (*textures_pixel)[i];
+          ++g_nr_res_probe.srv_checks;
+          nr::ResSrvBindingFacts nr_res_facts;
+          texture_cache_->NrDescribeActiveBinding(nr_res_tb.fetch_constant, &nr_res_facts);
+          uint32_t nr_res_ours = 0;
+          const nr::ResSrvOutcome nr_res_out = nr::ResSrvIndexForBinding(
+              &g_nr_res_tmap, &nr_res_facts, uint32_t(nr_res_tb.dimension), nr_res_tb.is_signed,
+              uint32_t(SystemBindlessView::kNullTexture2DArray),
+              uint32_t(SystemBindlessView::kNullTexture3D),
+              uint32_t(SystemBindlessView::kNullTextureCube), &nr_res_ours);
+          if (nr_res_out == nr::kResSrvRefuseSpecialView) {
+            ++g_nr_res_probe.srv_special;
+            continue;
+          }
+          if (nr_res_out == nr::kResSrvRefuseUnknown) {
+            ++g_nr_res_probe.srv_unknown;
+            continue;
+          }
+          if (nr_res_out == nr::kResSrvNull) {
+            ++g_nr_res_probe.srv_null;
+          }
+          const uint32_t nr_res_theirs =
+              texture_cache_->GetActiveTextureBindlessSRVIndex(nr_res_tb);
+          if (nr_res_ours != nr_res_theirs) {
+            ++g_nr_res_probe.srv_ne;
+            if (g_nr_res_samples_this_window < kNrResMaxSamplesPerWindow) {
+              ++g_nr_res_samples_this_window;
+              REXGPU_WARN("[nr-rsy] SRV DIFF p i={} fc={} outcome={} ours={} theirs={}", i,
+                          nr_res_tb.fetch_constant, uint32_t(nr_res_out), nr_res_ours,
+                          nr_res_theirs);
+            }
+          }
+        }
       }
       current_texture_layout_uid_pixel_ = texture_layout_uid_pixel;
       if (texture_count_pixel) {
