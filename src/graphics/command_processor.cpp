@@ -266,6 +266,18 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip, false, "GPU",
                     "Implies gpu_nr_issue and gpu_nr_walk_effects. Off by "
                     "default.");
 
+// [NR-SPP] 5-4-4 step 0b: prices the skip path's halves. Whole-buffer bracket
+// minus the two stop-dispatch brackets = the walk decode + bulk range applies;
+// drawstop minus [gpu-split]'s IssueDraw bracket = the per-draw delegation
+// round-trip (packet re-parse + Type3Draw framing). ~2 timestamps per stop
+// (~770k/s at city), same self-cost class as the gpu_split_profile draw
+// bracket it is meant to be read beside.
+REXCVAR_DEFINE_BOOL(gpu_nr_skip_profile, false, "GPU",
+                    "[nr-spp] Diagnostic: time the skip path (whole buffer / "
+                    "draw-stop dispatch / delegated-stop dispatch; remainder = "
+                    "walk + bulk applies). Read beside gpu_split_profile. "
+                    "Launch-time only. Off by default.");
+
 // [NR-SDB] Increment 4b-2: the shader-database probe. The offline census
 // proved the whole 3,320-shader corpus in xeshader.sdb translates, and the
 // index keys each blob by the runtime's own shader key -- but "the corpus
@@ -1011,6 +1023,12 @@ uint64_t g_skp_deleg_op[128] = {};
 uint64_t g_skp_rng = 0;
 uint64_t g_skp_rng_dw = 0;
 uint64_t g_skp_pdw = 0;
+// [NR-SPP] 5-4-4 step 0b: skip-path timing (CP-thread-only, gated on
+// gpu_nr_skip_profile; one bool test per stop when off).
+bool g_skp_prof = false;
+uint64_t g_spp_buf_ns = 0;    // whole NrSkipExecuteBuffer
+uint64_t g_spp_draw_ns = 0;   // ExecutePacket at draw stops (incl. IssueDraw)
+uint64_t g_spp_deleg_ns = 0;  // ExecutePacket at delegated stops
 
 // [NR-PKT] Phase 5-4-1: the non-draw packet census. CP-thread-only. Counted
 // at the executor's own dispatch, AFTER its predicate skip, so the tallies
@@ -1589,6 +1607,9 @@ void CommandProcessor::WorkerThreadMain() {
   // walk and the running context).
   const bool kNrSkip = REXCVAR_GET(gpu_nr_skip);
   g_nr_skip = kNrSkip;
+  // [NR-SPP] skip-path timing probe rides the skip.
+  const bool kSkpProf = REXCVAR_GET(gpu_nr_skip_profile) && kNrSkip;
+  g_skp_prof = kSkpProf;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
@@ -1733,7 +1754,7 @@ void CommandProcessor::WorkerThreadMain() {
     }
 
     // [GPU-WORKER-PROFILE] / [GPU-SPLIT] / [PM4-CENSUS] ~1s wall-time report.
-    if (kProfile || kSplit || kCensus || kIbLedger || kNrSdb) {
+    if (kProfile || kSplit || kCensus || kIbLedger || kNrSdb || kSkpProf) {
       auto now = prof_clock::now();
       uint64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              now - prof_last_report).count();
@@ -2376,6 +2397,21 @@ void CommandProcessor::WorkerThreadMain() {
           g_skp_exec_fail = g_skp_arm_orphan = 0;
           g_skp_rng = g_skp_rng_dw = g_skp_pdw = 0;
           for (uint32_t op = 0; op < 128; ++op) g_skp_deleg_op[op] = 0;
+        }
+        // [NR-SPP] 5-4-4 step 0b. walk+rng = buf minus the two stop-dispatch
+        // brackets: the walk decode plus the bulk range applies. drawstop
+        // minus [gpu-split]'s draw bracket = the per-draw delegation
+        // round-trip.
+        if (kSkpProf && g_spp_buf_ns) {
+          const double spp_buf_ms = g_spp_buf_ns / 1e6;
+          const double spp_draw_ms = g_spp_draw_ns / 1e6;
+          const double spp_deleg_ms = g_spp_deleg_ns / 1e6;
+          REXGPU_INFO(
+              "[nr-spp] buf={:.1f}ms drawstop={:.1f}ms delegstop={:.1f}ms "
+              "walk+rng={:.1f}ms (wall={:.0f}ms)",
+              spp_buf_ms, spp_draw_ms, spp_deleg_ms,
+              spp_buf_ms - spp_draw_ms - spp_deleg_ms, wall_ms);
+          g_spp_buf_ns = g_spp_draw_ns = g_spp_deleg_ns = 0;
         }
         // [NR-PKT] Phase 5-4-1. The header carries the buffer split and the
         // stateful-port classes; one sub-line per NON-STREAM op actually
@@ -3423,6 +3459,10 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   ++g_skp_bufs;
   g_nr_skip_bufactive = true;
+  // [NR-SPP] whole-buffer bracket.
+  const bool spp = g_skp_prof;
+  const auto spp_buf_t0 = spp ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   const uint8_t* raw = memory_->TranslatePhysical(ptr);
   nr::CtxDrawStop stop;
   bool aborted = false;
@@ -3450,7 +3490,15 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     memory::RingBuffer reader(
         const_cast<uint8_t*>(raw) + stop.dword * sizeof(uint32_t), span_bytes);
     reader.set_write_offset(span_bytes);
+    const auto spp_stop_t0 = spp ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
     const bool ok = ExecutePacket(&reader);
+    if (spp) {
+      const uint64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - spp_stop_t0)
+                             .count();
+      (stop.delegate ? g_spp_deleg_ns : g_spp_draw_ns) += d;
+    }
     if (g_nr_skip_draw_pending) {
       // The handler returned before reaching the lockstep block (short
       // packet / invalid source select). The draw did not run in either
@@ -3485,6 +3533,11 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   CtxFinishWalk();
   bin_select_ = g_ctx_walker.bin.select;
   bin_mask_ = g_ctx_walker.bin.mask;
+  if (spp) {
+    g_spp_buf_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - spp_buf_t0)
+                        .count();
+  }
   g_nr_skip_bufactive = false;
 }
 
