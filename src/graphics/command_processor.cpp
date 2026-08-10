@@ -278,6 +278,24 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_profile, false, "GPU",
                     "walk + bulk applies). Read beside gpu_split_profile. "
                     "Launch-time only. Off by default.");
 
+// [NR-SKP] Phase 5-4-4a: the framing kill. At a draw stop the walk has
+// ALREADY applied the packet's own register payload (VGT_DRAW_INITIATOR +
+// DMA base/size go through the full virtual WriteRegister before the stop
+// returns), so the delegated re-dispatch -- span RingBuffer construction +
+// ExecutePacket + re-reading the same dwords + re-writing the same registers
+// -- is pure framing (measured 0.58us/draw at city peak, 13.6% of the CP
+// second, [nr-spp] naruto_362). With this on, a draw stop derives its args
+// straight from the buffer bytes (the same reads ExecutePacketType3Draw
+// performs) and calls the extracted tail directly; the lockstep arm +
+// gpu_nr_issue seam run unchanged inside it. Any packet shape the direct
+// decode does not cover falls back to the delegated dispatch, so every odd
+// case keeps the proven handler.
+REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, false, "GPU",
+                    "[nr-skp] Phase 5-4-4a: under gpu_nr_skip, issue draw "
+                    "stops by direct call from the walk instead of the "
+                    "per-draw delegated packet re-parse. Odd packet shapes "
+                    "fall back to delegation. Off by default.");
+
 // [NR-SDB] Increment 4b-2: the shader-database probe. The offline census
 // proved the whole 3,320-shader corpus in xeshader.sdb translates, and the
 // index keys each blob by the runtime's own shader key -- but "the corpus
@@ -1023,6 +1041,13 @@ uint64_t g_skp_deleg_op[128] = {};
 uint64_t g_skp_rng = 0;
 uint64_t g_skp_rng_dw = 0;
 uint64_t g_skp_pdw = 0;
+// [NR-SKP] Phase 5-4-4a: the direct draw path. direct counts draw stops
+// issued by direct call (no delegated re-parse); dfb counts the ones the
+// direct decode refused (odd packet shape) that fell back to delegation.
+// Gate under the cvar: direct == draws, dfb == 0.
+bool g_nr_skip_direct = false;
+uint64_t g_skp_direct = 0;
+uint64_t g_skp_direct_fb = 0;
 // [NR-SPP] 5-4-4 step 0b: skip-path timing (CP-thread-only, gated on
 // gpu_nr_skip_profile; one bool test per stop when off).
 bool g_skp_prof = false;
@@ -1610,6 +1635,8 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-SPP] skip-path timing probe rides the skip.
   const bool kSkpProf = REXCVAR_GET(gpu_nr_skip_profile) && kNrSkip;
   g_skp_prof = kSkpProf;
+  // [NR-SKP] 5-4-4a: the direct draw path only exists under the skip.
+  g_nr_skip_direct = REXCVAR_GET(gpu_nr_skip_direct) && kNrSkip;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
@@ -2388,12 +2415,13 @@ void CommandProcessor::WorkerThreadMain() {
             if (n >= int(sizeof(ops)) - 24) break;
           }
           REXGPU_INFO(
-              "[nr-skp] bufs={} fb={} draws={} deleg={} exec_fail={} "
-              "orphan={} rng={}/{}dw pdw={} |{}",
-              g_skp_bufs, g_skp_fb, g_skp_draws, g_skp_deleg, g_skp_exec_fail,
-              g_skp_arm_orphan, g_skp_rng, g_skp_rng_dw, g_skp_pdw,
-              n ? ops : " deleg none");
+              "[nr-skp] bufs={} fb={} draws={} direct={} dfb={} deleg={} "
+              "exec_fail={} orphan={} rng={}/{}dw pdw={} |{}",
+              g_skp_bufs, g_skp_fb, g_skp_draws, g_skp_direct, g_skp_direct_fb,
+              g_skp_deleg, g_skp_exec_fail, g_skp_arm_orphan, g_skp_rng,
+              g_skp_rng_dw, g_skp_pdw, n ? ops : " deleg none");
           g_skp_bufs = g_skp_fb = g_skp_draws = g_skp_deleg = 0;
+          g_skp_direct = g_skp_direct_fb = 0;
           g_skp_exec_fail = g_skp_arm_orphan = 0;
           g_skp_rng = g_skp_rng_dw = g_skp_pdw = 0;
           for (uint32_t op = 0; op < 128; ++op) g_skp_deleg_op[op] = 0;
@@ -3479,6 +3507,33 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       g_nr_skip_stop = stop;
       g_nr_skip_draw_pending = true;
       ++g_skp_draws;
+      // [NR-SKP] 5-4-4a: direct issue -- the walk already applied this
+      // packet's register payload, so the delegated re-dispatch below is
+      // pure framing. The tail consumes the pending stop exactly as the
+      // delegated handler would (same lockstep arm, same orphan semantics
+      // on a viz-killed draw); an odd packet shape refuses and falls
+      // through to the proven delegated path.
+      if (g_nr_skip_direct) {
+        const auto spp_direct_t0 = spp ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+        if (NrSkipDrawDirect(stop.opcode, stop.dword, raw, count)) {
+          if (spp) {
+            g_spp_draw_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - spp_direct_t0)
+                    .count();
+          }
+          ++g_skp_direct;
+          if (g_nr_skip_draw_pending) {
+            // Viz-killed draw: the tail returned before the lockstep block,
+            // same as the delegated path. Drop the stop so it cannot leak.
+            g_nr_skip_draw_pending = false;
+            ++g_skp_arm_orphan;
+          }
+          continue;
+        }
+        ++g_skp_direct_fb;
+      }
     } else {
       ++g_skp_deleg;
       ++g_skp_deleg_op[stop.opcode & 0x7F];
@@ -3578,6 +3633,64 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
   }
   ++g_skp_rng;
   g_skp_rng_dw += n;
+  return true;
+}
+
+// [NR-SKP] Phase 5-4-4a: one draw stop, issued by direct call. The walk has
+// already applied this packet's register payload (CtxApplyDrawPayload ->
+// full virtual WriteRegister) before the stop returned, so re-writing
+// VGT_DRAW_INITIATOR / VGT_DMA_BASE / VGT_DMA_SIZE would store the same
+// values the register file already holds; only the executor's arg derivation
+// remains, reproduced here from the same buffer dwords its reader would
+// consume, bounds check for bounds check. Returns false -- nothing ran --
+// whenever the delegated handler would have done anything beyond the plain
+// issue: truncated buffer (Type3's overflow abort), short packet (the
+// "packet too small" false return), immediate/invalid source select (the
+// logged drop). The caller then delegates, so those shapes keep the proven
+// path bit for bit.
+bool CommandProcessor::NrSkipDrawDirect(uint32_t opcode, uint32_t dword,
+                                        const uint8_t* raw, uint32_t count) {
+  const auto rd = [raw](uint32_t k) {
+    return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(raw + k * 4));
+  };
+  const uint32_t hdr = rd(dword);
+  const uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
+  const uint32_t end = dword + 1 + cnt;
+  if (end > count) return false;
+  // DRAW_INDX leads with a viz-query token (read and unused by the handler);
+  // DRAW_INDX_2 does not.
+  const uint32_t p = dword + 1 + (opcode == 0x22 ? 1u : 0u);
+  if (p >= end) return false;
+  reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+  vgt_draw_initiator.value = rd(p);
+  bool is_indexed = false;
+  IndexBufferInfo index_buffer_info;
+  switch (vgt_draw_initiator.source_select) {
+    case xenos::SourceSelect::kDMA: {
+      if (p + 2 >= end) return false;
+      is_indexed = true;
+      const uint32_t vgt_dma_base = rd(p + 1);
+      reg::VGT_DMA_SIZE vgt_dma_size;
+      vgt_dma_size.value = rd(p + 2);
+      uint32_t index_size_bytes = vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16
+                                      ? sizeof(uint16_t)
+                                      : sizeof(uint32_t);
+      index_buffer_info.guest_base = vgt_dma_base & ~(index_size_bytes - 1);
+      index_buffer_info.endianness = vgt_dma_size.swap_mode;
+      index_buffer_info.format = vgt_draw_initiator.index_size;
+      index_buffer_info.length = vgt_dma_size.num_words * index_size_bytes;
+      index_buffer_info.count = vgt_draw_initiator.num_indices;
+    } break;
+    case xenos::SourceSelect::kAutoIndex:
+      index_buffer_info.guest_base = 0;
+      index_buffer_info.length = 0;
+      break;
+    default:
+      return false;
+  }
+  ExecutePacketType3DrawTail(
+      vgt_draw_initiator.value, is_indexed ? &index_buffer_info : nullptr,
+      opcode == 0x22 ? "PM4_DRAW_INDX" : "PM4_DRAW_INDX_2", opcode);
   return true;
 }
 
@@ -4433,6 +4546,32 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
+    // [NR-SKP] 5-4-4a: the body lives in ExecutePacketType3DrawTail so the
+    // skip's direct draw path (NrSkipDrawDirect) runs the exact same code.
+    ExecutePacketType3DrawTail(vgt_draw_initiator.value,
+                               is_indexed ? &index_buffer_info : nullptr,
+                               opcode_name, draw_opcode);
+  }
+
+  // If read the packed correctly, but merely couldn't execute it (because of,
+  // for instance, features not supported by the host), don't terminate command
+  // buffer processing as that would leave rendering in a way more inconsistent
+  // state than just a single dropped draw command.
+  return true;
+}
+
+// [NR-SKP] Phase 5-4-4a: the post-parse half of ExecutePacketType3Draw,
+// extracted VERBATIM (only the wrapper changed: the initiator arrives as a
+// value, index_buffer_info as a pointer that is already null for the
+// non-indexed case; the inner brace block preserves the extracted body
+// byte-for-byte). Both the packet handler and the skip's direct draw path
+// run this body, so the two paths cannot drift.
+void CommandProcessor::ExecutePacketType3DrawTail(
+    uint32_t vgt_draw_initiator_value, IndexBufferInfo* index_buffer_info,
+    const char* opcode_name, uint32_t draw_opcode) {
+  reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+  vgt_draw_initiator.value = vgt_draw_initiator_value;
+  {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
@@ -4554,8 +4693,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       const bool kTimeDraw = g_exec_prof || g_split_prof;
       const auto draw_t0 = kTimeDraw ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
-      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-                                 is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      const bool draw_succeeded =
+          IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                    index_buffer_info, major_mode_explicit);
       // [NR-ISSUE] Disarm unconditionally: the handshake is one draw wide.
       if (nr_issue_armed_ || nr_issue_shaders_active_) {
         nr_issue_armed_ = false;
@@ -4600,12 +4740,6 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       }
     }
   }
-
-  // If read the packed correctly, but merely couldn't execute it (because of,
-  // for instance, features not supported by the host), don't terminate command
-  // buffer processing as that would leave rendering in a way more inconsistent
-  // state than just a single dropped draw command.
-  return true;
 }
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,

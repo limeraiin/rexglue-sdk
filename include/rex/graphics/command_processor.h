@@ -249,6 +249,18 @@ class CommandProcessor {
   // the walk cursor. Called from ExecuteIndirectBuffer instead of the packet
   // loop; the walker must already be begun for this buffer.
   void NrSkipExecuteBuffer(uint32_t ptr, uint32_t count);
+  // [NR-SKP] Phase 5-4-4a: issue one draw stop by direct call, skipping the
+  // per-draw delegated re-dispatch (span reader + ExecutePacket + packet
+  // re-parse). The walk has already applied the packet's own register payload
+  // through the full virtual WriteRegister before the stop returned, so the
+  // only work left is the arg derivation -- reproduced from the same buffer
+  // dwords ExecutePacketType3Draw reads, read for read -- and the extracted
+  // tail. Returns false (nothing ran, caller delegates) for any shape but a
+  // well-formed kDMA/kAutoIndex draw, so every odd case -- short packet,
+  // truncated buffer, immediate/invalid source select -- keeps the proven
+  // handler and its exact log/abort behavior.
+  bool NrSkipDrawDirect(uint32_t opcode, uint32_t dword, const uint8_t* raw,
+                        uint32_t count);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
@@ -278,6 +290,14 @@ class CommandProcessor {
   bool ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet, const char* opcode_name,
                               uint32_t draw_opcode, uint32_t viz_query_condition,
                               uint32_t count_remaining);
+  // [NR-SKP] Phase 5-4-4a: the post-parse half of ExecutePacketType3Draw,
+  // extracted verbatim (viz-kill check -> lockstep arm -> IssueDraw -> disarm
+  // -> coverage -> failure log) so the skip's direct draw path and the packet
+  // handler run the SAME body. `index_buffer_info` is null for a non-indexed
+  // draw.
+  void ExecutePacketType3DrawTail(uint32_t vgt_draw_initiator_value,
+                                  IndexBufferInfo* index_buffer_info,
+                                  const char* opcode_name, uint32_t draw_opcode);
   bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
