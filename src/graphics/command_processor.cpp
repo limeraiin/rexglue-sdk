@@ -296,6 +296,27 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, false, "GPU",
                     "per-draw delegated packet re-parse. Odd packet shapes "
                     "fall back to delegation. Off by default.");
 
+// [NR-VERIFY] Phase 5-4-4a inc 2: the per-draw VERIFY work is real CP cost --
+// RegShadowSweep (256 reg compares/draw), the per-draw shader re-hash in the
+// arm (LoadShader x2 = XXH3 over the whole ucode), the 4b-3 census feeds and
+// its per-draw coverage, the d3d12 compare passes (sysconst memcmp, the
+// residency predict/compare lists, the 5-1 state-mirror compare) -- and every
+// one of those gates has already proven its subsystem city-clean. ON (the
+// default) keeps everything exactly as shipped. OFF is the perf config:
+// every MIRROR a swap consumes keeps updating (sysconst derivation, the
+// texture-descriptor map hooks, the g_nri_file replay state), every
+// compare/census pass on the draw path is skipped, and the arm memoizes the
+// resolved Shader* per walked IM_LOAD (the executor also resolves at
+// IM_LOAD, not per draw). Flipping back ON mid-run re-seeds the drifted
+// mirrors (d3d12 latch) so the gates re-arm honestly. The live gates under
+// OFF are the swaps' own counters: [nr-skp] direct==draws, [nr-swp]
+// swapped==draws fallback=0, [nr-issue] issued==armed.
+REXCVAR_DEFINE_BOOL(gpu_nr_verify, true, "GPU",
+                    "[nr-*] Phase 5-4-4a inc 2: run the per-draw compare/"
+                    "census passes of the settled native-renderer gates. ON "
+                    "(default) = full verify; OFF = perf config (mirrors and "
+                    "swaps keep running, compares skipped).");
+
 // [NR-SDB] Increment 4b-2: the shader-database probe. The offline census
 // proved the whole 3,320-shader corpus in xeshader.sdb translates, and the
 // index keys each blob by the runtime's own shader key -- but "the corpus
@@ -824,7 +845,20 @@ void NrExecWatch(uint32_t reg, uint32_t value) {
   }
 }
 
+// [NR-VERIFY] inc 2: base-side latch of gpu_nr_verify + the arm's shader
+// memo (valid only while verify is off; invalidated by every walked
+// IM_LOAD/IM_LOAD_IMMEDIATE via CtxShaderSeen below).
+bool g_nr_verify_base = true;
+bool g_nri_sh_dirty = true;
+nr::ShaderRef g_nri_vs_ref = {}, g_nri_ps_ref = {};
+Shader* g_nri_vs_cached = nullptr;
+Shader* g_nri_ps_cached = nullptr;
+
 void CtxShaderSeen(void*, const nr::ShaderRef& ref) {
+  // [NR-VERIFY] inc 2: any walked shader load invalidates the arm's memoized
+  // Shader* pair -- the ucode behind an unchanged ref may have been patched,
+  // and the re-IM_LOAD is exactly the event that publishes that.
+  g_nri_sh_dirty = true;
   uint64_t key = (uint64_t(ref.addr) << 17) ^ (uint64_t(ref.size_dwords) << 1) ^
                  (ref.immediate ? 1u : 0u);
   if (!key) key = 1;
@@ -1303,7 +1337,10 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   if (g_nr_res) {
     nr::ResApplyWrite(&g_res_state, &g_res_stats, reg, value, from_memory);
   }
-  if (g_nr_draw) {
+  // [NR-VERIFY] inc 2: the shadow's only consumers are the per-draw sweep
+  // (verify) and the one-time issue seed; an unfed shadow makes the seed a
+  // pure live-file copy, which at a lockstep arm is the same values.
+  if (g_nr_draw && g_nr_verify_base) {
     nr::RegShadowApplyWrite(&g_reg_shadow, &g_reg_stats, reg, value);
   }
   // [NR-ISSUE] Increment 4e: the replay file takes every decoded write as it
@@ -1624,8 +1661,14 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_bufcache = kNrBuf;
   const bool kNrState = REXCVAR_GET(gpu_nr_state);
   g_nr_state = kNrState;
-  // [NR-RES] rides the 4a context walk, so it implies it.
-  const bool kNrRes = REXCVAR_GET(gpu_nr_res);
+  // [NR-VERIFY] inc 2: the master verify latch. Applied here to the
+  // compare-only base probes; the d3d12 side latches its own copy per frame.
+  const bool kNrVerify = REXCVAR_GET(gpu_nr_verify);
+  g_nr_verify_base = kNrVerify;
+  if (kNrVerify) g_nri_sh_dirty = true;  // memo never trusted across verify
+  // [NR-RES] rides the 4a context walk, so it implies it. Compare-only
+  // census: forced off by the perf config.
+  const bool kNrRes = REXCVAR_GET(gpu_nr_res) && kNrVerify;
   g_nr_res = kNrRes;
   // [NR-SKP] 5-4-2: the skip is the consumer of BOTH the issue seam and the
   // walk-driven effects, so it implies them (and through them the lockstep
@@ -3625,7 +3668,7 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
   if (g_nr_res) {
     nr::ResApplyRange(&g_res_state, &g_res_stats, base, host, n, from_memory);
   }
-  if (g_nr_draw) {
+  if (g_nr_draw && g_nr_verify_base) {
     nr::RegShadowApplyRange(&g_reg_shadow, &g_reg_stats, base, host, n);
   }
   if (g_nr_issue && g_nri_seeded) {
@@ -4614,8 +4657,12 @@ void CommandProcessor::ExecutePacketType3DrawTail(
           g_ctx_walk_lockstep = false;
         } else {
           ++g_nrd_stops;
-          nr::RegShadowSweep(&g_reg_shadow, &g_reg_stats, kNrdSweepPerDraw,
-                             register_file_->values, NrdFinding, nullptr);
+          // [NR-VERIFY] inc 2: the rolling shadow-vs-live compare is pure
+          // verify (256 reg compares per draw).
+          if (g_nr_verify_base) {
+            nr::RegShadowSweep(&g_reg_shadow, &g_reg_stats, kNrdSweepPerDraw,
+                               register_file_->values, NrdFinding, nullptr);
+          }
           // [NR-ISSUE] Increment 4d: arm this draw to be issued from the
           // shadow. Increment 4f: copy-mode draws (resolves) arm too --
           // IssueCopy's state reads now honor the active draw file (the one
@@ -4643,14 +4690,40 @@ void CommandProcessor::ExecutePacketType3DrawTail(
                 // holds, unless the walk's shader tracking is wrong -- counted
                 // apart, and the walk's shaders are used either way: that IS
                 // the recovered path, and it exercises the 4b-2 result.
-                Shader* vs = LoadShader(
-                    xenos::ShaderType::kVertex, g_ctx_state.vs.addr,
-                    memory_->TranslatePhysical<uint32_t*>(g_ctx_state.vs.addr),
-                    g_ctx_state.vs.size_dwords);
-                Shader* ps = LoadShader(
-                    xenos::ShaderType::kPixel, g_ctx_state.ps.addr,
-                    memory_->TranslatePhysical<uint32_t*>(g_ctx_state.ps.addr),
-                    g_ctx_state.ps.size_dwords);
+                // [NR-VERIFY] inc 2: under the perf config the resolved
+                // Shader* is memoized -- shader refs only change at IM_LOAD
+                // packets (the executor also resolves at IM_LOAD, not per
+                // draw), and every walked IM_LOAD invalidates the memo via
+                // CtxShaderSeen, including a re-IM_LOAD of patched ucode at
+                // the same address. Re-hashing the whole ucode twice per draw
+                // is verify cost.
+                Shader* vs;
+                Shader* ps;
+                const bool nri_sh_memo_ok =
+                    !g_nr_verify_base && !g_nri_sh_dirty && g_nri_vs_cached &&
+                    g_nri_ps_cached &&
+                    g_nri_vs_ref.addr == g_ctx_state.vs.addr &&
+                    g_nri_vs_ref.size_dwords == g_ctx_state.vs.size_dwords &&
+                    g_nri_ps_ref.addr == g_ctx_state.ps.addr &&
+                    g_nri_ps_ref.size_dwords == g_ctx_state.ps.size_dwords;
+                if (nri_sh_memo_ok) {
+                  vs = g_nri_vs_cached;
+                  ps = g_nri_ps_cached;
+                } else {
+                  vs = LoadShader(
+                      xenos::ShaderType::kVertex, g_ctx_state.vs.addr,
+                      memory_->TranslatePhysical<uint32_t*>(g_ctx_state.vs.addr),
+                      g_ctx_state.vs.size_dwords);
+                  ps = LoadShader(
+                      xenos::ShaderType::kPixel, g_ctx_state.ps.addr,
+                      memory_->TranslatePhysical<uint32_t*>(g_ctx_state.ps.addr),
+                      g_ctx_state.ps.size_dwords);
+                  g_nri_vs_cached = vs;
+                  g_nri_ps_cached = ps;
+                  g_nri_vs_ref = g_ctx_state.vs;
+                  g_nri_ps_ref = g_ctx_state.ps;
+                  g_nri_sh_dirty = false;
+                }
                 // [NR-SKP] Under the skip the executor never sees IM_LOAD, so
                 // the active members hold the previous draw's shaders: the
                 // compare would count real shader changes as mismatches.

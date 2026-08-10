@@ -76,6 +76,9 @@ REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
 // draw_util) against the same register file at the same moment, and compares
 // the packed descriptions byte for byte. mismatch must be 0 at city load
 // before the native pipeline is allowed to use our mapping instead.
+// [NR-VERIFY] inc 2: defined base-side (command_processor.cpp).
+REXCVAR_DECLARE(bool, gpu_nr_verify);
+
 REXCVAR_DEFINE_BOOL(gpu_nr_pso, false, "GPU",
                     "Diagnostic [nr-pso]: derive the D3D12 pipeline state from "
                     "the draw's register file with the native renderer's own "
@@ -1053,7 +1056,10 @@ bool PipelineCache::ConfigurePipeline(
   // provably the same register file at provably the same moment -- the trap
   // increment 4c had to correct, where a probe answered a per-draw question
   // with state read at another time.
-  if (REXCVAR_GET(gpu_nr_pso)) {
+  // [NR-VERIFY] inc 2: a full second derivation + field compare per draw is
+  // pure verify. (gpu_nr_shadercache below is NOT gated: our cache is what
+  // the native pipeline objects consume; its byte-verify is once per key.)
+  if (REXCVAR_GET(gpu_nr_pso) && REXCVAR_GET(gpu_nr_verify)) {
     NrPsoCheck(vertex_shader, pixel_shader, primitive_processing_result, normalized_depth_control,
                normalized_color_mask, bound_depth_and_color_render_target_bits,
                bound_depth_and_color_render_target_formats, description);

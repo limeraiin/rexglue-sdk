@@ -173,6 +173,8 @@ REXCVAR_DEFINE_BOOL(gpu_instance, true, "GPU/D3D12",
 // [NR-NPSO] Phase 5-3a. Defined with the mapping, in pipeline_cache.cpp.
 REXCVAR_DECLARE(bool, gpu_nr_native_pso);
 REXCVAR_DECLARE(bool, gpu_nr_native_pso_bind);
+// [NR-VERIFY] inc 2: defined base-side (command_processor.cpp).
+REXCVAR_DECLARE(bool, gpu_nr_verify);
 
 // [NR-BND] Phase 5-3b-0: the bindings mirror's gate.
 REXCVAR_DEFINE_BOOL(gpu_nr_bindings, false, "GPU/D3D12",
@@ -796,6 +798,15 @@ struct NrSwapProbe {
   uint64_t smp_alloc = 0;       // sampler-heap slots OUR resolution allocated
 };
 NrSwapProbe g_nr_swap_probe{};
+
+// [NR-VERIFY] Phase 5-4-4a inc 2: d3d12-side latch of gpu_nr_verify (per
+// frame, like the probe latches below). OFF = perf config: the compare
+// passes are skipped while every mirror a swap consumes keeps updating (the
+// sysconst derivation, the texture-descriptor map hooks, the shared sampler
+// allocator). A rising edge re-seeds the mirrors that drift while their
+// compare/finish passes are off (vfetch + view pool + sysconst), so the
+// gates re-arm honestly instead of reporting stale-mirror mismatches.
+bool g_nr_verify = true;
 
 // [NR-SWP] The 1Hz verdict line.
 void NrSwapReportIfDue() {
@@ -3377,9 +3388,25 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // path reads a plain bool. Binding implies building.
   g_nr_native_pso_bind = REXCVAR_GET(gpu_nr_native_pso_bind);
   g_nr_native_pso = REXCVAR_GET(gpu_nr_native_pso) || g_nr_native_pso_bind;
+  // [NR-VERIFY] inc 2: master verify latch. On a rising edge the mirrors
+  // whose per-draw finish/compare passes were off are re-seeded from the
+  // emulated state before any gate reads them again.
+  {
+    const bool nr_verify_now = REXCVAR_GET(gpu_nr_verify);
+    if (nr_verify_now && !g_nr_verify) {
+      g_nr_sys_seeded = false;
+      if (g_nr_res) {
+        NrResVfetchSeedFromEmulated();
+        NrResPoolReseed();
+      }
+    }
+    g_nr_verify = nr_verify_now;
+  }
   // [NR-BND] Phase 5-3b-0: the bindings mirror's verdict + latch, same shape.
+  // Compare-only (lives inside the emulated UpdateBindings): forced off by
+  // the perf config.
   NrBindReportIfDue();
-  g_nr_bindings = REXCVAR_GET(gpu_nr_bindings);
+  g_nr_bindings = REXCVAR_GET(gpu_nr_bindings) && g_nr_verify;
   // [NR-SYS] Phase 5-3b-1: verdict + latch. A rising edge re-seeds the mirror
   // from the emulated struct (it kept evolving while the gate was off, and
   // its sticky never-derived fields are only knowable by seeding).
@@ -3397,7 +3424,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // re-runs the one-shot bit-layout self-check.
   NrDescReportIfDue();
   {
-    const bool nr_desc_now = REXCVAR_GET(gpu_nr_desc);
+    // [NR-VERIFY] inc 2: compare-only (sampler/key/heap-mirror checks inside
+    // the emulated UpdateBindings; the swap uses the derivation code and the
+    // SHARED allocator directly, not this probe): forced off by perf config.
+    const bool nr_desc_now = REXCVAR_GET(gpu_nr_desc) && g_nr_verify;
     if (nr_desc_now && !g_nr_desc) {
       nr::DescSamplerMapReset(&g_nr_desc_smap, sampler_bindless_heap_allocated_);
       NrDescLayoutSelfCheck();
@@ -4149,7 +4179,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // Process primitives.
   // [NR-RSY] Phase 5-3b-3: watch the index-buffer residency request this
   // Process call makes (the installed observer records the actual call).
-  if (g_nr_res) {
+  // [NR-VERIFY] inc 2: the predict/compare is verify; the observer itself
+  // stays installed (map/mirror maintenance is not per-draw cost).
+  const bool nr_rsy_verify = g_nr_res && g_nr_verify;
+  if (nr_rsy_verify) {
     g_nr_res_ib_seen = false;
   }
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
@@ -4164,7 +4197,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // WHETHER the guest buffer is requested is the primitive processor's
   // convert-vs-DMA decision (declared, counted by outcome); the ARGUMENTS of
   // a request that does happen must equal ours.
-  if (g_nr_res) {
+  if (nr_rsy_verify) {
     ++g_nr_res_probe.ib_checks;
     nr::ResIndexPrediction nr_res_ibp;
     nr::ResIndexPredict(regs[XE_GPU_REG_VGT_DRAW_INITIATOR], regs[XE_GPU_REG_VGT_DMA_SIZE],
@@ -4459,7 +4492,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // reports every actual RequestRange and its result, and the finish call at
   // each exit compares the lists, applies the walk to the mirror and checks
   // the mirror equals the emulated sync state bit for bit.
-  if (g_nr_res) {
+  if (nr_rsy_verify) {
     g_nr_res_vf_bitmap[0] = constant_map_vertex.vertex_fetch_bitmap[0];
     g_nr_res_vf_bitmap[1] = constant_map_vertex.vertex_fetch_bitmap[1];
     g_nr_res_vf_bitmap[2] = constant_map_vertex.vertex_fetch_bitmap[2];
@@ -7120,7 +7153,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       nr_in.texture_signs_fn = NrSysTextureSigns;
       nr_in.texture_res_scaled_fn = NrSysTextureResScaled;
       nr_in.texture_ctx = static_cast<TextureCache*>(texture_cache_.get());
-      if (nr::NrSysUpdate(nr_in, &g_nr_sys_state)) {
+      // [NR-VERIFY] inc 2: the derivation ALWAYS runs -- g_nr_sys_state is
+      // what the swap uploads -- but the coverage counters and the whole-
+      // struct memcmp are verify.
+      if (nr::NrSysUpdate(nr_in, &g_nr_sys_state) && g_nr_verify) {
         ++g_nr_sys.checks;
         // Branch coverage, from the same inputs the derivation read.
         if (!pa_cl_clip_cntl.clip_disable && pa_cl_clip_cntl.ucp_ena) {
