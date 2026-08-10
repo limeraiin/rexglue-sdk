@@ -290,11 +290,13 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_profile, false, "GPU",
 // gpu_nr_issue seam run unchanged inside it. Any packet shape the direct
 // decode does not cover falls back to the delegated dispatch, so every odd
 // case keeps the proven handler.
-REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, true, "GPU",
                     "[nr-skp] Phase 5-4-4a: under gpu_nr_skip, issue draw "
                     "stops by direct call from the walk instead of the "
                     "per-draw delegated packet re-parse. Odd packet shapes "
-                    "fall back to delegation. Off by default.");
+                    "fall back to delegation. Default ON since the 5-4-4a "
+                    "city validation (naruto_364, pixel-perfect at 13M "
+                    "draws).");
 
 // [NR-VERIFY] Phase 5-4-4a inc 2: the per-draw VERIFY work is real CP cost --
 // RegShadowSweep (256 reg compares/draw), the per-draw shader re-hash in the
@@ -311,11 +313,13 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, false, "GPU",
 // mirrors (d3d12 latch) so the gates re-arm honestly. The live gates under
 // OFF are the swaps' own counters: [nr-skp] direct==draws, [nr-swp]
 // swapped==draws fallback=0, [nr-issue] issued==armed.
-REXCVAR_DEFINE_BOOL(gpu_nr_verify, true, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_nr_verify, false, "GPU",
                     "[nr-*] Phase 5-4-4a inc 2: run the per-draw compare/"
-                    "census passes of the settled native-renderer gates. ON "
-                    "(default) = full verify; OFF = perf config (mirrors and "
-                    "swaps keep running, compares skipped).");
+                    "census passes of the settled native-renderer gates. OFF "
+                    "(default since the 2026-08-10 city A/B: +10-15 fps at "
+                    "matched load, peak 351k draws/s) = perf config, mirrors "
+                    "and swaps keep running with compares skipped. Set "
+                    "--gpu_nr_verify true for a gate-validation run.");
 
 // [NR-SDB] Increment 4b-2: the shader-database probe. The offline census
 // proved the whole 3,320-shader corpus in xeshader.sdb translates, and the
