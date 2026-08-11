@@ -259,7 +259,15 @@ uint64_t g_const_writes_skipped = 0;
 // Index: 0=prim 1=rt-update 2=pipeline 3=textures 4=bindings 5=total IssueDraw
 //        6=BeginSubmission 7=draw-tail(residency+barriers+draw) 8=fixed-fn+sysconst.
 bool g_draw_prof = false;
-uint64_t g_draw_ns[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+// [GPU-DRAW] 0..8 = the 9 named phases; 9..11 = tail sub-brackets
+// (9 = vertex-residency loop, 10 = primitive topology, 11 = index-buffer
+// view + barriers + deferred emission + memexport finish), added 5-4-4b so
+// a city run can name the dominant slice of the tail without guessing.
+uint64_t g_draw_ns[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+// [GPU-DRAW] residency-loop counters: slots visited / in_sync-bit hits /
+// state-match re-arms (no request) / RequestRange calls. Names the inner
+// cost driver of the res bracket instead of guessing it.
+uint64_t g_draw_res_cnt[4] = {0, 0, 0, 0};
 uint64_t g_draw_count = 0;
 // [GPU-PRECORD] Phase 1a: cached once/frame in IssueSwap. Segment size = draws
 // between forced full-state re-emits (correctness probe; tunable cvar comes in Phase 3).
@@ -3536,20 +3544,27 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // frame is presented.
   FlushInstancedBatch();
   if (g_draw_prof) {
-    static uint64_t s_last[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, s_last_cnt = 0;
+    static uint64_t s_last[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, s_last_cnt = 0;
+    static uint64_t s_last_res[4] = {0, 0, 0, 0};
     static auto s_last_report = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     if (now - s_last_report >= std::chrono::seconds(1)) {
-      double d[9];
-      for (int i = 0; i < 9; ++i) d[i] = (g_draw_ns[i] - s_last[i]) / 1e6;
+      double d[12];
+      for (int i = 0; i < 12; ++i) d[i] = (g_draw_ns[i] - s_last[i]) / 1e6;
       uint64_t dc = g_draw_count - s_last_cnt;
       REXGPU_INFO(
           "[gpu-draw] draws={} total={:.1f}ms | begin={:.1f} prim={:.1f} rt={:.1f} pso={:.1f} "
-          "tex={:.1f} ff+sc={:.1f} bind={:.1f} tail={:.1f} other={:.1f}ms",
+          "tex={:.1f} ff+sc={:.1f} bind={:.1f} tail={:.1f} other={:.1f}ms "
+          "| tail: res={:.1f} topo={:.1f} emit={:.1f} | resn: vis={} sync={} "
+          "rearm={} req={}",
           dc, d[5], d[6], d[0], d[1], d[2], d[3], d[8], d[4], d[7],
-          d[5] - (d[0] + d[1] + d[2] + d[3] + d[4] + d[6] + d[7] + d[8]));
+          d[5] - (d[0] + d[1] + d[2] + d[3] + d[4] + d[6] + d[7] + d[8]),
+          d[9], d[10], d[11], g_draw_res_cnt[0] - s_last_res[0],
+          g_draw_res_cnt[1] - s_last_res[1], g_draw_res_cnt[2] - s_last_res[2],
+          g_draw_res_cnt[3] - s_last_res[3]);
       s_last_report = now;
-      for (int i = 0; i < 9; ++i) s_last[i] = g_draw_ns[i];
+      for (int i = 0; i < 12; ++i) s_last[i] = g_draw_ns[i];
+      for (int i = 0; i < 4; ++i) s_last_res[i] = g_draw_res_cnt[i];
       s_last_cnt = g_draw_count;
     }
   }
@@ -4526,6 +4541,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                                : std::chrono::steady_clock::time_point{};
 
   // Ensure vertex buffers are resident.
+  auto _dp_tres0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   // [NR-RSY] Phase 5-3b-3: predict this draw's residency request list from
   // the same file the loop below reads, before the loop runs; the loop then
@@ -4552,7 +4569,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       vfetch_bits_remaining &= ~(uint32_t(1) << j);
       uint32_t vfetch_index = i * 32 + j;
       uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
+      if (g_draw_prof) ++g_draw_res_cnt[0];
       if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
+        if (g_draw_prof) ++g_draw_res_cnt[1];
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
@@ -4584,9 +4603,11 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       }
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+        if (g_draw_prof) ++g_draw_res_cnt[2];
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
+      if (g_draw_prof) ++g_draw_res_cnt[3];
       const bool nr_res_range_ok =
           shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2);
       if (g_nr_res && g_nr_res_vf_active) {
@@ -4620,6 +4641,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_nr_res) {
     NrResVfetchFinishDraw(0);
   }
+  if (g_draw_prof) g_draw_ns[9] += prof_ns_since(_dp_tres0);
 
   // [GPU-DRAW-DUMP] Native-renderer R&D (Ch.9 path B): emit this draw's full
   // geometry/shader stream. IssueDraw is the ONE seam that sees every world draw
@@ -4706,6 +4728,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   }
 
   // Primitive topology.
+  auto _dp_tib0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
   if (primitive_processing_result.IsTessellated()) {
     switch (primitive_processing_result.host_primitive_type) {
@@ -4768,6 +4792,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   }
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
+  if (g_draw_prof) g_draw_ns[10] += prof_ns_since(_dp_tib0);
+  auto _dp_temit0 = g_draw_prof ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -4895,7 +4922,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     }
   }
 
-  if (g_draw_prof) g_draw_ns[7] += prof_ns_since(_dp_tail0);
+  if (g_draw_prof) {
+    g_draw_ns[11] += prof_ns_since(_dp_temit0);
+    g_draw_ns[7] += prof_ns_since(_dp_tail0);
+  }
   return true;
 }
 
