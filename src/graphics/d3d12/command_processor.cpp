@@ -15,6 +15,7 @@
 #include <cstring>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -265,9 +266,13 @@ bool g_draw_prof = false;
 // a city run can name the dominant slice of the tail without guessing.
 uint64_t g_draw_ns[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 // [GPU-DRAW] residency-loop counters: slots visited / in_sync-bit hits /
-// state-match re-arms (no request) / RequestRange calls. Names the inner
-// cost driver of the res bracket instead of guessing it.
-uint64_t g_draw_res_cnt[4] = {0, 0, 0, 0};
+// state-match re-arms (no request) / RequestRange calls / RequestRange
+// calls whose exact {addr,size} was already requested since the last swap
+// (a value-keyed front cache would eliminate exactly these). Names the
+// inner cost driver of the res bracket instead of guessing it.
+uint64_t g_draw_res_cnt[5] = {0, 0, 0, 0, 0};
+// Per-frame set of requested ranges for the dup counter (probe-only).
+std::unordered_set<uint64_t> g_draw_res_seen;
 uint64_t g_draw_count = 0;
 // [GPU-PRECORD] Phase 1a: cached once/frame in IssueSwap. Segment size = draws
 // between forced full-state re-emits (correctness probe; tunable cvar comes in Phase 3).
@@ -3545,7 +3550,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   FlushInstancedBatch();
   if (g_draw_prof) {
     static uint64_t s_last[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, s_last_cnt = 0;
-    static uint64_t s_last_res[4] = {0, 0, 0, 0};
+    static uint64_t s_last_res[5] = {0, 0, 0, 0, 0};
     static auto s_last_report = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     if (now - s_last_report >= std::chrono::seconds(1)) {
@@ -3556,19 +3561,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           "[gpu-draw] draws={} total={:.1f}ms | begin={:.1f} prim={:.1f} rt={:.1f} pso={:.1f} "
           "tex={:.1f} ff+sc={:.1f} bind={:.1f} tail={:.1f} other={:.1f}ms "
           "| tail: res={:.1f} topo={:.1f} emit={:.1f} | resn: vis={} sync={} "
-          "rearm={} req={}",
+          "rearm={} req={} dup={}",
           dc, d[5], d[6], d[0], d[1], d[2], d[3], d[8], d[4], d[7],
           d[5] - (d[0] + d[1] + d[2] + d[3] + d[4] + d[6] + d[7] + d[8]),
           d[9], d[10], d[11], g_draw_res_cnt[0] - s_last_res[0],
           g_draw_res_cnt[1] - s_last_res[1], g_draw_res_cnt[2] - s_last_res[2],
-          g_draw_res_cnt[3] - s_last_res[3]);
+          g_draw_res_cnt[3] - s_last_res[3], g_draw_res_cnt[4] - s_last_res[4]);
       s_last_report = now;
       for (int i = 0; i < 12; ++i) s_last[i] = g_draw_ns[i];
-      for (int i = 0; i < 4; ++i) s_last_res[i] = g_draw_res_cnt[i];
+      for (int i = 0; i < 5; ++i) s_last_res[i] = g_draw_res_cnt[i];
       s_last_cnt = g_draw_count;
     }
   }
 
+  if (g_draw_prof) g_draw_res_seen.clear();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
   // [NR-RSY] Phase 5-3b-3: the swap clears the sync bits ONLY (per-slot
@@ -4607,7 +4613,14 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
-      if (g_draw_prof) ++g_draw_res_cnt[3];
+      if (g_draw_prof) {
+        ++g_draw_res_cnt[3];
+        const uint64_t res_key =
+            (uint64_t(vfetch_constant.address) << 32) | uint64_t(vfetch_constant.size);
+        if (!g_draw_res_seen.insert(res_key).second) {
+          ++g_draw_res_cnt[4];
+        }
+      }
       const bool nr_res_range_ok =
           shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2);
       if (g_nr_res && g_nr_res_vf_active) {

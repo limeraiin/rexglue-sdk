@@ -183,6 +183,11 @@ class SharedMemory {
   // persistently allocated vector).
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
 
+  // RequestRanges scratch (persistently allocated for the same reason as
+  // upload_ranges_ - one heap allocation per call otherwise, and vertex
+  // residency calls this per out-of-sync fetch slot per draw).
+  std::vector<std::pair<uint32_t, uint32_t>> request_merged_ranges_;
+
   // GPU-written memory downloading for traces. <Start address, length>.
   std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
   uint32_t trace_download_page_count_ = 0;
