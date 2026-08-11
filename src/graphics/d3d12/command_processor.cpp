@@ -217,6 +217,19 @@ REXCVAR_DEFINE_BOOL(gpu_nr_bindings_swap, false, "GPU/D3D12",
                     "Reports '[nr-swp]' once/sec. Off by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [NR-LEAN] Phase 5-4-4b inc 2b: skip the emulated sysconst derivation.
+// Default ON 2026-08-11 after the city A/B (naruto_380 vs 374: drawstop
+// 1.94 -> 1.81us/draw at ~330k draws/s, user: better, all gates zero); the
+// verify latch already forces it off for gate runs.
+REXCVAR_DEFINE_BOOL(gpu_nr_lean_sysconst, true, "GPU/D3D12",
+                    "[NR-LEAN] 5-4-4b inc 2b: under the bindings swap with verify off, "
+                    "skip the emulated UpdateSystemConstantValues body per draw. The "
+                    "5-3b-1 mirror (the swap's upload source) keeps running and supplies "
+                    "the dirty signal by whole-struct compare; the rare fallback to the "
+                    "emulated UpdateBindings re-syncs the member by one memcpy from the "
+                    "mirror. Counted on '[nr-swp]' as lean=/lazy=. On by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // [NR-RSY] Phase 5-3b-3: the residency + descriptor-allocation mirror's gate.
 REXCVAR_DEFINE_BOOL(gpu_nr_residency, false, "GPU/D3D12",
                     "[NR-RSY] Phase 5-3b-3 residency mirror: predict every vertex/index "
@@ -796,6 +809,9 @@ struct NrSwapProbe {
   uint64_t swapped = 0, fallback = 0, srv_query = 0;
   uint64_t di_v = 0, di_p = 0;  // descriptor-indices rebuilds ours performed
   uint64_t smp_alloc = 0;       // sampler-heap slots OUR resolution allocated
+  // [NR-LEAN] 5-4-4b inc 2b: draws whose emulated sysconst derivation was
+  // skipped (mirror-only path) / fallback re-syncs of the member by memcpy.
+  uint64_t sys_lean = 0, sys_lazy = 0;
 };
 NrSwapProbe g_nr_swap_probe{};
 
@@ -807,6 +823,14 @@ NrSwapProbe g_nr_swap_probe{};
 // compare/finish passes are off (vfetch + view pool + sysconst), so the
 // gates re-arm honestly instead of reporting stale-mirror mismatches.
 bool g_nr_verify = true;
+
+// [NR-LEAN] 5-4-4b inc 2b: latched once a frame (requires the swap armed AND
+// verify off). g_nr_sys_member_stale marks that the lean path skipped the
+// emulated derivation since system_constants_ was last written; every
+// consumer of the member re-syncs it from the mirror (byte-proven equivalent,
+// sticky fields included) with one memcpy before reading.
+bool g_nr_lean_sys = false;
+bool g_nr_sys_member_stale = false;
 
 // [NR-SWP] The 1Hz verdict line.
 void NrSwapReportIfDue() {
@@ -822,9 +846,11 @@ void NrSwapReportIfDue() {
   s_last = now;
   const NrSwapProbe& p = g_nr_swap_probe;
   REXGPU_INFO(
-      "[nr-swp] swapped={} fallback={} srv_query={} | di v={} p={} smp_alloc={}",
+      "[nr-swp] swapped={} fallback={} srv_query={} | di v={} p={} smp_alloc={} "
+      "| lean={} lazy={}",
       p.swapped - s_prev.swapped, p.fallback, p.srv_query, p.di_v - s_prev.di_v,
-      p.di_p - s_prev.di_p, p.smp_alloc);
+      p.di_p - s_prev.di_p, p.smp_alloc, p.sys_lean - s_prev.sys_lean,
+      p.sys_lazy);
   s_prev = p;
 }
 
@@ -2859,6 +2885,8 @@ bool D3D12CommandProcessor::SetupContext() {
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
+  // [NR-LEAN] fresh member, nothing skipped yet.
+  g_nr_sys_member_stale = false;
 
   return true;
 }
@@ -3466,6 +3494,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   NrSwapReportIfDue();
   g_nr_swap = REXCVAR_GET(gpu_nr_bindings_swap) && bindless_resources_used_ &&
               g_nr_sysconst && g_nr_sys_seeded && g_nr_res;
+  // [NR-LEAN] 5-4-4b inc 2b: the lean sysconst path needs the swap (mirror is
+  // the upload source) and verify off (the whole-struct memcmp gate reads the
+  // member the lean path stops deriving).
+  g_nr_lean_sys = REXCVAR_GET(gpu_nr_lean_sysconst) && g_nr_swap && !g_nr_verify;
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
   // gate itself is latched base-side (WorkerThreadMain), not here.
   NrFxReportIfDue();
@@ -4470,6 +4502,14 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                          &nr_swp_refused);
     if (nr_swp_refused) {
       ++g_nr_swap_probe.fallback;
+      // [NR-LEAN] the emulated UpdateBindings uploads system_constants_; if
+      // the lean path skipped the emulated derivation this draw, the mirror
+      // holds the current values (it ran above) - one memcpy re-syncs.
+      if (g_nr_sys_member_stale) {
+        std::memcpy(&system_constants_, &g_nr_sys_state, sizeof(system_constants_));
+        g_nr_sys_member_stale = false;
+        ++g_nr_swap_probe.sys_lazy;
+      }
       _dp_bind_ok = UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used);
     } else {
       ++g_nr_swap_probe.swapped;
@@ -6712,6 +6752,64 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
 
+  // [NR-SYS]/[NR-LEAN] shared input fill for the 5-3b-1 mirror derivation,
+  // used by the lean early-out below and the compare-site call at the end.
+  auto nr_sys_fill_inputs = [&](nr::NrSysInputs& nr_in) {
+    nr_in.regs = &regs[0];
+    nr_in.shared_memory_is_uav = shared_memory_is_uav;
+    nr_in.primitive_polygonal = primitive_polygonal;
+    nr_in.line_loop_closing_index = line_loop_closing_index;
+    nr_in.index_endian = uint32_t(index_endian);
+    for (uint32_t i = 0; i < 3; ++i) {
+      nr_in.ndc_scale[i] = viewport_info.ndc_scale[i];
+      nr_in.ndc_offset[i] = viewport_info.ndc_offset[i];
+    }
+    nr_in.xy_extent[0] = viewport_info.xy_extent[0];
+    nr_in.xy_extent[1] = viewport_info.xy_extent[1];
+    nr_in.used_texture_mask = used_texture_mask;
+    nr_in.edram_rov_used = false;
+    nr_in.color_exp_bias_host_remap =
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+        !render_target_cache_->IsFixed16TruncatedToMinus1To1();
+    nr_in.gamma_render_target_as_unorm16 =
+        render_target_cache_->gamma_render_target_as_unorm16();
+    nr_in.draw_resolution_scale_x = draw_resolution_scale_x;
+    nr_in.draw_resolution_scale_y = draw_resolution_scale_y;
+    nr_in.texture_signs_fn = NrSysTextureSigns;
+    nr_in.texture_res_scaled_fn = NrSysTextureResScaled;
+    nr_in.texture_ctx = static_cast<TextureCache*>(texture_cache_.get());
+  };
+
+  // [NR-LEAN] 5-4-4b inc 2b: the member is stale whenever the lean path below
+  // skipped the emulated derivation. Re-sync it from the mirror (the byte-
+  // proven equivalent of what the skipped body would have written, sticky
+  // fields included) before any full-body run reads it for dirty compares.
+  if (g_nr_sys_member_stale) {
+    std::memcpy(&system_constants_, &g_nr_sys_state, sizeof(system_constants_));
+    g_nr_sys_member_stale = false;
+  }
+  if (g_nr_lean_sys && !edram_rov_used) {
+    // Mirror-only fast path: run the 5-3b-1 derivation the swap uploads and
+    // collapse the emulated body's per-field dirty accumulation into one
+    // whole-struct before/after compare (equivalent: NrSysUpdate has the
+    // emulated write semantics field for field). Nothing else reads
+    // system_constants_ under the swap with verify off; the rare fallback
+    // re-syncs it in IssueDrawImpl.
+    nr::NrSysConstants nr_prev;
+    std::memcpy(&nr_prev, &g_nr_sys_state, sizeof(nr_prev));
+    nr::NrSysInputs nr_in;
+    nr_sys_fill_inputs(nr_in);
+    if (nr::NrSysUpdate(nr_in, &g_nr_sys_state)) {
+      if (std::memcmp(&nr_prev, &g_nr_sys_state, sizeof(nr_prev)) != 0) {
+        cbuffer_binding_system_.up_to_date = false;
+      }
+      g_nr_sys_member_stale = true;
+      ++g_nr_swap_probe.sys_lean;
+      return;
+    }
+    // ROV refusal (never seen in this game): fall through to the full body.
+  }
+
   // Get the color info register values for each render target. Also, for ROV,
   // exclude components that don't exist in the format from the write mask.
   // Don't exclude fully overlapping render targets, however - two render
@@ -7130,29 +7228,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
         ++g_nr_sys.reseeds;
       }
       nr::NrSysInputs nr_in;
-      nr_in.regs = &regs[0];
-      nr_in.shared_memory_is_uav = shared_memory_is_uav;
-      nr_in.primitive_polygonal = primitive_polygonal;
-      nr_in.line_loop_closing_index = line_loop_closing_index;
-      nr_in.index_endian = uint32_t(index_endian);
-      for (uint32_t i = 0; i < 3; ++i) {
-        nr_in.ndc_scale[i] = viewport_info.ndc_scale[i];
-        nr_in.ndc_offset[i] = viewport_info.ndc_offset[i];
-      }
-      nr_in.xy_extent[0] = viewport_info.xy_extent[0];
-      nr_in.xy_extent[1] = viewport_info.xy_extent[1];
-      nr_in.used_texture_mask = used_texture_mask;
-      nr_in.edram_rov_used = false;
-      nr_in.color_exp_bias_host_remap =
-          render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-          !render_target_cache_->IsFixed16TruncatedToMinus1To1();
-      nr_in.gamma_render_target_as_unorm16 =
-          render_target_cache_->gamma_render_target_as_unorm16();
-      nr_in.draw_resolution_scale_x = draw_resolution_scale_x;
-      nr_in.draw_resolution_scale_y = draw_resolution_scale_y;
-      nr_in.texture_signs_fn = NrSysTextureSigns;
-      nr_in.texture_res_scaled_fn = NrSysTextureResScaled;
-      nr_in.texture_ctx = static_cast<TextureCache*>(texture_cache_.get());
+      nr_sys_fill_inputs(nr_in);
       // [NR-VERIFY] inc 2: the derivation ALWAYS runs -- g_nr_sys_state is
       // what the swap uploads -- but the coverage counters and the whole-
       // struct memcmp are verify.
