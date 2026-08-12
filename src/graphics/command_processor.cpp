@@ -1376,6 +1376,8 @@ uint64_t g_res_addr_distinct = 0, g_res_addr_ovf = 0;
 // buffer entry (component shadows, bin trio split out because the ring
 // rewrites it per tile). See NEXT-AGENT-5.md "5-4-5" for the model.
 bool g_nr_ruse = false;
+bool g_nr_ruse_v0 = false;  // the v0 digest/prefix reporting rides the probe
+                            // cvar only; the fast path needs just v2
 struct RuseBuf {
   uint32_t dwords = 0;      // buffer size at last replay
   uint32_t last_swap = 0;   // swap_counter() at last replay
@@ -1616,15 +1618,26 @@ bool NrRuseEntryComponent(std::vector<uint32_t>& shad, const uint32_t* live,
     return true;
   }
   bool eq = true;
-  for (uint32_t i = 0; i < count; ++i) {
-    if (skip_n && i >= skip_lo && i < skip_lo + skip_n) continue;
+  // u64-stride, drill on mismatch (the skip window only matters inside a
+  // mismatching block; an equal block needs nothing).
+  const uint64_t* a64 = reinterpret_cast<const uint64_t*>(live);
+  const uint64_t* s64 = reinterpret_cast<const uint64_t*>(shad.data());
+  const uint32_t words = count / 2;
+  const auto drill = [&](uint32_t i) {
+    if (skip_n && i >= skip_lo && i < skip_lo + skip_n) return;
     if (shad[i] != live[i]) {
       if (eq && first_ne && *first_ne == 0xFFFFFFFFu) *first_ne = base_reg + i;
       eq = false;
       NrRuseStaleMark(base_reg + i, true);
       shad[i] = live[i];
     }
+  };
+  for (uint32_t w = 0; w < words; ++w) {
+    if (a64[w] == s64[w]) continue;
+    drill(w * 2);
+    drill(w * 2 + 1);
   }
+  if (count & 1) drill(count - 1);
   return eq;
 }
 
@@ -1676,15 +1689,28 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
     g_ruse_first_diff = 0;  // nothing comparable: no draw may claim a prefix
   } else {
     // Changed-dword bitmap + first diff + count vs the previous replay.
+    // u64-stride with drill-on-mismatch: the all-equal case (most replays)
+    // is a straight vectorizable compare.
     uint32_t first = count, changed = 0;
     const uint32_t* a = reinterpret_cast<const uint32_t*>(raw);
     const uint32_t* s = reinterpret_cast<const uint32_t*>(b.shadow.data());
-    for (uint32_t i = 0; i < count; ++i) {
-      if (a[i] != s[i]) {
-        g_ruse_diff[i >> 6] |= 1ull << (i & 63);
-        if (first == count) first = i;
-        ++changed;
+    const uint64_t* a64 = reinterpret_cast<const uint64_t*>(raw);
+    const uint64_t* s64 = reinterpret_cast<const uint64_t*>(b.shadow.data());
+    const uint32_t words = count / 2;
+    for (uint32_t w = 0; w < words; ++w) {
+      if (a64[w] == s64[w]) continue;
+      for (uint32_t i = w * 2; i < w * 2 + 2; ++i) {
+        if (a[i] != s[i]) {
+          g_ruse_diff[i >> 6] |= 1ull << (i & 63);
+          if (first == count) first = i;
+          ++changed;
+        }
       }
+    }
+    if ((count & 1) && a[count - 1] != s[count - 1]) {
+      g_ruse_diff[(count - 1) >> 6] |= 1ull << ((count - 1) & 63);
+      if (first == count) first = count - 1;
+      ++changed;
     }
     g_ruse_first_diff = first;
     const bool sf = b.last_swap == swap_now;
@@ -1800,24 +1826,27 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
   d.vs_size = vs.size_dwords;
   d.ps_addr = ps.addr;
   d.ps_size = ps.size_dwords;
-  // v0: the prefix rule (sound floor).
-  if (!g_ruse_have_prev || !key_prev) {
-    ++g_ruse_w_first;
-  } else if (g_ruse_first_diff < end) {
-    ++g_ruse_w_miss_pfx;
-  } else if (!byref_eq) {
-    ++g_ruse_w_miss_byref;
-  } else if (!g_ruse_entry_core_eq) {
-    for (uint32_t i = 0; i < 5; ++i) {
-      if (g_ruse_entry_ne_mask & (1u << i)) {
-        ++g_ruse_w_miss_entry[i];
-        break;
+  // v0: the prefix rule (sound floor). Reporting only; skipped when only
+  // the fast path wants the verdict.
+  if (g_nr_ruse_v0) {
+    if (!g_ruse_have_prev || !key_prev) {
+      ++g_ruse_w_first;
+    } else if (g_ruse_first_diff < end) {
+      ++g_ruse_w_miss_pfx;
+    } else if (!byref_eq) {
+      ++g_ruse_w_miss_byref;
+    } else if (!g_ruse_entry_core_eq) {
+      for (uint32_t i = 0; i < 5; ++i) {
+        if (g_ruse_entry_ne_mask & (1u << i)) {
+          ++g_ruse_w_miss_entry[i];
+          break;
+        }
       }
+    } else {
+      ++g_ruse_w_reuse;
+      if (g_ruse_same_frame) ++g_ruse_w_reuse_sf; else ++g_ruse_w_reuse_xf;
+      if (g_ruse_bin_ne) ++g_ruse_w_reuse_binonly;
     }
-  } else {
-    ++g_ruse_w_reuse;
-    if (g_ruse_same_frame) ++g_ruse_w_reuse_sf; else ++g_ruse_w_reuse_xf;
-    if (g_ruse_bin_ne) ++g_ruse_w_reuse_binonly;
   }
   // v2: the stale-register rule. The draw's own packet span still gets a
   // direct byte check (the 0x22 viz token is consumed but is not a register
@@ -1910,7 +1939,7 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
     // patched single-dword LOAD_ALU would classify as reusable; every
     // per-dword apply also drives the v2 stale set.
     if (g_nr_ruse) {
-      if (from_memory) NrRuseFeedByrefDword(reg, value);
+      if (g_nr_ruse_v0 && from_memory) NrRuseFeedByrefDword(reg, value);
       NrRuseDword(reg, value, from_memory);
     }
     static_cast<CommandProcessor*>(user)->NrSkipApplyRegWrite(reg, value);
@@ -2238,10 +2267,11 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_skip_direct = REXCVAR_GET(gpu_nr_skip_direct) && kNrSkip;
   // [NR-RUSE] 5-4-5 inc 0: the reuse pricing probe rides the skip (the walk
   // is the only decoder there, so buffer bytes ARE the input stream).
-  // 5-4-5-2: the fast path consumes the verdict, so it implies the probe.
-  g_nr_ruse = (REXCVAR_GET(gpu_nr_reuse_probe) ||
-               REXCVAR_GET(gpu_nr_reuse_fast)) &&
-              kNrSkip;
+  // 5-4-5-2: the fast path consumes the verdict, so it implies the probe
+  // machinery; the v0 digest/prefix reporting runs only under the probe
+  // cvar itself (fast-only runs pay just the v2 verdict).
+  g_nr_ruse_v0 = REXCVAR_GET(gpu_nr_reuse_probe) && kNrSkip;
+  g_nr_ruse = (g_nr_ruse_v0 || REXCVAR_GET(gpu_nr_reuse_fast)) && kNrSkip;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
@@ -4314,7 +4344,7 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
   // also drives the v2 stale set (inline via the diff bitmap, by-ref via the
   // per-buffer value-stream shadow).
   if (g_nr_ruse) {
-    if (from_memory) NrRuseFeedByrefRange(base, be, n);
+    if (g_nr_ruse_v0 && from_memory) NrRuseFeedByrefRange(base, be, n);
     NrRuseRange(base, be, n, from_memory);
   }
   WriteRegistersFromMem(base, be, n);
