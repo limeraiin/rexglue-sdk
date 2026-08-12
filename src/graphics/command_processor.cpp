@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -34,6 +36,7 @@
 #include <rex/graphics/nr_regfile.h>
 #include <rex/graphics/nr_resource.h>
 #include <rex/graphics/nr_shader_db.h>
+#include <rex/hash.h>  // [NR-RUSE] XXH3, header-only (XXH_INLINE_ALL)
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -297,6 +300,25 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, true, "GPU",
                     "fall back to delegation. Default ON since the 5-4-4a "
                     "city validation (naruto_364, pixel-perfect at 13M "
                     "draws).");
+
+// [NR-RUSE] Phase 5-4-5 inc 0: the replay state-reuse pricing probe. Buffers
+// are recorded once and replayed many times (once per bin = 3x/frame, and
+// across frames); a draw whose full input state is byte-identical to its
+// previous execution re-derives and re-uploads everything today. This probe
+// prices the reuse ceiling WITHOUT changing behavior: per skip-driven buffer,
+// a shadow copy names the first changed dword vs the previous replay
+// (same-frame vs cross-frame split); entry-state component shadows over the
+// replay file (ctl minus the per-tile bin trio, float/fetch/bool-loop files,
+// walker shader refs) attribute inherited-state churn; an order-sensitive
+// chain digest of every by-ref LOAD_ALU payload (the only draw input that
+// bypasses the buffer bytes) is checked per draw key. A draw classifies
+// REUSABLE when its byte prefix, by-ref digest and entry core all match its
+// previous execution. Decision gate in NEXT-AGENT-5.md "5-4-5".
+REXCVAR_DEFINE_BOOL(gpu_nr_reuse_probe, false, "GPU",
+                    "[nr-ruse] Phase 5-4-5 inc 0: price per-draw input-state "
+                    "identity across buffer replays (reuse ceiling for the "
+                    "native replay's state engine). Requires gpu_nr_skip. "
+                    "Diagnostic only, off by default.");
 
 // [NR-VERIFY] Phase 5-4-4a inc 2: the per-draw VERIFY work is real CP cost --
 // RegShadowSweep (256 reg compares/draw), the per-draw shader re-hash in the
@@ -1334,6 +1356,247 @@ constexpr uint32_t kResAddrSetSize = 8192;
 uint32_t g_res_addr_set[kResAddrSetSize];
 uint64_t g_res_addr_distinct = 0, g_res_addr_ovf = 0;
 
+// [NR-RUSE] Phase 5-4-5 inc 0: the replay state-reuse pricing probe. All
+// state below is command-processor-thread-only. A draw's inputs are exactly:
+// the buffer bytes up to its packet end (prefix), every by-ref LOAD_ALU
+// payload applied before it (chain digest), and the replay-file state at
+// buffer entry (component shadows, bin trio split out because the ring
+// rewrites it per tile). See NEXT-AGENT-5.md "5-4-5" for the model.
+bool g_nr_ruse = false;
+struct RuseBuf {
+  uint32_t dwords = 0;      // buffer size at last replay
+  uint32_t last_swap = 0;   // swap_counter() at last replay
+  bool have_entry = false;  // entry shadows captured (g_nri_file was seeded)
+  std::vector<uint8_t> shadow;  // raw buffer bytes at last replay
+  // Entry-state shadows (host-order dwords from g_nri_file at buffer entry).
+  std::vector<uint32_t> e_ctl;             // 0x2000..0x2FFF (4096 dwords)
+  std::vector<uint32_t> e_flt;             // 0x4000..0x47FF (2048)
+  std::vector<uint32_t> e_ftc;             // 0x4800..0x48BF (192)
+  std::vector<uint32_t> e_bl;              // 0x4900..0x4927 (40)
+  uint32_t e_bin[3] = {0, 0, 0};           // the per-tile trio 0x2080-0x2082
+  nr::ShaderRef e_vs = {}, e_ps = {};      // walker refs at entry
+};
+std::unordered_map<uint32_t, RuseBuf> g_ruse_bufs;          // phys ptr -> buf
+std::unordered_map<uint32_t, uint64_t> g_ruse_draw_digest;  // pkt phys -> digest
+size_t g_ruse_shadow_bytes = 0;
+constexpr size_t kRuseShadowCap = 128ull << 20;  // clear-all backstop
+// Per-replay classification, set at buffer entry, read at each draw stop.
+uint64_t g_ruse_byref_h = 0;          // chain digest of by-ref payloads so far
+uint32_t g_ruse_first_diff = 0;       // first differing dword vs prev replay
+bool g_ruse_have_prev = false;        // prev replay comparable (size+entry ok)
+bool g_ruse_same_frame = false;
+bool g_ruse_entry_core_eq = false;    // all components eq (bin trio excluded)
+bool g_ruse_bin_ne = false;           // ONLY the bin trio differed
+uint8_t g_ruse_entry_ne_mask = 0;     // bit 0..4 = ctl/flt/ftc/bl/sh
+// Window counters (reset each 1Hz report).
+uint64_t g_ruse_w_bufs = 0, g_ruse_w_new = 0, g_ruse_w_id = 0, g_ruse_w_ch = 0;
+uint64_t g_ruse_w_sf = 0, g_ruse_w_sf_id = 0, g_ruse_w_xf = 0, g_ruse_w_xf_id = 0;
+uint64_t g_ruse_w_chdw = 0;  // changed dwords summed over changed replays
+uint64_t g_ruse_w_entry_eq = 0, g_ruse_w_entry_binonly = 0;
+uint64_t g_ruse_w_entry_ne[5] = {};  // ctl flt ftc bl sh
+uint32_t g_ruse_w_ctl_diff_reg = 0xFFFFFFFFu;  // sample: first ctl reg that ne'd
+uint64_t g_ruse_w_draws = 0, g_ruse_w_first = 0, g_ruse_w_reuse = 0;
+uint64_t g_ruse_w_reuse_sf = 0, g_ruse_w_reuse_xf = 0, g_ruse_w_reuse_binonly = 0;
+uint64_t g_ruse_w_miss_pfx = 0, g_ruse_w_miss_byref = 0;
+uint64_t g_ruse_w_miss_entry[5] = {};  // first-fail attribution, ctl..sh
+uint64_t g_ruse_w_evict = 0, g_ruse_w_cost_ns = 0;
+
+// Chain the by-ref payload stream (order-sensitive: same payloads in the same
+// order give the same digest at every draw prefix).
+inline void NrRuseFeedByrefRange(uint32_t base, const uint32_t* values_be,
+                                 uint32_t n) {
+  const uint32_t head[2] = {base, n};
+  const uint64_t h = XXH3_64bits_withSeed(head, sizeof(head), g_ruse_byref_h);
+  g_ruse_byref_h =
+      XXH3_64bits_withSeed(values_be, size_t(n) * sizeof(uint32_t), h);
+}
+inline void NrRuseFeedByrefDword(uint32_t reg, uint32_t value) {
+  const uint32_t pair[2] = {reg, value};
+  g_ruse_byref_h = XXH3_64bits_withSeed(pair, sizeof(pair), g_ruse_byref_h);
+}
+
+// One entry-state component: compare against the shadow, refresh the shadow
+// when it changed. Returns true when equal. `skip_lo`/`skip_n` cut the bin
+// trio out of the ctl compare (they are compared separately).
+bool NrRuseEntryComponent(std::vector<uint32_t>& shad, const uint32_t* live,
+                          uint32_t count, uint32_t skip_lo, uint32_t skip_n,
+                          bool* had_prev, uint32_t* first_ne) {
+  if (shad.size() != count) {
+    shad.assign(live, live + count);
+    *had_prev = false;
+    return true;
+  }
+  bool eq = true;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (skip_n && i >= skip_lo && i < skip_lo + skip_n) continue;
+    if (shad[i] != live[i]) {
+      if (eq && first_ne && *first_ne == 0xFFFFFFFFu) *first_ne = i;
+      eq = false;
+      break;
+    }
+  }
+  if (!eq) std::memcpy(shad.data(), live, count * sizeof(uint32_t));
+  return eq;
+}
+
+// Buffer entry: shadow-compare the bytes, compare the entry components,
+// arm the per-replay classification flags. Runs only under the skip (the
+// walk is the only decoder there, so `raw` is exactly what will be decoded).
+void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
+                    uint32_t swap_now) {
+  const auto t0 = std::chrono::steady_clock::now();
+  ++g_ruse_w_bufs;
+  g_ruse_byref_h = 0;
+  g_ruse_have_prev = false;
+  g_ruse_first_diff = 0;
+  if (g_ruse_shadow_bytes > kRuseShadowCap) {
+    g_ruse_bufs.clear();
+    g_ruse_draw_digest.clear();
+    g_ruse_shadow_bytes = 0;
+    ++g_ruse_w_evict;
+  }
+  RuseBuf& b = g_ruse_bufs[ptr & 0x1FFFFFFFu];
+  const size_t bytes = size_t(count) * sizeof(uint32_t);
+  bool have_prev = b.dwords == count && b.shadow.size() == bytes;
+  if (!have_prev) {
+    g_ruse_shadow_bytes += bytes - b.shadow.size();
+    b.shadow.assign(raw, raw + bytes);
+    b.dwords = count;
+    ++g_ruse_w_new;
+    g_ruse_first_diff = 0;  // nothing comparable: no draw may claim a prefix
+  } else {
+    // First differing dword + changed count vs the previous replay.
+    uint32_t first = count, changed = 0;
+    const uint32_t* a = reinterpret_cast<const uint32_t*>(raw);
+    const uint32_t* s = reinterpret_cast<const uint32_t*>(b.shadow.data());
+    for (uint32_t i = 0; i < count; ++i) {
+      if (a[i] != s[i]) {
+        if (first == count) first = i;
+        ++changed;
+      }
+    }
+    g_ruse_first_diff = first;
+    const bool sf = b.last_swap == swap_now;
+    if (sf) ++g_ruse_w_sf; else ++g_ruse_w_xf;
+    g_ruse_same_frame = sf;
+    if (changed) {
+      ++g_ruse_w_ch;
+      g_ruse_w_chdw += changed;
+      std::memcpy(b.shadow.data(), raw, bytes);
+    } else {
+      ++g_ruse_w_id;
+      if (sf) ++g_ruse_w_sf_id; else ++g_ruse_w_xf_id;
+    }
+  }
+  b.last_swap = swap_now;
+  // Entry components, only meaningful once the replay file is live.
+  g_ruse_entry_ne_mask = 0;
+  g_ruse_bin_ne = false;
+  g_ruse_entry_core_eq = false;
+  if (g_nr_issue && g_nri_seeded) {
+    const uint32_t* f = g_nri_file.values;
+    bool comp_prev = b.have_entry;
+    uint32_t ctl_ne = 0xFFFFFFFFu;
+    // ctl 0x2000..0x2FFF with the bin trio (0x2080-0x2082) cut out.
+    if (!NrRuseEntryComponent(b.e_ctl, f + 0x2000, 0x1000,
+                              XE_GPU_REG_PA_SC_WINDOW_OFFSET - 0x2000, 3,
+                              &comp_prev, &ctl_ne)) {
+      g_ruse_entry_ne_mask |= 1u << 0;
+      if (g_ruse_w_ctl_diff_reg == 0xFFFFFFFFu && ctl_ne != 0xFFFFFFFFu) {
+        g_ruse_w_ctl_diff_reg = 0x2000 + ctl_ne;
+      }
+    }
+    if (!NrRuseEntryComponent(b.e_flt, f + 0x4000, 0x800, 0, 0, &comp_prev,
+                              nullptr)) {
+      g_ruse_entry_ne_mask |= 1u << 1;
+    }
+    if (!NrRuseEntryComponent(b.e_ftc, f + 0x4800, 0xC0, 0, 0, &comp_prev,
+                              nullptr)) {
+      g_ruse_entry_ne_mask |= 1u << 2;
+    }
+    if (!NrRuseEntryComponent(b.e_bl, f + 0x4900, 0x28, 0, 0, &comp_prev,
+                              nullptr)) {
+      g_ruse_entry_ne_mask |= 1u << 3;
+    }
+    const nr::ShaderRef& vs = g_ctx_state.vs;
+    const nr::ShaderRef& ps = g_ctx_state.ps;
+    if (vs.addr != b.e_vs.addr || vs.size_dwords != b.e_vs.size_dwords ||
+        vs.valid != b.e_vs.valid || ps.addr != b.e_ps.addr ||
+        ps.size_dwords != b.e_ps.size_dwords || ps.valid != b.e_ps.valid) {
+      g_ruse_entry_ne_mask |= 1u << 4;
+      b.e_vs = vs;
+      b.e_ps = ps;
+    }
+    g_ruse_bin_ne = f[XE_GPU_REG_PA_SC_WINDOW_OFFSET] != b.e_bin[0] ||
+                    f[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] != b.e_bin[1] ||
+                    f[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] != b.e_bin[2];
+    b.e_bin[0] = f[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+    b.e_bin[1] = f[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
+    b.e_bin[2] = f[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+    g_ruse_entry_core_eq = comp_prev && g_ruse_entry_ne_mask == 0;
+    if (comp_prev) {
+      if (g_ruse_entry_ne_mask == 0) {
+        ++g_ruse_w_entry_eq;
+        if (g_ruse_bin_ne) ++g_ruse_w_entry_binonly;
+      } else {
+        for (uint32_t i = 0; i < 5; ++i) {
+          if (g_ruse_entry_ne_mask & (1u << i)) ++g_ruse_w_entry_ne[i];
+        }
+      }
+    }
+    g_ruse_have_prev = have_prev && comp_prev;
+    b.have_entry = true;
+  } else {
+    b.have_entry = false;
+  }
+  g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+}
+
+// One draw stop: classify this execution against the draw's previous one.
+void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
+                    uint32_t stop_dword) {
+  const auto t0 = std::chrono::steady_clock::now();
+  ++g_ruse_w_draws;
+  const uint32_t hdr = __builtin_bswap32(
+      *reinterpret_cast<const uint32_t*>(raw + size_t(stop_dword) * 4));
+  const uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1;
+  uint32_t end = stop_dword + 1 + cnt;
+  if (end > count) end = count;
+  const uint32_t key = (ptr & 0x1FFFFFFFu) + stop_dword * 4;
+  const uint64_t digest = g_ruse_byref_h;
+  auto it = g_ruse_draw_digest.find(key);
+  const bool key_prev = it != g_ruse_draw_digest.end();
+  const bool byref_eq = key_prev && it->second == digest;
+  if (key_prev) {
+    it->second = digest;
+  } else {
+    g_ruse_draw_digest.emplace(key, digest);
+  }
+  if (!g_ruse_have_prev || !key_prev) {
+    ++g_ruse_w_first;
+  } else if (g_ruse_first_diff < end) {
+    ++g_ruse_w_miss_pfx;
+  } else if (!byref_eq) {
+    ++g_ruse_w_miss_byref;
+  } else if (!g_ruse_entry_core_eq) {
+    for (uint32_t i = 0; i < 5; ++i) {
+      if (g_ruse_entry_ne_mask & (1u << i)) {
+        ++g_ruse_w_miss_entry[i];
+        break;
+      }
+    }
+  } else {
+    ++g_ruse_w_reuse;
+    if (g_ruse_same_frame) ++g_ruse_w_reuse_sf; else ++g_ruse_w_reuse_xf;
+    if (g_ruse_bin_ne) ++g_ruse_w_reuse_binonly;
+  }
+  g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+}
+
 // [NR-RES]/[NR-DRAW] Every register write the ONE walk decodes, fanned out to
 // whichever censuses are on. Both consume the same stream by design: a second
 // decoder is the drift 4b-1 had to repair across four walkers.
@@ -1361,6 +1624,9 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   // fired on top (WriteRegister's own tail already ran).
   if (g_nr_skip_bufactive && user) {
     ++g_skp_pdw;
+    // [NR-RUSE] the one-reg by-ref fallback must feed the digest too, or a
+    // patched single-dword LOAD_ALU would classify as reusable.
+    if (g_nr_ruse && from_memory) NrRuseFeedByrefDword(reg, value);
     static_cast<CommandProcessor*>(user)->NrSkipApplyRegWrite(reg, value);
     return;
   }
@@ -1684,6 +1950,9 @@ void CommandProcessor::WorkerThreadMain() {
   g_skp_prof = kSkpProf;
   // [NR-SKP] 5-4-4a: the direct draw path only exists under the skip.
   g_nr_skip_direct = REXCVAR_GET(gpu_nr_skip_direct) && kNrSkip;
+  // [NR-RUSE] 5-4-5 inc 0: the reuse pricing probe rides the skip (the walk
+  // is the only decoder there, so buffer bytes ARE the input stream).
+  g_nr_ruse = REXCVAR_GET(gpu_nr_reuse_probe) && kNrSkip;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
@@ -2472,6 +2741,52 @@ void CommandProcessor::WorkerThreadMain() {
           g_skp_exec_fail = g_skp_arm_orphan = 0;
           g_skp_rng = g_skp_rng_dw = g_skp_pdw = 0;
           for (uint32_t op = 0; op < 128; ++op) g_skp_deleg_op[op] = 0;
+        }
+        // [NR-RUSE] 5-4-5 inc 0. Line 1 = buffer replays: id/ch = byte
+        // identical vs changed vs previous replay of the same buffer, sf/xf
+        // = same-frame (bin) vs cross-frame splits with their identical
+        // counts, entry = inherited-state component stability at buffer
+        // entry (bin trio excluded; binonly = ONLY the trio moved). Line 2 =
+        // the per-draw verdict: reuse = prefix-clean AND by-ref digest eq
+        // AND entry core eq vs this draw's previous execution; miss
+        // attribution is first-fail (pfx > byref > ctl/flt/ftc/bl/sh).
+        if (g_nr_ruse && (g_ruse_w_bufs || g_ruse_w_draws)) {
+          REXGPU_INFO(
+              "[nr-ruse] bufs={} new={} id={} ch={} chdw={} sf={}/{} "
+              "xf={}/{} | entry eq={} binonly={} ne c/f/t/b/s={}/{}/{}/{}/{} "
+              "ctl1st={:04X} | live={} shad={}MB evict={} cost={:.1f}ms",
+              g_ruse_w_bufs, g_ruse_w_new, g_ruse_w_id, g_ruse_w_ch,
+              g_ruse_w_chdw, g_ruse_w_sf_id, g_ruse_w_sf, g_ruse_w_xf_id,
+              g_ruse_w_xf, g_ruse_w_entry_eq, g_ruse_w_entry_binonly,
+              g_ruse_w_entry_ne[0], g_ruse_w_entry_ne[1], g_ruse_w_entry_ne[2],
+              g_ruse_w_entry_ne[3], g_ruse_w_entry_ne[4],
+              g_ruse_w_ctl_diff_reg == 0xFFFFFFFFu ? 0u : g_ruse_w_ctl_diff_reg,
+              g_ruse_bufs.size(), g_ruse_shadow_bytes >> 20, g_ruse_w_evict,
+              g_ruse_w_cost_ns / 1e6);
+          const uint64_t with_prev = g_ruse_w_draws - g_ruse_w_first;
+          REXGPU_INFO(
+              "[nr-ruse]   draws={} 1st={} reuse={} ({:.1f}% of prev'd) "
+              "sf={} xf={} binonly={} | miss pfx={} byref={} "
+              "c/f/t/b/s={}/{}/{}/{}/{}",
+              g_ruse_w_draws, g_ruse_w_first, g_ruse_w_reuse,
+              with_prev ? 100.0 * g_ruse_w_reuse / with_prev : 0.0,
+              g_ruse_w_reuse_sf, g_ruse_w_reuse_xf, g_ruse_w_reuse_binonly,
+              g_ruse_w_miss_pfx, g_ruse_w_miss_byref, g_ruse_w_miss_entry[0],
+              g_ruse_w_miss_entry[1], g_ruse_w_miss_entry[2],
+              g_ruse_w_miss_entry[3], g_ruse_w_miss_entry[4]);
+          g_ruse_w_bufs = g_ruse_w_new = g_ruse_w_id = g_ruse_w_ch = 0;
+          g_ruse_w_chdw = 0;
+          g_ruse_w_sf = g_ruse_w_sf_id = g_ruse_w_xf = g_ruse_w_xf_id = 0;
+          g_ruse_w_entry_eq = g_ruse_w_entry_binonly = 0;
+          for (uint32_t i = 0; i < 5; ++i) {
+            g_ruse_w_entry_ne[i] = g_ruse_w_miss_entry[i] = 0;
+          }
+          g_ruse_w_ctl_diff_reg = 0xFFFFFFFFu;
+          g_ruse_w_draws = g_ruse_w_first = g_ruse_w_reuse = 0;
+          g_ruse_w_reuse_sf = g_ruse_w_reuse_xf = g_ruse_w_reuse_binonly = 0;
+          g_ruse_w_miss_pfx = g_ruse_w_miss_byref = 0;
+          g_ruse_w_evict = 0;
+          g_ruse_w_cost_ns = 0;
         }
         // [NR-SPP] 5-4-4 step 0b. walk+rng = buf minus the two stop-dispatch
         // brackets: the walk decode plus the bulk range applies. drawstop
@@ -3539,6 +3854,9 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   const auto spp_buf_t0 = spp ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
   const uint8_t* raw = memory_->TranslatePhysical(ptr);
+  // [NR-RUSE] 5-4-5 inc 0: arm this replay's classification before any
+  // packet is decoded (shadow compare + entry components + digest reset).
+  if (g_nr_ruse) NrRuseBufEntry(ptr, raw, count, swap_counter());
   nr::CtxDrawStop stop;
   bool aborted = false;
   while (nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
@@ -3554,6 +3872,9 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       g_nr_skip_stop = stop;
       g_nr_skip_draw_pending = true;
       ++g_skp_draws;
+      // [NR-RUSE] classify BOTH direct and delegated draw stops (this is
+      // before the direct/delegate split on purpose).
+      if (g_nr_ruse) NrRuseDrawStop(ptr, raw, count, stop.dword);
       // [NR-SKP] 5-4-4a: direct issue -- the walk already applied this
       // packet's register payload, so the delegated re-dispatch below is
       // pure framing. The tail consumes the pending stop exactly as the
@@ -3667,6 +3988,9 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
     be = memory_->TranslatePhysical<uint32_t*>(phys);
     if (!be) return false;
   }
+  // [NR-RUSE] by-ref payloads bypass the buffer bytes; chain them so a draw's
+  // prefix digest covers everything the packet dwords cannot.
+  if (g_nr_ruse && from_memory) NrRuseFeedByrefRange(base, be, n);
   WriteRegistersFromMem(base, be, n);
   const uint32_t* host = &register_file_->values[base];
   if (g_nr_res) {
