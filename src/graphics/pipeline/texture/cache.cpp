@@ -125,7 +125,19 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "96 MB, and with 3x3, it will be 360 + 216 MB.",
 //     "GPU");
 
+// [NR-TEXP] 5-4-4b inc 3: RequestTextures sub-profile, active only while
+// gpu_draw_profile is on (defined in d3d12/command_processor.cpp, same DLL).
+REXCVAR_DECLARE(bool, gpu_draw_profile);
+
 namespace rex::graphics {
+
+// [NR-TEXP] ns: 0=binding derivation loop 1=shared-memory RequestRanges
+// 2=texture data loads 3=UpdateTextureBindingsImpl; counters: 0=calls
+// 1=slots re-derived 2=binding-changed slots 3=pending loads 4=pending
+// ranges. CP-thread only (called from IssueDrawImpl), like every [gpu-draw]
+// counter. Names the cost driver inside the tex phase before any lean.
+static uint64_t g_texp_ns[4] = {};
+static uint64_t g_texp_cnt[5] = {};
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -449,6 +461,12 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 
+  // [NR-TEXP] see the globals above; ~free when gpu_draw_profile is off.
+  const bool texp = REXCVAR_GET(gpu_draw_profile);
+  if (texp) {
+    ++g_texp_cnt[0];
+  }
+
   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
     // A texture has become outdated - make sure whether textures are outdated
     // is rechecked in this draw and in subsequent ones to reload the new data
@@ -480,11 +498,16 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       pending_shared_memory_ranges.push_back(pending_ranges[i]);
     }
   };
+  auto texp_derive0 = texp ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
   uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
   uint32_t index = 0;
   while (rex::bit_scan_forward(textures_remaining, &index)) {
     uint32_t index_bit = UINT32_C(1) << index;
     textures_remaining &= ~index_bit;
+    if (texp) {
+      ++g_texp_cnt[1];
+    }
     TextureBinding& binding = texture_bindings_[index];
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
@@ -557,11 +580,22 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
   }
 
+  if (texp) {
+    auto texp_now = std::chrono::steady_clock::now();
+    g_texp_ns[0] += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(texp_now - texp_derive0).count());
+    g_texp_cnt[2] += rex::bit_count(bindings_changed);
+    g_texp_cnt[3] += pending_texture_loads.size();
+    g_texp_cnt[4] += pending_shared_memory_ranges.size();
+  }
+
   COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
                     uint32_t(pending_texture_loads.size()));
   COUNT_profile_set("gpu/texture_cache/request_textures_pending_range_count",
                     uint32_t(pending_shared_memory_ranges.size()));
 
+  auto texp_rng0 = texp ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
   bool batched_shared_memory_request_succeeded = true;
   std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs;
   if (!pending_shared_memory_ranges.empty()) {
@@ -573,6 +607,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
   }
 
+  auto texp_load0 = texp ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
   if (batched_shared_memory_request_succeeded) {
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
       CommitPreparedTextureLoad(pending_load);
@@ -584,8 +620,33 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
     }
   }
+  auto texp_bind0 = texp ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
+  }
+  if (texp) {
+    auto texp_end = std::chrono::steady_clock::now();
+    g_texp_ns[1] += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(texp_load0 - texp_rng0).count());
+    g_texp_ns[2] += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(texp_bind0 - texp_load0).count());
+    g_texp_ns[3] += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(texp_end - texp_bind0).count());
+    static auto s_texp_last_report = std::chrono::steady_clock::now();
+    if (texp_end - s_texp_last_report >= std::chrono::seconds(1)) {
+      s_texp_last_report = texp_end;
+      static uint64_t s_ns[4] = {}, s_cnt[5] = {};
+      REXGPU_INFO(
+          "[nr-texp] calls={} slots={} chg={} loads={} rng={} | derive={:.1f} rng={:.1f} "
+          "load={:.1f} bind={:.1f}ms",
+          g_texp_cnt[0] - s_cnt[0], g_texp_cnt[1] - s_cnt[1], g_texp_cnt[2] - s_cnt[2],
+          g_texp_cnt[3] - s_cnt[3], g_texp_cnt[4] - s_cnt[4], (g_texp_ns[0] - s_ns[0]) / 1e6,
+          (g_texp_ns[1] - s_ns[1]) / 1e6, (g_texp_ns[2] - s_ns[2]) / 1e6,
+          (g_texp_ns[3] - s_ns[3]) / 1e6);
+      for (int i = 0; i < 4; ++i) s_ns[i] = g_texp_ns[i];
+      for (int i = 0; i < 5; ++i) s_cnt[i] = g_texp_cnt[i];
+    }
   }
 }
 
