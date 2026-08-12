@@ -320,6 +320,19 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_probe, false, "GPU",
                     "native replay's state engine). Requires gpu_nr_skip. "
                     "Diagnostic only, off by default.");
 
+// [NR-RUSE] Phase 5-4-5-2: the fast path's master switch. Turns the reuse
+// probe's v2 verdict into the driver of the backend's per-draw state reuse
+// (the D3D12 side latches its own eligibility beside the bindings swap).
+// Implies gpu_nr_reuse_probe: the verdict machinery is the classification
+// source. Off by default until the city A/B.
+REXCVAR_DEFINE_BOOL(gpu_nr_reuse_fast, false, "GPU",
+                    "[nr-ruse] Phase 5-4-5-2: reuse a draw's previously "
+                    "derived state when the v2 verdict proves its inputs "
+                    "unchanged (bindings restored from the bundle instead of "
+                    "recomposed). Implies gpu_nr_reuse_probe and requires "
+                    "the bindings swap + bundle gate machinery. Off by "
+                    "default.");
+
 // [NR-VERIFY] Phase 5-4-4a inc 2: the per-draw VERIFY work is real CP cost --
 // RegShadowSweep (256 reg compares/draw), the per-draw shader re-hash in the
 // arm (LoadShader x2 = XXH3 over the whole ucode), the 4b-3 census feeds and
@@ -1378,12 +1391,22 @@ struct RuseBuf {
   std::vector<uint32_t> byref_prev;        // by-ref value stream, prev replay
 };
 struct RuseDraw {
+  uint32_t key = 0;                    // full packet phys addr (slot validity)
+  uint8_t used = 0;
   uint64_t digest = 0;                 // v0: by-ref chain digest at the stop
   uint32_t vs_addr = 0, ps_addr = 0;   // walker shader refs at the stop
   uint32_t vs_size = 0, ps_size = 0;
 };
-std::unordered_map<uint32_t, RuseBuf> g_ruse_bufs;       // phys ptr -> buf
-std::unordered_map<uint32_t, RuseDraw> g_ruse_draws_m;   // pkt phys -> draw
+std::unordered_map<uint32_t, RuseBuf> g_ruse_bufs;  // phys ptr -> buf
+// Per-draw records in a direct map (the join cache's proven shape): the
+// city classifies ~270k draws/s, so a hash map find per stop is real cost.
+// Collisions overwrite (counted) and read as first-seen, never as stale.
+constexpr uint32_t kRuseDrawMapBits = 20;
+std::vector<RuseDraw> g_ruse_draws_m;  // sized 1<<kRuseDrawMapBits on arm
+inline RuseDraw* RuseDrawSlot(uint32_t key) {
+  return &g_ruse_draws_m[(key >> 2) & ((1u << kRuseDrawMapBits) - 1)];
+}
+uint64_t g_ruse_w_coll = 0;  // slot collisions (info)
 size_t g_ruse_shadow_bytes = 0;
 constexpr size_t kRuseShadowCap = 128ull << 20;  // clear-all backstop
 // Per-replay classification, set at buffer entry, read at each draw stop.
@@ -1403,6 +1426,7 @@ uint8_t g_ruse_entry_ne_mask = 0;     // bit 0..4 = ctl/flt/ftc/bl/sh
 std::vector<uint64_t> g_ruse_diff;      // changed-dword bitmap, this replay
 std::vector<uint32_t> g_ruse_byref_cur; // by-ref value stream, this replay
 std::vector<uint8_t> g_ruse_stale;      // per-register stale flag (0x5003)
+std::vector<uint32_t> g_ruse_stale_list;  // regs ever marked this replay
 uint32_t g_ruse_stale_cnt = 0;
 uint32_t g_ruse_stale_sample = 0xFFFFFFFFu;  // last reg marked stale
 RuseBuf* g_ruse_cur_buf = nullptr;      // this replay's buffer entry
@@ -1467,6 +1491,7 @@ inline void NrRuseStaleMark(uint32_t reg, bool changed) {
   if (changed) {
     if (!g_ruse_stale[reg]) {
       g_ruse_stale[reg] = 1;
+      g_ruse_stale_list.push_back(reg);
       ++g_ruse_stale_cnt;
       g_ruse_stale_sample = reg;
     }
@@ -1613,13 +1638,18 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   g_ruse_byref_h = 0;
   g_ruse_have_prev = false;
   g_ruse_first_diff = 0;
-  // v2 per-replay reset.
+  // v2 per-replay reset: only the regs actually marked are cleared (a full
+  // 20KB memset per replay was measurable at city rates).
   if (g_ruse_stale.size() != RegisterFile::kRegisterCount) {
     g_ruse_stale.assign(RegisterFile::kRegisterCount, 0);
-  } else if (g_ruse_stale_cnt) {
-    std::fill(g_ruse_stale.begin(), g_ruse_stale.end(), uint8_t(0));
+  } else {
+    for (uint32_t r : g_ruse_stale_list) g_ruse_stale[r] = 0;
   }
+  g_ruse_stale_list.clear();
   g_ruse_stale_cnt = 0;
+  if (g_ruse_draws_m.size() != (size_t(1) << kRuseDrawMapBits)) {
+    g_ruse_draws_m.assign(size_t(1) << kRuseDrawMapBits, RuseDraw{});
+  }
   g_ruse_diff.assign((count + 63) / 64, 0);
   g_ruse_byref_cur.clear();
   g_ruse_pkt_dw = 0xFFFFFFFFu;
@@ -1630,7 +1660,7 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   g_ruse_v2_ok = false;
   if (g_ruse_shadow_bytes > kRuseShadowCap) {
     g_ruse_bufs.clear();
-    g_ruse_draws_m.clear();
+    for (RuseDraw& d : g_ruse_draws_m) d.used = 0;
     g_ruse_shadow_bytes = 0;
     ++g_ruse_w_evict;
   }
@@ -1754,28 +1784,22 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
   const uint64_t digest = g_ruse_byref_h;
   const nr::ShaderRef& vs = g_ctx_state.vs;
   const nr::ShaderRef& ps = g_ctx_state.ps;
-  auto it = g_ruse_draws_m.find(key);
-  const bool key_prev = it != g_ruse_draws_m.end();
+  RuseDraw& d = *RuseDrawSlot(key);
+  const bool key_prev = d.used && d.key == key;
+  if (d.used && d.key != key) ++g_ruse_w_coll;
   bool byref_eq = false, sh_eq = false;
   if (key_prev) {
-    RuseDraw& d = it->second;
     byref_eq = d.digest == digest;
     sh_eq = d.vs_addr == vs.addr && d.vs_size == vs.size_dwords &&
             d.ps_addr == ps.addr && d.ps_size == ps.size_dwords;
-    d.digest = digest;
-    d.vs_addr = vs.addr;
-    d.vs_size = vs.size_dwords;
-    d.ps_addr = ps.addr;
-    d.ps_size = ps.size_dwords;
-  } else {
-    RuseDraw d;
-    d.digest = digest;
-    d.vs_addr = vs.addr;
-    d.vs_size = vs.size_dwords;
-    d.ps_addr = ps.addr;
-    d.ps_size = ps.size_dwords;
-    g_ruse_draws_m.emplace(key, d);
   }
+  d.key = key;
+  d.used = 1;
+  d.digest = digest;
+  d.vs_addr = vs.addr;
+  d.vs_size = vs.size_dwords;
+  d.ps_addr = ps.addr;
+  d.ps_size = ps.size_dwords;
   // v0: the prefix rule (sound floor).
   if (!g_ruse_have_prev || !key_prev) {
     ++g_ruse_w_first;
@@ -2214,7 +2238,10 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_skip_direct = REXCVAR_GET(gpu_nr_skip_direct) && kNrSkip;
   // [NR-RUSE] 5-4-5 inc 0: the reuse pricing probe rides the skip (the walk
   // is the only decoder there, so buffer bytes ARE the input stream).
-  g_nr_ruse = REXCVAR_GET(gpu_nr_reuse_probe) && kNrSkip;
+  // 5-4-5-2: the fast path consumes the verdict, so it implies the probe.
+  g_nr_ruse = (REXCVAR_GET(gpu_nr_reuse_probe) ||
+               REXCVAR_GET(gpu_nr_reuse_fast)) &&
+              kNrSkip;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;

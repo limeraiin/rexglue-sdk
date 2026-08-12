@@ -177,6 +177,7 @@ REXCVAR_DECLARE(bool, gpu_nr_native_pso);
 REXCVAR_DECLARE(bool, gpu_nr_native_pso_bind);
 // [NR-VERIFY] inc 2: defined base-side (command_processor.cpp).
 REXCVAR_DECLARE(bool, gpu_nr_verify);
+REXCVAR_DECLARE(bool, gpu_nr_reuse_fast);
 
 // [NR-BND] Phase 5-3b-0: the bindings mirror's gate.
 REXCVAR_DEFINE_BOOL(gpu_nr_bindings, false, "GPU/D3D12",
@@ -917,6 +918,7 @@ void NrSwapReportIfDue() {
 // composes write upload memory directly; comparing requires CPU-side copies,
 // [[upload-heap-readback-trap]]).
 bool g_nr_rub = false;
+bool g_nr_rub_fast = false;   // [NR-RUF] 5-4-5-2: restore instead of derive
 bool g_rub_stage_ok = false;  // staging coherent since arm (fallback clears)
 struct NrRubBundle {
   uint32_t flt_v_bytes = 0, flt_p_bytes = 0;
@@ -926,6 +928,18 @@ struct NrRubBundle {
   std::vector<uint32_t> si_v, si_p;
   uint64_t sys_hash = 0;
   void* rootsig = nullptr;
+  // [NR-RUF] 5-4-5-2 restore state: valid same-frame only (the pool ring
+  // recycles per frame; the city verdict says reuse IS within-frame).
+  bool packs_valid = false;
+  uint64_t frame = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS a_flt_v = 0, a_flt_p = 0, a_bl = 0, a_ftc = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS a_di_v = 0, a_di_p = 0;
+  size_t smp_uid_v = 0, smp_uid_p = 0, tex_uid_v = 0, tex_uid_p = 0;
+  std::vector<D3D12TextureCache::TextureSRVKey> keys_v, keys_p;
+  // pso identity capture (compare only for now; the bypass is a later peel)
+  bool pso_valid = false;
+  void* pso_handle = nullptr;
+  void* npso = nullptr;
 };
 std::unordered_map<uint32_t, NrRubBundle> g_rub_map;
 uint64_t g_rub_frame = ~0ull;
@@ -941,6 +955,9 @@ struct NrRubProbe {
   uint64_t ne_div = 0, ne_dip = 0, ne_smpv = 0, ne_smpp = 0, ne_siv = 0,
            ne_sip = 0, ne_rootsig = 0;
   uint64_t sys_eq = 0, sys_ne = 0;
+  uint64_t pso_eq = 0, ne_pso = 0;      // pso-handle identity (IssueDrawImpl)
+  uint64_t fast = 0, fast_miss = 0;     // [NR-RUF] restores / eligible misses
+  uint64_t fast_pso = 0;                // [NR-RUF] ConfigurePipeline bypasses
 } g_rub_probe;
 
 void NrRubReportIfDue() {
@@ -952,12 +969,13 @@ void NrRubReportIfDue() {
   const NrRubProbe& p = g_rub_probe;
   REXGPU_INFO(
       "[nr-rub] draws={} chk={} cap={} nobundle={} nostop={} stageoff={} | "
-      "ne fv/fp/bl/ft={}/{}/{}/{} di={}/{} smp={}/{} si={}/{} rs={} | sys "
-      "eq={} ne={} | bundles={}",
+      "ne fv/fp/bl/ft={}/{}/{}/{} di={}/{} smp={}/{} si={}/{} rs={} pso={} "
+      "(eq={}) | sys eq={} ne={} | fast={} fastmiss={} fastpso={} | "
+      "bundles={}",
       p.draws, p.checked, p.captured, p.nobundle, p.nostop, p.stage_off,
       p.ne_fltv, p.ne_fltp, p.ne_bl, p.ne_ftc, p.ne_div, p.ne_dip, p.ne_smpv,
-      p.ne_smpp, p.ne_siv, p.ne_sip, p.ne_rootsig, p.sys_eq, p.sys_ne,
-      g_rub_map.size());
+      p.ne_smpp, p.ne_siv, p.ne_sip, p.ne_rootsig, p.ne_pso, p.pso_eq,
+      p.sys_eq, p.sys_ne, p.fast, p.fast_miss, p.fast_pso, g_rub_map.size());
   g_rub_probe = NrRubProbe{};
 }
 
@@ -3611,7 +3629,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // are the current effective packs again.
   NrRubReportIfDue();
   {
-    const bool nr_rub_now = REXCVAR_GET(gpu_nr_ruse_bundle) && g_nr_swap;
+    // [NR-RUF] 5-4-5-2: the fast path implies the bundle machinery (its
+    // captures are the restore source); the compare gate stays available
+    // independently.
+    const bool nr_ruf_now = REXCVAR_GET(gpu_nr_reuse_fast);
+    const bool nr_rub_now =
+        (REXCVAR_GET(gpu_nr_ruse_bundle) || nr_ruf_now) && g_nr_swap;
+    g_nr_rub_fast = nr_ruf_now && nr_rub_now;
     if (nr_rub_now && (!g_nr_rub || !g_rub_stage_ok)) {
       cbuffer_binding_system_.up_to_date = false;
       cbuffer_binding_float_vertex_.up_to_date = false;
@@ -4516,12 +4540,35 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
   if (g_draw_prof) g_draw_ns[14] += prof_ns_since(_dp_otrans0);
+  // [NR-RUF] 5-4-5-2: pipeline identity is a pure function of the draw's
+  // inputs (5-1 description determinism + 5-3a description-keyed objects,
+  // measured live: pso ne=0 under the bundle gate), and the objects are
+  // persistent (never evicted). A v2-reusable draw therefore reuses its
+  // previous execution's {handle, root signature, native object} and skips
+  // ConfigurePipeline + the native lookup entirely.
+  bool nr_ruf_pso = false;
+  if (g_nr_rub_fast && g_rub_stage_ok) {
+    uint32_t ruf_key;
+    bool ruf_r2, ruf_sf;
+    if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && ruf_r2) {
+      auto ruf_it = g_rub_map.find(ruf_key);
+      if (ruf_it != g_rub_map.end() && ruf_it->second.pso_valid) {
+        pipeline_handle = ruf_it->second.pso_handle;
+        root_signature =
+            static_cast<ID3D12RootSignature*>(ruf_it->second.rootsig);
+        nr_ruf_pso = root_signature != nullptr;
+        if (nr_ruf_pso) ++g_rub_probe.fast_pso;
+      }
+    }
+  }
   auto _dp_pso0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
-  bool _dp_pso_ok = pipeline_cache_->ConfigurePipeline(
-      vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
-      normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
-      bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature);
+  bool _dp_pso_ok =
+      nr_ruf_pso ||
+      pipeline_cache_->ConfigurePipeline(
+          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+          normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
+          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature);
   if (g_draw_prof) g_draw_ns[2] += prof_ns_since(_dp_pso0);
   if (!_dp_pso_ok) {
     return false;
@@ -4582,6 +4629,29 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     current_external_pipeline_ = nullptr;
   }
   if (g_draw_prof) g_draw_ns[17] += prof_ns_since(_dp_npso0);
+
+  // [NR-RUB] 5-4-5-1 extension: pipeline identity per draw key. Inputs
+  // unchanged must mean the same pipeline handle and the same native object
+  // (description-keyed, 5-1/5-3a determinism) -- evidence the ConfigurePipeline
+  // bypass peel needs before it exists.
+  if (g_nr_rub) {
+    uint32_t rub_key;
+    bool rub_r2, rub_sf;
+    if (NrRuseCurrentDraw(&rub_key, &rub_r2, &rub_sf)) {
+      NrRubBundle& rub_b = g_rub_map[rub_key];
+      if (rub_r2 && rub_b.pso_valid) {
+        if (rub_b.pso_handle != pipeline_handle ||
+            rub_b.npso != static_cast<void*>(nr_native_pipeline)) {
+          ++g_rub_probe.ne_pso;
+        } else {
+          ++g_rub_probe.pso_eq;
+        }
+      }
+      rub_b.pso_handle = pipeline_handle;
+      rub_b.npso = static_cast<void*>(nr_native_pipeline);
+      rub_b.pso_valid = true;
+    }
+  }
 
   // Get dynamic rasterizer state.
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
@@ -8851,6 +8921,89 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
   }
 
+  // [NR-RUF] 5-4-5-2: the fast path. When the v2 verdict proves this draw's
+  // inputs byte-identical to its previous execution THIS frame (the pool
+  // ring keeps that execution's uploads alive), restore the binding state
+  // machine from the bundle instead of re-deriving: the guest cbuffers and
+  // descriptor-indices keep their previous GPU addresses (values proven
+  // identical by the 5-4-5-1 gate), sampler params/indices and SRV keys are
+  // restored as members. System constants stay LIVE (bin-dependent, sys_ne
+  // was 100%), the shared-memory flavor check stays live, the key-freshness
+  // check below stays live (a mid-frame texture-cache change then clears the
+  // di binding and the existing compose rebuilds it fresh -- the safety
+  // valve), and the root tail runs off the restored addresses.
+  bool nr_rub_fast_restore = false;
+  if (g_nr_rub_fast && g_rub_stage_ok) {
+    uint32_t ruf_key;
+    bool ruf_r2, ruf_sf;
+    if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && ruf_r2 && ruf_sf) {
+      auto ruf_it = g_rub_map.find(ruf_key);
+      if (ruf_it != g_rub_map.end() && ruf_it->second.packs_valid &&
+          ruf_it->second.frame == frame_current_) {
+        const NrRubBundle& b = ruf_it->second;
+        nr_rub_fast_restore = true;
+        ++g_rub_probe.fast;
+        const auto ruf_restore_cb = [this](ConstantBufferBinding& cb,
+                                           D3D12_GPU_VIRTUAL_ADDRESS a,
+                                           uint32_t root_parameter) {
+          if (cb.address != a) {
+            cb.address = a;
+            current_graphics_root_up_to_date_ &= ~(1u << root_parameter);
+          }
+          cb.up_to_date = true;
+        };
+        ruf_restore_cb(cbuffer_binding_float_vertex_, b.a_flt_v,
+                       kRootParameter_Bindless_FloatConstantsVertex);
+        ruf_restore_cb(cbuffer_binding_float_pixel_, b.a_flt_p,
+                       kRootParameter_Bindless_FloatConstantsPixel);
+        ruf_restore_cb(cbuffer_binding_bool_loop_, b.a_bl,
+                       kRootParameter_Bindless_BoolLoopConstants);
+        ruf_restore_cb(cbuffer_binding_fetch_, b.a_ftc,
+                       kRootParameter_Bindless_FetchConstants);
+        ruf_restore_cb(cbuffer_binding_descriptor_indices_vertex_, b.a_di_v,
+                       kRootParameter_Bindless_DescriptorIndicesVertex);
+        ruf_restore_cb(cbuffer_binding_descriptor_indices_pixel_, b.a_di_p,
+                       kRootParameter_Bindless_DescriptorIndicesPixel);
+        current_sampler_layout_uid_vertex_ = b.smp_uid_v;
+        current_sampler_layout_uid_pixel_ = b.smp_uid_p;
+        current_texture_layout_uid_vertex_ = b.tex_uid_v;
+        current_texture_layout_uid_pixel_ = b.tex_uid_p;
+        current_samplers_vertex_.resize(
+            std::max(current_samplers_vertex_.size(), b.smp_v.size()));
+        for (size_t i = 0; i < b.smp_v.size(); ++i) {
+          current_samplers_vertex_[i].value =
+              decltype(current_samplers_vertex_[i].value)(b.smp_v[i]);
+        }
+        current_samplers_pixel_.resize(
+            std::max(current_samplers_pixel_.size(), b.smp_p.size()));
+        for (size_t i = 0; i < b.smp_p.size(); ++i) {
+          current_samplers_pixel_[i].value =
+              decltype(current_samplers_pixel_[i].value)(b.smp_p[i]);
+        }
+        current_sampler_bindless_indices_vertex_.resize(std::max(
+            current_sampler_bindless_indices_vertex_.size(), b.si_v.size()));
+        for (size_t i = 0; i < b.si_v.size(); ++i) {
+          current_sampler_bindless_indices_vertex_[i] = b.si_v[i];
+        }
+        current_sampler_bindless_indices_pixel_.resize(std::max(
+            current_sampler_bindless_indices_pixel_.size(), b.si_p.size()));
+        for (size_t i = 0; i < b.si_p.size(); ++i) {
+          current_sampler_bindless_indices_pixel_[i] = b.si_p[i];
+        }
+        current_texture_srv_keys_vertex_.resize(std::max(
+            current_texture_srv_keys_vertex_.size(), b.keys_v.size()));
+        std::copy(b.keys_v.begin(), b.keys_v.end(),
+                  current_texture_srv_keys_vertex_.begin());
+        current_texture_srv_keys_pixel_.resize(std::max(
+            current_texture_srv_keys_pixel_.size(), b.keys_p.size()));
+        std::copy(b.keys_p.begin(), b.keys_p.end(),
+                  current_texture_srv_keys_pixel_.begin());
+      } else {
+        ++g_rub_probe.fast_miss;
+      }
+    }
+  }
+
   // Write the constant buffer data - ours. (Direct writes into the upload
   // pointer are fine: sequential stores, never read back.)
   if (!cbuffer_binding_system_.up_to_date) {
@@ -9000,7 +9153,9 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       vertex_shader->GetSamplerBindingsAfterTranslation();
   size_t texture_count_vertex = textures_vertex.size();
   size_t sampler_count_vertex = samplers_vertex.size();
-  if (sampler_count_vertex) {
+  // [NR-RUF] under a fast restore the params/uids/indices are the bundle's
+  // (byte-proven identical); the derivation loops are the cost being skipped.
+  if (sampler_count_vertex && !nr_rub_fast_restore) {
     if (current_sampler_layout_uid_vertex_ != sampler_layout_uid_vertex) {
       current_sampler_layout_uid_vertex_ = sampler_layout_uid_vertex;
       cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
@@ -9034,7 +9189,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     texture_count_pixel = textures_pixel->size();
     samplers_pixel = &pixel_shader->GetSamplerBindingsAfterTranslation();
     sampler_count_pixel = samplers_pixel->size();
-    if (sampler_count_pixel) {
+    if (sampler_count_pixel && !nr_rub_fast_restore) {
       if (current_sampler_layout_uid_pixel_ != sampler_layout_uid_pixel) {
         current_sampler_layout_uid_pixel_ = sampler_layout_uid_pixel;
         cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
@@ -9356,7 +9511,9 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   // tile repeats; whether they actually do is a fast-path design datum).
   if (g_nr_rub) {
     ++g_rub_probe.draws;
-    if (!g_rub_stage_ok) {
+    if (nr_rub_fast_restore) {
+      // [NR-RUF] nothing was derived; the bundle already holds this state.
+    } else if (!g_rub_stage_ok) {
       ++g_rub_probe.stage_off;
     } else {
       uint32_t rub_key;
@@ -9437,6 +9594,31 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
         }
         nb.sys_hash = rub_sys_hash;
         nb.rootsig = static_cast<void*>(root_signature);
+        // [NR-RUF] the restore state: same-frame GPU addresses + the member
+        // state a fast restore rebuilds.
+        nb.frame = frame_current_;
+        nb.a_flt_v = cbuffer_binding_float_vertex_.address;
+        nb.a_flt_p = cbuffer_binding_float_pixel_.address;
+        nb.a_bl = cbuffer_binding_bool_loop_.address;
+        nb.a_ftc = cbuffer_binding_fetch_.address;
+        nb.a_di_v = cbuffer_binding_descriptor_indices_vertex_.address;
+        nb.a_di_p = cbuffer_binding_descriptor_indices_pixel_.address;
+        nb.smp_uid_v = current_sampler_layout_uid_vertex_;
+        nb.smp_uid_p = current_sampler_layout_uid_pixel_;
+        nb.tex_uid_v = current_texture_layout_uid_vertex_;
+        nb.tex_uid_p = current_texture_layout_uid_pixel_;
+        if (current_texture_srv_keys_vertex_.size() >= texture_count_vertex &&
+            current_texture_srv_keys_pixel_.size() >= texture_count_pixel) {
+          nb.keys_v.assign(
+              current_texture_srv_keys_vertex_.begin(),
+              current_texture_srv_keys_vertex_.begin() + texture_count_vertex);
+          nb.keys_p.assign(
+              current_texture_srv_keys_pixel_.begin(),
+              current_texture_srv_keys_pixel_.begin() + texture_count_pixel);
+          nb.packs_valid = true;
+        } else {
+          nb.packs_valid = false;
+        }
       }
     }
   }
