@@ -396,6 +396,12 @@ class PipelineCache {
   // [NR-NPSO] Phase 5-3a. Set once the native pipeline cache has been given
   // this object's device callbacks.
   bool nr_native_pso_configured_ = false;
+  // [NR-NPSO] 5-4-4b inc 3 (gpu_nr_npso_memo): pipeline handle -> our
+  // verified-ok pipeline state. Safe for this object's lifetime: a handle's
+  // description is immutable, the env is device-constant, our shader-cache
+  // and npso-cache entries never move or evict, and handles are only freed
+  // in Shutdown. A device reset builds a fresh PipelineCache = empty memo.
+  std::unordered_map<void*, ID3D12PipelineState*> nr_npso_memo_;
 
   // Command processor thread DXIL conversion/disassembly interfaces, if DXIL
   // disassembly is enabled.

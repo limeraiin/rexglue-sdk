@@ -122,6 +122,14 @@ REXCVAR_DEFINE_UINT32(gpu_nr_native_pso_entries, 4096, "GPU",
                       "[nr-npso] Maximum number of distinct pipeline descriptions the native "
                       "pipeline cache holds. Beyond it, descriptions are refused and counted, "
                       "never evicted -- a released pipeline could still be bound.");
+// 5-4-4b inc 3: the NrNativePipeline call rebuilds env+blobs and hashes the
+// 64-byte description every draw, but its result is constant per pipeline
+// handle once the entry is verified. The memo skips all of that on a hit.
+// Under the memo the [nr-npso] req/hit counters only see memo MISSES; the
+// live swap gate stays [nr-swp]/[nr-skp].
+REXCVAR_DEFINE_BOOL(gpu_nr_npso_memo, false, "GPU",
+                    "Memo the native pipeline lookup per pipeline handle (5-4-4b perf "
+                    "increment). Off by default.");
 
 namespace rex::graphics::d3d12 {
 
@@ -1741,6 +1749,14 @@ ID3D12PipelineState* PipelineCache::NrNativePipeline(void* pipeline_handle,
   if (!pipeline) {
     return nullptr;
   }
+  // [NR-NPSO] 5-4-4b inc 3: the per-handle memo (see the cvar comment).
+  const bool nr_npso_memo_on = REXCVAR_GET(gpu_nr_npso_memo);
+  if (nr_npso_memo_on) {
+    auto memo_it = nr_npso_memo_.find(pipeline_handle);
+    if (memo_it != nr_npso_memo_.end()) {
+      return memo_it->second;
+    }
+  }
   const PipelineRuntimeDescription& runtime_description = pipeline->description;
 
   NrShaderCacheEnsure();
@@ -1831,7 +1847,14 @@ ID3D12PipelineState* PipelineCache::NrNativePipeline(void* pipeline_handle,
       }
     }
   }
-  return ours->status == nr::kNrNpsoOk ? ours->state : nullptr;
+  ID3D12PipelineState* nr_npso_result = ours->status == nr::kNrNpsoOk ? ours->state : nullptr;
+  // Memo only a settled entry: verified and created. An unverified or failed
+  // lookup must keep coming back here so the once-per-pipeline compare (and a
+  // later successful create) still happen.
+  if (nr_npso_memo_on && nr_npso_result && ours->verified) {
+    nr_npso_memo_.emplace(pipeline_handle, nr_npso_result);
+  }
+  return nr_npso_result;
 }
 
 void PipelineCache::NrNativePsoReportIfDue() {
