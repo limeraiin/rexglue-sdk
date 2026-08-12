@@ -917,7 +917,8 @@ void NrSwapReportIfDue() {
 // draws) + persistent staging mirrors of the current effective packs (the
 // composes write upload memory directly; comparing requires CPU-side copies,
 // [[upload-heap-readback-trap]]).
-bool g_nr_rub = false;
+bool g_nr_rub = false;        // any bundle machinery (compare OR fast)
+bool g_nr_rub_cmp = false;    // compare mode: staging + byte captures + gate
 bool g_nr_rub_fast = false;   // [NR-RUF] 5-4-5-2: restore instead of derive
 bool g_rub_stage_ok = false;  // staging coherent since arm (fallback clears)
 struct NrRubBundle {
@@ -930,6 +931,11 @@ struct NrRubBundle {
   void* rootsig = nullptr;
   // [NR-RUF] 5-4-5-2 restore state: valid same-frame only (the pool ring
   // recycles per frame; the city verdict says reuse IS within-frame).
+  // packs_valid = the SMALL restore state is captured; the pack/di byte
+  // copies above exist only for the compare gate (packs_have_bytes) -- the
+  // fast path restores by ADDRESS and must never pay for them (the byte
+  // captures were the measured net-negative of the first city A/B).
+  bool packs_have_bytes = false;
   bool packs_valid = false;
   uint64_t frame = 0;
   D3D12_GPU_VIRTUAL_ADDRESS a_flt_v = 0, a_flt_p = 0, a_bl = 0, a_ftc = 0;
@@ -3631,12 +3637,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   {
     // [NR-RUF] 5-4-5-2: the fast path implies the bundle machinery (its
     // captures are the restore source); the compare gate stays available
-    // independently.
+    // independently. Fast-only runs capture the SMALL restore state and
+    // never stage or copy pack bytes.
     const bool nr_ruf_now = REXCVAR_GET(gpu_nr_reuse_fast);
-    const bool nr_rub_now =
-        (REXCVAR_GET(gpu_nr_ruse_bundle) || nr_ruf_now) && g_nr_swap;
+    const bool nr_cmp_now = REXCVAR_GET(gpu_nr_ruse_bundle) && g_nr_swap;
+    const bool nr_rub_now = (nr_cmp_now || nr_ruf_now) && g_nr_swap;
     g_nr_rub_fast = nr_ruf_now && nr_rub_now;
-    if (nr_rub_now && (!g_nr_rub || !g_rub_stage_ok)) {
+    if (nr_cmp_now && (!g_nr_rub_cmp || !g_rub_stage_ok)) {
       cbuffer_binding_system_.up_to_date = false;
       cbuffer_binding_float_vertex_.up_to_date = false;
       cbuffer_binding_float_pixel_.up_to_date = false;
@@ -3646,6 +3653,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
       g_rub_stage_ok = true;
     }
+    g_nr_rub_cmp = nr_cmp_now;
     if (!nr_rub_now && g_nr_rub) {
       g_rub_map.clear();
     }
@@ -4547,7 +4555,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // previous execution's {handle, root signature, native object} and skips
   // ConfigurePipeline + the native lookup entirely.
   bool nr_ruf_pso = false;
-  if (g_nr_rub_fast && g_rub_stage_ok) {
+  if (g_nr_rub_fast) {
     uint32_t ruf_key;
     bool ruf_r2, ruf_sf;
     if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && ruf_r2) {
@@ -8933,7 +8941,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   // di binding and the existing compose rebuilds it fresh -- the safety
   // valve), and the root tail runs off the restored addresses.
   bool nr_rub_fast_restore = false;
-  if (g_nr_rub_fast && g_rub_stage_ok) {
+  if (g_nr_rub_fast) {
     uint32_t ruf_key;
     bool ruf_r2, ruf_sf;
     if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && ruf_r2 && ruf_sf) {
@@ -9039,7 +9047,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     // [NR-RUB] stage in cached memory, publish with one memcpy (the compare
     // gate must never read the upload heap back).
     uint8_t* nr_rub_dst = float_constants;
-    if (g_nr_rub && g_rub_stage_ok) {
+    if (g_nr_rub_cmp && g_rub_stage_ok) {
       g_rub_stage.flt_v.resize(float_vertex_size);
       nr_rub_dst = g_rub_stage.flt_v.data();
     }
@@ -9068,7 +9076,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     }
     const uint64_t nr_zero_bitmap[4] = {0, 0, 0, 0};
     uint8_t* nr_rub_dst = float_constants;
-    if (g_nr_rub && g_rub_stage_ok) {
+    if (g_nr_rub_cmp && g_rub_stage_ok) {
       g_rub_stage.flt_p.resize(float_pixel_size);
       nr_rub_dst = g_rub_stage.flt_p.data();
     }
@@ -9096,7 +9104,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     uint8_t* nr_rub_dst = bool_loop_constants;
-    if (g_nr_rub && g_rub_stage_ok) {
+    if (g_nr_rub_cmp && g_rub_stage_ok) {
       g_rub_stage.bl.resize(nr::kBindBoolLoopBytes);
       nr_rub_dst = g_rub_stage.bl.data();
     }
@@ -9120,7 +9128,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     uint8_t* nr_rub_dst = fetch_constants;
-    if (g_nr_rub && g_rub_stage_ok) {
+    if (g_nr_rub_cmp && g_rub_stage_ok) {
       g_rub_stage.ftc.resize(nr::kBindFetchBytes);
       nr_rub_dst = g_rub_stage.ftc.data();
     }
@@ -9355,7 +9363,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     // [NR-RUB] staging redirect: full-span publish (the 1-based slot rule
     // means span_alloc already covers the last slot -- nothing is dropped).
     uint32_t* nr_rub_di = descriptor_indices;
-    if (g_nr_rub && g_rub_stage_ok) {
+    if (g_nr_rub_cmp && g_rub_stage_ok) {
       g_rub_stage.di_v.resize(span_alloc);
       nr_rub_di = g_rub_stage.di_v.data();
     }
@@ -9404,7 +9412,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     uint32_t* nr_rub_di = descriptor_indices;
-    if (g_nr_rub && g_rub_stage_ok) {
+    if (g_nr_rub_cmp && g_rub_stage_ok) {
       g_rub_stage.di_p.resize(span_alloc);
       nr_rub_di = g_rub_stage.di_p.data();
     }
@@ -9511,9 +9519,10 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   // tile repeats; whether they actually do is a fast-path design datum).
   if (g_nr_rub) {
     ++g_rub_probe.draws;
+    const bool rub_cmp_live = g_nr_rub_cmp && g_rub_stage_ok;
     if (nr_rub_fast_restore) {
       // [NR-RUF] nothing was derived; the bundle already holds this state.
-    } else if (!g_rub_stage_ok) {
+    } else if (g_nr_rub_cmp && !g_rub_stage_ok) {
       ++g_rub_probe.stage_off;
     } else {
       uint32_t rub_key;
@@ -9522,10 +9531,11 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
         ++g_rub_probe.nostop;
       } else {
         const uint64_t rub_sys_hash =
-            XXH3_64bits(&g_nr_sys_state, sizeof(g_nr_sys_state));
+            rub_cmp_live ? XXH3_64bits(&g_nr_sys_state, sizeof(g_nr_sys_state))
+                         : 0;
         auto rub_it = g_rub_map.find(rub_key);
-        if (rub_r2) {
-          if (rub_it == g_rub_map.end()) {
+        if (rub_r2 && rub_cmp_live) {
+          if (rub_it == g_rub_map.end() || !rub_it->second.packs_have_bytes) {
             ++g_rub_probe.nobundle;
           } else {
             const NrRubBundle& b = rub_it->second;
@@ -9567,15 +9577,21 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
           }
         }
         // Capture/refresh: the bundle always holds the LATEST execution.
+        // The pack/di BYTE copies serve only the compare gate; the fast
+        // path's restore state is the small tail below.
         NrRubBundle& nb =
             rub_it != g_rub_map.end() ? rub_it->second : g_rub_map[rub_key];
         ++g_rub_probe.captured;
-        nb.flt_v = g_rub_stage.flt_v;
-        nb.flt_p = g_rub_stage.flt_p;
-        nb.bl = g_rub_stage.bl;
-        nb.ftc = g_rub_stage.ftc;
-        nb.di_v = g_rub_stage.di_v;
-        nb.di_p = g_rub_stage.di_p;
+        if (rub_cmp_live) {
+          nb.flt_v = g_rub_stage.flt_v;
+          nb.flt_p = g_rub_stage.flt_p;
+          nb.bl = g_rub_stage.bl;
+          nb.ftc = g_rub_stage.ftc;
+          nb.di_v = g_rub_stage.di_v;
+          nb.di_p = g_rub_stage.di_p;
+          nb.sys_hash = rub_sys_hash;
+          nb.packs_have_bytes = true;
+        }
         nb.smp_v.resize(sampler_count_vertex);
         for (size_t i = 0; i < sampler_count_vertex; ++i) {
           nb.smp_v[i] = current_samplers_vertex_[i].value;
@@ -9592,7 +9608,6 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
         for (size_t i = 0; i < sampler_count_pixel; ++i) {
           nb.si_p[i] = current_sampler_bindless_indices_pixel_[i];
         }
-        nb.sys_hash = rub_sys_hash;
         nb.rootsig = static_cast<void*>(root_signature);
         // [NR-RUF] the restore state: same-frame GPU addresses + the member
         // state a fast restore rebuilds.
