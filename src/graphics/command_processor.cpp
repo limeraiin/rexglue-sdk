@@ -1412,6 +1412,12 @@ bool g_ruse_v2_ok = false;              // buffer+entry comparable for v2
 bool g_ruse_deleg_poison = false;       // reg-writing delegate ran this replay
 uint32_t g_ruse_pkt_dw = 0xFFFFFFFFu;   // per-packet payload cursor
 uint32_t g_ruse_pkt_m = 0;
+// [NR-RUB] 5-4-5-1: the pending stop's verdict, read by the backend's
+// bundle gate while it derives this draw (same thread, synchronous).
+uint32_t g_ruse_stop_key = 0;
+bool g_ruse_stop_r2 = false;
+bool g_ruse_stop_sf = false;
+bool g_ruse_stop_valid = false;
 // Window counters (reset each 1Hz report).
 uint64_t g_ruse_w_bufs = 0, g_ruse_w_new = 0, g_ruse_w_id = 0, g_ruse_w_ch = 0;
 uint64_t g_ruse_w_sf = 0, g_ruse_w_sf_id = 0, g_ruse_w_xf = 0, g_ruse_w_xf_id = 0;
@@ -1792,6 +1798,7 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
   // v2: the stale-register rule. The draw's own packet span still gets a
   // direct byte check (the 0x22 viz token is consumed but is not a register
   // write, so the stale set alone cannot see it change).
+  bool reusable2 = false;
   if (!g_ruse_v2_ok || !key_prev) {
     ++g_ruse_w_first2;
   } else if (g_ruse_deleg_poison) {
@@ -1809,14 +1816,35 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
     } else if (!sh_eq) {
       ++g_ruse_w_miss2_sh;
     } else {
+      reusable2 = true;
       ++g_ruse_w_reuse2;
       if (g_ruse_same_frame) ++g_ruse_w_reuse2_sf; else ++g_ruse_w_reuse2_xf;
     }
   }
+  // [NR-RUB] publish the verdict for the backend's bundle gate: the issue of
+  // this draw runs synchronously after this classification.
+  g_ruse_stop_key = key;
+  g_ruse_stop_r2 = reusable2;
+  g_ruse_stop_sf = g_ruse_same_frame;
+  g_ruse_stop_valid = true;
   g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
 }
+
+}  // namespace-local helpers continue below
+
+// [NR-RUB] 5-4-5-1: the backend's bundle gate asks for the pending draw's
+// reuse verdict. Returns false when the probe is off or no stop is pending.
+bool NrRuseCurrentDraw(uint32_t* key, bool* reusable2, bool* same_frame) {
+  if (!g_nr_ruse || !g_ruse_stop_valid) return false;
+  *key = g_ruse_stop_key;
+  *reusable2 = g_ruse_stop_r2;
+  *same_frame = g_ruse_stop_sf;
+  return true;
+}
+
+namespace {
 
 // Buffer end: this replay's by-ref stream becomes the previous one.
 void NrRuseBufEnd() {

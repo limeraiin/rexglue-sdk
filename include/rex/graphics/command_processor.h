@@ -429,4 +429,12 @@ class CommandProcessor {
   uint32_t gamma_ramp_rw_component_ = 0;
 };
 
+// [NR-RUB] Phase 5-4-5-1: the pending draw stop's reuse verdict
+// (gpu_nr_reuse_probe v2), for the backend's bundle capture/compare gate.
+// Returns false when the probe is off or no stop is pending. `key` is the
+// DRAW_INDX packet's physical dword address (the draw's identity across
+// replays); `reusable2` the stale-set verdict; `same_frame` whether the
+// previous execution was in the current frame (bin repeat).
+bool NrRuseCurrentDraw(uint32_t* key, bool* reusable2, bool* same_frame);
+
 }  // namespace rex::graphics

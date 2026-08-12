@@ -33,6 +33,7 @@
 #include <rex/graphics/nr_sys_constants.h>
 #include <rex/graphics/nr_native_pso.h>
 #include <rex/graphics/registers.h>
+#include <rex/hash.h>  // [NR-RUB] XXH3, header-only (XXH_INLINE_ALL)
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -229,6 +230,26 @@ REXCVAR_DEFINE_BOOL(gpu_nr_lean_sysconst, true, "GPU/D3D12",
                     "the dirty signal by whole-struct compare; the rare fallback to the "
                     "emulated UpdateBindings re-syncs the member by one memcpy from the "
                     "mirror. Counted on '[nr-swp]' as lean=/lazy=. On by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [NR-RUB] Phase 5-4-5-1: the replay-reuse bundle gate. For every swapped
+// draw with a reuse-probe identity, the derived binding outputs (the four
+// guest cbuffer packs, both descriptor-indices composes, sampler params and
+// heap indices, root signature) are captured per draw key in a frame-scoped
+// bundle; when the base-side v2 verdict says this execution's inputs are
+// byte-identical to the previous one, the fresh derivation is compared
+// against the stored bundle. ne=0 proves the reuse model BY CONSUMPTION
+// before any fast path skips a derivation. System constants are hashed and
+// counted separately (bin-dependent NDC fields expected). Pack/di composes
+// stage in cached memory and publish with one memcpy under this gate --
+// never read an upload heap back.
+REXCVAR_DEFINE_BOOL(gpu_nr_ruse_bundle, false, "GPU/D3D12",
+                    "[NR-RUB] Phase 5-4-5-1: capture each swapped draw's derived binding "
+                    "outputs per draw key and byte-compare them against the previous "
+                    "execution whenever the gpu_nr_reuse_probe v2 verdict says the "
+                    "draw's inputs are unchanged. Requires the bindings swap and the "
+                    "reuse probe. Reports '[nr-rub]' once/sec. Diagnostic only, off by "
+                    "default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-RSY] Phase 5-3b-3: the residency + descriptor-allocation mirror's gate.
@@ -887,6 +908,57 @@ void NrSwapReportIfDue() {
       p.di_p - s_prev.di_p, p.smp_alloc, p.sys_lean - s_prev.sys_lean,
       p.sys_lazy);
   s_prev = p;
+}
+
+// [NR-RUB] Phase 5-4-5-1: the bundle store (frame-scoped: cleared when
+// frame_current_ advances -- the city verdict says reuse is within-frame
+// only, and a frame-scoped store bounds memory to one frame's distinct
+// draws) + persistent staging mirrors of the current effective packs (the
+// composes write upload memory directly; comparing requires CPU-side copies,
+// [[upload-heap-readback-trap]]).
+bool g_nr_rub = false;
+bool g_rub_stage_ok = false;  // staging coherent since arm (fallback clears)
+struct NrRubBundle {
+  uint32_t flt_v_bytes = 0, flt_p_bytes = 0;
+  std::vector<uint8_t> flt_v, flt_p, bl, ftc;
+  std::vector<uint32_t> di_v, di_p;
+  std::vector<uint64_t> smp_v, smp_p;
+  std::vector<uint32_t> si_v, si_p;
+  uint64_t sys_hash = 0;
+  void* rootsig = nullptr;
+};
+std::unordered_map<uint32_t, NrRubBundle> g_rub_map;
+uint64_t g_rub_frame = ~0ull;
+struct NrRubStage {
+  std::vector<uint8_t> flt_v, flt_p, bl, ftc;
+  uint32_t flt_v_bytes = 0, flt_p_bytes = 0;
+  std::vector<uint32_t> di_v, di_p;
+} g_rub_stage;
+struct NrRubProbe {
+  uint64_t draws = 0, checked = 0, captured = 0, nobundle = 0, nostop = 0,
+           stage_off = 0;
+  uint64_t ne_fltv = 0, ne_fltp = 0, ne_bl = 0, ne_ftc = 0;
+  uint64_t ne_div = 0, ne_dip = 0, ne_smpv = 0, ne_smpp = 0, ne_siv = 0,
+           ne_sip = 0, ne_rootsig = 0;
+  uint64_t sys_eq = 0, sys_ne = 0;
+} g_rub_probe;
+
+void NrRubReportIfDue() {
+  if (!g_nr_rub || !g_rub_probe.draws) return;
+  static auto s_last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) return;
+  s_last = now;
+  const NrRubProbe& p = g_rub_probe;
+  REXGPU_INFO(
+      "[nr-rub] draws={} chk={} cap={} nobundle={} nostop={} stageoff={} | "
+      "ne fv/fp/bl/ft={}/{}/{}/{} di={}/{} smp={}/{} si={}/{} rs={} | sys "
+      "eq={} ne={} | bundles={}",
+      p.draws, p.checked, p.captured, p.nobundle, p.nostop, p.stage_off,
+      p.ne_fltv, p.ne_fltp, p.ne_bl, p.ne_ftc, p.ne_div, p.ne_dip, p.ne_smpv,
+      p.ne_smpp, p.ne_siv, p.ne_sip, p.ne_rootsig, p.sys_eq, p.sys_ne,
+      g_rub_map.size());
+  g_rub_probe = NrRubProbe{};
 }
 
 // [NR-FX] Phase 5-4-0: walk-driven side-effect counters (CP thread only).
@@ -3533,6 +3605,32 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // the upload source) and verify off (the whole-struct memcmp gate reads the
   // member the lean path stops deriving).
   g_nr_lean_sys = REXCVAR_GET(gpu_nr_lean_sysconst) && g_nr_swap && !g_nr_verify;
+  // [NR-RUB] 5-4-5-1: verdict + latch. Needs the swap (the gate instruments
+  // OUR UpdateBindings). On arm, or after a fallback made the staging
+  // mirrors stale, force every compose to re-run once so the staged copies
+  // are the current effective packs again.
+  NrRubReportIfDue();
+  {
+    const bool nr_rub_now = REXCVAR_GET(gpu_nr_ruse_bundle) && g_nr_swap;
+    if (nr_rub_now && (!g_nr_rub || !g_rub_stage_ok)) {
+      cbuffer_binding_system_.up_to_date = false;
+      cbuffer_binding_float_vertex_.up_to_date = false;
+      cbuffer_binding_float_pixel_.up_to_date = false;
+      cbuffer_binding_bool_loop_.up_to_date = false;
+      cbuffer_binding_fetch_.up_to_date = false;
+      cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+      cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+      g_rub_stage_ok = true;
+    }
+    if (!nr_rub_now && g_nr_rub) {
+      g_rub_map.clear();
+    }
+    g_nr_rub = nr_rub_now;
+    if (g_nr_rub && g_rub_frame != frame_current_) {
+      g_rub_map.clear();
+      g_rub_frame = frame_current_;
+    }
+  }
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
   // gate itself is latched base-side (WorkerThreadMain), not here.
   NrFxReportIfDue();
@@ -4594,6 +4692,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                          &nr_swp_refused);
     if (nr_swp_refused) {
       ++g_nr_swap_probe.fallback;
+      // [NR-RUB] the emulated retry recomposes into its own pools; the
+      // staging mirrors no longer match the effective packs. The per-frame
+      // latch re-arms by forcing one full recompose.
+      g_rub_stage_ok = false;
       // [NR-LEAN] the emulated UpdateBindings uploads system_constants_; if
       // the lean path skipped the emulated derivation this draw, the mirror
       // holds the current values (it ran above) - one memcpy re-syncs.
@@ -4608,6 +4710,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     }
   } else {
     _dp_bind_ok = UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used);
+    // [NR-RUB] a draw outside the swap invalidates the staging mirrors too.
+    if (g_nr_rub) g_rub_stage_ok = false;
   }
   if (g_draw_prof) g_draw_ns[4] += prof_ns_since(_dp_bind0);
   if (!_dp_bind_ok) {
@@ -8779,8 +8883,19 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (float_constants == nullptr) {
       return false;
     }
+    // [NR-RUB] stage in cached memory, publish with one memcpy (the compare
+    // gate must never read the upload heap back).
+    uint8_t* nr_rub_dst = float_constants;
+    if (g_nr_rub && g_rub_stage_ok) {
+      g_rub_stage.flt_v.resize(float_vertex_size);
+      nr_rub_dst = g_rub_stage.flt_v.data();
+    }
     nr::BindComposeFloats(nr_rf, nr::kBindFloatVertexBase, float_constant_map_vertex.float_bitmap,
-                          float_constants, float_vertex_size);
+                          nr_rub_dst, float_vertex_size);
+    if (nr_rub_dst != float_constants) {
+      std::memcpy(float_constants, nr_rub_dst, float_vertex_size);
+      g_rub_stage.flt_v_bytes = float_vertex_size;
+    }
     cbuffer_binding_float_vertex_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsVertex);
   }
@@ -8799,10 +8914,19 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     const uint64_t nr_zero_bitmap[4] = {0, 0, 0, 0};
+    uint8_t* nr_rub_dst = float_constants;
+    if (g_nr_rub && g_rub_stage_ok) {
+      g_rub_stage.flt_p.resize(float_pixel_size);
+      nr_rub_dst = g_rub_stage.flt_p.data();
+    }
     nr::BindComposeFloats(
         nr_rf, nr::kBindFloatPixelBase,
         pixel_shader ? pixel_shader->constant_register_map().float_bitmap : nr_zero_bitmap,
-        float_constants, float_pixel_size);
+        nr_rub_dst, float_pixel_size);
+    if (nr_rub_dst != float_constants) {
+      std::memcpy(float_constants, nr_rub_dst, float_pixel_size);
+      g_rub_stage.flt_p_bytes = float_pixel_size;
+    }
     cbuffer_binding_float_pixel_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsPixel);
   }
@@ -8818,7 +8942,15 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (bool_loop_constants == nullptr) {
       return false;
     }
-    nr::BindComposeBoolLoop(nr_rf, bool_loop_constants, nr::kBindBoolLoopBytes);
+    uint8_t* nr_rub_dst = bool_loop_constants;
+    if (g_nr_rub && g_rub_stage_ok) {
+      g_rub_stage.bl.resize(nr::kBindBoolLoopBytes);
+      nr_rub_dst = g_rub_stage.bl.data();
+    }
+    nr::BindComposeBoolLoop(nr_rf, nr_rub_dst, nr::kBindBoolLoopBytes);
+    if (nr_rub_dst != bool_loop_constants) {
+      std::memcpy(bool_loop_constants, nr_rub_dst, nr::kBindBoolLoopBytes);
+    }
     cbuffer_binding_bool_loop_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_BoolLoopConstants);
   }
@@ -8834,7 +8966,15 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (fetch_constants == nullptr) {
       return false;
     }
-    nr::BindComposeFetch(nr_rf, fetch_constants, nr::kBindFetchBytes);
+    uint8_t* nr_rub_dst = fetch_constants;
+    if (g_nr_rub && g_rub_stage_ok) {
+      g_rub_stage.ftc.resize(nr::kBindFetchBytes);
+      nr_rub_dst = g_rub_stage.ftc.data();
+    }
+    nr::BindComposeFetch(nr_rf, nr_rub_dst, nr::kBindFetchBytes);
+    if (nr_rub_dst != fetch_constants) {
+      std::memcpy(fetch_constants, nr_rub_dst, nr::kBindFetchBytes);
+    }
     cbuffer_binding_fetch_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FetchConstants);
   }
@@ -9057,15 +9197,25 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (!descriptor_indices) {
       return false;
     }
-    std::memset(descriptor_indices, 0, span_alloc * sizeof(uint32_t));
+    // [NR-RUB] staging redirect: full-span publish (the 1-based slot rule
+    // means span_alloc already covers the last slot -- nothing is dropped).
+    uint32_t* nr_rub_di = descriptor_indices;
+    if (g_nr_rub && g_rub_stage_ok) {
+      g_rub_stage.di_v.resize(span_alloc);
+      nr_rub_di = g_rub_stage.di_v.data();
+    }
+    std::memset(nr_rub_di, 0, span_alloc * sizeof(uint32_t));
     for (size_t i = 0; i < texture_count_vertex; ++i) {
       const D3D12Shader::TextureBinding& texture = textures_vertex[i];
-      descriptor_indices[texture.bindless_descriptor_index] =
+      nr_rub_di[texture.bindless_descriptor_index] =
           nr_swp_srv_value(texture) - uint32_t(SystemBindlessView::kUnboundedSRVsStart);
     }
     for (size_t i = 0; i < sampler_count_vertex; ++i) {
-      descriptor_indices[samplers_vertex[i].bindless_descriptor_index] =
+      nr_rub_di[samplers_vertex[i].bindless_descriptor_index] =
           current_sampler_bindless_indices_vertex_[i];
+    }
+    if (nr_rub_di != descriptor_indices) {
+      std::memcpy(descriptor_indices, nr_rub_di, span_alloc * sizeof(uint32_t));
     }
     ++g_nr_swap_probe.di_v;
     current_texture_layout_uid_vertex_ = texture_layout_uid_vertex;
@@ -9098,15 +9248,23 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (!descriptor_indices) {
       return false;
     }
-    std::memset(descriptor_indices, 0, span_alloc * sizeof(uint32_t));
+    uint32_t* nr_rub_di = descriptor_indices;
+    if (g_nr_rub && g_rub_stage_ok) {
+      g_rub_stage.di_p.resize(span_alloc);
+      nr_rub_di = g_rub_stage.di_p.data();
+    }
+    std::memset(nr_rub_di, 0, span_alloc * sizeof(uint32_t));
     for (size_t i = 0; i < texture_count_pixel; ++i) {
       const D3D12Shader::TextureBinding& texture = (*textures_pixel)[i];
-      descriptor_indices[texture.bindless_descriptor_index] =
+      nr_rub_di[texture.bindless_descriptor_index] =
           nr_swp_srv_value(texture) - uint32_t(SystemBindlessView::kUnboundedSRVsStart);
     }
     for (size_t i = 0; i < sampler_count_pixel; ++i) {
-      descriptor_indices[(*samplers_pixel)[i].bindless_descriptor_index] =
+      nr_rub_di[(*samplers_pixel)[i].bindless_descriptor_index] =
           current_sampler_bindless_indices_pixel_[i];
+    }
+    if (nr_rub_di != descriptor_indices) {
+      std::memcpy(descriptor_indices, nr_rub_di, span_alloc * sizeof(uint32_t));
     }
     ++g_nr_swap_probe.di_p;
     current_texture_layout_uid_pixel_ = texture_layout_uid_pixel;
@@ -9187,6 +9345,101 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_ViewHeap;
   }
   if (g_draw_prof) g_bind_ns[5] += prof_ns_since(_bp_root0);
+
+  // [NR-RUB] 5-4-5-1: bundle compare + capture. The staging mirrors hold
+  // this draw's effective packs (every compose since arm staged first);
+  // sampler params / heap indices / root signature are CPU members. When the
+  // base-side v2 verdict says this execution's inputs are byte-identical to
+  // the draw's previous one, every derived output must byte-match the stored
+  // bundle -- any ne names an input the reuse model missed. System constants
+  // are counted separately (bin-dependent fields expected to differ across
+  // tile repeats; whether they actually do is a fast-path design datum).
+  if (g_nr_rub) {
+    ++g_rub_probe.draws;
+    if (!g_rub_stage_ok) {
+      ++g_rub_probe.stage_off;
+    } else {
+      uint32_t rub_key;
+      bool rub_r2, rub_sf;
+      if (!NrRuseCurrentDraw(&rub_key, &rub_r2, &rub_sf)) {
+        ++g_rub_probe.nostop;
+      } else {
+        const uint64_t rub_sys_hash =
+            XXH3_64bits(&g_nr_sys_state, sizeof(g_nr_sys_state));
+        auto rub_it = g_rub_map.find(rub_key);
+        if (rub_r2) {
+          if (rub_it == g_rub_map.end()) {
+            ++g_rub_probe.nobundle;
+          } else {
+            const NrRubBundle& b = rub_it->second;
+            ++g_rub_probe.checked;
+            if (b.flt_v != g_rub_stage.flt_v) ++g_rub_probe.ne_fltv;
+            if (b.flt_p != g_rub_stage.flt_p) ++g_rub_probe.ne_fltp;
+            if (b.bl != g_rub_stage.bl) ++g_rub_probe.ne_bl;
+            if (b.ftc != g_rub_stage.ftc) ++g_rub_probe.ne_ftc;
+            if (b.di_v != g_rub_stage.di_v) ++g_rub_probe.ne_div;
+            if (b.di_p != g_rub_stage.di_p) ++g_rub_probe.ne_dip;
+            bool smp_v_eq = b.smp_v.size() == sampler_count_vertex;
+            for (size_t i = 0; smp_v_eq && i < sampler_count_vertex; ++i) {
+              smp_v_eq = b.smp_v[i] == current_samplers_vertex_[i].value;
+            }
+            if (!smp_v_eq) ++g_rub_probe.ne_smpv;
+            bool smp_p_eq = b.smp_p.size() == sampler_count_pixel;
+            for (size_t i = 0; smp_p_eq && i < sampler_count_pixel; ++i) {
+              smp_p_eq = b.smp_p[i] == current_samplers_pixel_[i].value;
+            }
+            if (!smp_p_eq) ++g_rub_probe.ne_smpp;
+            bool si_v_eq = b.si_v.size() == sampler_count_vertex;
+            for (size_t i = 0; si_v_eq && i < sampler_count_vertex; ++i) {
+              si_v_eq = b.si_v[i] == current_sampler_bindless_indices_vertex_[i];
+            }
+            if (!si_v_eq) ++g_rub_probe.ne_siv;
+            bool si_p_eq = b.si_p.size() == sampler_count_pixel;
+            for (size_t i = 0; si_p_eq && i < sampler_count_pixel; ++i) {
+              si_p_eq = b.si_p[i] == current_sampler_bindless_indices_pixel_[i];
+            }
+            if (!si_p_eq) ++g_rub_probe.ne_sip;
+            if (b.rootsig != static_cast<void*>(root_signature)) {
+              ++g_rub_probe.ne_rootsig;
+            }
+            if (b.sys_hash == rub_sys_hash) {
+              ++g_rub_probe.sys_eq;
+            } else {
+              ++g_rub_probe.sys_ne;
+            }
+          }
+        }
+        // Capture/refresh: the bundle always holds the LATEST execution.
+        NrRubBundle& nb =
+            rub_it != g_rub_map.end() ? rub_it->second : g_rub_map[rub_key];
+        ++g_rub_probe.captured;
+        nb.flt_v = g_rub_stage.flt_v;
+        nb.flt_p = g_rub_stage.flt_p;
+        nb.bl = g_rub_stage.bl;
+        nb.ftc = g_rub_stage.ftc;
+        nb.di_v = g_rub_stage.di_v;
+        nb.di_p = g_rub_stage.di_p;
+        nb.smp_v.resize(sampler_count_vertex);
+        for (size_t i = 0; i < sampler_count_vertex; ++i) {
+          nb.smp_v[i] = current_samplers_vertex_[i].value;
+        }
+        nb.smp_p.resize(sampler_count_pixel);
+        for (size_t i = 0; i < sampler_count_pixel; ++i) {
+          nb.smp_p[i] = current_samplers_pixel_[i].value;
+        }
+        nb.si_v.resize(sampler_count_vertex);
+        for (size_t i = 0; i < sampler_count_vertex; ++i) {
+          nb.si_v[i] = current_sampler_bindless_indices_vertex_[i];
+        }
+        nb.si_p.resize(sampler_count_pixel);
+        for (size_t i = 0; i < sampler_count_pixel; ++i) {
+          nb.si_p[i] = current_sampler_bindless_indices_pixel_[i];
+        }
+        nb.sys_hash = rub_sys_hash;
+        nb.rootsig = static_cast<void*>(root_signature);
+      }
+    }
+  }
 
   return true;
 }
