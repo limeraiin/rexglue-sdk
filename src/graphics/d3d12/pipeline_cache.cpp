@@ -127,9 +127,11 @@ REXCVAR_DEFINE_UINT32(gpu_nr_native_pso_entries, 4096, "GPU",
 // handle once the entry is verified. The memo skips all of that on a hit.
 // Under the memo the [nr-npso] req/hit counters only see memo MISSES; the
 // live swap gate stays [nr-swp]/[nr-skp].
-REXCVAR_DEFINE_BOOL(gpu_nr_npso_memo, false, "GPU",
+// Default ON since the city A/B (naruto_391 vs 392: npso 0.175 -> 0.063
+// us/draw at matched load, verify coverage intact, no artifacts).
+REXCVAR_DEFINE_BOOL(gpu_nr_npso_memo, true, "GPU",
                     "Memo the native pipeline lookup per pipeline handle (5-4-4b perf "
-                    "increment). Off by default.");
+                    "increment). On by default.");
 
 namespace rex::graphics::d3d12 {
 

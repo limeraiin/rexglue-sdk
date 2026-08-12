@@ -279,11 +279,14 @@ uint64_t g_draw_ns[20] = {};
 // [GPU-DRAW] 5-4-4b inc 3: NrUpdateBindings sub-profile (g_draw_prof only,
 // printed as [nr-bndp]). ns: 0=cbuffer composes 1=sampler-params derivation
 // 2=srv-key freshness checks 3=sampler-heap find-or-allocate
-// 4=descriptor-indices composes 5=root-parameter tail. Counters:
+// 4=descriptor-indices composes 5=root-parameter tail, 6=time inside the
+// constant-pool Request calls alone (subset of 0 and 4 - prices the
+// combined-allocation lean against the gathers). Counters:
 // 0=DescSamplerParams evals 1=srv-value derivations 2=constant-pool
-// Requests. Names the cost driver inside bind before any lean is designed.
-uint64_t g_bind_ns[6] = {};
-uint64_t g_bind_cnt[3] = {};
+// Requests, 3..7=per-cbuffer recompose fires (sys/float_v/float_p/
+// bool_loop/fetch). Names the cost driver inside bind before any lean.
+uint64_t g_bind_ns[7] = {};
+uint64_t g_bind_cnt[8] = {};
 // [GPU-DRAW] residency-loop counters: slots visited / in_sync-bit hits /
 // state-match re-arms (no request) / RequestRange calls / RequestRange
 // calls whose exact {addr,size} was already requested since the last swap
@@ -3570,14 +3573,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (g_draw_prof) {
     static uint64_t s_last[20] = {}, s_last_cnt = 0;
     static uint64_t s_last_res[5] = {0, 0, 0, 0, 0};
-    static uint64_t s_last_bnd[6] = {}, s_last_bndc[3] = {};
+    static uint64_t s_last_bnd[7] = {}, s_last_bndc[8] = {};
     static auto s_last_report = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     if (now - s_last_report >= std::chrono::seconds(1)) {
       double d[20];
       for (int i = 0; i < 20; ++i) d[i] = (g_draw_ns[i] - s_last[i]) / 1e6;
-      double b[6];
-      for (int i = 0; i < 6; ++i) b[i] = (g_bind_ns[i] - s_last_bnd[i]) / 1e6;
+      double b[7];
+      for (int i = 0; i < 7; ++i) b[i] = (g_bind_ns[i] - s_last_bnd[i]) / 1e6;
       uint64_t dc = g_draw_count - s_last_cnt;
       double other = d[5] - (d[0] + d[1] + d[2] + d[3] + d[4] + d[6] + d[7] + d[8]);
       REXGPU_INFO(
@@ -3595,16 +3598,19 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           g_draw_res_cnt[3] - s_last_res[3], g_draw_res_cnt[4] - s_last_res[4]);
       REXGPU_INFO(
           "[nr-bndp] cb={:.1f} smp={:.1f} key={:.1f} smpidx={:.1f} di={:.1f} root={:.1f}ms "
-          "rest={:.1f} | evals={} srvv={} req={}",
+          "rest={:.1f} reqns={:.1f} | evals={} srvv={} req={} | fires sys={} fv={} fp={} "
+          "bl={} ft={}",
           b[0], b[1], b[2], b[3], b[4], b[5],
-          d[4] - (b[0] + b[1] + b[2] + b[3] + b[4] + b[5]),
+          d[4] - (b[0] + b[1] + b[2] + b[3] + b[4] + b[5]), b[6],
           g_bind_cnt[0] - s_last_bndc[0], g_bind_cnt[1] - s_last_bndc[1],
-          g_bind_cnt[2] - s_last_bndc[2]);
+          g_bind_cnt[2] - s_last_bndc[2], g_bind_cnt[3] - s_last_bndc[3],
+          g_bind_cnt[4] - s_last_bndc[4], g_bind_cnt[5] - s_last_bndc[5],
+          g_bind_cnt[6] - s_last_bndc[6], g_bind_cnt[7] - s_last_bndc[7]);
       s_last_report = now;
       for (int i = 0; i < 20; ++i) s_last[i] = g_draw_ns[i];
       for (int i = 0; i < 5; ++i) s_last_res[i] = g_draw_res_cnt[i];
-      for (int i = 0; i < 6; ++i) s_last_bnd[i] = g_bind_ns[i];
-      for (int i = 0; i < 3; ++i) s_last_bndc[i] = g_bind_cnt[i];
+      for (int i = 0; i < 7; ++i) s_last_bnd[i] = g_bind_ns[i];
+      for (int i = 0; i < 8; ++i) s_last_bndc[i] = g_bind_cnt[i];
       s_last_cnt = g_draw_count;
     }
   }
@@ -8744,10 +8750,14 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   // Write the constant buffer data - ours. (Direct writes into the upload
   // pointer are fine: sequential stores, never read back.)
   if (!cbuffer_binding_system_.up_to_date) {
+    if (g_draw_prof) ++g_bind_cnt[3];
     if (g_draw_prof) ++g_bind_cnt[2];
+    auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     uint8_t* system_constants = constant_buffer_pool_->Request(
         frame_current_, sizeof(g_nr_sys_state), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
         nullptr, nullptr, &cbuffer_binding_system_.address);
+    if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
     if (system_constants == nullptr) {
       return false;
     }
@@ -8756,12 +8766,16 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SystemConstants);
   }
   if (!cbuffer_binding_float_vertex_.up_to_date) {
+    if (g_draw_prof) ++g_bind_cnt[4];
     const uint32_t float_vertex_size =
         uint32_t(sizeof(float)) * 4 * std::max(float_constant_count_vertex, uint32_t(1));
     if (g_draw_prof) ++g_bind_cnt[2];
+    auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     uint8_t* float_constants = constant_buffer_pool_->Request(
         frame_current_, float_vertex_size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr,
         nullptr, &cbuffer_binding_float_vertex_.address);
+    if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
     if (float_constants == nullptr) {
       return false;
     }
@@ -8771,12 +8785,16 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsVertex);
   }
   if (!cbuffer_binding_float_pixel_.up_to_date) {
+    if (g_draw_prof) ++g_bind_cnt[5];
     const uint32_t float_pixel_size =
         uint32_t(sizeof(float)) * 4 * std::max(float_constant_count_pixel, uint32_t(1));
     if (g_draw_prof) ++g_bind_cnt[2];
+    auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     uint8_t* float_constants = constant_buffer_pool_->Request(
         frame_current_, float_pixel_size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr,
         nullptr, &cbuffer_binding_float_pixel_.address);
+    if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
     if (float_constants == nullptr) {
       return false;
     }
@@ -8789,10 +8807,14 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsPixel);
   }
   if (!cbuffer_binding_bool_loop_.up_to_date) {
+    if (g_draw_prof) ++g_bind_cnt[6];
     if (g_draw_prof) ++g_bind_cnt[2];
+    auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     uint8_t* bool_loop_constants = constant_buffer_pool_->Request(
         frame_current_, nr::kBindBoolLoopBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
         nullptr, nullptr, &cbuffer_binding_bool_loop_.address);
+    if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
     if (bool_loop_constants == nullptr) {
       return false;
     }
@@ -8801,10 +8823,14 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_BoolLoopConstants);
   }
   if (!cbuffer_binding_fetch_.up_to_date) {
+    if (g_draw_prof) ++g_bind_cnt[7];
     if (g_draw_prof) ++g_bind_cnt[2];
+    auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     uint8_t* fetch_constants = constant_buffer_pool_->Request(
         frame_current_, nr::kBindFetchBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
         nullptr, nullptr, &cbuffer_binding_fetch_.address);
+    if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
     if (fetch_constants == nullptr) {
       return false;
     }
@@ -9021,10 +9047,13 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     }
     const uint32_t span_alloc = std::max(span, uint32_t(1));
     if (g_draw_prof) ++g_bind_cnt[2];
+    auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
         frame_current_, span_alloc * sizeof(uint32_t),
         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
         &cbuffer_binding_descriptor_indices_vertex_.address));
+    if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
     if (!descriptor_indices) {
       return false;
     }
@@ -9059,10 +9088,13 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     }
     const uint32_t span_alloc = std::max(span, uint32_t(1));
     if (g_draw_prof) ++g_bind_cnt[2];
+    auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
         frame_current_, span_alloc * sizeof(uint32_t),
         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
         &cbuffer_binding_descriptor_indices_pixel_.address));
+    if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
     if (!descriptor_indices) {
       return false;
     }
