@@ -264,7 +264,26 @@ bool g_draw_prof = false;
 // (9 = vertex-residency loop, 10 = primitive topology, 11 = index-buffer
 // view + barriers + deferred emission + memexport finish), added 5-4-4b so
 // a city run can name the dominant slice of the tail without guessing.
-uint64_t g_draw_ns[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+// 12..15 = `other` sub-brackets (5-4-4b inc 3): 12 = head (entry ->
+// BeginSubmission: shader-ucode analysis, rasterization checks, instanced
+// merge, pipeline lock), 13 = mods (prim -> rt-update: interpolator mask +
+// shader modification selection), 14 = trans (rt-update -> pso:
+// GetOrCreateTranslation + bound-RT query), 15 = vp (tex -> ff+sc: native
+// pso lookup/bind + viewport cache key + scissor), 16 = copy (the IssueCopy
+// early-return path: resolves ride IssueDrawImpl's total bracket but close
+// no phase bracket, so without this they hide in rest). rest = other - sum,
+// printed so the split provably covers the slice.
+// 17..19 = vp sub-brackets (17 = NrNativePipeline lookup + pipeline bind,
+// 18 = viewport cache key build/compare + host viewport info, 19 = scissor).
+uint64_t g_draw_ns[20] = {};
+// [GPU-DRAW] 5-4-4b inc 3: NrUpdateBindings sub-profile (g_draw_prof only,
+// printed as [nr-bndp]). ns: 0=cbuffer composes 1=sampler-params derivation
+// 2=srv-key freshness checks 3=sampler-heap find-or-allocate
+// 4=descriptor-indices composes 5=root-parameter tail. Counters:
+// 0=DescSamplerParams evals 1=srv-value derivations 2=constant-pool
+// Requests. Names the cost driver inside bind before any lean is designed.
+uint64_t g_bind_ns[6] = {};
+uint64_t g_bind_cnt[3] = {};
 // [GPU-DRAW] residency-loop counters: slots visited / in_sync-bit hits /
 // state-match re-arms (no request) / RequestRange calls / RequestRange
 // calls whose exact {addr,size} was already requested since the last swap
@@ -3549,27 +3568,43 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // frame is presented.
   FlushInstancedBatch();
   if (g_draw_prof) {
-    static uint64_t s_last[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, s_last_cnt = 0;
+    static uint64_t s_last[20] = {}, s_last_cnt = 0;
     static uint64_t s_last_res[5] = {0, 0, 0, 0, 0};
+    static uint64_t s_last_bnd[6] = {}, s_last_bndc[3] = {};
     static auto s_last_report = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     if (now - s_last_report >= std::chrono::seconds(1)) {
-      double d[12];
-      for (int i = 0; i < 12; ++i) d[i] = (g_draw_ns[i] - s_last[i]) / 1e6;
+      double d[20];
+      for (int i = 0; i < 20; ++i) d[i] = (g_draw_ns[i] - s_last[i]) / 1e6;
+      double b[6];
+      for (int i = 0; i < 6; ++i) b[i] = (g_bind_ns[i] - s_last_bnd[i]) / 1e6;
       uint64_t dc = g_draw_count - s_last_cnt;
+      double other = d[5] - (d[0] + d[1] + d[2] + d[3] + d[4] + d[6] + d[7] + d[8]);
       REXGPU_INFO(
           "[gpu-draw] draws={} total={:.1f}ms | begin={:.1f} prim={:.1f} rt={:.1f} pso={:.1f} "
           "tex={:.1f} ff+sc={:.1f} bind={:.1f} tail={:.1f} other={:.1f}ms "
-          "| tail: res={:.1f} topo={:.1f} emit={:.1f} | resn: vis={} sync={} "
+          "| tail: res={:.1f} topo={:.1f} emit={:.1f} | other: head={:.1f} mods={:.1f} "
+          "trans={:.1f} vp={:.1f} copy={:.1f} rest={:.1f} | vp: npso={:.1f} vpk={:.1f} "
+          "sci={:.1f} | resn: vis={} sync={} "
           "rearm={} req={} dup={}",
-          dc, d[5], d[6], d[0], d[1], d[2], d[3], d[8], d[4], d[7],
-          d[5] - (d[0] + d[1] + d[2] + d[3] + d[4] + d[6] + d[7] + d[8]),
-          d[9], d[10], d[11], g_draw_res_cnt[0] - s_last_res[0],
+          dc, d[5], d[6], d[0], d[1], d[2], d[3], d[8], d[4], d[7], other,
+          d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16],
+          other - (d[12] + d[13] + d[14] + d[15] + d[16]), d[17], d[18], d[19],
+          g_draw_res_cnt[0] - s_last_res[0],
           g_draw_res_cnt[1] - s_last_res[1], g_draw_res_cnt[2] - s_last_res[2],
           g_draw_res_cnt[3] - s_last_res[3], g_draw_res_cnt[4] - s_last_res[4]);
+      REXGPU_INFO(
+          "[nr-bndp] cb={:.1f} smp={:.1f} key={:.1f} smpidx={:.1f} di={:.1f} root={:.1f}ms "
+          "rest={:.1f} | evals={} srvv={} req={}",
+          b[0], b[1], b[2], b[3], b[4], b[5],
+          d[4] - (b[0] + b[1] + b[2] + b[3] + b[4] + b[5]),
+          g_bind_cnt[0] - s_last_bndc[0], g_bind_cnt[1] - s_last_bndc[1],
+          g_bind_cnt[2] - s_last_bndc[2]);
       s_last_report = now;
-      for (int i = 0; i < 12; ++i) s_last[i] = g_draw_ns[i];
+      for (int i = 0; i < 20; ++i) s_last[i] = g_draw_ns[i];
       for (int i = 0; i < 5; ++i) s_last_res[i] = g_draw_res_cnt[i];
+      for (int i = 0; i < 6; ++i) s_last_bnd[i] = g_bind_ns[i];
+      for (int i = 0; i < 3; ++i) s_last_bndc[i] = g_bind_cnt[i];
       s_last_cnt = g_draw_count;
     }
   }
@@ -4124,7 +4159,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    // [GPU-DRAW] other sub-bracket 16 (copy): the whole resolve path.
+    bool _dp_copy_ok = IssueCopy();
+    if (g_draw_prof) g_draw_ns[16] += prof_ns_since(_dp_total.t0);
+    return _dp_copy_ok;
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -4200,6 +4238,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  // [GPU-DRAW] other sub-bracket 12 (head): entry -> here. g_draw_prof is
+  // launch-only, so it matched _dp_total.on when t0 was taken.
+  if (g_draw_prof) g_draw_ns[12] += prof_ns_since(_dp_total.t0);
   auto _dp_bs0 = g_draw_prof ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
   bool _dp_bs_ok = BeginSubmission(true);
@@ -4246,6 +4287,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (!_dp_prim_ok) {
     return false;
   }
+  // [GPU-DRAW] other sub-bracket 13 (mods): here -> rt-update.
+  auto _dp_omods0 = g_draw_prof ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
   // [NR-RSY] Phase 5-3b-3: our index-request derivation vs the observed call.
   // WHETHER the guest buffer is requested is the primitive processor's
   // convert-vs-DMA decision (declared, counted by outcome); the ARGUMENTS of
@@ -4331,6 +4375,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  if (g_draw_prof) g_draw_ns[13] += prof_ns_since(_dp_omods0);
   auto _dp_rt0 = g_draw_prof ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
   bool _dp_rt_ok = render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
@@ -4339,6 +4384,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (!_dp_rt_ok) {
     return false;
   }
+  // [GPU-DRAW] other sub-bracket 14 (trans): here -> ConfigurePipeline.
+  auto _dp_otrans0 = g_draw_prof ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
 
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
@@ -4363,6 +4411,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   }
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
+  if (g_draw_prof) g_draw_ns[14] += prof_ns_since(_dp_otrans0);
   auto _dp_pso0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
   bool _dp_pso_ok = pipeline_cache_->ConfigurePipeline(
@@ -4393,6 +4442,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                               : std::chrono::steady_clock::time_point{};
   texture_cache_->RequestTextures(used_texture_mask);
   if (g_draw_prof) g_draw_ns[3] += prof_ns_since(_dp_tex0);
+  // [GPU-DRAW] other sub-bracket 15 (vp): here -> fixed-function state.
+  auto _dp_ovp0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
 
   // [NR-NPSO] Phase 5-3a: the first peel. Ask the native renderer for its own
   // pipeline object for this draw -- our description mapping over our shader
@@ -4400,6 +4452,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // of the emulated cache's. Compare-only by default: the object is still
   // built, created and checked against theirs, but theirs is what draws, so a
   // mapping difference is reported before it can be seen.
+  // [GPU-DRAW] vp sub-bracket 17 (npso): native pso lookup + pipeline bind.
+  auto _dp_npso0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
   ID3D12PipelineState* nr_native_pipeline = nullptr;
   if (g_nr_native_pso) {
     nr_native_pipeline = pipeline_cache_->NrNativePipeline(pipeline_handle, root_signature);
@@ -4422,6 +4477,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     current_guest_pipeline_ = pipeline_handle;
     current_external_pipeline_ = nullptr;
   }
+  if (g_draw_prof) g_draw_ns[17] += prof_ns_since(_dp_npso0);
 
   // Get dynamic rasterizer state.
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
@@ -4433,6 +4489,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
 
   // Build a cache key from all viewport-affecting state to skip redundant
   // recalculation when the viewport registers haven't changed between draws.
+  // [GPU-DRAW] vp sub-bracket 18 (vpk): key build/compare + viewport info.
+  auto _dp_vpk0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   ViewportCacheKey viewport_key;
   viewport_key.pa_cl_clip_cntl = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
   viewport_key.pa_cl_vte_cntl = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
@@ -4457,14 +4516,20 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     previous_viewport_info_ = viewport_info;
     viewport_cache_valid_ = true;
   }
+  if (g_draw_prof) g_draw_ns[18] += prof_ns_since(_dp_vpk0);
 
+  // [GPU-DRAW] vp sub-bracket 19 (sci): scissor derivation + scaling.
+  auto _dp_sci0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
+  if (g_draw_prof) g_draw_ns[19] += prof_ns_since(_dp_sci0);
 
+  if (g_draw_prof) g_draw_ns[15] += prof_ns_since(_dp_ovp0);
   auto _dp_ff0 = g_draw_prof ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
   // Update viewport, scissor, blend factor and stencil reference.
@@ -8644,6 +8709,9 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
   }
 
+  // [NR-BNDP] sub-bracket 0 (cb): float-map checks + the 5 cbuffer composes.
+  auto _bp_cb0 = g_draw_prof ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
   // Check if the float constant layout is still the same and get the counts.
   const Shader::ConstantRegisterMap& float_constant_map_vertex =
       vertex_shader->constant_register_map();
@@ -8676,6 +8744,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   // Write the constant buffer data - ours. (Direct writes into the upload
   // pointer are fine: sequential stores, never read back.)
   if (!cbuffer_binding_system_.up_to_date) {
+    if (g_draw_prof) ++g_bind_cnt[2];
     uint8_t* system_constants = constant_buffer_pool_->Request(
         frame_current_, sizeof(g_nr_sys_state), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
         nullptr, nullptr, &cbuffer_binding_system_.address);
@@ -8689,6 +8758,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   if (!cbuffer_binding_float_vertex_.up_to_date) {
     const uint32_t float_vertex_size =
         uint32_t(sizeof(float)) * 4 * std::max(float_constant_count_vertex, uint32_t(1));
+    if (g_draw_prof) ++g_bind_cnt[2];
     uint8_t* float_constants = constant_buffer_pool_->Request(
         frame_current_, float_vertex_size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr,
         nullptr, &cbuffer_binding_float_vertex_.address);
@@ -8703,6 +8773,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   if (!cbuffer_binding_float_pixel_.up_to_date) {
     const uint32_t float_pixel_size =
         uint32_t(sizeof(float)) * 4 * std::max(float_constant_count_pixel, uint32_t(1));
+    if (g_draw_prof) ++g_bind_cnt[2];
     uint8_t* float_constants = constant_buffer_pool_->Request(
         frame_current_, float_pixel_size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr,
         nullptr, &cbuffer_binding_float_pixel_.address);
@@ -8718,6 +8789,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsPixel);
   }
   if (!cbuffer_binding_bool_loop_.up_to_date) {
+    if (g_draw_prof) ++g_bind_cnt[2];
     uint8_t* bool_loop_constants = constant_buffer_pool_->Request(
         frame_current_, nr::kBindBoolLoopBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
         nullptr, nullptr, &cbuffer_binding_bool_loop_.address);
@@ -8729,6 +8801,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_BoolLoopConstants);
   }
   if (!cbuffer_binding_fetch_.up_to_date) {
+    if (g_draw_prof) ++g_bind_cnt[2];
     uint8_t* fetch_constants = constant_buffer_pool_->Request(
         frame_current_, nr::kBindFetchBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
         nullptr, nullptr, &cbuffer_binding_fetch_.address);
@@ -8746,7 +8819,11 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_shared_memory_binding_is_uav_ = shared_memory_is_uav;
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SharedMemory);
   }
+  if (g_draw_prof) g_bind_ns[0] += prof_ns_since(_bp_cb0);
 
+  // [NR-BNDP] sub-bracket 1 (smp): the per-draw sampler-params derivation.
+  auto _bp_smp0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   // Sampler parameters - our derivation, same dirty machine.
   const int32_t nr_swp_aniso = REXCVAR_GET(anisotropic_override);
   size_t texture_layout_uid_vertex = vertex_shader->GetTextureBindingLayoutUserUID();
@@ -8766,6 +8843,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_samplers_vertex_.resize(
         std::max(current_samplers_vertex_.size(), sampler_count_vertex));
     for (size_t i = 0; i < sampler_count_vertex; ++i) {
+      if (g_draw_prof) ++g_bind_cnt[0];
       D3D12TextureCache::SamplerParameters parameters;
       parameters.value = nr::DescSamplerParams(
           &nr_rf[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + samplers_vertex[i].fetch_constant * 6],
@@ -8799,6 +8877,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       current_samplers_pixel_.resize(
           std::max(current_samplers_pixel_.size(), size_t(sampler_count_pixel)));
       for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
+        if (g_draw_prof) ++g_bind_cnt[0];
         D3D12TextureCache::SamplerParameters parameters;
         parameters.value = nr::DescSamplerParams(
             &nr_rf[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
@@ -8822,6 +8901,11 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     sampler_count_pixel = 0;
   }
 
+  if (g_draw_prof) g_bind_ns[1] += prof_ns_since(_bp_smp0);
+
+  // [NR-BNDP] sub-bracket 2 (key): srv-key freshness checks.
+  auto _bp_key0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   // Texture-key freshness (cache bookkeeping over keys the 5-3b-2 gate
   // proved equal to our derivation).
   if (texture_count_vertex && cbuffer_binding_descriptor_indices_vertex_.up_to_date &&
@@ -8839,6 +8923,13 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
   }
 
+  if (g_draw_prof) g_bind_ns[2] += prof_ns_since(_bp_key0);
+
+  // [NR-BNDP] sub-bracket 3 (smpidx): sampler-heap find-or-allocate. The
+  // refusal early-return leaves it open; fallback=0 at city so the loss is
+  // nil.
+  auto _bp_si0 = g_draw_prof ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
   // Sampler heap indices: the shared find-or-allocate; overflow refuses to
   // the emulated path (which owns the heap-switch machinery). Everything
   // allocated up to a refusal stays valid for the retry.
@@ -8894,9 +8985,12 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     }
   }
 
+  if (g_draw_prof) g_bind_ns[3] += prof_ns_since(_bp_si0);
+
   // Our texture SRV index value for one binding (5-3b-3's map + decision
   // tree; the emulated warm query only as a counted per-value fallback).
   const auto nr_swp_srv_value = [this](const D3D12Shader::TextureBinding& binding) -> uint32_t {
+    if (g_draw_prof) ++g_bind_cnt[1];
     nr::ResSrvBindingFacts facts;
     texture_cache_->NrDescribeActiveBinding(binding.fetch_constant, &facts);
     uint32_t ours = 0;
@@ -8912,6 +9006,9 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     return texture_cache_->GetActiveTextureBindlessSRVIndex(binding);
   };
 
+  // [NR-BNDP] sub-bracket 4 (di): both descriptor-indices composes.
+  auto _bp_di0 = g_draw_prof ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
   // Descriptor-indices constant buffers - ours, sized by the 1-BASED slot
   // rule (max_slot + 1, never tex+smp: [[descriptor-slots-one-based]]).
   if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
@@ -8923,6 +9020,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       span = std::max(span, samplers_vertex[i].bindless_descriptor_index + 1);
     }
     const uint32_t span_alloc = std::max(span, uint32_t(1));
+    if (g_draw_prof) ++g_bind_cnt[2];
     uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
         frame_current_, span_alloc * sizeof(uint32_t),
         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
@@ -8960,6 +9058,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       span = std::max(span, (*samplers_pixel)[i].bindless_descriptor_index + 1);
     }
     const uint32_t span_alloc = std::max(span, uint32_t(1));
+    if (g_draw_prof) ++g_bind_cnt[2];
     uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
         frame_current_, span_alloc * sizeof(uint32_t),
         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
@@ -8988,7 +9087,11 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
   }
+  if (g_draw_prof) g_bind_ns[4] += prof_ns_since(_bp_di0);
 
+  // [NR-BNDP] sub-bracket 5 (root): the root-parameter tail.
+  auto _bp_root0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
   // Update the root parameters (the transcribed bindless tail).
   if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_FetchConstants))) {
     deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
@@ -9051,6 +9154,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
                                                              view_bindless_heap_gpu_start_);
     current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_ViewHeap;
   }
+  if (g_draw_prof) g_bind_ns[5] += prof_ns_since(_bp_root0);
 
   return true;
 }
