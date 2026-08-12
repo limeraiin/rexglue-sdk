@@ -1375,9 +1375,15 @@ struct RuseBuf {
   std::vector<uint32_t> e_bl;              // 0x4900..0x4927 (40)
   uint32_t e_bin[3] = {0, 0, 0};           // the per-tile trio 0x2080-0x2082
   nr::ShaderRef e_vs = {}, e_ps = {};      // walker refs at entry
+  std::vector<uint32_t> byref_prev;        // by-ref value stream, prev replay
 };
-std::unordered_map<uint32_t, RuseBuf> g_ruse_bufs;          // phys ptr -> buf
-std::unordered_map<uint32_t, uint64_t> g_ruse_draw_digest;  // pkt phys -> digest
+struct RuseDraw {
+  uint64_t digest = 0;                 // v0: by-ref chain digest at the stop
+  uint32_t vs_addr = 0, ps_addr = 0;   // walker shader refs at the stop
+  uint32_t vs_size = 0, ps_size = 0;
+};
+std::unordered_map<uint32_t, RuseBuf> g_ruse_bufs;       // phys ptr -> buf
+std::unordered_map<uint32_t, RuseDraw> g_ruse_draws_m;   // pkt phys -> draw
 size_t g_ruse_shadow_bytes = 0;
 constexpr size_t kRuseShadowCap = 128ull << 20;  // clear-all backstop
 // Per-replay classification, set at buffer entry, read at each draw stop.
@@ -1388,6 +1394,24 @@ bool g_ruse_same_frame = false;
 bool g_ruse_entry_core_eq = false;    // all components eq (bin trio excluded)
 bool g_ruse_bin_ne = false;           // ONLY the bin trio differed
 uint8_t g_ruse_entry_ne_mask = 0;     // bit 0..4 = ctl/flt/ftc/bl/sh
+// [NR-RUSE] v2: the stale-register set. Layout is stable under in-place
+// patching, so a changed source dword changes exactly the register it
+// writes, and only until a later write from UNCHANGED bytes re-converges
+// the value stream. A draw is v2-reusable when the set is empty (and its
+// shader refs match its previous execution). Entry diffs seed the set;
+// walk applies mark (changed source) or clear (unchanged source) it.
+std::vector<uint64_t> g_ruse_diff;      // changed-dword bitmap, this replay
+std::vector<uint32_t> g_ruse_byref_cur; // by-ref value stream, this replay
+std::vector<uint8_t> g_ruse_stale;      // per-register stale flag (0x5003)
+uint32_t g_ruse_stale_cnt = 0;
+uint32_t g_ruse_stale_sample = 0xFFFFFFFFu;  // last reg marked stale
+RuseBuf* g_ruse_cur_buf = nullptr;      // this replay's buffer entry
+const uint8_t* g_ruse_raw = nullptr;    // this replay's buffer bytes
+uint32_t g_ruse_dwords = 0;
+bool g_ruse_v2_ok = false;              // buffer+entry comparable for v2
+bool g_ruse_deleg_poison = false;       // reg-writing delegate ran this replay
+uint32_t g_ruse_pkt_dw = 0xFFFFFFFFu;   // per-packet payload cursor
+uint32_t g_ruse_pkt_m = 0;
 // Window counters (reset each 1Hz report).
 uint64_t g_ruse_w_bufs = 0, g_ruse_w_new = 0, g_ruse_w_id = 0, g_ruse_w_ch = 0;
 uint64_t g_ruse_w_sf = 0, g_ruse_w_sf_id = 0, g_ruse_w_xf = 0, g_ruse_w_xf_id = 0;
@@ -1400,6 +1424,12 @@ uint64_t g_ruse_w_reuse_sf = 0, g_ruse_w_reuse_xf = 0, g_ruse_w_reuse_binonly = 
 uint64_t g_ruse_w_miss_pfx = 0, g_ruse_w_miss_byref = 0;
 uint64_t g_ruse_w_miss_entry[5] = {};  // first-fail attribution, ctl..sh
 uint64_t g_ruse_w_evict = 0, g_ruse_w_cost_ns = 0;
+// v2 window counters.
+uint64_t g_ruse_w_first2 = 0, g_ruse_w_reuse2 = 0;
+uint64_t g_ruse_w_reuse2_sf = 0, g_ruse_w_reuse2_xf = 0;
+uint64_t g_ruse_w_miss2_pkt = 0, g_ruse_w_miss2_stale = 0;
+uint64_t g_ruse_w_stale_sum = 0, g_ruse_w_miss2_sh = 0, g_ruse_w_miss2_deleg = 0;
+uint64_t g_ruse_w_pdw_cons = 0;  // per-dword applies with no offset mapping
 
 // Chain the by-ref payload stream (order-sensitive: same payloads in the same
 // order give the same digest at every draw prefix).
@@ -1415,12 +1445,140 @@ inline void NrRuseFeedByrefDword(uint32_t reg, uint32_t value) {
   g_ruse_byref_h = XXH3_64bits_withSeed(pair, sizeof(pair), g_ruse_byref_h);
 }
 
-// One entry-state component: compare against the shadow, refresh the shadow
-// when it changed. Returns true when equal. `skip_lo`/`skip_n` cut the bin
-// trio out of the ctl compare (they are compared separately).
+// v2: mark or clear one register's staleness from one applied write. The bin
+// trio is never tracked (expected to differ per tile; the mechanism
+// re-derives viewport/scissor/sys per execution), and neither are the
+// non-stream regs (outside the 4c stream closure by definition).
+inline void NrRuseStaleMark(uint32_t reg, bool changed) {
+  if (reg >= RegisterFile::kRegisterCount) return;
+  if (reg >= XE_GPU_REG_PA_SC_WINDOW_OFFSET &&
+      reg <= XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR) {
+    return;
+  }
+  for (uint32_t r : kNriNonStreamRegs) {
+    if (r == reg) return;
+  }
+  if (changed) {
+    if (!g_ruse_stale[reg]) {
+      g_ruse_stale[reg] = 1;
+      ++g_ruse_stale_cnt;
+      g_ruse_stale_sample = reg;
+    }
+  } else if (g_ruse_stale[reg]) {
+    g_ruse_stale[reg] = 0;
+    --g_ruse_stale_cnt;
+  }
+}
+
+// Changed-dword test against this replay's diff bitmap; out of range reads
+// as changed (conservative).
+inline bool NrRuseDiffBit(uint32_t dw) {
+  return dw >= g_ruse_dwords ||
+         ((g_ruse_diff[dw >> 6] >> (dw & 63)) & 1ull) != 0;
+}
+
+// v2: one per-dword walk apply. The source offset is reconstructable for
+// every shape the walker decodes per-dword (payload dwords arrive in order,
+// so a per-packet cursor names each write's source dword); anything else is
+// conservatively stale.
+void NrRuseDword(uint32_t reg, uint32_t value, bool from_memory) {
+  if (!g_ruse_cur_buf) return;
+  if (from_memory) {
+    const size_t idx = g_ruse_byref_cur.size();
+    const std::vector<uint32_t>& prev = g_ruse_cur_buf->byref_prev;
+    const bool changed =
+        !g_ruse_v2_ok || idx >= prev.size() || prev[idx] != value;
+    g_ruse_byref_cur.push_back(value);
+    NrRuseStaleMark(reg, changed);
+    return;
+  }
+  const uint32_t dw = g_ctx_walker.cur_dw;
+  const uint32_t hdr = g_ctx_walker.cur_hdr;
+  if (dw != g_ruse_pkt_dw) {
+    g_ruse_pkt_dw = dw;
+    g_ruse_pkt_m = 0;
+  }
+  const uint32_t m = g_ruse_pkt_m++;
+  const uint32_t ty = hdr >> 30;
+  uint32_t start;
+  if (ty == 0 || ty == 1) {
+    start = dw + 1;
+  } else if (ty == 3) {
+    const uint32_t op = (hdr >> 8) & 0x7F;
+    if (op == 0x2D || op == 0x55 || op == 0x56 || op == 0x22) {
+      start = dw + 2;  // typed/raw index dword (or the 0x22 viz token) first
+    } else if (op == 0x36) {
+      start = dw + 1;
+    } else {
+      ++g_ruse_w_pdw_cons;
+      NrRuseStaleMark(reg, true);
+      return;
+    }
+  } else {
+    ++g_ruse_w_pdw_cons;
+    NrRuseStaleMark(reg, true);
+    return;
+  }
+  NrRuseStaleMark(reg, NrRuseDiffBit(start + m));
+}
+
+// v2: one bulk range apply (inline source inside the buffer, or by-ref).
+void NrRuseRange(uint32_t base, const uint32_t* be, uint32_t n,
+                 bool from_memory) {
+  if (!g_ruse_cur_buf) return;
+  if (from_memory) {
+    const std::vector<uint32_t>& prev = g_ruse_cur_buf->byref_prev;
+    for (uint32_t i = 0; i < n; ++i) {
+      const size_t idx = g_ruse_byref_cur.size();
+      const uint32_t v = be[i];
+      const bool changed =
+          !g_ruse_v2_ok || idx >= prev.size() || prev[idx] != v;
+      g_ruse_byref_cur.push_back(v);
+      NrRuseStaleMark(base + i, changed);
+    }
+    return;
+  }
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(be);
+  if (p < g_ruse_raw ||
+      p + size_t(n) * 4 > g_ruse_raw + size_t(g_ruse_dwords) * 4) {
+    // Inline ranges always point into the buffer; keep a conservative arm
+    // anyway so a future walker change cannot silently break the model.
+    for (uint32_t i = 0; i < n; ++i) NrRuseStaleMark(base + i, true);
+    return;
+  }
+  const uint32_t o0 = uint32_t((p - g_ruse_raw) / 4);
+  if (g_ruse_stale_cnt == 0) {
+    // Fast path: nothing stale and nothing changed in the span => no effect.
+    bool any = false;
+    uint32_t i = 0;
+    while (i < n && !any) {
+      const uint32_t dw = o0 + i;
+      if ((dw & 63) == 0 && i + 64 <= n && dw < g_ruse_dwords) {
+        if (g_ruse_diff[dw >> 6]) {
+          any = true;
+        } else {
+          i += 64;
+        }
+      } else if (NrRuseDiffBit(dw)) {
+        any = true;
+      } else {
+        ++i;
+      }
+    }
+    if (!any) return;
+  }
+  for (uint32_t i = 0; i < n; ++i) {
+    NrRuseStaleMark(base + i, NrRuseDiffBit(o0 + i));
+  }
+}
+
+// One entry-state component: full diff scan (each differing register seeds
+// the v2 stale set), shadow refreshed in place. Returns true when equal.
+// `skip_lo`/`skip_n` cut the bin trio out of the ctl compare (it is compared
+// separately and never tracked).
 bool NrRuseEntryComponent(std::vector<uint32_t>& shad, const uint32_t* live,
-                          uint32_t count, uint32_t skip_lo, uint32_t skip_n,
-                          bool* had_prev, uint32_t* first_ne) {
+                          uint32_t count, uint32_t base_reg, uint32_t skip_lo,
+                          uint32_t skip_n, bool* had_prev, uint32_t* first_ne) {
   if (shad.size() != count) {
     shad.assign(live, live + count);
     *had_prev = false;
@@ -1430,12 +1588,12 @@ bool NrRuseEntryComponent(std::vector<uint32_t>& shad, const uint32_t* live,
   for (uint32_t i = 0; i < count; ++i) {
     if (skip_n && i >= skip_lo && i < skip_lo + skip_n) continue;
     if (shad[i] != live[i]) {
-      if (eq && first_ne && *first_ne == 0xFFFFFFFFu) *first_ne = i;
+      if (eq && first_ne && *first_ne == 0xFFFFFFFFu) *first_ne = base_reg + i;
       eq = false;
-      break;
+      NrRuseStaleMark(base_reg + i, true);
+      shad[i] = live[i];
     }
   }
-  if (!eq) std::memcpy(shad.data(), live, count * sizeof(uint32_t));
   return eq;
 }
 
@@ -1449,13 +1607,29 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   g_ruse_byref_h = 0;
   g_ruse_have_prev = false;
   g_ruse_first_diff = 0;
+  // v2 per-replay reset.
+  if (g_ruse_stale.size() != RegisterFile::kRegisterCount) {
+    g_ruse_stale.assign(RegisterFile::kRegisterCount, 0);
+  } else if (g_ruse_stale_cnt) {
+    std::fill(g_ruse_stale.begin(), g_ruse_stale.end(), uint8_t(0));
+  }
+  g_ruse_stale_cnt = 0;
+  g_ruse_diff.assign((count + 63) / 64, 0);
+  g_ruse_byref_cur.clear();
+  g_ruse_pkt_dw = 0xFFFFFFFFu;
+  g_ruse_pkt_m = 0;
+  g_ruse_deleg_poison = false;
+  g_ruse_raw = raw;
+  g_ruse_dwords = count;
+  g_ruse_v2_ok = false;
   if (g_ruse_shadow_bytes > kRuseShadowCap) {
     g_ruse_bufs.clear();
-    g_ruse_draw_digest.clear();
+    g_ruse_draws_m.clear();
     g_ruse_shadow_bytes = 0;
     ++g_ruse_w_evict;
   }
   RuseBuf& b = g_ruse_bufs[ptr & 0x1FFFFFFFu];
+  g_ruse_cur_buf = &b;
   const size_t bytes = size_t(count) * sizeof(uint32_t);
   bool have_prev = b.dwords == count && b.shadow.size() == bytes;
   if (!have_prev) {
@@ -1465,12 +1639,13 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
     ++g_ruse_w_new;
     g_ruse_first_diff = 0;  // nothing comparable: no draw may claim a prefix
   } else {
-    // First differing dword + changed count vs the previous replay.
+    // Changed-dword bitmap + first diff + count vs the previous replay.
     uint32_t first = count, changed = 0;
     const uint32_t* a = reinterpret_cast<const uint32_t*>(raw);
     const uint32_t* s = reinterpret_cast<const uint32_t*>(b.shadow.data());
     for (uint32_t i = 0; i < count; ++i) {
       if (a[i] != s[i]) {
+        g_ruse_diff[i >> 6] |= 1ull << (i & 63);
         if (first == count) first = i;
         ++changed;
       }
@@ -1493,29 +1668,30 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   g_ruse_entry_ne_mask = 0;
   g_ruse_bin_ne = false;
   g_ruse_entry_core_eq = false;
+  bool comp_prev = false;
   if (g_nr_issue && g_nri_seeded) {
     const uint32_t* f = g_nri_file.values;
-    bool comp_prev = b.have_entry;
+    comp_prev = b.have_entry;
     uint32_t ctl_ne = 0xFFFFFFFFu;
     // ctl 0x2000..0x2FFF with the bin trio (0x2080-0x2082) cut out.
-    if (!NrRuseEntryComponent(b.e_ctl, f + 0x2000, 0x1000,
+    if (!NrRuseEntryComponent(b.e_ctl, f + 0x2000, 0x1000, 0x2000,
                               XE_GPU_REG_PA_SC_WINDOW_OFFSET - 0x2000, 3,
                               &comp_prev, &ctl_ne)) {
       g_ruse_entry_ne_mask |= 1u << 0;
       if (g_ruse_w_ctl_diff_reg == 0xFFFFFFFFu && ctl_ne != 0xFFFFFFFFu) {
-        g_ruse_w_ctl_diff_reg = 0x2000 + ctl_ne;
+        g_ruse_w_ctl_diff_reg = ctl_ne;
       }
     }
-    if (!NrRuseEntryComponent(b.e_flt, f + 0x4000, 0x800, 0, 0, &comp_prev,
-                              nullptr)) {
+    if (!NrRuseEntryComponent(b.e_flt, f + 0x4000, 0x800, 0x4000, 0, 0,
+                              &comp_prev, nullptr)) {
       g_ruse_entry_ne_mask |= 1u << 1;
     }
-    if (!NrRuseEntryComponent(b.e_ftc, f + 0x4800, 0xC0, 0, 0, &comp_prev,
-                              nullptr)) {
+    if (!NrRuseEntryComponent(b.e_ftc, f + 0x4800, 0xC0, 0x4800, 0, 0,
+                              &comp_prev, nullptr)) {
       g_ruse_entry_ne_mask |= 1u << 2;
     }
-    if (!NrRuseEntryComponent(b.e_bl, f + 0x4900, 0x28, 0, 0, &comp_prev,
-                              nullptr)) {
+    if (!NrRuseEntryComponent(b.e_bl, f + 0x4900, 0x28, 0x4900, 0, 0,
+                              &comp_prev, nullptr)) {
       g_ruse_entry_ne_mask |= 1u << 3;
     }
     const nr::ShaderRef& vs = g_ctx_state.vs;
@@ -1545,6 +1721,9 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
       }
     }
     g_ruse_have_prev = have_prev && comp_prev;
+    // v2: bytes + entry comparable is enough (entry diffs are IN the stale
+    // set; shader identity is checked per draw). Entry ne does not block.
+    g_ruse_v2_ok = have_prev && comp_prev;
     b.have_entry = true;
   } else {
     b.have_entry = false;
@@ -1554,7 +1733,8 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
                           .count();
 }
 
-// One draw stop: classify this execution against the draw's previous one.
+// One draw stop: classify this execution against the draw's previous one,
+// under both rules (v0 prefix, v2 stale set).
 void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
                     uint32_t stop_dword) {
   const auto t0 = std::chrono::steady_clock::now();
@@ -1566,14 +1746,31 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
   if (end > count) end = count;
   const uint32_t key = (ptr & 0x1FFFFFFFu) + stop_dword * 4;
   const uint64_t digest = g_ruse_byref_h;
-  auto it = g_ruse_draw_digest.find(key);
-  const bool key_prev = it != g_ruse_draw_digest.end();
-  const bool byref_eq = key_prev && it->second == digest;
+  const nr::ShaderRef& vs = g_ctx_state.vs;
+  const nr::ShaderRef& ps = g_ctx_state.ps;
+  auto it = g_ruse_draws_m.find(key);
+  const bool key_prev = it != g_ruse_draws_m.end();
+  bool byref_eq = false, sh_eq = false;
   if (key_prev) {
-    it->second = digest;
+    RuseDraw& d = it->second;
+    byref_eq = d.digest == digest;
+    sh_eq = d.vs_addr == vs.addr && d.vs_size == vs.size_dwords &&
+            d.ps_addr == ps.addr && d.ps_size == ps.size_dwords;
+    d.digest = digest;
+    d.vs_addr = vs.addr;
+    d.vs_size = vs.size_dwords;
+    d.ps_addr = ps.addr;
+    d.ps_size = ps.size_dwords;
   } else {
-    g_ruse_draw_digest.emplace(key, digest);
+    RuseDraw d;
+    d.digest = digest;
+    d.vs_addr = vs.addr;
+    d.vs_size = vs.size_dwords;
+    d.ps_addr = ps.addr;
+    d.ps_size = ps.size_dwords;
+    g_ruse_draws_m.emplace(key, d);
   }
+  // v0: the prefix rule (sound floor).
   if (!g_ruse_have_prev || !key_prev) {
     ++g_ruse_w_first;
   } else if (g_ruse_first_diff < end) {
@@ -1592,9 +1789,42 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
     if (g_ruse_same_frame) ++g_ruse_w_reuse_sf; else ++g_ruse_w_reuse_xf;
     if (g_ruse_bin_ne) ++g_ruse_w_reuse_binonly;
   }
+  // v2: the stale-register rule. The draw's own packet span still gets a
+  // direct byte check (the 0x22 viz token is consumed but is not a register
+  // write, so the stale set alone cannot see it change).
+  if (!g_ruse_v2_ok || !key_prev) {
+    ++g_ruse_w_first2;
+  } else if (g_ruse_deleg_poison) {
+    ++g_ruse_w_miss2_deleg;
+  } else {
+    bool pkt_changed = false;
+    for (uint32_t i = stop_dword; i < end && !pkt_changed; ++i) {
+      pkt_changed = NrRuseDiffBit(i);
+    }
+    if (pkt_changed) {
+      ++g_ruse_w_miss2_pkt;
+    } else if (g_ruse_stale_cnt) {
+      ++g_ruse_w_miss2_stale;
+      g_ruse_w_stale_sum += g_ruse_stale_cnt;
+    } else if (!sh_eq) {
+      ++g_ruse_w_miss2_sh;
+    } else {
+      ++g_ruse_w_reuse2;
+      if (g_ruse_same_frame) ++g_ruse_w_reuse2_sf; else ++g_ruse_w_reuse2_xf;
+    }
+  }
   g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
+}
+
+// Buffer end: this replay's by-ref stream becomes the previous one.
+void NrRuseBufEnd() {
+  if (!g_ruse_cur_buf) return;
+  g_ruse_cur_buf->byref_prev.swap(g_ruse_byref_cur);
+  g_ruse_cur_buf = nullptr;
+  g_ruse_raw = nullptr;
+  g_ruse_dwords = 0;
 }
 
 // [NR-RES]/[NR-DRAW] Every register write the ONE walk decodes, fanned out to
@@ -1625,8 +1855,12 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   if (g_nr_skip_bufactive && user) {
     ++g_skp_pdw;
     // [NR-RUSE] the one-reg by-ref fallback must feed the digest too, or a
-    // patched single-dword LOAD_ALU would classify as reusable.
-    if (g_nr_ruse && from_memory) NrRuseFeedByrefDword(reg, value);
+    // patched single-dword LOAD_ALU would classify as reusable; every
+    // per-dword apply also drives the v2 stale set.
+    if (g_nr_ruse) {
+      if (from_memory) NrRuseFeedByrefDword(reg, value);
+      NrRuseDword(reg, value, from_memory);
+    }
     static_cast<CommandProcessor*>(user)->NrSkipApplyRegWrite(reg, value);
     return;
   }
@@ -2774,6 +3008,21 @@ void CommandProcessor::WorkerThreadMain() {
               g_ruse_w_miss_pfx, g_ruse_w_miss_byref, g_ruse_w_miss_entry[0],
               g_ruse_w_miss_entry[1], g_ruse_w_miss_entry[2],
               g_ruse_w_miss_entry[3], g_ruse_w_miss_entry[4]);
+          const uint64_t with_prev2 = g_ruse_w_draws - g_ruse_w_first2;
+          REXGPU_INFO(
+              "[nr-ruse]   v2 reuse2={} ({:.1f}% of prev'd) sf={} xf={} | "
+              "miss2 pkt={} stale={} (avg {:.1f}) sh={} deleg={} 1st2={} "
+              "pdwcons={} stale1st={:04X}",
+              g_ruse_w_reuse2,
+              with_prev2 ? 100.0 * g_ruse_w_reuse2 / with_prev2 : 0.0,
+              g_ruse_w_reuse2_sf, g_ruse_w_reuse2_xf, g_ruse_w_miss2_pkt,
+              g_ruse_w_miss2_stale,
+              g_ruse_w_miss2_stale
+                  ? double(g_ruse_w_stale_sum) / g_ruse_w_miss2_stale
+                  : 0.0,
+              g_ruse_w_miss2_sh, g_ruse_w_miss2_deleg, g_ruse_w_first2,
+              g_ruse_w_pdw_cons,
+              g_ruse_stale_sample == 0xFFFFFFFFu ? 0u : g_ruse_stale_sample);
           g_ruse_w_bufs = g_ruse_w_new = g_ruse_w_id = g_ruse_w_ch = 0;
           g_ruse_w_chdw = 0;
           g_ruse_w_sf = g_ruse_w_sf_id = g_ruse_w_xf = g_ruse_w_xf_id = 0;
@@ -2787,6 +3036,11 @@ void CommandProcessor::WorkerThreadMain() {
           g_ruse_w_miss_pfx = g_ruse_w_miss_byref = 0;
           g_ruse_w_evict = 0;
           g_ruse_w_cost_ns = 0;
+          g_ruse_w_first2 = g_ruse_w_reuse2 = 0;
+          g_ruse_w_reuse2_sf = g_ruse_w_reuse2_xf = 0;
+          g_ruse_w_miss2_pkt = g_ruse_w_miss2_stale = g_ruse_w_stale_sum = 0;
+          g_ruse_w_miss2_sh = g_ruse_w_miss2_deleg = g_ruse_w_pdw_cons = 0;
+          g_ruse_stale_sample = 0xFFFFFFFFu;
         }
         // [NR-SPP] 5-4-4 step 0b. walk+rng = buf minus the two stop-dispatch
         // brackets: the walk decode plus the bulk range applies. drawstop
@@ -3905,6 +4159,16 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     } else {
       ++g_skp_deleg;
       ++g_skp_deleg_op[stop.opcode & 0x7F];
+      // [NR-RUSE] v2: a delegated packet that can write registers runs
+      // OUTSIDE the walk's apply stream, so the stale set cannot see it --
+      // poison the rest of this replay (counted per draw as miss2 deleg).
+      if (g_nr_ruse) {
+        const uint32_t dop = stop.opcode & 0x7F;
+        if (dop == 0x3F /*INDIRECT_BUFFER*/ || dop == 0x45 /*COND_WRITE*/ ||
+            dop == 0x21 /*REG_RMW*/) {
+          g_ruse_deleg_poison = true;
+        }
+      }
     }
     // One packet through the executor's own dispatch. The reader spans from
     // the packet header to the buffer's end; ExecutePacket consumes exactly
@@ -3950,6 +4214,8 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     }
   }
   if (aborted) g_ctx_walker.cursor = g_ctx_walker.dwords;
+  // [NR-RUSE] this replay's by-ref stream becomes the previous one.
+  if (g_nr_ruse) NrRuseBufEnd();
   // Fold this buffer's stats/flags exactly as the lockstep path does, and
   // leave the CP's bin members holding the walk's end state (an in-buffer
   // SET_BIN would otherwise be lost to the packets that follow).
@@ -3989,8 +4255,13 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
     if (!be) return false;
   }
   // [NR-RUSE] by-ref payloads bypass the buffer bytes; chain them so a draw's
-  // prefix digest covers everything the packet dwords cannot.
-  if (g_nr_ruse && from_memory) NrRuseFeedByrefRange(base, be, n);
+  // prefix digest covers everything the packet dwords cannot. Every range
+  // also drives the v2 stale set (inline via the diff bitmap, by-ref via the
+  // per-buffer value-stream shadow).
+  if (g_nr_ruse) {
+    if (from_memory) NrRuseFeedByrefRange(base, be, n);
+    NrRuseRange(base, be, n, from_memory);
+  }
   WriteRegistersFromMem(base, be, n);
   const uint32_t* host = &register_file_->values[base];
   if (g_nr_res) {
