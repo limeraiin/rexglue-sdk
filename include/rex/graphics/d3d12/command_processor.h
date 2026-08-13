@@ -246,6 +246,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // scans the emitted span (self-describing stream) and fills the sample.
   void NrBfcBufBegin() override;
   bool NrBfcBufEnd(NrBfcBackendSample* out) override;
+  // [NR-DSP] Phase 5-4-7-0: per-draw native span capture + compare.
+  void NrDspDrawBegin(uint32_t key, bool reusable) override;
+  void NrDspDrawEnd() override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
 

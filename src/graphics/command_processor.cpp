@@ -352,6 +352,21 @@ REXCVAR_DEFINE_BOOL(gpu_nr_bufreplay_census, false, "GPU",
                     "set. Requires gpu_nr_skip + the reuse machinery. "
                     "Diagnostic only, off by default.");
 
+// [NR-DSP] Phase 5-4-7-0: the DRAW-level half of the same question, and the
+// bigger one -- v2 calls 71-77% of prev'd draws reusable while only 24% sit
+// in wholly byte-identical buffers, so a per-draw native span replay serves
+// ~3x the population of the buffer-level mechanism. This probe captures each
+// draw's emitted native command span and, at its next execution under a
+// reusable verdict, compares fresh vs stored: equal, equal-except-the-fields
+// a replay would patch (root view addresses / descriptor-table bases), or a
+// real difference (named by command class). Design + gate: NEXT-AGENT-5.md
+// "THE ENDGAME".
+REXCVAR_DEFINE_BOOL(gpu_nr_drawspan_census, false, "GPU",
+                    "[nr-dsp] Phase 5-4-7-0: does a reusable draw re-emit a "
+                    "byte-identical native command span? Prices per-draw "
+                    "span replay. Requires gpu_nr_skip + the reuse "
+                    "machinery. Diagnostic only, off by default.");
+
 // [NR-RUSE-EP] The epoch shortcut is REFUTED as a byte-equivalence at city
 // (naruto_410 verify run: ep_ne ~45% of clean predictions -- same-frame bin
 // repeats DO carry patches whose recorder-hook epoch bump trails the byte
@@ -1536,6 +1551,8 @@ uint64_t g_ruse_w_pdw_cons = 0;  // per-dword applies with no offset mapping
 // whole-buffer byref-eq), evaluated BEFORE NrRuseBufEnd swaps the by-ref
 // stream. Design + decision gates: NEXT-AGENT-5.md "5-4-6".
 bool g_nr_bfc = false;
+// [NR-DSP] Phase 5-4-7-0: per-draw native span probe (backend-side storage).
+bool g_nr_dsp = false;
 struct BfcPerBuf {
   // Delegate schedule (the replay must still run these at their stops).
   uint32_t deleg = 0;
@@ -1554,6 +1571,11 @@ struct BfcPerBuf {
   uint32_t rng = 0, pdw = 0;
   uint32_t dw_float = 0, dw_fetch = 0, dw_bl = 0, dw_ctl = 0, dw_other = 0;
   uint32_t pdw_stateful = 0;  // per-dword writes outside constants + ctl
+  // [NR-BFC] gap 2: the sub-0x2000 writes split by whether they are the 2
+  // known side-effect ports (which a replay must fire in ORDER) or plain
+  // registers (which the bulk end-state can carry).
+  uint32_t pdw_port = 0;
+  uint32_t pdw_plain = 0;
   uint32_t frags = 0;         // non-contiguous apply fragments
   uint32_t last_end = 0xFFFFFFFFu;
   uint32_t draws = 0;
@@ -1576,6 +1598,8 @@ struct BfcAgg {
            sp_disp = 0, sp_query = 0, sp_heaps = 0, sp_marker = 0,
            sp_other = 0;
   uint64_t viol_bufs = 0;  // bufs whose span holds any non-whitelist command
+  uint64_t viol_draws = 0;  // and the DRAWS they carry (the honest weight)
+  uint64_t pdw_port = 0, pdw_plain = 0;
   uint32_t vp_max = 0, sci_max = 0, sys_max = 0;
   uint64_t rt_runs = 0;
   uint32_t rt_max = 0;
@@ -1619,7 +1643,18 @@ inline void NrBfcApply(uint32_t base, uint32_t n, bool per_dword) {
     b.dw_ctl += n;
   } else {
     b.dw_other += n;
-    if (per_dword) b.pdw_stateful += n;
+    if (per_dword) {
+      b.pdw_stateful += n;
+      // The 4c closure: exactly two ports carry side effects on write.
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t r = base + i;
+        if (r == XE_GPU_REG_COHER_STATUS_HOST || r == XE_GPU_REG_DC_LUT_RW_INDEX) {
+          ++b.pdw_port;
+        } else {
+          ++b.pdw_plain;
+        }
+      }
+    }
   }
   NrBfcMarkWritten(base, n);
 }
@@ -1696,6 +1731,7 @@ void NrBfcFold(CommandProcessor* cp) {
     if (s.cmd_barrier + s.cmd_copy + s.cmd_clear + s.cmd_dispatch +
         s.cmd_query + s.cmd_other) {
       ++a.viol_bufs;
+      a.viol_draws += b.draws;
     }
     a.vp_max = std::max(a.vp_max, s.cmd_vp);
     a.sci_max = std::max(a.sci_max, s.cmd_sci);
@@ -1710,6 +1746,8 @@ void NrBfcFold(CommandProcessor* cp) {
   a.dw_ctl += b.dw_ctl;
   a.dw_other += b.dw_other;
   a.pdw_stateful += b.pdw_stateful;
+  a.pdw_port += b.pdw_port;
+  a.pdw_plain += b.pdw_plain;
   a.byref_dw += g_ruse_byref_cur.size();
 }
 
@@ -2614,6 +2652,8 @@ void CommandProcessor::WorkerThreadMain() {
   // candidacy (bytes/entry/byref facts) and only measures skip-driven
   // buffers.
   g_nr_bfc = REXCVAR_GET(gpu_nr_bufreplay_census) && kNrSkip && g_nr_ruse;
+  // [NR-DSP] 5-4-7-0: same requirements (the verdict is the population).
+  g_nr_dsp = REXCVAR_GET(gpu_nr_drawspan_census) && kNrSkip && g_nr_ruse;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
@@ -3495,18 +3535,20 @@ void CommandProcessor::WorkerThreadMain() {
             REXGPU_INFO(
                 "[nr-bfc]   span el={} draw={} pso={} sys={} (mx {}) cbv={} "
                 "root={} ia={} vp={} (mx {}) sci={} (mx {}) rt_set={} om={} "
-                "heaps={} mrk={} | viol bufs={} bar={} cpy={} clr={} dsp={} "
-                "qry={} oth={}",
+                "heaps={} mrk={} | viol bufs={} draws={} bar={} cpy={} clr={} "
+                "dsp={} qry={} oth={}",
                 a.span_el, a.sp_draw, a.sp_pso, a.sp_sys, a.sys_max, a.sp_cbv,
                 a.sp_root, a.sp_ia, a.sp_vp, a.vp_max, a.sp_sci, a.sci_max,
                 a.sp_om_rt, a.sp_om_misc, a.sp_heaps, a.sp_marker,
-                a.viol_bufs, a.sp_bar, a.sp_copy, a.sp_clear, a.sp_disp,
-                a.sp_query, a.sp_other);
+                a.viol_bufs, a.viol_draws, a.sp_bar, a.sp_copy, a.sp_clear,
+                a.sp_disp, a.sp_query, a.sp_other);
             REXGPU_INFO(
                 "[nr-bfc]   rt_runs={} (mx {}) subx={} | wset={} (mx {}) "
-                "frags={} ctl={} othdw={} pdwsf={} byref={}",
+                "frags={} ctl={} othdw={} pdwsf={} (port={} plain={}) "
+                "byref={}",
                 a.rt_runs, a.rt_max, a.sub_cross, a.wset, a.wset_max,
-                a.frags, a.dw_ctl, a.dw_other, a.pdw_stateful, a.byref_dw);
+                a.frags, a.dw_ctl, a.dw_other, a.pdw_stateful, a.pdw_port,
+                a.pdw_plain, a.byref_dw);
           };
           bfc_print("CAND", g_bfc_cand);
           bfc_print("non ", g_bfc_non);
@@ -4605,6 +4647,7 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   }
   nr::CtxDrawStop stop;
   bool aborted = false;
+  bool dsp_open = false;  // [NR-DSP] a draw's span bracket is open
   while (nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
     // The delegated dispatch re-checks the predicate against the CP's own
     // bin members (including the predicated-XE_SWAP rule), and a delegated
@@ -4626,6 +4669,17 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       // [NR-RUSE] classify BOTH direct and delegated draw stops (this is
       // before the direct/delegate split on purpose).
       if (g_nr_ruse) NrRuseDrawStop(ptr, raw, count, stop.dword);
+      // [NR-DSP] 5-4-7-0: open this draw's native-span bracket AFTER the
+      // classification (the verdict selects the measured population) and
+      // close it at both dispatch exits below.
+      if (g_nr_dsp) {
+        uint32_t dsp_key = 0;
+        bool dsp_r2 = false, dsp_sf = false;
+        if (NrRuseCurrentDraw(&dsp_key, &dsp_r2, &dsp_sf)) {
+          NrDspDrawBegin(dsp_key, dsp_r2 && dsp_sf);
+          dsp_open = true;
+        }
+      }
       // [NR-SKP] 5-4-4a: direct issue -- the walk already applied this
       // packet's register payload, so the delegated re-dispatch below is
       // pure framing. The tail consumes the pending stop exactly as the
@@ -4648,6 +4702,10 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
             // same as the delegated path. Drop the stop so it cannot leak.
             g_nr_skip_draw_pending = false;
             ++g_skp_arm_orphan;
+          }
+          if (dsp_open) {
+            NrDspDrawEnd();
+            dsp_open = false;
           }
           continue;
         }
@@ -4749,6 +4807,11 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       // model; drop the stop so it cannot leak onto a later draw.
       g_nr_skip_draw_pending = false;
       ++g_skp_arm_orphan;
+    }
+    // [NR-DSP] close the bracket for a draw that took the delegated path.
+    if (dsp_open) {
+      NrDspDrawEnd();
+      dsp_open = false;
     }
     if (!ok) {
       ++g_skp_exec_fail;

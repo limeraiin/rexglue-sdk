@@ -1077,6 +1077,66 @@ struct NrRubProbe {
   uint64_t v2b_up = 0, v2b_ref = 0;     // [NR-RUF-V2B] upgrades / refusals
 } g_rub_probe;
 
+// [NR-DSP] Phase 5-4-7-0: per-draw native span store + verdict counters.
+// One slot per draw key (direct map, collisions overwrite and read as
+// first-seen, never as stale). A slot holds the whole span inline: the city
+// emits ~21 elements per draw, so 64 covers it with room and anything longer
+// simply is not stored (counted).
+// ⚠ The key is a packet ADDRESS, so its low bits alias hard across buffers
+// (a plain key>>2 index collided 1,426/s at menu, silently costing coverage
+// -- collisions read as first-seen, never as stale). Mix before indexing.
+constexpr uint32_t kDspSlotBits = 17;
+constexpr uint32_t kDspSlots = 1u << kDspSlotBits;
+constexpr uint32_t kDspSlotElements = 64;
+inline uint32_t NrDspSlotIndex(uint32_t key) {
+  return uint32_t((uint64_t(key) * 2654435761ull) >> (32 - kDspSlotBits)) &
+         (kDspSlots - 1);
+}
+struct DspSlot {
+  uint32_t key = 0;
+  uint32_t len = 0;
+  uint8_t used = 0;
+  uintmax_t data[kDspSlotElements];
+};
+std::vector<DspSlot> g_dsp_slots;
+uint32_t g_dsp_key = 0;
+bool g_dsp_reusable = false;
+bool g_dsp_open = false;
+size_t g_dsp_start = 0;
+uint64_t g_dsp_gen = 0;
+struct NrDspProbe {
+  uint64_t draws = 0, compared = 0, eq = 0, eq_dyn = 0, real_ne = 0, len_ne = 0;
+  uint64_t first_seen = 0, collision = 0, unstored = 0, reset = 0;
+  uint64_t elements = 0, cmds = 0, view_sites = 0, dyn_view = 0, dyn_table = 0;
+  uint64_t len_longer = 0, len_shorter = 0, len_delta = 0, len_and_real = 0;
+  uint32_t first_real = 0xFFFFFFFFu;
+};
+NrDspProbe g_dsp_probe;
+
+void NrDspReportIfDue() {
+  if (!g_dsp_probe.draws) return;
+  static auto s_last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) return;
+  s_last = now;
+  const NrDspProbe& p = g_dsp_probe;
+  const double c = double(p.compared ? p.compared : 1);
+  REXGPU_INFO(
+      "[nr-dsp] draws={} el={:.1f}/draw | compared={} eq={} ({:.1f}%) "
+      "eqdyn={} ({:.1f}%) ne={} lenne={} (long={} short={} avg{:.1f}el "
+      "real={}) | replayable={:.1f}% | patch views={:.2f}/draw (dynview={} "
+      "dyntable={}) | 1st={} coll={} unstored={} reset={} real1st={}",
+      p.draws, p.draws ? double(p.elements) / double(p.draws) : 0.0, p.compared,
+      p.eq, 100.0 * double(p.eq) / c, p.eq_dyn, 100.0 * double(p.eq_dyn) / c,
+      p.real_ne, p.len_ne, p.len_longer, p.len_shorter,
+      p.len_ne ? double(p.len_delta) / double(p.len_ne) : 0.0, p.len_and_real,
+      100.0 * double(p.eq + p.eq_dyn) / c,
+      p.compared ? double(p.view_sites) / c : 0.0, p.dyn_view, p.dyn_table,
+      p.first_seen, p.collision, p.unstored, p.reset,
+      p.first_real == 0xFFFFFFFFu ? -1 : int32_t(p.first_real));
+  g_dsp_probe = NrDspProbe{};
+}
+
 void NrRubReportIfDue() {
   if (!g_nr_rub || !g_rub_probe.draws) return;
   static auto s_last = std::chrono::steady_clock::now();
@@ -3746,6 +3806,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // mirrors stale, force every compose to re-run once so the staged copies
   // are the current effective packs again.
   NrRubReportIfDue();
+  NrDspReportIfDue();
   {
     // [NR-RUF] 5-4-5-2: the fast path implies the bundle machinery (its
     // captures are the restore source); the compare gate stays available
@@ -6380,6 +6441,83 @@ bool D3D12CommandProcessor::NrSkipBackendEligible() const {
   // capture's write log cannot both own WriteRegister's effects. Same
   // exclusion the gpu_nr_issue seam already enforces per draw.
   return !g_precord_capture;
+}
+
+void D3D12CommandProcessor::NrDspDrawBegin(uint32_t key, bool reusable) {
+  // [NR-DSP] 5-4-7-0: latch this draw's span anchor. Storage is lazy so a
+  // run without the probe never pays the ~34 MB.
+  if (g_dsp_slots.empty()) g_dsp_slots.resize(kDspSlots);
+  g_dsp_key = key;
+  g_dsp_reusable = reusable;
+  g_dsp_start = deferred_command_list_.stream_size_elements();
+  g_dsp_gen = deferred_command_list_.reset_generation();
+  g_dsp_open = true;
+}
+
+void D3D12CommandProcessor::NrDspDrawEnd() {
+  if (!g_dsp_open) return;
+  g_dsp_open = false;
+  NrDspProbe& p = g_dsp_probe;
+  ++p.draws;
+  // A Reset inside the draw (submission boundary) invalidates the anchor --
+  // same rule as the buffer census, never the submission id.
+  if (deferred_command_list_.reset_generation() != g_dsp_gen) {
+    ++p.reset;
+    return;
+  }
+  DspSlot& slot = g_dsp_slots[NrDspSlotIndex(g_dsp_key)];
+  const bool have_prev = slot.used && slot.key == g_dsp_key;
+  if (have_prev && g_dsp_reusable) {
+    DeferredCommandList::NrDspDiff d;
+    deferred_command_list_.NrDspCompareSpan(slot.data, slot.len, g_dsp_start, &d);
+    ++p.compared;
+    p.view_sites += d.view_sites;
+    p.cmds += d.cmds;
+    if (d.length_differs) {
+      // Direction matters for the 5-4-7 design: a span's contents depend on
+      // the CP's dedupe state (a command is emitted only when it CHANGES),
+      // so a length mismatch means the surrounding context differed, not
+      // that this draw's inputs did. Longer-now means the recording was the
+      // deduped one; shorter-now means the recording carried sets this
+      // execution inherited. Either way a dedupe-free recording would cover
+      // it -- these are the draws that decide record-full vs gate-on-entry.
+      ++p.len_ne;
+      const size_t fresh =
+          deferred_command_list_.stream_size_elements() - g_dsp_start;
+      if (fresh > slot.len) {
+        ++p.len_longer;
+        p.len_delta += fresh - slot.len;
+      } else {
+        ++p.len_shorter;
+        p.len_delta += slot.len - fresh;
+      }
+      if (d.real) ++p.len_and_real;
+    } else if (d.real) {
+      ++p.real_ne;
+      if (p.first_real == 0xFFFFFFFFu) p.first_real = d.first_real;
+    } else if (d.dyn_view || d.dyn_table) {
+      ++p.eq_dyn;
+      p.dyn_view += d.dyn_view;
+      p.dyn_table += d.dyn_table;
+    } else {
+      ++p.eq;
+    }
+  } else if (!have_prev) {
+    ++p.first_seen;
+    if (slot.used) ++p.collision;
+  }
+  // Store this execution's span as the next comparison's baseline.
+  const size_t len =
+      deferred_command_list_.NrDspCopySpan(g_dsp_start, slot.data, kDspSlotElements);
+  p.elements += deferred_command_list_.stream_size_elements() - g_dsp_start;
+  if (!len) {
+    ++p.unstored;  // empty (early-out draw) or longer than a slot
+    slot.used = 0;
+    return;
+  }
+  slot.key = g_dsp_key;
+  slot.len = uint32_t(len);
+  slot.used = 1;
 }
 
 void D3D12CommandProcessor::NrBfcBufBegin() {

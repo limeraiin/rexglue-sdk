@@ -61,6 +61,28 @@ class DeferredCommandList {
   };
   void NrBfcScan(size_t start_elements, NrBfcSpanCounts* out) const;
 
+  // [NR-DSP] Phase 5-4-7-0: per-draw native span capture + compare. The
+  // question this answers: if a draw's recorded native commands were
+  // memcpy'd back on a later execution the reuse model calls identical,
+  // would they reproduce what the derivation freshly emits? Everything a
+  // replay would have to PATCH is classified as dynamic rather than as a
+  // difference: a root view's GPU address (the per-frame constant pool
+  // hands out a new one every Request) and a descriptor-table base.
+  struct NrDspDiff {
+    uint32_t cmds = 0;        // commands walked
+    uint32_t dyn_view = 0;    // differ only in a root view's GPU address
+    uint32_t dyn_table = 0;   // differ only in a descriptor-table base
+    uint32_t real = 0;        // any other difference
+    uint32_t view_sites = 0;  // root-view sets = the patch sites a replay owes
+    uint32_t first_real = 0xFFFFFFFFu;  // Command enum of the first real diff
+    bool length_differs = false;
+  };
+  // Copy [start_elements, end) out; returns elements copied, 0 if it does
+  // not fit in `capacity`.
+  size_t NrDspCopySpan(size_t start_elements, uintmax_t* dst, size_t capacity) const;
+  void NrDspCompareSpan(const uintmax_t* prev, size_t prev_len, size_t start_elements,
+                        NrDspDiff* out) const;
+
   // [GPU-PRECORD] Phase 1a-ii: move the recorded command stream out (leaving this
   // list empty, ready to record the next segment) for later ordered replay.
   std::vector<uintmax_t> TakeStream() {

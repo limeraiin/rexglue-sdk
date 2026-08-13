@@ -234,6 +234,17 @@ class CommandProcessor {
     return false;
   }
 
+  // [NR-DSP] Phase 5-4-7-0: bracket ONE draw's native command emission so the
+  // backend can compare the span it emits now against the span the same draw
+  // emitted at its previous execution. `reusable` is the reuse model's own
+  // verdict for this draw, so the probe measures exactly the population a
+  // per-draw span replay would serve.
+  virtual void NrDspDrawBegin(uint32_t key, bool reusable) {
+    (void)key;
+    (void)reusable;
+  }
+  virtual void NrDspDrawEnd() {}
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;

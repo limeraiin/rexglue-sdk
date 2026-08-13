@@ -392,6 +392,75 @@ void DeferredCommandList::NrBfcScan(size_t start_elements, NrBfcSpanCounts* out)
   }
 }
 
+size_t DeferredCommandList::NrDspCopySpan(size_t start_elements, uintmax_t* dst,
+                                          size_t capacity) const {
+  if (command_stream_.size() < start_elements) return 0;
+  const size_t len = command_stream_.size() - start_elements;
+  if (!len || len > capacity) return 0;
+  std::memcpy(dst, command_stream_.data() + start_elements, len * sizeof(uintmax_t));
+  return len;
+}
+
+void DeferredCommandList::NrDspCompareSpan(const uintmax_t* prev, size_t prev_len,
+                                           size_t start_elements, NrDspDiff* out) const {
+  // [NR-DSP] Lockstep walk of the stored span against the freshly emitted
+  // one. A command whose bytes differ is charged to `real` unless the ONLY
+  // differing field is one a replay would patch anyway.
+  const uintmax_t* a = prev;
+  size_t a_rem = prev_len;
+  const uintmax_t* b = command_stream_.data() + start_elements;
+  size_t b_rem = command_stream_.size() >= start_elements
+                     ? command_stream_.size() - start_elements
+                     : 0;
+  if (a_rem != b_rem) out->length_differs = true;
+  while (a_rem >= kCommandHeaderSizeElements && b_rem >= kCommandHeaderSizeElements) {
+    const CommandHeader& ha = *reinterpret_cast<const CommandHeader*>(a);
+    const CommandHeader& hb = *reinterpret_cast<const CommandHeader*>(b);
+    const size_t na = ha.arguments_size_elements, nb = hb.arguments_size_elements;
+    if (na > a_rem - kCommandHeaderSizeElements || nb > b_rem - kCommandHeaderSizeElements) {
+      out->length_differs = true;
+      return;
+    }
+    ++out->cmds;
+    const uintmax_t* pa = a + kCommandHeaderSizeElements;
+    const uintmax_t* pb = b + kCommandHeaderSizeElements;
+    const bool is_view = hb.command == Command::kD3DSetGraphicsRootConstantBufferView ||
+                         hb.command == Command::kD3DSetComputeRootConstantBufferView ||
+                         hb.command == Command::kD3DSetGraphicsRootShaderResourceView ||
+                         hb.command == Command::kD3DSetComputeRootShaderResourceView ||
+                         hb.command == Command::kD3DSetGraphicsRootUnorderedAccessView ||
+                         hb.command == Command::kD3DSetComputeRootUnorderedAccessView;
+    if (is_view) ++out->view_sites;
+    if (ha.command != hb.command || na != nb) {
+      ++out->real;
+      if (out->first_real == 0xFFFFFFFFu) out->first_real = uint32_t(hb.command);
+    } else if (na && std::memcmp(pa, pb, na * sizeof(uintmax_t)) != 0) {
+      bool dynamic_only = false;
+      if (is_view) {
+        auto& va = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(pa);
+        auto& vb = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(pb);
+        // Same slot, only the address moved: exactly the patch a replay does.
+        dynamic_only = va.root_parameter_index == vb.root_parameter_index;
+        if (dynamic_only) ++out->dyn_view;
+      } else if (hb.command == Command::kD3DSetGraphicsRootDescriptorTable ||
+                 hb.command == Command::kD3DSetComputeRootDescriptorTable) {
+        auto& ta = *reinterpret_cast<const SetRootDescriptorTableArguments*>(pa);
+        auto& tb = *reinterpret_cast<const SetRootDescriptorTableArguments*>(pb);
+        dynamic_only = ta.root_parameter_index == tb.root_parameter_index;
+        if (dynamic_only) ++out->dyn_table;
+      }
+      if (!dynamic_only) {
+        ++out->real;
+        if (out->first_real == 0xFFFFFFFFu) out->first_real = uint32_t(hb.command);
+      }
+    }
+    a += kCommandHeaderSizeElements + na;
+    a_rem -= kCommandHeaderSizeElements + na;
+    b += kCommandHeaderSizeElements + nb;
+    b_rem -= kCommandHeaderSizeElements + nb;
+  }
+}
+
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
