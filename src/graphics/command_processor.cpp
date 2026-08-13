@@ -333,6 +333,20 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_fast, false, "GPU",
                     "the bindings swap + bundle gate machinery. Off by "
                     "default.");
 
+// [NR-RUSE-EP] The epoch shortcut is REFUTED as a byte-equivalence at city
+// (naruto_410 verify run: ep_ne ~45% of clean predictions -- same-frame bin
+// repeats DO carry patches whose recorder-hook epoch bump trails the byte
+// writes). With the shortcut on, those replays classify against a stale
+// shadow and the fast path serves the PREVIOUS execution's state where the
+// executor would re-derive from the live (torn) bytes. One city pixel A/B
+// (naruto_409) survived that deviation, but it is a deviation. Keep OFF
+// unless deliberately trading exactness for the compare cost.
+REXCVAR_DEFINE_BOOL(gpu_nr_ruse_epoch, false, "GPU",
+                    "[nr-ruse] skip the buffer entry byte compare when the "
+                    "granule dirty-epoch sum is unchanged. UNSOUND at city "
+                    "(ep_ne ~45%%): trades executor-exact classification "
+                    "for compare cost. Off by default.");
+
 // [NR-VERIFY] Phase 5-4-4a inc 2: the per-draw VERIFY work is real CP cost --
 // RegShadowSweep (256 reg compares/draw), the per-draw shader re-hash in the
 // arm (LoadShader x2 = XXH3 over the whole ucode), the 4b-3 census feeds and
@@ -1378,6 +1392,7 @@ uint64_t g_res_addr_distinct = 0, g_res_addr_ovf = 0;
 bool g_nr_ruse = false;
 bool g_nr_ruse_v0 = false;  // the v0 digest/prefix reporting rides the probe
                             // cvar only; the fast path needs just v2
+bool g_nr_ruse_ep = false;  // [NR-RUSE-EP] opt-in epoch compare shortcut
 struct RuseBuf {
   uint32_t dwords = 0;      // buffer size at last replay
   uint32_t last_swap = 0;   // swap_counter() at last replay
@@ -1721,7 +1736,7 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
     b.dwords = count;
     ++g_ruse_w_new;
     g_ruse_first_diff = 0;  // nothing comparable: no draw may claim a prefix
-  } else if (ep_clean && !g_nr_verify_base) {
+  } else if (ep_clean && g_nr_ruse_ep && !g_nr_verify_base) {
     // Compare skipped wholesale: bytes unchanged, shadow already equal, the
     // diff bitmap stays unallocated (g_ruse_diff_empty short-circuits every
     // reader).
@@ -2330,6 +2345,8 @@ void CommandProcessor::WorkerThreadMain() {
   // cvar itself (fast-only runs pay just the v2 verdict).
   g_nr_ruse_v0 = REXCVAR_GET(gpu_nr_reuse_probe) && kNrSkip;
   g_nr_ruse = (g_nr_ruse_v0 || REXCVAR_GET(gpu_nr_reuse_fast)) && kNrSkip;
+  // [NR-RUSE-EP] the unsound-at-city compare shortcut, deliberate opt-in.
+  g_nr_ruse_ep = REXCVAR_GET(gpu_nr_ruse_epoch);
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
