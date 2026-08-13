@@ -89,6 +89,12 @@ bool LookupDraw(uint32_t phys_addr, DrawRecord* out);
 // re-admissions with unchanged content.
 uint64_t SumRangeEpoch(uint32_t phys_addr, uint32_t bytes);
 
+// Nonzero once the guest recorder hook has ever recorded a draw (i.e. the
+// epoch counters are actually being fed). A consumer that would SKIP work on
+// an unchanged epoch sum must refuse while this is zero: a dead hook reads
+// every range as eternally unchanged.
+uint64_t EpochActivity();
+
 struct CacheStats {
   uint64_t recorded;   // draws stored since the last reset
   uint64_t replaced;   // upserts: same-address re-records (patch-in-place rate)

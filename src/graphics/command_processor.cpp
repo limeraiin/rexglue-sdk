@@ -1382,6 +1382,13 @@ struct RuseBuf {
   uint32_t dwords = 0;      // buffer size at last replay
   uint32_t last_swap = 0;   // swap_counter() at last replay
   bool have_entry = false;  // entry shadows captured (g_nri_file was seeded)
+  // [NR-RUSE-EP] granule dirty-epoch sum over the buffer's range at last
+  // replay (the bufcache scheme): unchanged sum = no recorded packet touched
+  // the range since, so the byte compare would find nothing. Soundness is
+  // the same empirical claim the bufcache shipped on (vne=0); the ep_ne
+  // counter re-proves it on every verify run.
+  uint64_t last_epoch = 0;
+  bool have_epoch = false;
   std::vector<uint8_t> shadow;  // raw buffer bytes at last replay
   // Entry-state shadows (host-order dwords from g_nri_file at buffer entry).
   std::vector<uint32_t> e_ctl;             // 0x2000..0x2FFF (4096 dwords)
@@ -1426,6 +1433,10 @@ uint8_t g_ruse_entry_ne_mask = 0;     // bit 0..4 = ctl/flt/ftc/bl/sh
 // shader refs match its previous execution). Entry diffs seed the set;
 // walk applies mark (changed source) or clear (unchanged source) it.
 std::vector<uint64_t> g_ruse_diff;      // changed-dword bitmap, this replay
+// [NR-RUSE-EP] when set, this replay's diff bitmap is all-zero BY
+// CONSTRUCTION and g_ruse_diff may be stale-sized -- every reader must
+// short-circuit on this flag before touching the bitmap.
+bool g_ruse_diff_empty = false;
 std::vector<uint32_t> g_ruse_byref_cur; // by-ref value stream, this replay
 std::vector<uint8_t> g_ruse_stale;      // per-register stale flag (0x5003)
 std::vector<uint32_t> g_ruse_stale_list;  // regs ever marked this replay
@@ -1456,6 +1467,11 @@ uint64_t g_ruse_w_reuse_sf = 0, g_ruse_w_reuse_xf = 0, g_ruse_w_reuse_binonly = 
 uint64_t g_ruse_w_miss_pfx = 0, g_ruse_w_miss_byref = 0;
 uint64_t g_ruse_w_miss_entry[5] = {};  // first-fail attribution, ctl..sh
 uint64_t g_ruse_w_evict = 0, g_ruse_w_cost_ns = 0;
+// [NR-RUSE-EP] epoch gate: replays whose epoch sum matched the previous
+// replay (compare skippable), and -- verify runs only -- how often a
+// clean-predicted replay actually had changed bytes (the soundness gate,
+// must stay 0).
+uint64_t g_ruse_w_ep_clean = 0, g_ruse_w_ep_ne = 0;
 // v2 window counters.
 uint64_t g_ruse_w_first2 = 0, g_ruse_w_reuse2 = 0;
 uint64_t g_ruse_w_reuse2_sf = 0, g_ruse_w_reuse2_xf = 0;
@@ -1506,8 +1522,9 @@ inline void NrRuseStaleMark(uint32_t reg, bool changed) {
 // Changed-dword test against this replay's diff bitmap; out of range reads
 // as changed (conservative).
 inline bool NrRuseDiffBit(uint32_t dw) {
-  return dw >= g_ruse_dwords ||
-         ((g_ruse_diff[dw >> 6] >> (dw & 63)) & 1ull) != 0;
+  if (dw >= g_ruse_dwords) return true;
+  if (g_ruse_diff_empty) return false;
+  return ((g_ruse_diff[dw >> 6] >> (dw & 63)) & 1ull) != 0;
 }
 
 // v2: one per-dword walk apply. The source offset is reconstructable for
@@ -1581,6 +1598,10 @@ void NrRuseRange(uint32_t base, const uint32_t* be, uint32_t n,
   }
   const uint32_t o0 = uint32_t((p - g_ruse_raw) / 4);
   if (g_ruse_stale_cnt == 0) {
+    // [NR-RUSE-EP] no diffs at all this replay: whole-span no-op, O(1).
+    // (Also the guard that keeps the block scan below off a stale-sized
+    // bitmap -- the epoch-clean path never allocates one.)
+    if (g_ruse_diff_empty) return;
     // Fast path: nothing stale and nothing changed in the span => no effect.
     bool any = false;
     uint32_t i = 0;
@@ -1645,7 +1666,7 @@ bool NrRuseEntryComponent(std::vector<uint32_t>& shad, const uint32_t* live,
 // arm the per-replay classification flags. Runs only under the skip (the
 // walk is the only decoder there, so `raw` is exactly what will be decoded).
 void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
-                    uint32_t swap_now) {
+                    uint32_t swap_now, uint64_t epoch, bool epoch_live) {
   const auto t0 = std::chrono::steady_clock::now();
   ++g_ruse_w_bufs;
   g_ruse_byref_h = 0;
@@ -1663,7 +1684,10 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   if (g_ruse_draws_m.size() != (size_t(1) << kRuseDrawMapBits)) {
     g_ruse_draws_m.assign(size_t(1) << kRuseDrawMapBits, RuseDraw{});
   }
-  g_ruse_diff.assign((count + 63) / 64, 0);
+  // [NR-RUSE-EP] the diff bitmap is only allocated on the compare path;
+  // until then this replay reads as diff-free (new buffers have no prev to
+  // diff against, epoch-clean replays are diff-free by the gate).
+  g_ruse_diff_empty = true;
   g_ruse_byref_cur.clear();
   g_ruse_pkt_dw = 0xFFFFFFFFu;
   g_ruse_pkt_m = 0;
@@ -1681,16 +1705,39 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   g_ruse_cur_buf = &b;
   const size_t bytes = size_t(count) * sizeof(uint32_t);
   bool have_prev = b.dwords == count && b.shadow.size() == bytes;
+  // [NR-RUSE-EP] epoch gate: same granule-epoch sum as the previous replay
+  // of this buffer means no recorded packet touched its range since -- the
+  // byte compare would find nothing. Trusted only when the epoch stream is
+  // live (the guest recorder hook has ever bumped it; a dead hook reads
+  // constant-zero and must not classify anything clean). Verify runs still
+  // compare and count ep_ne (must stay 0).
+  const bool ep_clean =
+      have_prev && epoch_live && b.have_epoch && b.last_epoch == epoch;
+  b.last_epoch = epoch;
+  b.have_epoch = true;
   if (!have_prev) {
     g_ruse_shadow_bytes += bytes - b.shadow.size();
     b.shadow.assign(raw, raw + bytes);
     b.dwords = count;
     ++g_ruse_w_new;
     g_ruse_first_diff = 0;  // nothing comparable: no draw may claim a prefix
+  } else if (ep_clean && !g_nr_verify_base) {
+    // Compare skipped wholesale: bytes unchanged, shadow already equal, the
+    // diff bitmap stays unallocated (g_ruse_diff_empty short-circuits every
+    // reader).
+    ++g_ruse_w_ep_clean;
+    g_ruse_first_diff = count;
+    const bool sf = b.last_swap == swap_now;
+    if (sf) ++g_ruse_w_sf; else ++g_ruse_w_xf;
+    g_ruse_same_frame = sf;
+    ++g_ruse_w_id;
+    if (sf) ++g_ruse_w_sf_id; else ++g_ruse_w_xf_id;
   } else {
     // Changed-dword bitmap + first diff + count vs the previous replay.
     // u64-stride with drill-on-mismatch: the all-equal case (most replays)
     // is a straight vectorizable compare.
+    g_ruse_diff.assign((count + 63) / 64, 0);
+    g_ruse_diff_empty = false;
     uint32_t first = count, changed = 0;
     const uint32_t* a = reinterpret_cast<const uint32_t*>(raw);
     const uint32_t* s = reinterpret_cast<const uint32_t*>(b.shadow.data());
@@ -1723,6 +1770,15 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
     } else {
       ++g_ruse_w_id;
       if (sf) ++g_ruse_w_sf_id; else ++g_ruse_w_xf_id;
+      // Identical after a full compare: diff-free for the walk's readers
+      // (same O(1) per-range no-op the epoch-clean path gets).
+      g_ruse_diff_empty = true;
+    }
+    // [NR-RUSE-EP] verify-run soundness gate: a clean-predicted replay with
+    // changed bytes would have been a stale skip. Must stay 0.
+    if (ep_clean) {
+      ++g_ruse_w_ep_clean;
+      if (changed) ++g_ruse_w_ep_ne;
     }
   }
   b.last_swap = swap_now;
@@ -1858,8 +1914,10 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
     ++g_ruse_w_miss2_deleg;
   } else {
     bool pkt_changed = false;
-    for (uint32_t i = stop_dword; i < end && !pkt_changed; ++i) {
-      pkt_changed = NrRuseDiffBit(i);
+    if (!g_ruse_diff_empty) {
+      for (uint32_t i = stop_dword; i < end && !pkt_changed; ++i) {
+        pkt_changed = NrRuseDiffBit(i);
+      }
     }
     if (pkt_changed) {
       ++g_ruse_w_miss2_pkt;
@@ -3072,11 +3130,13 @@ void CommandProcessor::WorkerThreadMain() {
         if (g_nr_ruse && (g_ruse_w_bufs || g_ruse_w_draws)) {
           REXGPU_INFO(
               "[nr-ruse] bufs={} new={} id={} ch={} chdw={} sf={}/{} "
-              "xf={}/{} | entry eq={} binonly={} ne c/f/t/b/s={}/{}/{}/{}/{} "
+              "xf={}/{} ep={}/{} | entry eq={} binonly={} "
+              "ne c/f/t/b/s={}/{}/{}/{}/{} "
               "ctl1st={:04X} | live={} shad={}MB evict={} cost={:.1f}ms",
               g_ruse_w_bufs, g_ruse_w_new, g_ruse_w_id, g_ruse_w_ch,
               g_ruse_w_chdw, g_ruse_w_sf_id, g_ruse_w_sf, g_ruse_w_xf_id,
-              g_ruse_w_xf, g_ruse_w_entry_eq, g_ruse_w_entry_binonly,
+              g_ruse_w_xf, g_ruse_w_ep_clean, g_ruse_w_ep_ne,
+              g_ruse_w_entry_eq, g_ruse_w_entry_binonly,
               g_ruse_w_entry_ne[0], g_ruse_w_entry_ne[1], g_ruse_w_entry_ne[2],
               g_ruse_w_entry_ne[3], g_ruse_w_entry_ne[4],
               g_ruse_w_ctl_diff_reg == 0xFFFFFFFFu ? 0u : g_ruse_w_ctl_diff_reg,
@@ -3110,6 +3170,7 @@ void CommandProcessor::WorkerThreadMain() {
               g_ruse_stale_sample == 0xFFFFFFFFu ? 0u : g_ruse_stale_sample);
           g_ruse_w_bufs = g_ruse_w_new = g_ruse_w_id = g_ruse_w_ch = 0;
           g_ruse_w_chdw = 0;
+          g_ruse_w_ep_clean = g_ruse_w_ep_ne = 0;
           g_ruse_w_sf = g_ruse_w_sf_id = g_ruse_w_xf = g_ruse_w_xf_id = 0;
           g_ruse_w_entry_eq = g_ruse_w_entry_binonly = 0;
           for (uint32_t i = 0; i < 5; ++i) {
@@ -4195,7 +4256,13 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   const uint8_t* raw = memory_->TranslatePhysical(ptr);
   // [NR-RUSE] 5-4-5 inc 0: arm this replay's classification before any
   // packet is decoded (shadow compare + entry components + digest reset).
-  if (g_nr_ruse) NrRuseBufEntry(ptr, raw, count, swap_counter());
+  // The dirty-epoch is read BEFORE the walk (a patch racing the walk reads
+  // as dirty at the next execution, never as a stale serve).
+  if (g_nr_ruse) {
+    NrRuseBufEntry(ptr, raw, count, swap_counter(),
+                   nr::SumRangeEpoch(ptr, count * 4),
+                   nr::EpochActivity() != 0);
+  }
   nr::CtxDrawStop stop;
   bool aborted = false;
   while (nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {

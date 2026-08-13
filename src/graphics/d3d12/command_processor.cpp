@@ -947,8 +947,88 @@ struct NrRubBundle {
   void* pso_handle = nullptr;
   void* npso = nullptr;
 };
-std::unordered_map<uint32_t, NrRubBundle> g_rub_map;
+// [NR-RUF] Direct-map find + bundle pool recycling: a hash-map find per
+// draw (3-4 of them at city rates) was real cost, and the per-frame
+// map.clear() destroyed and re-allocated every bundle's vectors each frame
+// (~3.5k bundles x ~8 vectors at city). Slots invalidate by frame stamp
+// (no per-frame sweep); the pool's bundles keep their vector capacity
+// across frames (clear() only). A slot collision overwrites and the
+// displaced key reads as no-bundle next time -- a re-derive, never a stale
+// serve (same rule as the draw-record map).
+constexpr uint32_t kRubMapBits = 20;
+struct NrRubSlot {
+  uint32_t key = 0;
+  uint32_t idx = 0;
+  uint64_t frame = ~0ull;
+};
+std::vector<NrRubSlot> g_rub_slots;   // sized 1<<kRubMapBits on first use
+std::vector<NrRubBundle> g_rub_pool;  // capacity persists across frames
+uint32_t g_rub_pool_used = 0;
 uint64_t g_rub_frame = ~0ull;
+
+inline NrRubBundle* NrRubFind(uint32_t key) {
+  if (g_rub_slots.empty()) return nullptr;
+  const NrRubSlot& s = g_rub_slots[(key >> 2) & ((1u << kRubMapBits) - 1)];
+  if (s.key != key || s.frame != g_rub_frame) return nullptr;
+  return &g_rub_pool[s.idx];
+}
+
+NrRubBundle* NrRubGetOrCreate(uint32_t key) {
+  if (g_rub_slots.empty()) {
+    g_rub_slots.resize(size_t(1) << kRubMapBits);
+  }
+  NrRubSlot& s = g_rub_slots[(key >> 2) & ((1u << kRubMapBits) - 1)];
+  if (s.key == key && s.frame == g_rub_frame) return &g_rub_pool[s.idx];
+  if (g_rub_pool_used == g_rub_pool.size()) {
+    g_rub_pool.emplace_back();
+  }
+  NrRubBundle& b = g_rub_pool[g_rub_pool_used];
+  // Recycle in place: vectors keep capacity, every validity flag resets.
+  b.flt_v_bytes = b.flt_p_bytes = 0;
+  b.flt_v.clear();
+  b.flt_p.clear();
+  b.bl.clear();
+  b.ftc.clear();
+  b.di_v.clear();
+  b.di_p.clear();
+  b.smp_v.clear();
+  b.smp_p.clear();
+  b.si_v.clear();
+  b.si_p.clear();
+  b.sys_hash = 0;
+  b.rootsig = nullptr;
+  b.packs_have_bytes = false;
+  b.packs_valid = false;
+  b.frame = 0;
+  b.a_flt_v = b.a_flt_p = b.a_bl = b.a_ftc = b.a_di_v = b.a_di_p = 0;
+  b.smp_uid_v = b.smp_uid_p = b.tex_uid_v = b.tex_uid_p = 0;
+  b.keys_v.clear();
+  b.keys_p.clear();
+  b.pso_valid = false;
+  b.pso_handle = nullptr;
+  b.npso = nullptr;
+  s.key = key;
+  s.idx = g_rub_pool_used;
+  s.frame = g_rub_frame;
+  ++g_rub_pool_used;
+  return &b;
+}
+
+// Frame advance: stale slots die by frame stamp, bundles are recycled.
+inline void NrRubFrameReset(uint64_t frame) {
+  g_rub_pool_used = 0;
+  g_rub_frame = frame;
+}
+
+// Full disarm: release everything.
+void NrRubRelease() {
+  g_rub_slots.clear();
+  g_rub_slots.shrink_to_fit();
+  g_rub_pool.clear();
+  g_rub_pool.shrink_to_fit();
+  g_rub_pool_used = 0;
+  g_rub_frame = ~0ull;
+}
 struct NrRubStage {
   std::vector<uint8_t> flt_v, flt_p, bl, ftc;
   uint32_t flt_v_bytes = 0, flt_p_bytes = 0;
@@ -981,7 +1061,7 @@ void NrRubReportIfDue() {
       p.draws, p.checked, p.captured, p.nobundle, p.nostop, p.stage_off,
       p.ne_fltv, p.ne_fltp, p.ne_bl, p.ne_ftc, p.ne_div, p.ne_dip, p.ne_smpv,
       p.ne_smpp, p.ne_siv, p.ne_sip, p.ne_rootsig, p.ne_pso, p.pso_eq,
-      p.sys_eq, p.sys_ne, p.fast, p.fast_miss, p.fast_pso, g_rub_map.size());
+      p.sys_eq, p.sys_ne, p.fast, p.fast_miss, p.fast_pso, g_rub_pool_used);
   g_rub_probe = NrRubProbe{};
 }
 
@@ -3655,12 +3735,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     g_nr_rub_cmp = nr_cmp_now;
     if (!nr_rub_now && g_nr_rub) {
-      g_rub_map.clear();
+      NrRubRelease();
     }
     g_nr_rub = nr_rub_now;
     if (g_nr_rub && g_rub_frame != frame_current_) {
-      g_rub_map.clear();
-      g_rub_frame = frame_current_;
+      NrRubFrameReset(frame_current_);
     }
   }
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
@@ -4559,11 +4638,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     uint32_t ruf_key;
     bool ruf_r2, ruf_sf;
     if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && ruf_r2) {
-      auto ruf_it = g_rub_map.find(ruf_key);
-      if (ruf_it != g_rub_map.end() && ruf_it->second.pso_valid) {
-        pipeline_handle = ruf_it->second.pso_handle;
-        root_signature =
-            static_cast<ID3D12RootSignature*>(ruf_it->second.rootsig);
+      const NrRubBundle* ruf_b = NrRubFind(ruf_key);
+      if (ruf_b && ruf_b->pso_valid) {
+        pipeline_handle = ruf_b->pso_handle;
+        root_signature = static_cast<ID3D12RootSignature*>(ruf_b->rootsig);
         nr_ruf_pso = root_signature != nullptr;
         if (nr_ruf_pso) ++g_rub_probe.fast_pso;
       }
@@ -4646,7 +4724,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     uint32_t rub_key;
     bool rub_r2, rub_sf;
     if (NrRuseCurrentDraw(&rub_key, &rub_r2, &rub_sf)) {
-      NrRubBundle& rub_b = g_rub_map[rub_key];
+      NrRubBundle& rub_b = *NrRubGetOrCreate(rub_key);
       if (rub_r2 && rub_b.pso_valid) {
         if (rub_b.pso_handle != pipeline_handle ||
             rub_b.npso != static_cast<void*>(nr_native_pipeline)) {
@@ -8945,10 +9023,9 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     uint32_t ruf_key;
     bool ruf_r2, ruf_sf;
     if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && ruf_r2 && ruf_sf) {
-      auto ruf_it = g_rub_map.find(ruf_key);
-      if (ruf_it != g_rub_map.end() && ruf_it->second.packs_valid &&
-          ruf_it->second.frame == frame_current_) {
-        const NrRubBundle& b = ruf_it->second;
+      const NrRubBundle* ruf_b = NrRubFind(ruf_key);
+      if (ruf_b && ruf_b->packs_valid && ruf_b->frame == frame_current_) {
+        const NrRubBundle& b = *ruf_b;
         nr_rub_fast_restore = true;
         ++g_rub_probe.fast;
         const auto ruf_restore_cb = [this](ConstantBufferBinding& cb,
@@ -9533,12 +9610,12 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
         const uint64_t rub_sys_hash =
             rub_cmp_live ? XXH3_64bits(&g_nr_sys_state, sizeof(g_nr_sys_state))
                          : 0;
-        auto rub_it = g_rub_map.find(rub_key);
+        NrRubBundle* rub_found = NrRubFind(rub_key);
         if (rub_r2 && rub_cmp_live) {
-          if (rub_it == g_rub_map.end() || !rub_it->second.packs_have_bytes) {
+          if (!rub_found || !rub_found->packs_have_bytes) {
             ++g_rub_probe.nobundle;
           } else {
-            const NrRubBundle& b = rub_it->second;
+            const NrRubBundle& b = *rub_found;
             ++g_rub_probe.checked;
             if (b.flt_v != g_rub_stage.flt_v) ++g_rub_probe.ne_fltv;
             if (b.flt_p != g_rub_stage.flt_p) ++g_rub_probe.ne_fltp;
@@ -9579,8 +9656,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
         // Capture/refresh: the bundle always holds the LATEST execution.
         // The pack/di BYTE copies serve only the compare gate; the fast
         // path's restore state is the small tail below.
-        NrRubBundle& nb =
-            rub_it != g_rub_map.end() ? rub_it->second : g_rub_map[rub_key];
+        NrRubBundle& nb = rub_found ? *rub_found : *NrRubGetOrCreate(rub_key);
         ++g_rub_probe.captured;
         if (rub_cmp_live) {
           nb.flt_v = g_rub_stage.flt_v;

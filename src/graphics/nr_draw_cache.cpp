@@ -68,6 +68,8 @@ uint64_t SumRangeEpoch(uint32_t phys_addr, uint32_t bytes) {
   return sum;
 }
 
+uint64_t EpochActivity() { return g_seq; }
+
 const CacheStats& GetCacheStats() { return g_stats; }
 
 void ResetCacheStats() { g_stats = CacheStats{}; }
