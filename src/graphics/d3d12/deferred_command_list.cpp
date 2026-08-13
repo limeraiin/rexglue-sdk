@@ -26,6 +26,8 @@ DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_pr
 
 void DeferredCommandList::Reset() {
   command_stream_.clear();
+  // [NR-BFC] invalidate every outstanding span anchor.
+  ++reset_generation_;
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
@@ -280,6 +282,113 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
     }
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
+  }
+}
+
+// [NR-BFC] Phase 5-4-6-0: walk the self-describing stream tail and bucket
+// each command for the buffer-replay census. Mirrors ExecuteRange's header
+// walk exactly; no command is executed.
+void DeferredCommandList::NrBfcScan(size_t start_elements, NrBfcSpanCounts* out) const {
+  const uintmax_t* stream = command_stream_.data() + start_elements;
+  size_t remaining = command_stream_.size() >= start_elements
+                         ? command_stream_.size() - start_elements
+                         : 0;
+  while (remaining >= kCommandHeaderSizeElements) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+    // A malformed tail (stale anchor) must terminate the scan, never
+    // underflow `remaining` -- this is a diagnostic, not an executor.
+    if (header.arguments_size_elements >
+        remaining - kCommandHeaderSizeElements) {
+      break;
+    }
+    stream += kCommandHeaderSizeElements;
+    remaining -= kCommandHeaderSizeElements;
+    switch (header.command) {
+      case Command::kD3DDrawIndexedInstanced:
+      case Command::kD3DDrawInstanced:
+        ++out->draw;
+        break;
+      case Command::kD3DSetPipelineState:
+      case Command::kSetPipelineStateHandle:
+        ++out->pso;
+        break;
+      case Command::kD3DSetGraphicsRootConstantBufferView: {
+        ++out->root_cbv;
+        auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
+        ++out->graphics_cbv_by_root[args.root_parameter_index < 16
+                                        ? args.root_parameter_index
+                                        : 15];
+      } break;
+      case Command::kD3DSetComputeRootConstantBufferView:
+        ++out->root_cbv;
+        break;
+      case Command::kD3DSetComputeRoot32BitConstants:
+      case Command::kD3DSetGraphicsRoot32BitConstants:
+      case Command::kD3DSetComputeRootDescriptorTable:
+      case Command::kD3DSetGraphicsRootDescriptorTable:
+      case Command::kD3DSetComputeRootShaderResourceView:
+      case Command::kD3DSetGraphicsRootShaderResourceView:
+      case Command::kD3DSetComputeRootUnorderedAccessView:
+      case Command::kD3DSetGraphicsRootUnorderedAccessView:
+      case Command::kD3DSetComputeRootSignature:
+      case Command::kD3DSetGraphicsRootSignature:
+        ++out->root_other;
+        break;
+      case Command::kD3DIASetIndexBuffer:
+      case Command::kD3DIASetPrimitiveTopology:
+      case Command::kD3DIASetVertexBuffers:
+        ++out->ia;
+        break;
+      case Command::kRSSetViewport:
+        ++out->vp;
+        break;
+      case Command::kRSSetScissorRect:
+        ++out->sci;
+        break;
+      case Command::kD3DOMSetRenderTargets:
+        ++out->om_rt;
+        break;
+      case Command::kD3DOMSetBlendFactor:
+      case Command::kD3DOMSetStencilRef:
+      case Command::kD3DSetSamplePositions:
+        ++out->om_misc;
+        break;
+      case Command::kD3DResourceBarrier:
+        ++out->barrier;
+        break;
+      case Command::kD3DCopyBufferRegion:
+      case Command::kD3DCopyResource:
+      case Command::kCopyTexture:
+      case Command::kD3DCopyTextureRegion:
+        ++out->copy;
+        break;
+      case Command::kD3DClearDepthStencilView:
+      case Command::kD3DClearRenderTargetView:
+      case Command::kD3DClearUnorderedAccessViewUint:
+        ++out->clear;
+        break;
+      case Command::kD3DDispatch:
+        ++out->dispatch;
+        break;
+      case Command::kD3DBeginQuery:
+      case Command::kD3DEndQuery:
+      case Command::kD3DResolveQueryData:
+        ++out->query;
+        break;
+      case Command::kBeginDebugMarker:
+      case Command::kEndDebugMarker:
+      case Command::kInsertDebugMarker:
+        ++out->marker;
+        break;
+      case Command::kSetDescriptorHeaps:
+        ++out->heaps;
+        break;
+      default:
+        ++out->other;
+        break;
+    }
+    stream += header.arguments_size_elements;
+    remaining -= header.arguments_size_elements;
   }
 }
 

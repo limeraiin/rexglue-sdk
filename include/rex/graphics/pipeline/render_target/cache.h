@@ -205,6 +205,13 @@ class RenderTargetCache {
     draw_extent_estimator_.SetRegisterFile(register_file);
   }
 
+  // [NR-BFC] Phase 5-4-6-0: how many times Update actually ran its body
+  // (fingerprint guard miss or guard ineligible). The buffer-replay census
+  // reads deltas of this per skip-driven buffer to price the per-bin
+  // RT-maintenance re-runs a buffer-level native replay would owe. Public:
+  // read by the owning D3D12CommandProcessor, not a subclass.
+  uint64_t nr_update_body_runs() const { return nr_update_body_runs_; }
+
  protected:
 
   virtual bool IsGammaFormatHostStorageSeparate() const = 0;
@@ -725,6 +732,8 @@ class RenderTargetCache {
   };
   RtUpdateFingerprint rt_update_fingerprint_ = {};
   bool rt_update_fingerprint_valid_ = false;
+  // [NR-BFC] Update body executions (see nr_update_body_runs()).
+  uint64_t nr_update_body_runs_ = 0;
   // Monotonic counter incremented whenever ownership_ranges_ is mutated.
   uint64_t ownership_generation_ = 0;
   // After an update (for simplicity, even an unsuccessful update invalidates

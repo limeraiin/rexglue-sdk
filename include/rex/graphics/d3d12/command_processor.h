@@ -241,6 +241,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // unless precord capture owns the draw path (same exclusion as the
   // gpu_nr_issue seam, counted there as precord_skip).
   bool NrSkipBackendEligible() const override;
+  // [NR-BFC] Phase 5-4-6-0: buffer-replay census bracket -- Begin latches the
+  // deferred-list stream position and the RT-update body-run counter, End
+  // scans the emitted span (self-describing stream) and fills the sample.
+  void NrBfcBufBegin() override;
+  bool NrBfcBufEnd(NrBfcBackendSample* out) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
 
@@ -645,6 +650,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  // [NR-BFC] Phase 5-4-6-0 census bracket state (valid between
+  // NrBfcBufBegin and NrBfcBufEnd; the deferred list's reset generation is
+  // the anchor-validity check -- the submission id lags the Reset).
+  size_t nr_bfc_span_start_ = 0;
+  uint64_t nr_bfc_rt_runs_start_ = 0;
+  uint64_t nr_bfc_gen_start_ = 0;
 
   // [GPU-PRECORD] Phase 1a per-submission draw counter; every N draws a forced
   // full-state re-emit models a segment boundary (correctness probe).

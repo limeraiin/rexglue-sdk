@@ -196,6 +196,44 @@ class CommandProcessor {
   bool NrSkipApplyRegRange(uint32_t base, const uint32_t* values_be,
                            uint32_t n, uint32_t phys, bool from_memory);
 
+  // [NR-BFC] Phase 5-4-6-0: what the backend measured across one skip-driven
+  // buffer execution, for the buffer-level native-replay census. Filled by
+  // NrBfcBufEnd from deltas since the matching NrBfcBufBegin. Public for the
+  // same reason as NrWalkWriteEffects: the census fold is a file-scope
+  // function.
+  struct NrBfcBackendSample {
+    uint64_t submission_id = 0;   // native stream generation (span validity)
+    uint64_t rt_body_runs = 0;    // RenderTargetCache::Update body executions
+    uint32_t span_elements = 0;   // deferred-list elements this buffer emitted
+    // Command-class counts over the span (the would-be recorded sequence):
+    uint32_t cmd_draw = 0;        // DrawIndexedInstanced / DrawInstanced
+    uint32_t cmd_pso = 0;         // pipeline sets (incl. handle indirection)
+    uint32_t cmd_sys_cbv = 0;     // graphics CBV sets on the sys-constants slot
+    uint32_t cmd_root_cbv = 0;    // other CBV sets
+    uint32_t cmd_root_other = 0;  // root sig/table/SRV/UAV/32bit sets
+    uint32_t cmd_ia = 0;          // IB/VB/topology sets
+    uint32_t cmd_vp = 0;          // RSSetViewport sites (bin fixup class)
+    uint32_t cmd_sci = 0;         // RSSetScissorRect sites (bin fixup class)
+    uint32_t cmd_om_rt = 0;       // OMSetRenderTargets sites
+    uint32_t cmd_om_misc = 0;     // blend factor / stencil ref / sample pos
+    uint32_t cmd_barrier = 0;     // whitelist violations from here down:
+    uint32_t cmd_copy = 0;        //   non-idempotent / data-dependent
+    uint32_t cmd_clear = 0;
+    uint32_t cmd_dispatch = 0;
+    uint32_t cmd_query = 0;
+    uint32_t cmd_marker = 0;      // debug markers (whitelisted)
+    uint32_t cmd_heaps = 0;       // SetDescriptorHeaps (preamble class)
+    uint32_t cmd_other = 0;
+  };
+  // [NR-BFC] Bracket one skip-driven buffer execution. Begin latches the
+  // backend's stream position / counters; End fills the sample with deltas
+  // and returns true when the backend actually measured (D3D12 only).
+  virtual void NrBfcBufBegin() {}
+  virtual bool NrBfcBufEnd(NrBfcBackendSample* out) {
+    (void)out;
+    return false;
+  }
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;

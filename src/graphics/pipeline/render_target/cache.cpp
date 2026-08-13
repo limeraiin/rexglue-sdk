@@ -453,6 +453,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
   }
 
+  // [NR-BFC] Past the guard: the body runs (guard miss or ineligible).
+  ++nr_update_body_runs_;
+
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
   assert_true(msaa_samples <= xenos::MsaaSamples::k4X);

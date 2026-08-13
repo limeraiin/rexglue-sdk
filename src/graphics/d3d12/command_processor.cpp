@@ -6382,6 +6382,60 @@ bool D3D12CommandProcessor::NrSkipBackendEligible() const {
   return !g_precord_capture;
 }
 
+void D3D12CommandProcessor::NrBfcBufBegin() {
+  // [NR-BFC] Phase 5-4-6-0: latch the span anchor. The submission id guards
+  // against a deferred-list Reset between Begin and End (the stream dies at
+  // submission boundaries -- exactly the zero-copy validity question the
+  // census exists to price).
+  nr_bfc_span_start_ = deferred_command_list_.stream_size_elements();
+  nr_bfc_rt_runs_start_ =
+      render_target_cache_ ? render_target_cache_->nr_update_body_runs() : 0;
+  nr_bfc_gen_start_ = deferred_command_list_.reset_generation();
+}
+
+bool D3D12CommandProcessor::NrBfcBufEnd(NrBfcBackendSample* out) {
+  // [NR-BFC] A deferred-list Reset inside the buffer means the span anchor
+  // points into a refilled stream (possibly mid-command) -- skip the scan
+  // rather than walking garbage. The submission id is NOT this check (it
+  // increments at EndSubmission's Signal, the Reset happens at the next
+  // BeginSubmission -- an anchor latched while no submission was open dies
+  // under an unchanged id; first smoke AV'd exactly there). The id still
+  // rides the sample for the between-replay crossing metric.
+  out->submission_id = submission_current_;
+  out->rt_body_runs =
+      (render_target_cache_ ? render_target_cache_->nr_update_body_runs()
+                            : 0) -
+      nr_bfc_rt_runs_start_;
+  if (deferred_command_list_.reset_generation() != nr_bfc_gen_start_) {
+    out->span_elements = 0;
+    return true;
+  }
+  const size_t end_elements = deferred_command_list_.stream_size_elements();
+  out->span_elements = uint32_t(end_elements - nr_bfc_span_start_);
+  DeferredCommandList::NrBfcSpanCounts c;
+  deferred_command_list_.NrBfcScan(nr_bfc_span_start_, &c);
+  out->cmd_draw = c.draw;
+  out->cmd_pso = c.pso;
+  const uint32_t sys_root = uint32_t(kRootParameter_Bindless_SystemConstants);
+  out->cmd_sys_cbv = sys_root < 16 ? c.graphics_cbv_by_root[sys_root] : 0;
+  out->cmd_root_cbv = c.root_cbv - out->cmd_sys_cbv;
+  out->cmd_root_other = c.root_other;
+  out->cmd_ia = c.ia;
+  out->cmd_vp = c.vp;
+  out->cmd_sci = c.sci;
+  out->cmd_om_rt = c.om_rt;
+  out->cmd_om_misc = c.om_misc;
+  out->cmd_barrier = c.barrier;
+  out->cmd_copy = c.copy;
+  out->cmd_clear = c.clear;
+  out->cmd_dispatch = c.dispatch;
+  out->cmd_query = c.query;
+  out->cmd_marker = c.marker;
+  out->cmd_heaps = c.heaps;
+  out->cmd_other = c.other;
+  return true;
+}
+
 void D3D12CommandProcessor::PrecordApplyWrite(RegisterFile* file, uint32_t index, uint32_t value) {
   // [GPU-PRECORD] Phase 1b-1c Inc 1: the replay-time equivalent of a single
   // WriteRegister for a DEFERRABLE register, applied against `file` (the per-segment

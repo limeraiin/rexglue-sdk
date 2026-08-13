@@ -35,6 +35,32 @@ class DeferredCommandList {
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
 
+  // [NR-BFC] Phase 5-4-6-0: current stream size in elements -- the span
+  // anchor for the buffer-replay census (the stream is Reset per submission,
+  // so spans are only meaningful within one submission).
+  size_t stream_size_elements() const { return command_stream_.size(); }
+  // [NR-BFC] Bumped on every Reset. THE span-anchor validity check: the
+  // submission id alone is NOT one -- submission_current_ increments at
+  // EndSubmission's Signal while the stream Reset happens at the NEXT
+  // BeginSubmission, so an anchor latched while no submission was open can
+  // point mid-command into a refilled stream under an unchanged id (found
+  // by an AV in NrBfcScan on the first smoke).
+  uint64_t reset_generation() const { return reset_generation_; }
+
+  // [NR-BFC] Census over the stream tail from `start_elements`: per-class
+  // command counts for the buffer-replay design (the stream is
+  // self-describing, so the scan needs no execution). `graphics_cbv_by_root`
+  // buckets kD3DSetGraphicsRootConstantBufferView by root parameter index
+  // (capped at 15) so the caller can split the sys-constants slot out.
+  struct NrBfcSpanCounts {
+    uint32_t draw = 0, pso = 0, root_cbv = 0, root_other = 0, ia = 0, vp = 0,
+             sci = 0, om_rt = 0, om_misc = 0, barrier = 0, copy = 0,
+             clear = 0, dispatch = 0, query = 0, marker = 0, heaps = 0,
+             other = 0;
+    uint32_t graphics_cbv_by_root[16] = {};
+  };
+  void NrBfcScan(size_t start_elements, NrBfcSpanCounts* out) const;
+
   // [GPU-PRECORD] Phase 1a-ii: move the recorded command stream out (leaving this
   // list empty, ready to record the next segment) for later ordered replay.
   std::vector<uintmax_t> TakeStream() {
@@ -664,6 +690,8 @@ class DeferredCommandList {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  // [NR-BFC] see reset_generation().
+  uint64_t reset_generation_ = 0;
 };
 
 }  // namespace rex::graphics::d3d12

@@ -335,6 +335,23 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_fast, true, "GPU",
                     "the bindings swap + bundle gate machinery. Default on "
                     "(city-gated + pixel-validated).");
 
+// [NR-BFC] Phase 5-4-6-0: the buffer-level native-replay census. For every
+// skip-driven buffer execution, split candidate (the measured bufid rule:
+// wholly byte-identical + same-frame + entry-core-eq, byref checked at end)
+// vs non-candidate, and price each 5-4-6 design branch: delegate schedule
+// composition (refuse classes: REG_RMW / COND_WRITE / nested IB / XE_SWAP /
+// WAIT on a non-COHER register), native span composition from the deferred
+// list (whitelist violations = barriers/copies/clears/dispatches/queries),
+// bin-fixup site counts (vp / sci / sys-CBV), RT-update body runs, written
+// register set size, stateful-port writes, submission-boundary crossings
+// (zero-copy span validity), by-ref volume. Design + decision gates in
+// NEXT-AGENT-5.md "5-4-6".
+REXCVAR_DEFINE_BOOL(gpu_nr_bufreplay_census, false, "GPU",
+                    "[nr-bfc] Phase 5-4-6-0: census pricing the buffer-level "
+                    "native replay (the 60 lever) over the bufid candidate "
+                    "set. Requires gpu_nr_skip + the reuse machinery. "
+                    "Diagnostic only, off by default.");
+
 // [NR-RUSE-EP] The epoch shortcut is REFUTED as a byte-equivalence at city
 // (naruto_410 verify run: ep_ne ~45% of clean predictions -- same-frame bin
 // repeats DO carry patches whose recorder-hook epoch bump trails the byte
@@ -1415,6 +1432,10 @@ struct RuseBuf {
   uint32_t e_bin[3] = {0, 0, 0};           // the per-tile trio 0x2080-0x2082
   nr::ShaderRef e_vs = {}, e_ps = {};      // walker refs at entry
   std::vector<uint32_t> byref_prev;        // by-ref value stream, prev replay
+  // [NR-BFC] 5-4-6-0: native-stream generation at this buffer's last replay
+  // (a crossing kills the zero-copy span; the census prices how often).
+  uint64_t bfc_submission = 0;
+  bool bfc_have_sub = false;
 };
 struct RuseDraw {
   uint32_t key = 0;                    // full packet phys addr (slot validity)
@@ -1507,6 +1528,190 @@ uint64_t g_ruse_w_bufid_draws = 0, g_ruse_w_bufid_byref = 0;
 uint64_t g_ruse_w_miss2_pkt = 0, g_ruse_w_miss2_stale = 0;
 uint64_t g_ruse_w_stale_sum = 0, g_ruse_w_miss2_sh = 0, g_ruse_w_miss2_deleg = 0;
 uint64_t g_ruse_w_pdw_cons = 0;  // per-dword applies with no offset mapping
+
+// [NR-BFC] Phase 5-4-6-0: the buffer-level native-replay census
+// (CP-thread-only). One BfcPerBuf per skip-driven buffer execution, folded
+// at buffer end into the candidate or non-candidate aggregate. Candidate =
+// the measured bufid rule (bytes identical + same-frame + entry-core-eq +
+// whole-buffer byref-eq), evaluated BEFORE NrRuseBufEnd swaps the by-ref
+// stream. Design + decision gates: NEXT-AGENT-5.md "5-4-6".
+bool g_nr_bfc = false;
+struct BfcPerBuf {
+  // Delegate schedule (the replay must still run these at their stops).
+  uint32_t deleg = 0;
+  uint32_t deleg_events = 0;      // EVENT_WRITE family + INTERRUPT
+  uint32_t deleg_wait_mem = 0;    // WAIT_REG_MEM, memory poll
+  uint32_t deleg_wait_coher = 0;  // WAIT_REG_MEM on COHER_STATUS_HOST
+  uint32_t deleg_wait_other = 0;  // WAIT_REG_MEM on any other register
+  uint32_t deleg_memw = 0;        // MEM_WRITE
+  uint32_t deleg_other = 0;
+  // bit0 REG_RMW, bit1 COND_WRITE, bit2 nested IB, bit3 XE_SWAP,
+  // bit4 WAIT on a non-COHER register -- any bit refuses the buffer.
+  uint32_t refuse_mask = 0;
+  uint32_t deleg_before_draw = 0;  // schedule position: before the 1st draw
+  bool saw_draw = false;
+  // Walk apply stream: end-state size + fixup-input classes.
+  uint32_t rng = 0, pdw = 0;
+  uint32_t dw_float = 0, dw_fetch = 0, dw_bl = 0, dw_ctl = 0, dw_other = 0;
+  uint32_t pdw_stateful = 0;  // per-dword writes outside constants + ctl
+  uint32_t frags = 0;         // non-contiguous apply fragments
+  uint32_t last_end = 0xFFFFFFFFu;
+  uint32_t draws = 0;
+};
+BfcPerBuf g_bfc_buf;
+// Distinct written registers this buffer (end-state size): bitmap + dirty
+// word list so the per-buffer clear is O(written), never O(file).
+std::vector<uint64_t> g_bfc_wset;
+std::vector<uint32_t> g_bfc_wset_words;
+uint32_t g_bfc_wset_distinct = 0;
+struct BfcAgg {
+  uint64_t bufs = 0, draws = 0;
+  uint64_t deleg = 0, dl_events = 0, dl_wait_mem = 0, dl_wait_coher = 0,
+           dl_wait_other = 0, dl_memw = 0, dl_other = 0, dl_before_draw = 0;
+  uint64_t refuse_bufs = 0;
+  uint64_t refuse_by[5] = {};  // rmw / condw / nested ib / xe_swap / wait-reg
+  uint64_t span_el = 0, sp_draw = 0, sp_pso = 0, sp_sys = 0, sp_cbv = 0,
+           sp_root = 0, sp_ia = 0, sp_vp = 0, sp_sci = 0, sp_om_rt = 0,
+           sp_om_misc = 0, sp_bar = 0, sp_copy = 0, sp_clear = 0,
+           sp_disp = 0, sp_query = 0, sp_heaps = 0, sp_marker = 0,
+           sp_other = 0;
+  uint64_t viol_bufs = 0;  // bufs whose span holds any non-whitelist command
+  uint32_t vp_max = 0, sci_max = 0, sys_max = 0;
+  uint64_t rt_runs = 0;
+  uint32_t rt_max = 0;
+  uint64_t sub_cross = 0;  // replays whose prev replay was another submission
+  uint64_t wset = 0;
+  uint32_t wset_max = 0;
+  uint64_t frags = 0, dw_ctl = 0, dw_other = 0, pdw_stateful = 0;
+  uint64_t byref_dw = 0;
+};
+BfcAgg g_bfc_cand, g_bfc_non;
+uint64_t g_bfc_backend_missing = 0;
+uint32_t g_bfc_wait_reg_sample = 0xFFFFFFFFu;
+
+inline void NrBfcMarkWritten(uint32_t reg, uint32_t n) {
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t r = reg + i;
+    if (r >= RegisterFile::kRegisterCount) break;
+    uint64_t& w = g_bfc_wset[r >> 6];
+    const uint64_t bit = 1ull << (r & 63);
+    if (!(w & bit)) {
+      if (!w) g_bfc_wset_words.push_back(r >> 6);
+      w |= bit;
+      ++g_bfc_wset_distinct;
+    }
+  }
+}
+
+// One walk apply (bulk range or per-dword) into the census.
+inline void NrBfcApply(uint32_t base, uint32_t n, bool per_dword) {
+  BfcPerBuf& b = g_bfc_buf;
+  if (per_dword) ++b.pdw; else ++b.rng;
+  if (base != b.last_end) ++b.frags;
+  b.last_end = base + n;
+  if (base >= 0x4000 && base + n <= 0x4800) {
+    b.dw_float += n;
+  } else if (base >= 0x4800 && base + n <= 0x48C0) {
+    b.dw_fetch += n;
+  } else if (base >= 0x4900 && base + n <= 0x4928) {
+    b.dw_bl += n;
+  } else if (base >= 0x2000 && base + n <= 0x3000) {
+    b.dw_ctl += n;
+  } else {
+    b.dw_other += n;
+    if (per_dword) b.pdw_stateful += n;
+  }
+  NrBfcMarkWritten(base, n);
+}
+
+// Buffer begin: reset the per-buffer state (bitmap cleared by dirty list).
+inline void NrBfcBufReset() {
+  g_bfc_buf = BfcPerBuf{};
+  const size_t words = (RegisterFile::kRegisterCount + 63) / 64;
+  if (g_bfc_wset.size() != words) {
+    g_bfc_wset.assign(words, 0);
+    g_bfc_wset_words.clear();
+  } else {
+    for (uint32_t w : g_bfc_wset_words) g_bfc_wset[w] = 0;
+    g_bfc_wset_words.clear();
+  }
+  g_bfc_wset_distinct = 0;
+}
+
+// Buffer end: classify candidate vs not, collect the backend sample, fold.
+void NrBfcFold(CommandProcessor* cp) {
+  RuseBuf* rb = g_ruse_cur_buf;
+  const bool bytes_id =
+      g_ruse_have_prev && g_ruse_first_diff >= g_ruse_dwords;
+  const bool byref_eq = rb && g_ruse_byref_cur == rb->byref_prev;
+  const bool cand = bytes_id && g_ruse_same_frame && g_ruse_entry_core_eq &&
+                    byref_eq;
+  CommandProcessor::NrBfcBackendSample s;
+  const bool have_backend = cp->NrBfcBufEnd(&s);
+  if (!have_backend) ++g_bfc_backend_missing;
+  bool sub_cross = false;
+  if (rb && have_backend) {
+    if (rb->bfc_have_sub && s.submission_id != rb->bfc_submission) {
+      sub_cross = true;
+    }
+    rb->bfc_submission = s.submission_id;
+    rb->bfc_have_sub = true;
+  }
+  const BfcPerBuf& b = g_bfc_buf;
+  BfcAgg& a = cand ? g_bfc_cand : g_bfc_non;
+  ++a.bufs;
+  a.draws += b.draws;
+  a.deleg += b.deleg;
+  a.dl_events += b.deleg_events;
+  a.dl_wait_mem += b.deleg_wait_mem;
+  a.dl_wait_coher += b.deleg_wait_coher;
+  a.dl_wait_other += b.deleg_wait_other;
+  a.dl_memw += b.deleg_memw;
+  a.dl_other += b.deleg_other;
+  a.dl_before_draw += b.deleg_before_draw;
+  if (b.refuse_mask) ++a.refuse_bufs;
+  for (uint32_t i = 0; i < 5; ++i) {
+    if (b.refuse_mask & (1u << i)) ++a.refuse_by[i];
+  }
+  if (have_backend) {
+    a.span_el += s.span_elements;
+    a.sp_draw += s.cmd_draw;
+    a.sp_pso += s.cmd_pso;
+    a.sp_sys += s.cmd_sys_cbv;
+    a.sp_cbv += s.cmd_root_cbv;
+    a.sp_root += s.cmd_root_other;
+    a.sp_ia += s.cmd_ia;
+    a.sp_vp += s.cmd_vp;
+    a.sp_sci += s.cmd_sci;
+    a.sp_om_rt += s.cmd_om_rt;
+    a.sp_om_misc += s.cmd_om_misc;
+    a.sp_bar += s.cmd_barrier;
+    a.sp_copy += s.cmd_copy;
+    a.sp_clear += s.cmd_clear;
+    a.sp_disp += s.cmd_dispatch;
+    a.sp_query += s.cmd_query;
+    a.sp_heaps += s.cmd_heaps;
+    a.sp_marker += s.cmd_marker;
+    a.sp_other += s.cmd_other;
+    if (s.cmd_barrier + s.cmd_copy + s.cmd_clear + s.cmd_dispatch +
+        s.cmd_query + s.cmd_other) {
+      ++a.viol_bufs;
+    }
+    a.vp_max = std::max(a.vp_max, s.cmd_vp);
+    a.sci_max = std::max(a.sci_max, s.cmd_sci);
+    a.sys_max = std::max(a.sys_max, s.cmd_sys_cbv);
+    a.rt_runs += s.rt_body_runs;
+    a.rt_max = std::max(a.rt_max, uint32_t(s.rt_body_runs));
+    if (sub_cross) ++a.sub_cross;
+  }
+  a.wset += g_bfc_wset_distinct;
+  a.wset_max = std::max(a.wset_max, g_bfc_wset_distinct);
+  a.frags += b.frags;
+  a.dw_ctl += b.dw_ctl;
+  a.dw_other += b.dw_other;
+  a.pdw_stateful += b.pdw_stateful;
+  a.byref_dw += g_ruse_byref_cur.size();
+}
 
 // Chain the by-ref payload stream (order-sensitive: same payloads in the same
 // order give the same digest at every draw prefix).
@@ -2070,6 +2275,9 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
       if (g_nr_ruse_v0 && from_memory) NrRuseFeedByrefDword(reg, value);
       NrRuseDword(reg, value, from_memory);
     }
+    // [NR-BFC] per-dword applies feed the census too (stateful ports and
+    // odd shapes only ever arrive here).
+    if (g_nr_bfc) NrBfcApply(reg, 1, true);
     static_cast<CommandProcessor*>(user)->NrSkipApplyRegWrite(reg, value);
     return;
   }
@@ -2402,6 +2610,10 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_ruse = (g_nr_ruse_v0 || REXCVAR_GET(gpu_nr_reuse_fast)) && kNrSkip;
   // [NR-RUSE-EP] the unsound-at-city compare shortcut, deliberate opt-in.
   g_nr_ruse_ep = REXCVAR_GET(gpu_nr_ruse_epoch);
+  // [NR-BFC] 5-4-6-0: the buffer-replay census needs the ruse machinery for
+  // candidacy (bytes/entry/byref facts) and only measures skip-driven
+  // buffers.
+  g_nr_bfc = REXCVAR_GET(gpu_nr_bufreplay_census) && kNrSkip && g_nr_ruse;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
@@ -3261,6 +3473,54 @@ void CommandProcessor::WorkerThreadMain() {
           g_ruse_w_miss2_sh = g_ruse_w_miss2_deleg = g_ruse_w_pdw_cons = 0;
           g_ruse_w_bufid_draws = g_ruse_w_bufid_byref = 0;
           g_ruse_stale_sample = 0xFFFFFFFFu;
+        }
+        // [NR-BFC] 5-4-6-0: buffer-replay census, candidate vs non-candidate
+        // aggregates. Line 1 = delegate schedule + refuse classes; line 2 =
+        // native span composition (viol = whitelist-violating buffers whose
+        // span a replay could NOT memcpy verbatim); line 3 = maintenance
+        // costs (RT body runs, submission crossings, end-state size, by-ref
+        // volume). Decision gates in NEXT-AGENT-5.md "5-4-6".
+        if (g_nr_bfc && (g_bfc_cand.bufs || g_bfc_non.bufs)) {
+          const auto bfc_print = [](const char* tag, const BfcAgg& a) {
+            if (!a.bufs) return;
+            REXGPU_INFO(
+                "[nr-bfc] {} bufs={} draws={} | deleg={} ev={} wcoh={} "
+                "wmem={} woth={} memw={} oth={} befdraw={} | refuse bufs={} "
+                "rmw/cw/ib/swap/wreg={}/{}/{}/{}/{}",
+                tag, a.bufs, a.draws, a.deleg, a.dl_events, a.dl_wait_coher,
+                a.dl_wait_mem, a.dl_wait_other, a.dl_memw, a.dl_other,
+                a.dl_before_draw, a.refuse_bufs, a.refuse_by[0],
+                a.refuse_by[1], a.refuse_by[2], a.refuse_by[3],
+                a.refuse_by[4]);
+            REXGPU_INFO(
+                "[nr-bfc]   span el={} draw={} pso={} sys={} (mx {}) cbv={} "
+                "root={} ia={} vp={} (mx {}) sci={} (mx {}) rt_set={} om={} "
+                "heaps={} mrk={} | viol bufs={} bar={} cpy={} clr={} dsp={} "
+                "qry={} oth={}",
+                a.span_el, a.sp_draw, a.sp_pso, a.sp_sys, a.sys_max, a.sp_cbv,
+                a.sp_root, a.sp_ia, a.sp_vp, a.vp_max, a.sp_sci, a.sci_max,
+                a.sp_om_rt, a.sp_om_misc, a.sp_heaps, a.sp_marker,
+                a.viol_bufs, a.sp_bar, a.sp_copy, a.sp_clear, a.sp_disp,
+                a.sp_query, a.sp_other);
+            REXGPU_INFO(
+                "[nr-bfc]   rt_runs={} (mx {}) subx={} | wset={} (mx {}) "
+                "frags={} ctl={} othdw={} pdwsf={} byref={}",
+                a.rt_runs, a.rt_max, a.sub_cross, a.wset, a.wset_max,
+                a.frags, a.dw_ctl, a.dw_other, a.pdw_stateful, a.byref_dw);
+          };
+          bfc_print("CAND", g_bfc_cand);
+          bfc_print("non ", g_bfc_non);
+          if (g_bfc_backend_missing) {
+            REXGPU_INFO("[nr-bfc] backend_missing={} (no D3D12 sample)",
+                        g_bfc_backend_missing);
+          }
+          if (g_bfc_wait_reg_sample != 0xFFFFFFFFu) {
+            REXGPU_INFO("[nr-bfc] wreg1st={:04X}", g_bfc_wait_reg_sample);
+          }
+          g_bfc_cand = BfcAgg{};
+          g_bfc_non = BfcAgg{};
+          g_bfc_backend_missing = 0;
+          g_bfc_wait_reg_sample = 0xFFFFFFFFu;
         }
         // [NR-SPP] 5-4-4 step 0b. walk+rng = buf minus the two stop-dispatch
         // brackets: the walk decode plus the bulk range applies. drawstop
@@ -4337,6 +4597,12 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
                    nr::SumRangeEpoch(ptr, count * 4),
                    nr::EpochActivity() != 0);
   }
+  // [NR-BFC] 5-4-6-0: census bracket. Candidacy is read from the ruse facts
+  // at buffer end; the backend latches its stream anchor here.
+  if (g_nr_bfc) {
+    NrBfcBufReset();
+    NrBfcBufBegin();
+  }
   nr::CtxDrawStop stop;
   bool aborted = false;
   while (nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
@@ -4352,6 +4618,11 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       g_nr_skip_stop = stop;
       g_nr_skip_draw_pending = true;
       ++g_skp_draws;
+      // [NR-BFC] schedule position: delegates counted so far were pre-draw.
+      if (g_nr_bfc) {
+        g_bfc_buf.saw_draw = true;
+        ++g_bfc_buf.draws;
+      }
       // [NR-RUSE] classify BOTH direct and delegated draw stops (this is
       // before the direct/delegate split on purpose).
       if (g_nr_ruse) NrRuseDrawStop(ptr, raw, count, stop.dword);
@@ -4385,6 +4656,66 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     } else {
       ++g_skp_deleg;
       ++g_skp_deleg_op[stop.opcode & 0x7F];
+      // [NR-BFC] delegate schedule census: what a buffer-level replay must
+      // still run at its stops, and the refuse classes that disqualify a
+      // buffer outright (register-writing delegates + XE_SWAP + WAIT on a
+      // register the recorded stateful-port schedule cannot pre-establish).
+      if (g_nr_bfc) {
+        BfcPerBuf& bb = g_bfc_buf;
+        ++bb.deleg;
+        if (!bb.saw_draw) ++bb.deleg_before_draw;
+        switch (stop.opcode & 0x7F) {
+          case PM4_REG_RMW:
+            bb.refuse_mask |= 1u << 0;
+            ++bb.deleg_other;
+            break;
+          case PM4_COND_WRITE:
+            bb.refuse_mask |= 1u << 1;
+            ++bb.deleg_other;
+            break;
+          case PM4_INDIRECT_BUFFER:
+            bb.refuse_mask |= 1u << 2;
+            ++bb.deleg_other;
+            break;
+          case PM4_XE_SWAP:
+            bb.refuse_mask |= 1u << 3;
+            ++bb.deleg_other;
+            break;
+          case PM4_WAIT_REG_MEM: {
+            const auto bfc_rd = [&](uint32_t i) {
+              return uint32_t(__builtin_bswap32(*reinterpret_cast<const uint32_t*>(
+                  raw + size_t(i) * 4)));
+            };
+            const uint32_t wait_info =
+                stop.dword + 1 < count ? bfc_rd(stop.dword + 1) : 0;
+            const uint32_t poll =
+                stop.dword + 2 < count ? bfc_rd(stop.dword + 2) : 0;
+            if (wait_info & 0x10) {
+              ++bb.deleg_wait_mem;
+            } else if (poll == XE_GPU_REG_COHER_STATUS_HOST) {
+              ++bb.deleg_wait_coher;
+            } else {
+              ++bb.deleg_wait_other;
+              bb.refuse_mask |= 1u << 4;
+              g_bfc_wait_reg_sample = poll;
+            }
+          } break;
+          case PM4_MEM_WRITE:
+            ++bb.deleg_memw;
+            break;
+          case PM4_EVENT_WRITE:
+          case PM4_EVENT_WRITE_SHD:
+          case PM4_EVENT_WRITE_CFL:
+          case PM4_EVENT_WRITE_EXT:
+          case PM4_EVENT_WRITE_ZPD:
+          case PM4_INTERRUPT:
+            ++bb.deleg_events;
+            break;
+          default:
+            ++bb.deleg_other;
+            break;
+        }
+      }
       // [NR-RUSE] v2: a delegated packet that can write registers runs
       // OUTSIDE the walk's apply stream, so the stale set cannot see it --
       // poison the rest of this replay (counted per draw as miss2 deleg).
@@ -4440,6 +4771,9 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     }
   }
   if (aborted) g_ctx_walker.cursor = g_ctx_walker.dwords;
+  // [NR-BFC] fold BEFORE NrRuseBufEnd swaps the by-ref stream: the
+  // whole-buffer byref compare must see cur vs prev, not cur vs itself.
+  if (g_nr_bfc) NrBfcFold(this);
   // [NR-RUSE] this replay's by-ref stream becomes the previous one.
   if (g_nr_ruse) NrRuseBufEnd();
   // Fold this buffer's stats/flags exactly as the lockstep path does, and
@@ -4499,6 +4833,8 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
   if (g_nr_issue && g_nri_seeded) {
     std::memcpy(&g_nri_file.values[base], host, n * sizeof(uint32_t));
   }
+  // [NR-BFC] bulk ranges feed the census (end-state size + class split).
+  if (g_nr_bfc) NrBfcApply(base, n, false);
   ++g_skp_rng;
   g_skp_rng_dw += n;
   return true;
