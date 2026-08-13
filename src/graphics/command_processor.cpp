@@ -324,14 +324,16 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_probe, false, "GPU",
 // probe's v2 verdict into the driver of the backend's per-draw state reuse
 // (the D3D12 side latches its own eligibility beside the bindings swap).
 // Implies gpu_nr_reuse_probe: the verdict machinery is the classification
-// source. Off by default until the city A/B.
-REXCVAR_DEFINE_BOOL(gpu_nr_reuse_fast, false, "GPU",
+// source. DEFAULT ON since 2026-08-13 (user decision): city gate run
+// naruto_410 ne=0 on every restored component, sound A/B naruto_412 = +3-4
+// fps at matched heavy load, pixel-clean runs 405/409/412.
+REXCVAR_DEFINE_BOOL(gpu_nr_reuse_fast, true, "GPU",
                     "[nr-ruse] Phase 5-4-5-2: reuse a draw's previously "
                     "derived state when the v2 verdict proves its inputs "
                     "unchanged (bindings restored from the bundle instead of "
                     "recomposed). Implies gpu_nr_reuse_probe and requires "
-                    "the bindings swap + bundle gate machinery. Off by "
-                    "default.");
+                    "the bindings swap + bundle gate machinery. Default on "
+                    "(city-gated + pixel-validated).");
 
 // [NR-RUSE-EP] The epoch shortcut is REFUTED as a byte-equivalence at city
 // (naruto_410 verify run: ep_ne ~45% of clean predictions -- same-frame bin
