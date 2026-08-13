@@ -1498,6 +1498,12 @@ uint64_t g_ruse_w_ep_clean = 0, g_ruse_w_ep_ne = 0;
 // v2 window counters.
 uint64_t g_ruse_w_first2 = 0, g_ruse_w_reuse2 = 0;
 uint64_t g_ruse_w_reuse2_sf = 0, g_ruse_w_reuse2_xf = 0;
+// [NR-BUFREPLAY] 60-lever candidate census (v0 reporting only): draws whose
+// buffer replay is WHOLLY byte-identical, same-frame, entry-core-eq -- the
+// population a buffer-level native replay could skip walk+issue for; the
+// second counter additionally requires the draw's by-ref prefix digest eq
+// (a whole-buffer skip must also prove its by-ref reads unchanged).
+uint64_t g_ruse_w_bufid_draws = 0, g_ruse_w_bufid_byref = 0;
 uint64_t g_ruse_w_miss2_pkt = 0, g_ruse_w_miss2_stale = 0;
 uint64_t g_ruse_w_stale_sum = 0, g_ruse_w_miss2_sh = 0, g_ruse_w_miss2_deleg = 0;
 uint64_t g_ruse_w_pdw_cons = 0;  // per-dword applies with no offset mapping
@@ -1908,6 +1914,12 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
   // v0: the prefix rule (sound floor). Reporting only; skipped when only
   // the fast path wants the verdict.
   if (g_nr_ruse_v0) {
+    // [NR-BUFREPLAY] 60-lever candidate census (see the counters).
+    if (g_ruse_have_prev && g_ruse_first_diff >= g_ruse_dwords &&
+        g_ruse_same_frame && g_ruse_entry_core_eq) {
+      ++g_ruse_w_bufid_draws;
+      if (key_prev && byref_eq) ++g_ruse_w_bufid_byref;
+    }
     if (!g_ruse_have_prev || !key_prev) {
       ++g_ruse_w_first;
     } else if (g_ruse_first_diff < end) {
@@ -3217,7 +3229,7 @@ void CommandProcessor::WorkerThreadMain() {
           REXGPU_INFO(
               "[nr-ruse]   v2 reuse2={} ({:.1f}% of prev'd) sf={} xf={} | "
               "miss2 pkt={} stale={} (avg {:.1f}) sh={} deleg={} 1st2={} "
-              "pdwcons={} stale1st={:04X}",
+              "pdwcons={} stale1st={:04X} | bufid={}/{}",
               g_ruse_w_reuse2,
               with_prev2 ? 100.0 * g_ruse_w_reuse2 / with_prev2 : 0.0,
               g_ruse_w_reuse2_sf, g_ruse_w_reuse2_xf, g_ruse_w_miss2_pkt,
@@ -3227,7 +3239,8 @@ void CommandProcessor::WorkerThreadMain() {
                   : 0.0,
               g_ruse_w_miss2_sh, g_ruse_w_miss2_deleg, g_ruse_w_first2,
               g_ruse_w_pdw_cons,
-              g_ruse_stale_sample == 0xFFFFFFFFu ? 0u : g_ruse_stale_sample);
+              g_ruse_stale_sample == 0xFFFFFFFFu ? 0u : g_ruse_stale_sample,
+              g_ruse_w_bufid_draws, g_ruse_w_bufid_byref);
           g_ruse_w_bufs = g_ruse_w_new = g_ruse_w_id = g_ruse_w_ch = 0;
           g_ruse_w_chdw = 0;
           g_ruse_w_ep_clean = g_ruse_w_ep_ne = 0;
@@ -3246,6 +3259,7 @@ void CommandProcessor::WorkerThreadMain() {
           g_ruse_w_reuse2_sf = g_ruse_w_reuse2_xf = 0;
           g_ruse_w_miss2_pkt = g_ruse_w_miss2_stale = g_ruse_w_stale_sum = 0;
           g_ruse_w_miss2_sh = g_ruse_w_miss2_deleg = g_ruse_w_pdw_cons = 0;
+          g_ruse_w_bufid_draws = g_ruse_w_bufid_byref = 0;
           g_ruse_stale_sample = 0xFFFFFFFFu;
         }
         // [NR-SPP] 5-4-4 step 0b. walk+rng = buf minus the two stop-dispatch
