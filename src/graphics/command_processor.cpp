@@ -1472,6 +1472,12 @@ uint32_t g_ruse_stop_key = 0;
 bool g_ruse_stop_r2 = false;
 bool g_ruse_stop_sf = false;
 bool g_ruse_stop_valid = false;
+// [NR-RUF-V2B] the miss was STALE-ONLY: prev comparable, packet span clean,
+// shaders equal, no delegate poison -- only the stale-register set blocked
+// reuse. The backend may upgrade such a miss when every stale register is a
+// float constant neither active shader reads (bitmap-packed packs never
+// carry it). The stale set itself is published via NrRuseStaleRegs.
+bool g_ruse_stop_stale_only = false;
 // Window counters (reset each 1Hz report).
 uint64_t g_ruse_w_bufs = 0, g_ruse_w_new = 0, g_ruse_w_id = 0, g_ruse_w_ch = 0;
 uint64_t g_ruse_w_sf = 0, g_ruse_w_sf_id = 0, g_ruse_w_xf = 0, g_ruse_w_xf_id = 0;
@@ -1925,6 +1931,7 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
   // direct byte check (the 0x22 viz token is consumed but is not a register
   // write, so the stale set alone cannot see it change).
   bool reusable2 = false;
+  bool stale_only = false;
   if (!g_ruse_v2_ok || !key_prev) {
     ++g_ruse_w_first2;
   } else if (g_ruse_deleg_poison) {
@@ -1941,6 +1948,11 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
     } else if (g_ruse_stale_cnt) {
       ++g_ruse_w_miss2_stale;
       g_ruse_w_stale_sum += g_ruse_stale_cnt;
+      // [NR-RUF-V2B] every other reuse condition holds; only the stale set
+      // blocked. Shader equality is REQUIRED here: the upgrade consults the
+      // active shaders' constant bitmaps, which the previous execution must
+      // share for its stored bundle to be layout-identical.
+      stale_only = sh_eq;
     } else if (!sh_eq) {
       ++g_ruse_w_miss2_sh;
     } else {
@@ -1954,6 +1966,7 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
   g_ruse_stop_key = key;
   g_ruse_stop_r2 = reusable2;
   g_ruse_stop_sf = g_ruse_same_frame;
+  g_ruse_stop_stale_only = stale_only;
   g_ruse_stop_valid = true;
   g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::steady_clock::now() - t0)
@@ -1970,6 +1983,34 @@ bool NrRuseCurrentDraw(uint32_t* key, bool* reusable2, bool* same_frame) {
   *reusable2 = g_ruse_stop_r2;
   *same_frame = g_ruse_stop_sf;
   return true;
+}
+
+// [NR-RUF-V2B] 5-4-5-2b: verdict + the stale-only miss flag. A stale-only
+// miss is upgradeable by the backend when the stale set intersects nothing
+// the draw's derivation reads (see NrRuseStaleRegs).
+bool NrRuseCurrentDrawEx(uint32_t* key, bool* reusable2, bool* same_frame,
+                         bool* stale_only) {
+  if (!NrRuseCurrentDraw(key, reusable2, same_frame)) return false;
+  *stale_only = g_ruse_stop_stale_only;
+  return true;
+}
+
+// [NR-RUF-V2B] Copy the pending stop's CURRENT stale-register set (up to
+// `max` entries) and return its true size; a return > max means the caller
+// got a truncated copy and must refuse. Valid only between a draw stop's
+// classification and the walk resuming -- the backend's issue runs there
+// synchronously. g_ruse_stale_list accumulates every reg EVER marked this
+// replay, so filter by the live flag.
+uint32_t NrRuseStaleRegs(uint32_t* out, uint32_t max) {
+  if (!g_nr_ruse || !g_ruse_stop_valid) return 0;
+  uint32_t n = 0;
+  for (uint32_t r : g_ruse_stale_list) {
+    if (!g_ruse_stale[r]) continue;
+    if (n < max) out[n] = r;
+    ++n;
+    if (n >= g_ruse_stale_cnt) break;  // all live entries found
+  }
+  return n;
 }
 
 namespace {

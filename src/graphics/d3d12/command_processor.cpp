@@ -178,6 +178,9 @@ REXCVAR_DECLARE(bool, gpu_nr_native_pso_bind);
 // [NR-VERIFY] inc 2: defined base-side (command_processor.cpp).
 REXCVAR_DECLARE(bool, gpu_nr_verify);
 REXCVAR_DECLARE(bool, gpu_nr_reuse_fast);
+// [NR-RUF-V2B] guard: the CPU vertex-shader extent path reads float
+// constants outside the bitmap-packed packs -- refuse upgrades under it.
+REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
 
 // [NR-BND] Phase 5-3b-0: the bindings mirror's gate.
 REXCVAR_DEFINE_BOOL(gpu_nr_bindings, false, "GPU/D3D12",
@@ -251,6 +254,26 @@ REXCVAR_DEFINE_BOOL(gpu_nr_ruse_bundle, false, "GPU/D3D12",
                     "draw's inputs are unchanged. Requires the bindings swap and the "
                     "reuse probe. Reports '[nr-rub]' once/sec. Diagnostic only, off by "
                     "default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// [NR-RUF-V2B] Phase 5-4-5-2b: upgrade a STALE-ONLY v2 miss (prev
+// comparable, packet span clean, shaders equal -- only the stale-register
+// set blocked) to reusable when every stale register is a float constant
+// (0x4000-0x47FF) that NEITHER active shader reads. Sound at the byte
+// level, not just consumption: the float packs are BITMAP-PACKED (5-3b-0),
+// so a constant outside both bitmaps never enters any derived or uploaded
+// artifact, and the 5-4-5-1 byte-compare gate stays exact over upgraded
+// draws. Fetch/bool-loop/ctl stale regs always refuse (their packs and the
+// pipeline description consume them whole). Refused whole-frame when the
+// CPU vertex-shader extent path is on (guest-memory reads outside the
+// packs), and per draw on dynamic float addressing or memexport stream
+// constants (the CP itself reads those float regs).
+REXCVAR_DEFINE_BOOL(gpu_nr_reuse_v2b, false, "GPU/D3D12",
+                    "[NR-RUF-V2B] Phase 5-4-5-2b: treat a v2 stale-only miss as "
+                    "reusable when every stale register is a float constant neither "
+                    "active shader reads (bitmap-packed packs cannot carry it). "
+                    "Requires the reuse machinery (bundle compare or fast path). "
+                    "Off by default until city-gated.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-RSY] Phase 5-3b-3: the residency + descriptor-allocation mirror's gate.
@@ -920,6 +943,13 @@ void NrSwapReportIfDue() {
 bool g_nr_rub = false;        // any bundle machinery (compare OR fast)
 bool g_nr_rub_cmp = false;    // compare mode: staging + byte captures + gate
 bool g_nr_rub_fast = false;   // [NR-RUF] 5-4-5-2: restore instead of derive
+bool g_nr_ruf_v2b = false;    // [NR-RUF-V2B] 5-4-5-2b: stale-only upgrades
+// [NR-RUF-V2B] this draw's upgrade verdict (computed once per draw in
+// IssueDrawImpl before the first consumer; false unless an upgrade held).
+bool g_ruf_v2b_up = false;
+// City miss2 stale sets average 3-4 registers; a set bigger than this is
+// refused (NrRuseStaleRegs reports true size past the cap).
+constexpr uint32_t kNrRufV2bMaxStale = 32;
 bool g_rub_stage_ok = false;  // staging coherent since arm (fallback clears)
 struct NrRubBundle {
   uint32_t flt_v_bytes = 0, flt_p_bytes = 0;
@@ -1044,6 +1074,7 @@ struct NrRubProbe {
   uint64_t pso_eq = 0, ne_pso = 0;      // pso-handle identity (IssueDrawImpl)
   uint64_t fast = 0, fast_miss = 0;     // [NR-RUF] restores / eligible misses
   uint64_t fast_pso = 0;                // [NR-RUF] ConfigurePipeline bypasses
+  uint64_t v2b_up = 0, v2b_ref = 0;     // [NR-RUF-V2B] upgrades / refusals
 } g_rub_probe;
 
 void NrRubReportIfDue() {
@@ -1056,12 +1087,13 @@ void NrRubReportIfDue() {
   REXGPU_INFO(
       "[nr-rub] draws={} chk={} cap={} nobundle={} nostop={} stageoff={} | "
       "ne fv/fp/bl/ft={}/{}/{}/{} di={}/{} smp={}/{} si={}/{} rs={} pso={} "
-      "(eq={}) | sys eq={} ne={} | fast={} fastmiss={} fastpso={} | "
-      "bundles={}",
+      "(eq={}) | sys eq={} ne={} | fast={} fastmiss={} fastpso={} "
+      "v2b={}/{} | bundles={}",
       p.draws, p.checked, p.captured, p.nobundle, p.nostop, p.stage_off,
       p.ne_fltv, p.ne_fltp, p.ne_bl, p.ne_ftc, p.ne_div, p.ne_dip, p.ne_smpv,
       p.ne_smpp, p.ne_siv, p.ne_sip, p.ne_rootsig, p.ne_pso, p.pso_eq,
-      p.sys_eq, p.sys_ne, p.fast, p.fast_miss, p.fast_pso, g_rub_pool_used);
+      p.sys_eq, p.sys_ne, p.fast, p.fast_miss, p.fast_pso, p.v2b_up,
+      p.v2b_ref, g_rub_pool_used);
   g_rub_probe = NrRubProbe{};
 }
 
@@ -3738,6 +3770,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       NrRubRelease();
     }
     g_nr_rub = nr_rub_now;
+    // [NR-RUF-V2B] the upgrade rides the reuse machinery; whole-frame refuse
+    // when the CPU vertex-shader extent path could read float constants
+    // outside the bitmap-packed packs.
+    g_nr_ruf_v2b = REXCVAR_GET(gpu_nr_reuse_v2b) && nr_rub_now &&
+                   !REXCVAR_GET(execute_unclipped_draw_vs_on_cpu);
     if (g_nr_rub && g_rub_frame != frame_current_) {
       NrRubFrameReset(frame_current_);
     }
@@ -4633,11 +4670,66 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // persistent (never evicted). A v2-reusable draw therefore reuses its
   // previous execution's {handle, root signature, native object} and skips
   // ConfigurePipeline + the native lookup entirely.
+  // [NR-RUF-V2B] 5-4-5-2b: compute this draw's upgrade verdict ONCE, before
+  // the first consumer (the PSO bypass below; the bindings restore and both
+  // bundle-compare sites read the same flag). A stale-only miss upgrades iff
+  // every stale register is a float constant neither active shader reads:
+  // bitmap-packed packs never carry an unread constant, so every derived and
+  // uploaded artifact is byte-identical to the previous execution and the
+  // 5-4-5-1 compare gate stays exact over upgraded draws. sh_eq inside the
+  // stale-only flag guarantees the previous execution shared these bitmaps.
+  g_ruf_v2b_up = false;
+  if (g_nr_ruf_v2b) {
+    uint32_t v2b_key;
+    bool v2b_r2, v2b_sf, v2b_so;
+    if (NrRuseCurrentDrawEx(&v2b_key, &v2b_r2, &v2b_sf, &v2b_so) && !v2b_r2 &&
+        v2b_so) {
+      const Shader::ConstantRegisterMap& v2b_vcm =
+          vertex_shader->constant_register_map();
+      const Shader::ConstantRegisterMap* v2b_pcm =
+          pixel_shader ? &pixel_shader->constant_register_map() : nullptr;
+      bool v2b_ok =
+          !v2b_vcm.float_dynamic_addressing &&
+          vertex_shader->memexport_stream_constants().empty() &&
+          (!v2b_pcm ||
+           (!v2b_pcm->float_dynamic_addressing &&
+            pixel_shader->memexport_stream_constants().empty()));
+      uint32_t v2b_regs[kNrRufV2bMaxStale];
+      uint32_t v2b_n = 0;
+      if (v2b_ok) {
+        v2b_n = NrRuseStaleRegs(v2b_regs, kNrRufV2bMaxStale);
+        v2b_ok = v2b_n > 0 && v2b_n <= kNrRufV2bMaxStale;
+      }
+      for (uint32_t i = 0; v2b_ok && i < v2b_n; ++i) {
+        const uint32_t v2b_reg = v2b_regs[i];
+        if (v2b_reg < nr::kBindFloatVertexBase ||
+            v2b_reg >= nr::kBindFetchBase) {
+          v2b_ok = false;
+          break;
+        }
+        const uint32_t v2b_c = (v2b_reg - nr::kBindFloatVertexBase) >> 2;
+        if (v2b_c < 256) {
+          v2b_ok = (v2b_vcm.float_bitmap[v2b_c >> 6] &
+                    (uint64_t(1) << (v2b_c & 63))) == 0;
+        } else {
+          const uint32_t v2b_pc = v2b_c - 256;
+          v2b_ok = !v2b_pcm || (v2b_pcm->float_bitmap[v2b_pc >> 6] &
+                                (uint64_t(1) << (v2b_pc & 63))) == 0;
+        }
+      }
+      if (v2b_ok) {
+        g_ruf_v2b_up = true;
+        ++g_rub_probe.v2b_up;
+      } else {
+        ++g_rub_probe.v2b_ref;
+      }
+    }
+  }
   bool nr_ruf_pso = false;
   if (g_nr_rub_fast) {
     uint32_t ruf_key;
     bool ruf_r2, ruf_sf;
-    if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && ruf_r2) {
+    if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && (ruf_r2 || g_ruf_v2b_up)) {
       const NrRubBundle* ruf_b = NrRubFind(ruf_key);
       if (ruf_b && ruf_b->pso_valid) {
         pipeline_handle = ruf_b->pso_handle;
@@ -4725,7 +4817,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     bool rub_r2, rub_sf;
     if (NrRuseCurrentDraw(&rub_key, &rub_r2, &rub_sf)) {
       NrRubBundle& rub_b = *NrRubGetOrCreate(rub_key);
-      if (rub_r2 && rub_b.pso_valid) {
+      if ((rub_r2 || g_ruf_v2b_up) && rub_b.pso_valid) {
         if (rub_b.pso_handle != pipeline_handle ||
             rub_b.npso != static_cast<void*>(nr_native_pipeline)) {
           ++g_rub_probe.ne_pso;
@@ -9022,7 +9114,8 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   if (g_nr_rub_fast) {
     uint32_t ruf_key;
     bool ruf_r2, ruf_sf;
-    if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) && ruf_r2 && ruf_sf) {
+    if (NrRuseCurrentDraw(&ruf_key, &ruf_r2, &ruf_sf) &&
+        (ruf_r2 || g_ruf_v2b_up) && ruf_sf) {
       const NrRubBundle* ruf_b = NrRubFind(ruf_key);
       if (ruf_b && ruf_b->packs_valid && ruf_b->frame == frame_current_) {
         const NrRubBundle& b = *ruf_b;
@@ -9611,7 +9704,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
             rub_cmp_live ? XXH3_64bits(&g_nr_sys_state, sizeof(g_nr_sys_state))
                          : 0;
         NrRubBundle* rub_found = NrRubFind(rub_key);
-        if (rub_r2 && rub_cmp_live) {
+        if ((rub_r2 || g_ruf_v2b_up) && rub_cmp_live) {
           if (!rub_found || !rub_found->packs_have_bytes) {
             ++g_rub_probe.nobundle;
           } else {

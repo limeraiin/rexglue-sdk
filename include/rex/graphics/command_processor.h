@@ -437,4 +437,19 @@ class CommandProcessor {
 // previous execution was in the current frame (bin repeat).
 bool NrRuseCurrentDraw(uint32_t* key, bool* reusable2, bool* same_frame);
 
+// [NR-RUF-V2B] Phase 5-4-5-2b: NrRuseCurrentDraw plus the stale-only flag --
+// true when ONLY the stale-register set blocked reuse (prev comparable,
+// packet span clean, shaders equal, no delegate poison). The backend may
+// upgrade such a miss to reusable when every stale register is provably
+// outside the draw's read set (float constants unread by either shader's
+// bitmap -- bitmap-packed packs never carry them).
+bool NrRuseCurrentDrawEx(uint32_t* key, bool* reusable2, bool* same_frame,
+                         bool* stale_only);
+
+// [NR-RUF-V2B] Copy the pending stop's stale-register set (up to `max`) and
+// return its TRUE size; a return > max means truncation -- refuse the
+// upgrade. Only meaningful while the stop's issue runs (same thread,
+// synchronous, before the walk resumes).
+uint32_t NrRuseStaleRegs(uint32_t* out, uint32_t max);
+
 }  // namespace rex::graphics
