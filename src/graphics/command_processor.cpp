@@ -388,6 +388,29 @@ REXCVAR_DEFINE_BOOL(gpu_nr_span_replay, false, "GPU",
                     "draws. Requires gpu_nr_skip + the reuse machinery. "
                     "Off by default.");
 
+// [NR-SPW] Phase 5-4-7-2: THE CONSUMING SWAP. A reusable+same-frame draw
+// whose key holds a whitelist-clean recording (city-gated ne=0 lenne=0 over
+// 3.37M compares, naruto_425) skips the whole derivation half of
+// IssueDrawImpl -- shader analysis, primitive processing, ConfigurePipeline,
+// UpdateBindings, topology/IB/draw emission -- and instead runs a LIVE HEAD
+// (RT-cache update, vertex/index residency, texture requests, barriers,
+// fixed-function state, system constants: the bin-dependent + safety-
+// critical set), then memcpys the recording into the deferred stream and
+// patches the 7 root-CBV GPU addresses from the current member state (the
+// bundle restore supplies them, exactly like the 5-4-5 fast path). Any
+// precondition failure falls through to the full proven path (everything
+// the head did is idempotent there). D3D12 + bindless + bindings-swap +
+// reuse-fast + verify-off only; under gpu_nr_verify the cvar degrades to
+// the 5-4-7-1 compare gate. ⚠ Under the swap [nr-swp] swapped<draws by
+// design (replayed draws never enter UpdateBindings) -- the live gates are
+// [nr-spw] rep/fallback accounting + [nr-skp] + pixel identity.
+REXCVAR_DEFINE_BOOL(gpu_nr_span_swap, false, "GPU",
+                    "[nr-spw] Phase 5-4-7-2: REPLAY recorded per-draw native "
+                    "spans instead of re-deriving (memcpy + patch + skip the "
+                    "derivation). Implies the 5-4-7-1 record machinery. "
+                    "Requires gpu_nr_skip + reuse-fast + the bindings swap; "
+                    "verify-off. Off by default.");
+
 // [NR-RUSE-EP] The epoch shortcut is REFUTED as a byte-equivalence at city
 // (naruto_410 verify run: ep_ne ~45% of clean predictions -- same-frame bin
 // repeats DO carry patches whose recorder-hook epoch bump trails the byte
@@ -2679,7 +2702,10 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_dsp = REXCVAR_GET(gpu_nr_drawspan_census) && kNrSkip && g_nr_ruse;
   // [NR-SPR] 5-4-7-1: same requirements again -- the reuse verdict IS the
   // replay gate (naruto_423: input identity implies emission identity).
-  g_nr_spr = REXCVAR_GET(gpu_nr_span_replay) && kNrSkip && g_nr_ruse;
+  // [NR-SPW] 5-4-7-2: the consuming swap implies the record machinery (its
+  // store is the replay source); the backend latches its own consume gate.
+  g_nr_spr = (REXCVAR_GET(gpu_nr_span_replay) || REXCVAR_GET(gpu_nr_span_swap)) &&
+             kNrSkip && g_nr_ruse;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;

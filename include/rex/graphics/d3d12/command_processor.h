@@ -550,6 +550,17 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   uint32_t normalized_color_mask);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
+
+  // [NR-RUF] 5-4-5-2 restore body, extracted verbatim from NrUpdateBindings
+  // so the 5-4-7-2 span replay runs the exact same member restore. The
+  // parameter is a cpp-local NrRubBundle (kept out of this header).
+  void NrRufRestoreFromBundle(const void* bundle);
+  // [NR-SPW] Phase 5-4-7-2: attempt to serve the current bracketed draw from
+  // its recorded native span (live head + memcpy + address patch). Returns
+  // true when the draw was fully replayed (IssueDrawImpl must return true);
+  // false = fall through to the full derivation path (every head step
+  // already taken is idempotent there).
+  bool NrSpanReplayTry();
   // [NR-SWP] Phase 5-3b swap: this project's own UpdateBindings (bindless
   // only, same member state machine). *refused_out = fall back to the
   // emulated function for this draw (counted by the caller).

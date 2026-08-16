@@ -178,6 +178,7 @@ REXCVAR_DECLARE(bool, gpu_nr_native_pso_bind);
 // [NR-VERIFY] inc 2: defined base-side (command_processor.cpp).
 REXCVAR_DECLARE(bool, gpu_nr_verify);
 REXCVAR_DECLARE(bool, gpu_nr_reuse_fast);
+REXCVAR_DECLARE(bool, gpu_nr_span_swap);
 // [NR-RUF-V2B] guard: the CPU vertex-shader extent path reads float
 // constants outside the bitmap-packed packs -- refuse upgrades under it.
 REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
@@ -1136,6 +1137,21 @@ struct SprSlot {
   uint8_t used = 0;
   uint8_t view_count = 0;
   uint16_t view_offsets[DeferredCommandList::kNrSprMaxViewSites];
+  // [NR-SPW] replay metadata, captured at record time from the recording
+  // execution's own IssueDrawImpl locals. meta_valid gates replay
+  // eligibility only -- the 5-4-7-1 compare never reads it.
+  uint8_t meta_valid = 0;
+  uint8_t ib_dma = 0;      // 1 = replay must RequestRange the guest IB
+  uint8_t index_endian = 0;
+  uint8_t view_roots[DeferredCommandList::kNrSprMaxViewSites] = {};
+  const D3D12Shader* vs = nullptr;  // shader objects are never destroyed
+  const D3D12Shader* ps = nullptr;
+  uint32_t tex_mask = 0;
+  uint32_t llci = 0;       // line loop closing index (pp result, reg-derived)
+  uint32_t ib_base = 0;
+  uint32_t ib_size = 0;
+  uint64_t smp_heap_ptr = 0;  // record-time heap table bases: a recreated
+  uint64_t view_heap_ptr = 0; // heap makes the recorded tables stale
   uintmax_t data[kSprSlotElements];
 };
 std::vector<SprSlot> g_spr_slots;
@@ -1144,6 +1160,26 @@ bool g_spr_reusable = false;
 bool g_spr_open = false;
 size_t g_spr_start = 0;
 uint64_t g_spr_gen = 0;
+// [NR-SPW] consume latch (per-frame, backend preconditions) + per-draw state.
+bool g_nr_span_consume = false;
+bool g_spr_forced = false;    // this bracket's fresh emission is context-free
+bool g_spr_replayed = false;  // this bracket was served from the store
+// [NR-SPW] record-time capture of the IssueDrawImpl locals a replay's live
+// head needs. Reset at bracket open, filled at the draw tail, consumed at
+// store time in NrSprDrawEnd.
+struct SprCapture {
+  const D3D12Shader* vs = nullptr;
+  const D3D12Shader* ps = nullptr;
+  uint32_t tex_mask = 0;
+  uint32_t llci = 0;
+  uint32_t ib_base = 0;
+  uint32_t ib_size = 0;
+  uint8_t index_endian = 0;
+  uint8_t ib_dma = 0;
+  bool valid = false;    // the draw reached its emission tail
+  bool refused = false;  // memexport / tessellated / non-kVertex / converted
+                         // IB / instanced-batch start: never replayable
+} g_spr_cap;
 struct NrSprProbe {
   uint64_t draws = 0, compared = 0, eq = 0, eq_dyn = 0, real_ne = 0, len_ne = 0;
   uint64_t cmp_refused = 0;  // reusable + stored, but fresh span not clean
@@ -1154,6 +1190,38 @@ struct NrSprProbe {
   uint32_t first_real = 0xFFFFFFFFu;
 };
 NrSprProbe g_spr_probe;
+
+// [NR-SPW] 5-4-7-2 swap accounting. cand = bracketed draws whose key held a
+// replay-eligible recording at Begin; rep = actually replayed; the fb_*
+// split names every fall-through to the full path. rep+fb == cand exactly.
+struct NrSpwProbe {
+  uint64_t cand = 0, rep = 0;
+  uint64_t fb_batch = 0, fb_begin = 0, fb_bundle = 0, fb_heap = 0,
+           fb_valve = 0, fb_rt = 0, fb_vf = 0, fb_ib = 0, fb_sys = 0;
+  uint64_t rep_elements = 0, rep_patched = 0;
+};
+NrSpwProbe g_spw_probe;
+
+void NrSpwReportIfDue() {
+  if (!g_spw_probe.cand && !g_nr_span_consume) return;
+  static auto s_last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) return;
+  s_last = now;
+  const NrSpwProbe& p = g_spw_probe;
+  const uint64_t fb = p.fb_batch + p.fb_begin + p.fb_bundle + p.fb_heap +
+                      p.fb_valve + p.fb_rt + p.fb_vf + p.fb_ib + p.fb_sys;
+  REXGPU_INFO(
+      "[nr-spw] cand={} rep={} ({:.1f}%) el={:.1f} patch={:.2f} | fb={} "
+      "(batch={} begin={} bundle={} heap={} valve={} rt={} vf={} ib={} "
+      "sys={})",
+      p.cand, p.rep, p.cand ? 100.0 * double(p.rep) / double(p.cand) : 0.0,
+      p.rep ? double(p.rep_elements) / double(p.rep) : 0.0,
+      p.rep ? double(p.rep_patched) / double(p.rep) : 0.0, fb, p.fb_batch,
+      p.fb_begin, p.fb_bundle, p.fb_heap, p.fb_valve, p.fb_rt, p.fb_vf,
+      p.fb_ib, p.fb_sys);
+  g_spw_probe = NrSpwProbe{};
+}
 
 void NrSprReportIfDue() {
   if (!g_spr_probe.draws) return;
@@ -3875,6 +3943,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   NrRubReportIfDue();
   NrDspReportIfDue();
   NrSprReportIfDue();
+  NrSpwReportIfDue();
   {
     // [NR-RUF] 5-4-5-2: the fast path implies the bundle machinery (its
     // captures are the restore source); the compare gate stays available
@@ -3908,6 +3977,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       NrRubFrameReset(frame_current_);
     }
   }
+  // [NR-SPW] 5-4-7-2: the span swap consumes the bundle restore (patch
+  // addresses) and the recorded store, bindless-only, and must never run
+  // under verify (verify = the 5-4-7-1 compare gate; consumption would make
+  // every compare vacuous). Latched once per frame like the bindings swap.
+  g_nr_span_consume = REXCVAR_GET(gpu_nr_span_swap) && !g_nr_verify &&
+                      g_nr_swap && g_nr_rub_fast && bindless_resources_used_;
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
   // gate itself is latched base-side (WorkerThreadMain), not here.
   NrFxReportIfDue();
@@ -4544,6 +4619,14 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     bool _dp_copy_ok = IssueCopy();
     if (g_draw_prof) g_draw_ns[16] += prof_ns_since(_dp_total.t0);
     return _dp_copy_ok;
+  }
+
+  // [NR-SPW] Phase 5-4-7-2: a reusable draw with a clean recording replays
+  // it (live head + memcpy + patch) instead of running the derivation below.
+  // A false return is a fall-through: every head step it took is idempotent
+  // on this path.
+  if (g_nr_span_consume && g_spr_open && NrSpanReplayTry()) {
+    return true;
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -5357,6 +5440,26 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   }
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
+  // [NR-SPR] record-time capture of what a span replay's live head needs.
+  // Refused classes are never replayable: memexport (barrier/UAV flow),
+  // tessellated / non-kVertex host shaders, an instanced-batch start (the
+  // draw is deferred out of the bracket); converted index buffers refuse in
+  // the indexed branch below (their pool VA is frame-scoped).
+  if (g_spr_open) {
+    g_spr_cap.valid = true;
+    g_spr_cap.refused = memexport_used || primitive_processing_result.IsTessellated() ||
+                        primitive_processing_result.host_vertex_shader_type !=
+                            Shader::HostVertexShaderType::kVertex ||
+                        start_instanced;
+    g_spr_cap.vs = vertex_shader;
+    g_spr_cap.ps = pixel_shader;
+    g_spr_cap.tex_mask = used_texture_mask;
+    g_spr_cap.llci = primitive_processing_result.line_loop_closing_index;
+    g_spr_cap.index_endian = uint8_t(primitive_processing_result.host_shader_index_endian);
+    g_spr_cap.ib_dma = 0;
+    g_spr_cap.ib_base = 0;
+    g_spr_cap.ib_size = 0;
+  }
   if (g_draw_prof) g_draw_ns[10] += prof_ns_since(_dp_tib0);
   auto _dp_temit0 = g_draw_prof ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
@@ -5415,11 +5518,23 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         } else {
           index_buffer_view.BufferLocation =
               shared_memory_->GetGPUAddress() + primitive_processing_result.guest_index_base;
+          // [NR-SPR] the replay must re-request this range (residency is
+          // the one live dependency of a DMA index buffer).
+          if (g_spr_open) {
+            g_spr_cap.ib_dma = 1;
+            g_spr_cap.ib_base = primitive_processing_result.guest_index_base;
+            g_spr_cap.ib_size = index_buffer_view.SizeInBytes;
+          }
         }
       } break;
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
         index_buffer_view.BufferLocation = primitive_processor_->GetConvertedIndexBufferGpuAddress(
             primitive_processing_result.host_index_buffer_handle);
+        // [NR-SPR] converted indices live in a frame-scoped pool: the
+        // recorded IB view would go stale. Never replayable.
+        if (g_spr_open) {
+          g_spr_cap.refused = true;
+        }
         break;
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto:
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA:
@@ -6606,6 +6721,22 @@ void D3D12CommandProcessor::NrSprDrawBegin(uint32_t key, bool reusable) {
   g_spr_start = deferred_command_list_.stream_size_elements();
   g_spr_gen = deferred_command_list_.reset_generation();
   g_spr_open = true;
+  g_spr_replayed = false;
+  g_spr_cap = SprCapture{};
+  // [NR-SPW] under consume, a draw whose key already holds a replay-eligible
+  // recording is NOT forced: it either replays (no fresh emission at all) or
+  // falls through emitting a normal deduped span (which End then must not
+  // store -- g_spr_forced gates the store). Everything else -- first-seen,
+  // collision-evicted, meta-less, or a v2-miss re-record -- is forced so its
+  // recording is context-free. Compare mode forces ALWAYS (both compare
+  // sides must be context-free).
+  bool force = true;
+  if (g_nr_span_consume && reusable) {
+    const SprSlot& s = g_spr_slots[NrSprSlotIndex(key)];
+    if (s.used && s.key == key && s.meta_valid) force = false;
+  }
+  g_spr_forced = force;
+  if (!force) return;
   current_guest_pipeline_ = nullptr;
   current_external_pipeline_ = nullptr;
   current_graphics_root_signature_ = nullptr;
@@ -6618,6 +6749,12 @@ void D3D12CommandProcessor::NrSprDrawEnd() {
   g_spr_open = false;
   NrSprProbe& p = g_spr_probe;
   ++p.draws;
+  // [NR-SPW] a replayed draw's span IS the recording (patched): nothing to
+  // compare or store.
+  if (g_spr_replayed) {
+    g_spr_replayed = false;
+    return;
+  }
   // A Reset inside the draw invalidates the anchor -- reset generation, never
   // the submission id (the 5-4-6 trap).
   if (deferred_command_list_.reset_generation() != g_spr_gen) {
@@ -6645,7 +6782,12 @@ void D3D12CommandProcessor::NrSprDrawEnd() {
   if (scan.other || scan.malformed || scan.draw != 1) ++p.ref_other;
   SprSlot& slot = g_spr_slots[NrSprSlotIndex(g_spr_key)];
   const bool have_prev = slot.used && slot.key == g_spr_key;
-  if (have_prev && g_spr_reusable) {
+  // [NR-SPW] consume mode: no compares (a fall-through candidate emits a
+  // DEDUPED span -- comparing it against the context-free recording would
+  // read as lenne and destroy a valid recording). Store only forced spans.
+  if (g_nr_span_consume) {
+    if (!g_spr_forced) return;  // recording retained, this span is deduped
+  } else if (have_prev && g_spr_reusable) {
     if (fresh_clean) {
       // The recording is clean by construction; the fresh span is clean too:
       // lockstep compare with the patch model (root-view addresses at the
@@ -6715,6 +6857,373 @@ void D3D12CommandProcessor::NrSprDrawEnd() {
   std::memcpy(slot.view_offsets, scan.view_offsets, sizeof(slot.view_offsets));
   slot.used = 1;
   ++p.stored;
+  // [NR-SPW] replay metadata. Eligible only when the capture reached the
+  // draw tail unrefused, every view site was collected, and every patch
+  // site is one of the 7 bindless root CBVs (whitelist again: an unknown
+  // root refuses replay, never guesses).
+  slot.meta_valid = 0;
+  if (g_spr_cap.valid && !g_spr_cap.refused &&
+      scan.view_offset_count == scan.view_sites &&
+      scan.view_offset_count <= DeferredCommandList::kNrSprMaxViewSites) {
+    uint32_t roots[DeferredCommandList::kNrSprMaxViewSites];
+    bool roots_ok = DeferredCommandList::NrSprViewSiteRoots(
+        slot.data, slot.view_offsets, slot.view_count, roots);
+    for (uint8_t i = 0; i < slot.view_count && roots_ok; ++i) {
+      switch (roots[i]) {
+        case kRootParameter_Bindless_FetchConstants:
+        case kRootParameter_Bindless_FloatConstantsVertex:
+        case kRootParameter_Bindless_FloatConstantsPixel:
+        case kRootParameter_Bindless_SystemConstants:
+        case kRootParameter_Bindless_BoolLoopConstants:
+        case kRootParameter_Bindless_DescriptorIndicesVertex:
+        case kRootParameter_Bindless_DescriptorIndicesPixel:
+          slot.view_roots[i] = uint8_t(roots[i]);
+          break;
+        default:
+          roots_ok = false;
+          break;
+      }
+    }
+    if (roots_ok) {
+      slot.vs = g_spr_cap.vs;
+      slot.ps = g_spr_cap.ps;
+      slot.tex_mask = g_spr_cap.tex_mask;
+      slot.llci = g_spr_cap.llci;
+      slot.ib_base = g_spr_cap.ib_base;
+      slot.ib_size = g_spr_cap.ib_size;
+      slot.ib_dma = g_spr_cap.ib_dma;
+      slot.index_endian = g_spr_cap.index_endian;
+      slot.smp_heap_ptr = sampler_bindless_heap_gpu_start_.ptr;
+      slot.view_heap_ptr = view_bindless_heap_gpu_start_.ptr;
+      slot.meta_valid = 1;
+    }
+  }
+}
+
+void D3D12CommandProcessor::NrRufRestoreFromBundle(const void* bundle) {
+  // [NR-RUF] 5-4-5-2 restore body, extracted VERBATIM from NrUpdateBindings
+  // so the 5-4-7-2 span replay leaves the binding state machine exactly as
+  // a fast draw would: guest cbuffer + descriptor-indices addresses,
+  // sampler params/indices, SRV keys and layout uids all become the
+  // bundle's (= this draw's previous same-frame execution's).
+  const NrRubBundle& b = *static_cast<const NrRubBundle*>(bundle);
+  const auto ruf_restore_cb = [this](ConstantBufferBinding& cb,
+                                     D3D12_GPU_VIRTUAL_ADDRESS a,
+                                     uint32_t root_parameter) {
+    if (cb.address != a) {
+      cb.address = a;
+      current_graphics_root_up_to_date_ &= ~(1u << root_parameter);
+    }
+    cb.up_to_date = true;
+  };
+  ruf_restore_cb(cbuffer_binding_float_vertex_, b.a_flt_v,
+                 kRootParameter_Bindless_FloatConstantsVertex);
+  ruf_restore_cb(cbuffer_binding_float_pixel_, b.a_flt_p,
+                 kRootParameter_Bindless_FloatConstantsPixel);
+  ruf_restore_cb(cbuffer_binding_bool_loop_, b.a_bl,
+                 kRootParameter_Bindless_BoolLoopConstants);
+  ruf_restore_cb(cbuffer_binding_fetch_, b.a_ftc,
+                 kRootParameter_Bindless_FetchConstants);
+  ruf_restore_cb(cbuffer_binding_descriptor_indices_vertex_, b.a_di_v,
+                 kRootParameter_Bindless_DescriptorIndicesVertex);
+  ruf_restore_cb(cbuffer_binding_descriptor_indices_pixel_, b.a_di_p,
+                 kRootParameter_Bindless_DescriptorIndicesPixel);
+  current_sampler_layout_uid_vertex_ = b.smp_uid_v;
+  current_sampler_layout_uid_pixel_ = b.smp_uid_p;
+  current_texture_layout_uid_vertex_ = b.tex_uid_v;
+  current_texture_layout_uid_pixel_ = b.tex_uid_p;
+  current_samplers_vertex_.resize(
+      std::max(current_samplers_vertex_.size(), b.smp_v.size()));
+  for (size_t i = 0; i < b.smp_v.size(); ++i) {
+    current_samplers_vertex_[i].value =
+        decltype(current_samplers_vertex_[i].value)(b.smp_v[i]);
+  }
+  current_samplers_pixel_.resize(
+      std::max(current_samplers_pixel_.size(), b.smp_p.size()));
+  for (size_t i = 0; i < b.smp_p.size(); ++i) {
+    current_samplers_pixel_[i].value =
+        decltype(current_samplers_pixel_[i].value)(b.smp_p[i]);
+  }
+  current_sampler_bindless_indices_vertex_.resize(std::max(
+      current_sampler_bindless_indices_vertex_.size(), b.si_v.size()));
+  for (size_t i = 0; i < b.si_v.size(); ++i) {
+    current_sampler_bindless_indices_vertex_[i] = b.si_v[i];
+  }
+  current_sampler_bindless_indices_pixel_.resize(std::max(
+      current_sampler_bindless_indices_pixel_.size(), b.si_p.size()));
+  for (size_t i = 0; i < b.si_p.size(); ++i) {
+    current_sampler_bindless_indices_pixel_[i] = b.si_p[i];
+  }
+  current_texture_srv_keys_vertex_.resize(std::max(
+      current_texture_srv_keys_vertex_.size(), b.keys_v.size()));
+  std::copy(b.keys_v.begin(), b.keys_v.end(),
+            current_texture_srv_keys_vertex_.begin());
+  current_texture_srv_keys_pixel_.resize(std::max(
+      current_texture_srv_keys_pixel_.size(), b.keys_p.size()));
+  std::copy(b.keys_p.begin(), b.keys_p.end(),
+            current_texture_srv_keys_pixel_.begin());
+}
+
+bool D3D12CommandProcessor::NrSpanReplayTry() {
+  // [NR-SPW] Phase 5-4-7-2: serve this draw from its recording. Everything
+  // up to the final memcpy is a FALL-THROUGH on failure: the full path
+  // redoes each head step (RT update guarded, requests dup-cheap, restore
+  // idempotent, sys re-derive idempotent) with its own proven
+  // logging/abort behavior, so no failure here needs one of its own.
+  NrSpwProbe& w = g_spw_probe;
+  if (g_spr_forced || !g_spr_reusable) return false;
+  SprSlot& slot = g_spr_slots[NrSprSlotIndex(g_spr_key)];
+  if (!slot.used || slot.key != g_spr_key || !slot.meta_valid) return false;
+  ++w.cand;
+  // An open instanced batch owns the stream tail; the merge-or-flush
+  // decision belongs to the full path.
+  if (g_instance && instanced_batch_.active) {
+    ++w.fb_batch;
+    return false;
+  }
+  if (!BeginSubmission(true)) {
+    ++w.fb_begin;
+    return false;
+  }
+  // Heap identity: a recreated bindless heap makes the recorded root
+  // descriptor tables stale (never observed live; unit-only class).
+  if (slot.smp_heap_ptr != sampler_bindless_heap_gpu_start_.ptr ||
+      slot.view_heap_ptr != view_bindless_heap_gpu_start_.ptr) {
+    ++w.fb_heap;
+    slot.meta_valid = 0;
+    return false;
+  }
+  // The bundle supplies the patch addresses (same-frame pool validity, the
+  // fast path's own rule).
+  const NrRubBundle* b = NrRubFind(g_spr_key);
+  if (!b || !b->packs_valid || b->frame != frame_current_) {
+    ++w.fb_bundle;
+    return false;
+  }
+  const D3D12Shader* vs = slot.vs;
+  const D3D12Shader* ps = slot.ps;
+  // Texture requests first (loads can move host SRV indices), then the
+  // key-freshness valve over the bundle's keys -- the same live check the
+  // fast path keeps; a stale key means the di pack must be recomposed,
+  // which only the full path can do.
+  texture_cache_->RequestTextures(slot.tex_mask);
+  const std::vector<D3D12Shader::TextureBinding>& nr_tex_v =
+      vs->GetTextureBindingsAfterTranslation();
+  if (!nr_tex_v.empty() &&
+      (b->keys_v.size() < nr_tex_v.size() ||
+       !texture_cache_->AreActiveTextureSRVKeysUpToDate(
+           b->keys_v.data(), nr_tex_v.data(), nr_tex_v.size()))) {
+    ++w.fb_valve;
+    return false;
+  }
+  if (ps) {
+    const std::vector<D3D12Shader::TextureBinding>& nr_tex_p =
+        ps->GetTextureBindingsAfterTranslation();
+    if (!nr_tex_p.empty() &&
+        (b->keys_p.size() < nr_tex_p.size() ||
+         !texture_cache_->AreActiveTextureSRVKeysUpToDate(
+             b->keys_p.data(), nr_tex_p.data(), nr_tex_p.size()))) {
+      ++w.fb_valve;
+      return false;
+    }
+  }
+  const RegisterFile& regs = GetActiveDrawRegisterFile();
+  // The live head, in the fresh path's order, over the stored shader facts.
+  const bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
+  const bool is_rasterization_done =
+      draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
+  reg::RB_DEPTHCONTROL normalized_depth_control =
+      draw_util::GetNormalizedDepthControl(regs);
+  const uint32_t normalized_color_mask =
+      ps ? draw_util::GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
+  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                    normalized_color_mask, *vs)) {
+    ++w.fb_rt;
+    return false;
+  }
+  const uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+  const uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  const bool host_render_targets_used =
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+  const bool convert_z_to_float24 =
+      host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader();
+  const bool ps_writes_depth = ps && ps->writes_depth();
+  ViewportCacheKey viewport_key;
+  viewport_key.pa_cl_clip_cntl = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
+  viewport_key.pa_cl_vte_cntl = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
+  viewport_key.pa_su_sc_mode_cntl = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+  viewport_key.pa_su_vtx_cntl = regs[XE_GPU_REG_PA_SU_VTX_CNTL];
+  viewport_key.pa_sc_window_offset = regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+  viewport_key.normalized_depth_control = normalized_depth_control.value;
+  std::memcpy(viewport_key.vport_regs, &regs[XE_GPU_REG_PA_CL_VPORT_XSCALE],
+              sizeof(viewport_key.vport_regs));
+  viewport_key.flags = (uint32_t(convert_z_to_float24) << 0) |
+                       (uint32_t(host_render_targets_used) << 1) |
+                       (uint32_t(ps_writes_depth) << 2);
+  draw_util::ViewportInfo viewport_info;
+  if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
+    viewport_info = previous_viewport_info_;
+  } else {
+    draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x, draw_resolution_scale_y, true,
+                                   D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
+                                   normalized_depth_control, convert_z_to_float24,
+                                   host_render_targets_used, ps_writes_depth, viewport_info);
+    previous_viewport_key_ = viewport_key;
+    previous_viewport_info_ = viewport_info;
+    viewport_cache_valid_ = true;
+  }
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  scissor.offset[0] *= draw_resolution_scale_x;
+  scissor.offset[1] *= draw_resolution_scale_y;
+  scissor.extent[0] *= draw_resolution_scale_x;
+  scissor.extent[1] *= draw_resolution_scale_y;
+  UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal,
+                           normalized_depth_control);
+  // System constants: under the consume preconditions this is the lean
+  // mirror path (bin-dependent NDC lives here), which sets the sys dirty
+  // flag the upload below consumes -- the swap's own upload block, minus
+  // its staging probe.
+  UpdateSystemConstantValues(false, primitive_polygonal, slot.llci,
+                             xenos::Endian(slot.index_endian), viewport_info, slot.tex_mask,
+                             normalized_depth_control, normalized_color_mask);
+  if (!cbuffer_binding_system_.up_to_date) {
+    uint8_t* system_constants = constant_buffer_pool_->Request(
+        frame_current_, sizeof(g_nr_sys_state), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+        nullptr, nullptr, &cbuffer_binding_system_.address);
+    if (system_constants == nullptr) {
+      ++w.fb_sys;
+      return false;
+    }
+    std::memcpy(system_constants, &g_nr_sys_state, sizeof(g_nr_sys_state));
+    cbuffer_binding_system_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SystemConstants);
+  }
+  // Float-map member update (the layout check the binding tail runs first),
+  // then the bundle restore -- same order as NrUpdateBindings, so the
+  // member machine ends exactly as a fast draw leaves it.
+  {
+    const Shader::ConstantRegisterMap& map_v = vs->constant_register_map();
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (current_float_constant_map_vertex_[i] != map_v.float_bitmap[i]) {
+        current_float_constant_map_vertex_[i] = map_v.float_bitmap[i];
+        if (map_v.float_count) {
+          cbuffer_binding_float_vertex_.up_to_date = false;
+        }
+      }
+    }
+    if (ps) {
+      const Shader::ConstantRegisterMap& map_p = ps->constant_register_map();
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (current_float_constant_map_pixel_[i] != map_p.float_bitmap[i]) {
+          current_float_constant_map_pixel_[i] = map_p.float_bitmap[i];
+          if (map_p.float_count) {
+            cbuffer_binding_float_pixel_.up_to_date = false;
+          }
+        }
+      }
+    } else {
+      std::memset(current_float_constant_map_pixel_, 0,
+                  sizeof(current_float_constant_map_pixel_));
+    }
+  }
+  NrRufRestoreFromBundle(b);
+  // Vertex residency: the fresh loop's happy path over the stored vertex
+  // shader's fetch bitmap; any abnormal case (invalid fetch type, request
+  // failure) falls through for the full path's exact behavior.
+  const Shader::ConstantRegisterMap& constant_map_vertex = vs->constant_register_map();
+  for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+    uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+      vfetch_bits_remaining &= ~(uint32_t(1) << j);
+      const uint32_t vfetch_index = i * 32 + j;
+      const uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
+      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
+        continue;
+      }
+      const xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+      if (vfetch_constant.type != xenos::FetchConstantType::kVertex &&
+          !(vfetch_constant.type == xenos::FetchConstantType::kInvalidVertex &&
+            REXCVAR_GET(gpu_allow_invalid_fetch_constants))) {
+        ++w.fb_vf;
+        return false;
+      }
+      VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+        continue;
+      }
+      if (!shared_memory_->RequestRange(vfetch_constant.address << 2,
+                                        vfetch_constant.size << 2)) {
+        ++w.fb_vf;
+        return false;
+      }
+      state.address = vfetch_constant.address;
+      state.size = vfetch_constant.size;
+      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+    }
+  }
+  // Index residency (guest DMA only; builtin buffers are static, converted
+  // was refused at record).
+  if (slot.ib_dma && !shared_memory_->RequestRange(slot.ib_base, slot.ib_size)) {
+    ++w.fb_ib;
+    return false;
+  }
+  // Shared memory read state + everything the head queued.
+  shared_memory_->UseForReading();
+  SubmitBarriers();
+  // The replay: recording -> stack -> patch the root-CBV addresses from the
+  // member state the restore/upload above just established -> stream.
+  uintmax_t patched[kSprSlotElements];
+  std::memcpy(patched, slot.data, slot.len * sizeof(uintmax_t));
+  for (uint8_t i = 0; i < slot.view_count; ++i) {
+    uint64_t nr_patch_addr;
+    switch (slot.view_roots[i]) {
+      case kRootParameter_Bindless_FetchConstants:
+        nr_patch_addr = cbuffer_binding_fetch_.address;
+        break;
+      case kRootParameter_Bindless_FloatConstantsVertex:
+        nr_patch_addr = cbuffer_binding_float_vertex_.address;
+        break;
+      case kRootParameter_Bindless_FloatConstantsPixel:
+        nr_patch_addr = cbuffer_binding_float_pixel_.address;
+        break;
+      case kRootParameter_Bindless_SystemConstants:
+        nr_patch_addr = cbuffer_binding_system_.address;
+        break;
+      case kRootParameter_Bindless_BoolLoopConstants:
+        nr_patch_addr = cbuffer_binding_bool_loop_.address;
+        break;
+      case kRootParameter_Bindless_DescriptorIndicesVertex:
+        nr_patch_addr = cbuffer_binding_descriptor_indices_vertex_.address;
+        break;
+      case kRootParameter_Bindless_DescriptorIndicesPixel:
+        nr_patch_addr = cbuffer_binding_descriptor_indices_pixel_.address;
+        break;
+      default:
+        // Cannot happen: roots validated at store time.
+        return false;
+    }
+    DeferredCommandList::NrSprPatchViewAddress(patched, slot.view_offsets[i], nr_patch_addr);
+  }
+  std::memcpy(deferred_command_list_.NrSprAppendRaw(slot.len), patched,
+              slot.len * sizeof(uintmax_t));
+  // The stream now holds the recording's tail state and the CP's dedupe
+  // members do not know it: clear the same five the forcing clears so the
+  // next fresh draw re-emits (replayed draws never read them). The span
+  // bound the SRV flavor of the shared-memory table.
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  current_shared_memory_binding_is_uav_ = false;
+  ++w.rep;
+  w.rep_elements += slot.len;
+  w.rep_patched += slot.view_count;
+  g_spr_replayed = true;
+  return true;
 }
 
 void D3D12CommandProcessor::NrBfcBufBegin() {
@@ -9507,64 +10016,9 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
         (ruf_r2 || g_ruf_v2b_up) && ruf_sf) {
       const NrRubBundle* ruf_b = NrRubFind(ruf_key);
       if (ruf_b && ruf_b->packs_valid && ruf_b->frame == frame_current_) {
-        const NrRubBundle& b = *ruf_b;
         nr_rub_fast_restore = true;
         ++g_rub_probe.fast;
-        const auto ruf_restore_cb = [this](ConstantBufferBinding& cb,
-                                           D3D12_GPU_VIRTUAL_ADDRESS a,
-                                           uint32_t root_parameter) {
-          if (cb.address != a) {
-            cb.address = a;
-            current_graphics_root_up_to_date_ &= ~(1u << root_parameter);
-          }
-          cb.up_to_date = true;
-        };
-        ruf_restore_cb(cbuffer_binding_float_vertex_, b.a_flt_v,
-                       kRootParameter_Bindless_FloatConstantsVertex);
-        ruf_restore_cb(cbuffer_binding_float_pixel_, b.a_flt_p,
-                       kRootParameter_Bindless_FloatConstantsPixel);
-        ruf_restore_cb(cbuffer_binding_bool_loop_, b.a_bl,
-                       kRootParameter_Bindless_BoolLoopConstants);
-        ruf_restore_cb(cbuffer_binding_fetch_, b.a_ftc,
-                       kRootParameter_Bindless_FetchConstants);
-        ruf_restore_cb(cbuffer_binding_descriptor_indices_vertex_, b.a_di_v,
-                       kRootParameter_Bindless_DescriptorIndicesVertex);
-        ruf_restore_cb(cbuffer_binding_descriptor_indices_pixel_, b.a_di_p,
-                       kRootParameter_Bindless_DescriptorIndicesPixel);
-        current_sampler_layout_uid_vertex_ = b.smp_uid_v;
-        current_sampler_layout_uid_pixel_ = b.smp_uid_p;
-        current_texture_layout_uid_vertex_ = b.tex_uid_v;
-        current_texture_layout_uid_pixel_ = b.tex_uid_p;
-        current_samplers_vertex_.resize(
-            std::max(current_samplers_vertex_.size(), b.smp_v.size()));
-        for (size_t i = 0; i < b.smp_v.size(); ++i) {
-          current_samplers_vertex_[i].value =
-              decltype(current_samplers_vertex_[i].value)(b.smp_v[i]);
-        }
-        current_samplers_pixel_.resize(
-            std::max(current_samplers_pixel_.size(), b.smp_p.size()));
-        for (size_t i = 0; i < b.smp_p.size(); ++i) {
-          current_samplers_pixel_[i].value =
-              decltype(current_samplers_pixel_[i].value)(b.smp_p[i]);
-        }
-        current_sampler_bindless_indices_vertex_.resize(std::max(
-            current_sampler_bindless_indices_vertex_.size(), b.si_v.size()));
-        for (size_t i = 0; i < b.si_v.size(); ++i) {
-          current_sampler_bindless_indices_vertex_[i] = b.si_v[i];
-        }
-        current_sampler_bindless_indices_pixel_.resize(std::max(
-            current_sampler_bindless_indices_pixel_.size(), b.si_p.size()));
-        for (size_t i = 0; i < b.si_p.size(); ++i) {
-          current_sampler_bindless_indices_pixel_[i] = b.si_p[i];
-        }
-        current_texture_srv_keys_vertex_.resize(std::max(
-            current_texture_srv_keys_vertex_.size(), b.keys_v.size()));
-        std::copy(b.keys_v.begin(), b.keys_v.end(),
-                  current_texture_srv_keys_vertex_.begin());
-        current_texture_srv_keys_pixel_.resize(std::max(
-            current_texture_srv_keys_pixel_.size(), b.keys_p.size()));
-        std::copy(b.keys_p.begin(), b.keys_p.end(),
-                  current_texture_srv_keys_pixel_.begin());
+        NrRufRestoreFromBundle(ruf_b);
       } else {
         ++g_rub_probe.fast_miss;
       }

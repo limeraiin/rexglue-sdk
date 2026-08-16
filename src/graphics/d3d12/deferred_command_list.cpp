@@ -474,6 +474,28 @@ void DeferredCommandList::NrSprScanSpan(size_t start_elements, NrSprScan* out) c
   }
 }
 
+bool DeferredCommandList::NrSprViewSiteRoots(const uintmax_t* span, const uint16_t* offsets,
+                                             uint32_t count, uint32_t* roots_out) {
+  for (uint32_t i = 0; i < count; ++i) {
+    const uintmax_t* cmd = span + offsets[i];
+    const CommandHeader& hdr = *reinterpret_cast<const CommandHeader*>(cmd);
+    if (hdr.command != Command::kD3DSetGraphicsRootConstantBufferView) {
+      return false;
+    }
+    const auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(
+        cmd + kCommandHeaderSizeElements);
+    roots_out[i] = args.root_parameter_index;
+  }
+  return true;
+}
+
+void DeferredCommandList::NrSprPatchViewAddress(uintmax_t* span, uint32_t offset,
+                                                uint64_t gpu_address) {
+  auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
+      span + offset + kCommandHeaderSizeElements);
+  args.buffer_location = D3D12_GPU_VIRTUAL_ADDRESS(gpu_address);
+}
+
 size_t DeferredCommandList::NrDspCopySpan(size_t start_elements, uintmax_t* dst,
                                           size_t capacity) const {
   if (command_stream_.size() < start_elements) return 0;

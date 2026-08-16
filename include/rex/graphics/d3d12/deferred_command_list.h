@@ -108,6 +108,24 @@ class DeferredCommandList {
     uint16_t view_offsets[kNrSprMaxViewSites] = {};  // element offset from span start
   };
   void NrSprScanSpan(size_t start_elements, NrSprScan* out) const;
+  // [NR-SPW] Phase 5-4-7-2: reserve `len_elements` at the stream tail and
+  // return the destination -- the caller memcpys a patched recording in.
+  // The bytes are a span this list itself emitted earlier (self-describing
+  // commands only, whitelist-gated at record), so Execute walks them like
+  // any other range.
+  uintmax_t* NrSprAppendRaw(size_t len_elements) {
+    const size_t offset = command_stream_.size();
+    command_stream_.resize(offset + len_elements);
+    return command_stream_.data() + offset;
+  }
+  // [NR-SPW] patch-site plumbing over a recorded span (the command stream
+  // types stay private): decode each site's root parameter index, refusing
+  // any site that is not a graphics root CBV set; overwrite a site's GPU
+  // address in place at replay.
+  static bool NrSprViewSiteRoots(const uintmax_t* span, const uint16_t* offsets,
+                                 uint32_t count, uint32_t* roots_out);
+  static void NrSprPatchViewAddress(uintmax_t* span, uint32_t offset,
+                                    uint64_t gpu_address);
 
   // [GPU-PRECORD] Phase 1a-ii: move the recorded command stream out (leaving this
   // list empty, ready to record the next segment) for later ordered replay.
