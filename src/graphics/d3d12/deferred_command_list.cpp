@@ -392,6 +392,88 @@ void DeferredCommandList::NrBfcScan(size_t start_elements, NrBfcSpanCounts* out)
   }
 }
 
+// [NR-SPR] Phase 5-4-7-1: whitelist scan + patch-site offsets. Mirrors the
+// census walks' header discipline (malformed tail terminates, never
+// underflows) because the caller's anchor validity is reset-generation-based
+// and this is a store gate, not an executor.
+void DeferredCommandList::NrSprScanSpan(size_t start_elements, NrSprScan* out) const {
+  const uintmax_t* stream = command_stream_.data() + start_elements;
+  size_t remaining = command_stream_.size() >= start_elements
+                         ? command_stream_.size() - start_elements
+                         : 0;
+  size_t offset = 0;
+  while (remaining >= kCommandHeaderSizeElements) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+    if (header.arguments_size_elements > remaining - kCommandHeaderSizeElements) {
+      out->malformed = true;
+      return;
+    }
+    ++out->cmds;
+    switch (header.command) {
+      case Command::kD3DDrawIndexedInstanced:
+      case Command::kD3DDrawInstanced:
+        ++out->draw;
+        break;
+      case Command::kD3DSetPipelineState:
+      case Command::kSetPipelineStateHandle:
+      case Command::kD3DSetGraphicsRootSignature:
+      case Command::kD3DIASetPrimitiveTopology:
+      case Command::kD3DIASetIndexBuffer:
+        break;
+      case Command::kD3DSetGraphicsRootConstantBufferView:
+      case Command::kD3DSetGraphicsRootShaderResourceView:
+      case Command::kD3DSetGraphicsRootUnorderedAccessView:
+        ++out->view_sites;
+        if (out->view_offset_count < kNrSprMaxViewSites && offset <= 0xFFFF) {
+          out->view_offsets[out->view_offset_count++] = uint16_t(offset);
+        }
+        break;
+      case Command::kD3DSetGraphicsRootDescriptorTable:
+        ++out->table_sites;
+        break;
+      case Command::kRSSetViewport:
+      case Command::kRSSetScissorRect:
+      case Command::kD3DOMSetBlendFactor:
+      case Command::kD3DOMSetStencilRef:
+      case Command::kD3DSetSamplePositions:
+        ++out->ff;
+        break;
+      case Command::kD3DResourceBarrier:
+        ++out->barrier;
+        break;
+      case Command::kD3DSetComputeRootSignature:
+      case Command::kD3DSetComputeRootConstantBufferView:
+      case Command::kD3DSetComputeRootShaderResourceView:
+      case Command::kD3DSetComputeRootUnorderedAccessView:
+      case Command::kD3DSetComputeRootDescriptorTable:
+      case Command::kD3DSetComputeRoot32BitConstants:
+      case Command::kD3DCopyBufferRegion:
+      case Command::kD3DCopyResource:
+      case Command::kCopyTexture:
+      case Command::kD3DCopyTextureRegion:
+      case Command::kD3DClearDepthStencilView:
+      case Command::kD3DClearRenderTargetView:
+      case Command::kD3DClearUnorderedAccessViewUint:
+      case Command::kD3DDispatch:
+      case Command::kD3DBeginQuery:
+      case Command::kD3DEndQuery:
+      case Command::kD3DResolveQueryData:
+        ++out->compute;
+        break;
+      case Command::kSetDescriptorHeaps:
+        ++out->heaps;
+        break;
+      default:
+        ++out->other;
+        break;
+    }
+    const size_t step = kCommandHeaderSizeElements + header.arguments_size_elements;
+    stream += step;
+    remaining -= step;
+    offset += step;
+  }
+}
+
 size_t DeferredCommandList::NrDspCopySpan(size_t start_elements, uintmax_t* dst,
                                           size_t capacity) const {
   if (command_stream_.size() < start_elements) return 0;

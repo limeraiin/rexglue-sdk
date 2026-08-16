@@ -245,6 +245,20 @@ class CommandProcessor {
   }
   virtual void NrDspDrawEnd() {}
 
+  // [NR-SPR] Phase 5-4-7-1: bracket ONE draw for the production span-replay
+  // store. Begin FORCES the backend's tail-state re-emit (pipeline, root
+  // signature, root parameters, topology) so the emitted span is
+  // context-free -- recordable once, replayable in any dedupe context. End
+  // scans the span against the replayable whitelist, stores the first clean
+  // recording per draw key, and on later reusable executions compares the
+  // fixed recording (patch model: root-view addresses) against the fresh
+  // emission. Compare-only: fresh always draws.
+  virtual void NrSprDrawBegin(uint32_t key, bool reusable) {
+    (void)key;
+    (void)reusable;
+  }
+  virtual void NrSprDrawEnd() {}
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;

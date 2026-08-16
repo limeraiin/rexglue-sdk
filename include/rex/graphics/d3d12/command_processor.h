@@ -249,6 +249,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // [NR-DSP] Phase 5-4-7-0: per-draw native span capture + compare.
   void NrDspDrawBegin(uint32_t key, bool reusable) override;
   void NrDspDrawEnd() override;
+  // [NR-SPR] Phase 5-4-7-1: context-free span record + replay-prediction
+  // gate. Begin forces the tail-state re-emit (members only -- the emissions
+  // happen inside the draw); End scans, stores, compares.
+  void NrSprDrawBegin(uint32_t key, bool reusable) override;
+  void NrSprDrawEnd() override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
 

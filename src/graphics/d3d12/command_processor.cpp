@@ -1113,6 +1113,73 @@ struct NrDspProbe {
 };
 NrDspProbe g_dsp_probe;
 
+// [NR-SPR] Phase 5-4-7-1: the production span store. One slot per draw key
+// (direct map, Fibonacci-mixed like the census -- packet addresses alias in
+// the low bits); a slot holds the FIRST whitelist-clean context-free span
+// this key emitted, plus its patch-site offsets, and is then FIXED: every
+// later reusable execution compares fresh emission against that one
+// recording, exactly the record-once/replay-many production shape (aging
+// pool addresses must land in the eqdyn/patch class, never in ne).
+// Collisions overwrite (read as first-seen, never as stale). 2^17 slots at
+// 64 elements = ~73 MB, lazy -- store sizing is the known coverage lever
+// (naruto_423 coll=23.7%), revisited when the swap increment owns a budget.
+constexpr uint32_t kSprSlotBits = 17;
+constexpr uint32_t kSprSlots = 1u << kSprSlotBits;
+constexpr uint32_t kSprSlotElements = 64;
+inline uint32_t NrSprSlotIndex(uint32_t key) {
+  return uint32_t((uint64_t(key) * 2654435761ull) >> (32 - kSprSlotBits)) &
+         (kSprSlots - 1);
+}
+struct SprSlot {
+  uint32_t key = 0;
+  uint32_t len = 0;
+  uint8_t used = 0;
+  uint8_t view_count = 0;
+  uint16_t view_offsets[DeferredCommandList::kNrSprMaxViewSites];
+  uintmax_t data[kSprSlotElements];
+};
+std::vector<SprSlot> g_spr_slots;
+uint32_t g_spr_key = 0;
+bool g_spr_reusable = false;
+bool g_spr_open = false;
+size_t g_spr_start = 0;
+uint64_t g_spr_gen = 0;
+struct NrSprProbe {
+  uint64_t draws = 0, compared = 0, eq = 0, eq_dyn = 0, real_ne = 0, len_ne = 0;
+  uint64_t cmp_refused = 0;  // reusable + stored, but fresh span not clean
+  uint64_t first_seen = 0, collision = 0, stored = 0, too_long = 0, empty = 0,
+           reset = 0;
+  uint64_t elements = 0, view_sites = 0, dyn_view = 0, dyn_table = 0;
+  uint64_t ref_ff = 0, ref_bar = 0, ref_comp = 0, ref_heaps = 0, ref_other = 0;
+  uint32_t first_real = 0xFFFFFFFFu;
+};
+NrSprProbe g_spr_probe;
+
+void NrSprReportIfDue() {
+  if (!g_spr_probe.draws) return;
+  static auto s_last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) return;
+  s_last = now;
+  const NrSprProbe& p = g_spr_probe;
+  const double c = double(p.compared ? p.compared : 1);
+  REXGPU_INFO(
+      "[nr-spr] draws={} el={:.1f}/draw | cmp={} eq={} ({:.1f}%) eqdyn={} "
+      "({:.1f}%) ne={} lenne={} real1st={} cmpref={} | replayable={:.1f}% | "
+      "views={:.2f}/draw dynview={} dyntable={} | rec={} 1st={} coll={} "
+      "long={} empty={} reset={} | refuse ff={} bar={} comp={} heaps={} "
+      "other={}",
+      p.draws, p.draws ? double(p.elements) / double(p.draws) : 0.0, p.compared,
+      p.eq, 100.0 * double(p.eq) / c, p.eq_dyn, 100.0 * double(p.eq_dyn) / c,
+      p.real_ne, p.len_ne,
+      p.first_real == 0xFFFFFFFFu ? -1 : int32_t(p.first_real), p.cmp_refused,
+      100.0 * double(p.eq + p.eq_dyn) / c,
+      p.compared ? double(p.view_sites) / c : 0.0, p.dyn_view, p.dyn_table,
+      p.stored, p.first_seen, p.collision, p.too_long, p.empty, p.reset,
+      p.ref_ff, p.ref_bar, p.ref_comp, p.ref_heaps, p.ref_other);
+  g_spr_probe = NrSprProbe{};
+}
+
 void NrDspReportIfDue() {
   if (!g_dsp_probe.draws) return;
   static auto s_last = std::chrono::steady_clock::now();
@@ -3807,6 +3874,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // are the current effective packs again.
   NrRubReportIfDue();
   NrDspReportIfDue();
+  NrSprReportIfDue();
   {
     // [NR-RUF] 5-4-5-2: the fast path implies the bundle machinery (its
     // captures are the restore source); the compare gate stays available
@@ -6518,6 +6586,135 @@ void D3D12CommandProcessor::NrDspDrawEnd() {
   slot.key = g_dsp_key;
   slot.len = uint32_t(len);
   slot.used = 1;
+}
+
+void D3D12CommandProcessor::NrSprDrawBegin(uint32_t key, bool reusable) {
+  // [NR-SPR] 5-4-7-1: latch the span anchor, then FORCE the tail-state
+  // re-emit so this draw's span is context-free -- the emulated and native
+  // binding tails both re-emit any root parameter whose up-to-date bit is
+  // clear, SetPipelineStateHandle/SetExternalPipeline re-emit on a cleared
+  // current pipeline, and SetPrimitiveTopology on UNDEFINED. Members only:
+  // nothing is emitted here, and no upload state is touched (the cbuffer
+  // up_to_date flags and float constant maps stay -- forcing those would
+  // force re-PACKS, which is derivation cost, not emission state). The
+  // fixed-function block deliberately stays deduped: vp/sci/blend/stencil
+  // are the bin-dependent set the replay keeps LIVE (5-4-6 fixup design), so
+  // a span containing one is refused by the whitelist instead of recorded.
+  if (g_spr_slots.empty()) g_spr_slots.resize(kSprSlots);
+  g_spr_key = key;
+  g_spr_reusable = reusable;
+  g_spr_start = deferred_command_list_.stream_size_elements();
+  g_spr_gen = deferred_command_list_.reset_generation();
+  g_spr_open = true;
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+}
+
+void D3D12CommandProcessor::NrSprDrawEnd() {
+  if (!g_spr_open) return;
+  g_spr_open = false;
+  NrSprProbe& p = g_spr_probe;
+  ++p.draws;
+  // A Reset inside the draw invalidates the anchor -- reset generation, never
+  // the submission id (the 5-4-6 trap).
+  if (deferred_command_list_.reset_generation() != g_spr_gen) {
+    ++p.reset;
+    return;
+  }
+  DeferredCommandList::NrSprScan scan;
+  deferred_command_list_.NrSprScanSpan(g_spr_start, &scan);
+  const size_t fresh_len =
+      deferred_command_list_.stream_size_elements() - g_spr_start;
+  p.elements += fresh_len;
+  if (!fresh_len || !scan.draw) {
+    // Early-out draw (no effect / viz-killed / deferred into an instanced
+    // batch): nothing a replay would reproduce.
+    ++p.empty;
+    return;
+  }
+  const bool fresh_clean = !scan.malformed && scan.draw == 1 && !scan.ff &&
+                           !scan.barrier && !scan.compute && !scan.heaps &&
+                           !scan.other;
+  if (scan.ff) ++p.ref_ff;
+  if (scan.barrier) ++p.ref_bar;
+  if (scan.compute) ++p.ref_comp;
+  if (scan.heaps) ++p.ref_heaps;
+  if (scan.other || scan.malformed || scan.draw != 1) ++p.ref_other;
+  SprSlot& slot = g_spr_slots[NrSprSlotIndex(g_spr_key)];
+  const bool have_prev = slot.used && slot.key == g_spr_key;
+  if (have_prev && g_spr_reusable) {
+    if (fresh_clean) {
+      // The recording is clean by construction; the fresh span is clean too:
+      // lockstep compare with the patch model (root-view addresses at the
+      // same root parameter = what a replay overwrites; table bases counted
+      // separately, city measured them immobile).
+      DeferredCommandList::NrDspDiff d;
+      deferred_command_list_.NrDspCompareSpan(slot.data, slot.len, g_spr_start,
+                                              &d);
+      ++p.compared;
+      p.view_sites += d.view_sites;
+      if (d.length_differs) {
+        // Refuse-and-re-record (the 5-4-7 design's rule for the `long`
+        // class): invalidate so the next execution records fresh, and ne
+        // counts transition events rather than a stuck recording.
+        ++p.len_ne;
+        slot.used = 0;
+      } else if (d.real) {
+        ++p.real_ne;
+        if (p.first_real == 0xFFFFFFFFu) p.first_real = d.first_real;
+        slot.used = 0;
+      } else if (d.dyn_view || d.dyn_table) {
+        ++p.eq_dyn;
+        p.dyn_view += d.dyn_view;
+        p.dyn_table += d.dyn_table;
+      } else {
+        ++p.eq;
+      }
+    } else {
+      // This execution emitted something a replay would refuse (texture
+      // load, barrier, ff change riding the bracket). Production would have
+      // replayed the clean recording WITHOUT that ambient work -- these are
+      // the draws whose rate prices that risk, so they are counted, not
+      // folded into ne.
+      ++p.cmp_refused;
+    }
+    return;  // the recording stays fixed once taken
+  }
+  if (!have_prev) {
+    ++p.first_seen;
+    if (slot.used) ++p.collision;
+  }
+  // Record (first execution of this key, a collision eviction, or a
+  // NON-reusable execution -- the reuse verdict certifies identity only
+  // against the PREVIOUS execution, so a v2 miss re-records; the transitive
+  // chain of reusable verdicts then keeps every later compare sound against
+  // this recording).
+  if (!fresh_clean) {
+    // Inputs moved and this execution is not recordable: a stale recording
+    // must not survive to be compared (or replayed) against.
+    if (have_prev) slot.used = 0;
+    return;
+  }
+  if (fresh_len > kSprSlotElements) {
+    ++p.too_long;
+    slot.used = 0;  // same staleness rule as the unclean path
+    return;
+  }
+  const size_t len = deferred_command_list_.NrDspCopySpan(g_spr_start, slot.data,
+                                                          kSprSlotElements);
+  if (!len) {
+    slot.used = 0;
+    return;
+  }
+  slot.key = g_spr_key;
+  slot.len = uint32_t(len);
+  slot.view_count = scan.view_offset_count;
+  std::memcpy(slot.view_offsets, scan.view_offsets, sizeof(slot.view_offsets));
+  slot.used = 1;
+  ++p.stored;
 }
 
 void D3D12CommandProcessor::NrBfcBufBegin() {

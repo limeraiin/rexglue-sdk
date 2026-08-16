@@ -367,6 +367,27 @@ REXCVAR_DEFINE_BOOL(gpu_nr_drawspan_census, false, "GPU",
                     "span replay. Requires gpu_nr_skip + the reuse "
                     "machinery. Diagnostic only, off by default.");
 
+// [NR-SPR] Phase 5-4-7-1: the production half of the naruto_423 verdict. The
+// census compared deduped spans (a command is emitted only when it CHANGES);
+// a real replay needs a CONTEXT-FREE recording it can memcpy under any
+// dedupe state. This cvar makes every bracketed draw emit its tail state in
+// full (pipeline, root signature, all root parameters, topology -- the
+// fixed-function block deliberately stays deduped: vp/sci/sys are the
+// bin-dependent set the replay keeps LIVE, per the 5-4-6 fixup design),
+// stores the first whitelist-clean span per draw key with its patch-site
+// offsets, and gates every later reusable execution's fresh emission against
+// that FIXED recording. City gate = ne=0 lenne=0. NOT passive: the forced
+// re-emits reach the real command list (redundant same-value sets, the
+// precord-1a-proven class); do not co-run with the censuses when reading
+// them. Consumption (memcpy + patch + skip the derivation) is the next
+// increment behind its own cvar.
+REXCVAR_DEFINE_BOOL(gpu_nr_span_replay, false, "GPU",
+                    "[nr-spr] Phase 5-4-7-1: record context-free per-draw "
+                    "native spans and gate the patched replay prediction "
+                    "against fresh emission. Compare-only: fresh always "
+                    "draws. Requires gpu_nr_skip + the reuse machinery. "
+                    "Off by default.");
+
 // [NR-RUSE-EP] The epoch shortcut is REFUTED as a byte-equivalence at city
 // (naruto_410 verify run: ep_ne ~45% of clean predictions -- same-frame bin
 // repeats DO carry patches whose recorder-hook epoch bump trails the byte
@@ -1553,6 +1574,8 @@ uint64_t g_ruse_w_pdw_cons = 0;  // per-dword applies with no offset mapping
 bool g_nr_bfc = false;
 // [NR-DSP] Phase 5-4-7-0: per-draw native span probe (backend-side storage).
 bool g_nr_dsp = false;
+// [NR-SPR] Phase 5-4-7-1: context-free span record + replay-prediction gate.
+bool g_nr_spr = false;
 struct BfcPerBuf {
   // Delegate schedule (the replay must still run these at their stops).
   uint32_t deleg = 0;
@@ -2654,6 +2677,9 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_bfc = REXCVAR_GET(gpu_nr_bufreplay_census) && kNrSkip && g_nr_ruse;
   // [NR-DSP] 5-4-7-0: same requirements (the verdict is the population).
   g_nr_dsp = REXCVAR_GET(gpu_nr_drawspan_census) && kNrSkip && g_nr_ruse;
+  // [NR-SPR] 5-4-7-1: same requirements again -- the reuse verdict IS the
+  // replay gate (naruto_423: input identity implies emission identity).
+  g_nr_spr = REXCVAR_GET(gpu_nr_span_replay) && kNrSkip && g_nr_ruse;
   // [NR-ISSUE] consumes the lockstep shadow, so it implies it.
   const bool kNrIssue = REXCVAR_GET(gpu_nr_issue) || kNrSkip;
   g_nr_issue = kNrIssue;
@@ -4648,6 +4674,7 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   nr::CtxDrawStop stop;
   bool aborted = false;
   bool dsp_open = false;  // [NR-DSP] a draw's span bracket is open
+  bool spr_open = false;  // [NR-SPR] a draw's record/compare bracket is open
   while (nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
     // The delegated dispatch re-checks the predicate against the CP's own
     // bin members (including the predicated-XE_SWAP rule), and a delegated
@@ -4680,6 +4707,17 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
           dsp_open = true;
         }
       }
+      // [NR-SPR] 5-4-7-1: open after the census bracket (Begin FORCES the
+      // tail-state re-emit, so the census -- if co-run -- would read the
+      // forced spans; keep gate reads single-probe).
+      if (g_nr_spr) {
+        uint32_t spr_key = 0;
+        bool spr_r2 = false, spr_sf = false;
+        if (NrRuseCurrentDraw(&spr_key, &spr_r2, &spr_sf)) {
+          NrSprDrawBegin(spr_key, spr_r2 && spr_sf);
+          spr_open = true;
+        }
+      }
       // [NR-SKP] 5-4-4a: direct issue -- the walk already applied this
       // packet's register payload, so the delegated re-dispatch below is
       // pure framing. The tail consumes the pending stop exactly as the
@@ -4702,6 +4740,10 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
             // same as the delegated path. Drop the stop so it cannot leak.
             g_nr_skip_draw_pending = false;
             ++g_skp_arm_orphan;
+          }
+          if (spr_open) {
+            NrSprDrawEnd();
+            spr_open = false;
           }
           if (dsp_open) {
             NrDspDrawEnd();
@@ -4808,7 +4850,12 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       g_nr_skip_draw_pending = false;
       ++g_skp_arm_orphan;
     }
-    // [NR-DSP] close the bracket for a draw that took the delegated path.
+    // [NR-SPR]/[NR-DSP] close the brackets for a draw that took the
+    // delegated path (inner bracket first).
+    if (spr_open) {
+      NrSprDrawEnd();
+      spr_open = false;
+    }
     if (dsp_open) {
       NrDspDrawEnd();
       dsp_open = false;

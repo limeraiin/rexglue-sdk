@@ -83,6 +83,32 @@ class DeferredCommandList {
   void NrDspCompareSpan(const uintmax_t* prev, size_t prev_len, size_t start_elements,
                         NrDspDiff* out) const;
 
+  // [NR-SPR] Phase 5-4-7-1: scan a draw's span against the REPLAYABLE
+  // WHITELIST (root signature / pipeline / graphics root parameters /
+  // topology / index buffer / exactly one draw) and collect the element
+  // offsets of the root-view sets -- the patch sites a replay overwrites in
+  // place. Everything outside the whitelist is a refuse class: ff
+  // (viewport/scissor/blend factor/stencil ref/sample positions -- the
+  // bin-dependent set a replay keeps live), barriers, compute/copy/clear/
+  // dispatch/query (texture-load and resolve work emitted inside the
+  // bracket), descriptor heaps, and anything unknown.
+  static constexpr uint32_t kNrSprMaxViewSites = 12;
+  struct NrSprScan {
+    uint32_t cmds = 0;
+    uint32_t draw = 0;
+    uint32_t view_sites = 0;   // graphics root CBV/SRV/UAV sets
+    uint32_t table_sites = 0;  // graphics root descriptor tables
+    uint32_t ff = 0;
+    uint32_t barrier = 0;
+    uint32_t compute = 0;      // compute root state / copy / clear / dispatch / query
+    uint32_t heaps = 0;
+    uint32_t other = 0;        // OM RT sets, markers, IA VB, anything unknown
+    bool malformed = false;    // stale anchor / truncated tail
+    uint8_t view_offset_count = 0;                 // capped at kNrSprMaxViewSites
+    uint16_t view_offsets[kNrSprMaxViewSites] = {};  // element offset from span start
+  };
+  void NrSprScanSpan(size_t start_elements, NrSprScan* out) const;
+
   // [GPU-PRECORD] Phase 1a-ii: move the recorded command stream out (leaving this
   // list empty, ready to record the next segment) for later ordered replay.
   std::vector<uintmax_t> TakeStream() {
