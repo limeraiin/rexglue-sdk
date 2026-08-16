@@ -6723,20 +6723,32 @@ void D3D12CommandProcessor::NrSprDrawBegin(uint32_t key, bool reusable) {
   g_spr_open = true;
   g_spr_replayed = false;
   g_spr_cap = SprCapture{};
-  // [NR-SPW] under consume, a draw whose key already holds a replay-eligible
-  // recording is NOT forced: it either replays (no fresh emission at all) or
-  // falls through emitting a normal deduped span (which End then must not
-  // store -- g_spr_forced gates the store). Everything else -- first-seen,
-  // collision-evicted, meta-less, or a v2-miss re-record -- is forced so its
-  // recording is context-free. Compare mode forces ALWAYS (both compare
-  // sides must be context-free).
-  bool force = true;
-  if (g_nr_span_consume && reusable) {
-    const SprSlot& s = g_spr_slots[NrSprSlotIndex(key)];
-    if (s.used && s.key == key && s.meta_valid) force = false;
+  // [NR-SPW] consume-mode forcing policy (v2, after the first city A/B read
+  // net negative): force + record ONLY a REUSABLE draw without a valid
+  // recording -- the one execution whose recording the next reusable
+  // execution can replay. A non-reusable draw is never forced and never
+  // recorded; if it holds a recording, the recording just dies (inputs
+  // moved -- the staleness rule), and the key's next reusable execution
+  // re-records. v1 forced ~half of all city draws (every v2-miss re-
+  // recorded a ~43-element context-free span the submission thread then
+  // executed for nothing) and read 2-3 fps BELOW baseline at matched load.
+  // Compare mode still forces ALWAYS (both compare sides context-free).
+  if (g_nr_span_consume) {
+    SprSlot& s = g_spr_slots[NrSprSlotIndex(key)];
+    const bool stored = s.used && s.key == key;
+    if (!reusable) {
+      if (stored) s.used = 0;  // inputs moved: the recording must not survive
+      g_spr_forced = false;
+      return;
+    }
+    if (stored && s.meta_valid) {
+      g_spr_forced = false;  // replay candidate: no fresh forcing
+      return;
+    }
+    g_spr_forced = true;  // reusable, recording missing/meta-less: record now
+  } else {
+    g_spr_forced = true;
   }
-  g_spr_forced = force;
-  if (!force) return;
   current_guest_pipeline_ = nullptr;
   current_external_pipeline_ = nullptr;
   current_graphics_root_signature_ = nullptr;
@@ -6753,6 +6765,13 @@ void D3D12CommandProcessor::NrSprDrawEnd() {
   // compare or store.
   if (g_spr_replayed) {
     g_spr_replayed = false;
+    return;
+  }
+  // [NR-SPW] consume mode: only a forced (recording) execution has store
+  // work -- v2-miss invalidation already happened at Begin, fall-through
+  // candidates keep their recording. Skip the span scan for everything
+  // else (it was per-draw cost serving nothing).
+  if (g_nr_span_consume && !g_spr_forced) {
     return;
   }
   // A Reset inside the draw invalidates the anchor -- reset generation, never
@@ -6784,10 +6803,9 @@ void D3D12CommandProcessor::NrSprDrawEnd() {
   const bool have_prev = slot.used && slot.key == g_spr_key;
   // [NR-SPW] consume mode: no compares (a fall-through candidate emits a
   // DEDUPED span -- comparing it against the context-free recording would
-  // read as lenne and destroy a valid recording). Store only forced spans.
-  if (g_nr_span_consume) {
-    if (!g_spr_forced) return;  // recording retained, this span is deduped
-  } else if (have_prev && g_spr_reusable) {
+  // read as lenne and destroy a valid recording); unforced draws already
+  // returned above, so consume mode falls straight to the store.
+  if (!g_nr_span_consume && have_prev && g_spr_reusable) {
     if (fresh_clean) {
       // The recording is clean by construction; the fresh span is clean too:
       // lockstep compare with the patch model (root-view addresses at the
@@ -7173,9 +7191,9 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
   // Shared memory read state + everything the head queued.
   shared_memory_->UseForReading();
   SubmitBarriers();
-  // The replay: recording -> stack -> patch the root-CBV addresses from the
-  // member state the restore/upload above just established -> stream.
-  uintmax_t patched[kSprSlotElements];
+  // The replay: recording -> stream (one memcpy), then patch the root-CBV
+  // addresses in place from the member state just established.
+  uintmax_t* patched = deferred_command_list_.NrSprAppendRaw(slot.len);
   std::memcpy(patched, slot.data, slot.len * sizeof(uintmax_t));
   for (uint8_t i = 0; i < slot.view_count; ++i) {
     uint64_t nr_patch_addr;
@@ -7202,13 +7220,13 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
         nr_patch_addr = cbuffer_binding_descriptor_indices_pixel_.address;
         break;
       default:
-        // Cannot happen: roots validated at store time.
-        return false;
+        // Cannot happen: roots validated at store time (and the span is
+        // already appended -- returning here would double-draw).
+        assert_unhandled_case(slot.view_roots[i]);
+        continue;
     }
     DeferredCommandList::NrSprPatchViewAddress(patched, slot.view_offsets[i], nr_patch_addr);
   }
-  std::memcpy(deferred_command_list_.NrSprAppendRaw(slot.len), patched,
-              slot.len * sizeof(uintmax_t));
   // The stream now holds the recording's tail state and the CP's dedupe
   // members do not know it: clear the same five the forcing clears so the
   // next fresh draw re-emits (replayed draws never read them). The span
