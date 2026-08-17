@@ -1125,7 +1125,11 @@ NrDspProbe g_dsp_probe;
 // Collisions overwrite (read as first-seen, never as stale). 2^17 slots at
 // 64 elements = ~73 MB, lazy -- store sizing is the known coverage lever
 // (naruto_423 coll=23.7%), revisited when the swap increment owns a budget.
-constexpr uint32_t kSprSlotBits = 17;
+// [NR-SPD] 17 -> 18 (2026-08-17, first city consume A/B): at 2^17 the city
+// evicted ~30k/s (coll ~= first_seen), losing ~20k/s of reusable draws their
+// recording and burning ~30k/s of record traffic on refills. Payload is lazy
+// (~196 MB virtual at 2^18); headers stay the hot 8B array (2 MB).
+constexpr uint32_t kSprSlotBits = 18;
 constexpr uint32_t kSprSlots = 1u << kSprSlotBits;
 constexpr uint32_t kSprSlotElements = 64;
 inline uint32_t NrSprSlotIndex(uint32_t key) {
