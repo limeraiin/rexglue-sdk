@@ -528,7 +528,10 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
 // Single-threaded on the CP thread, like the walker. Streams are owned here;
 // the walker only ever holds borrowed pointers between Begin and End.
 
-constexpr size_t kCtxMemoByteCap = 64u << 20;  // op storage; clear-all on hit
+// 64MB thrashed at city under verify (naruto_446: ~52MB held, 5 clear-alls
+// in a short run); 256MB gives the city working set room. Clear-all stays as
+// the backstop only.
+constexpr size_t kCtxMemoByteCap = 256u << 20;
 constexpr size_t kCtxMemoStreamsPerBuf = 8;    // bin regimes per buffer
 
 struct CtxMemoBufEntry {
@@ -766,11 +769,10 @@ bool CtxMemoRecordCommit(CtxWalker* w, uint32_t ptr, uint32_t dwords,
   slot->select = select;
   slot->mask = mask;
   slot->dwords = dwords;
-  slot->ops = g_memo_rec;  // copy; scratch reused (shrinks alloc churn)
-  slot->ops.shrink_to_fit();
+  slot->ops = std::move(g_memo_rec);
   g_memo_stats.bytes += slot->ops.capacity() * sizeof(CtxMemoOp);
   ++g_memo_stats.commits;
-  g_memo_rec.clear();
+  g_memo_rec = std::vector<CtxMemoOp>();
   return clean;
 }
 

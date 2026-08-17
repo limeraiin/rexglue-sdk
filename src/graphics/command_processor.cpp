@@ -4786,7 +4786,14 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       nr::CtxMemoRecordBegin(&g_ctx_walker);
       wm_compare = wm_recording = g_ctx_walker.rec != nullptr;
       if (wm_compare) ++g_wm_cmp;
-    } else if (!nr::CtxMemoRefused(bufkey)) {
+    } else if (g_ruse_bytes_ident && !nr::CtxMemoRefused(bufkey)) {
+      // Record ONLY a buffer that just proved byte-stable across one gap.
+      // The city recorder patches buffers in place constantly; recording
+      // every stream-less execution (the v1 policy) spent ~750 commits/s +
+      // ~500 invalidations/s on churners whose streams never served one
+      // replay (naruto_447, store 207MB). Stability-gated, a churner costs
+      // nothing and a stable buffer records once, one execution later than
+      // v1 (the lost replay is the cheap half of record-once/replay-many).
       nr::CtxMemoRecordBegin(&g_ctx_walker);
       wm_recording = g_ctx_walker.rec != nullptr;
       if (wm_recording) ++g_wm_rec;
