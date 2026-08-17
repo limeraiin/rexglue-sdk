@@ -422,15 +422,37 @@ void DeferredCommandList::NrSprScanSpan(size_t start_elements, NrSprScan* out) c
         break;
       case Command::kD3DSetGraphicsRootConstantBufferView:
       case Command::kD3DSetGraphicsRootShaderResourceView:
-      case Command::kD3DSetGraphicsRootUnorderedAccessView:
+      case Command::kD3DSetGraphicsRootUnorderedAccessView: {
         ++out->view_sites;
         if (out->view_offset_count < kNrSprMaxViewSites && offset <= 0xFFFF) {
           out->view_offsets[out->view_offset_count++] = uint16_t(offset);
         }
+        // [NR-SPD] all three share SetRootConstantBufferViewArguments; the
+        // root index is the first UINT.
+        const UINT nr_spd_root =
+            reinterpret_cast<const SetRootConstantBufferViewArguments*>(
+                stream + kCommandHeaderSizeElements)
+                ->root_parameter_index;
+        if (nr_spd_root < 32) {
+          out->root_mask |= 1u << nr_spd_root;
+        } else {
+          ++out->other;
+        }
         break;
-      case Command::kD3DSetGraphicsRootDescriptorTable:
+      }
+      case Command::kD3DSetGraphicsRootDescriptorTable: {
         ++out->table_sites;
+        const UINT nr_spd_root =
+            reinterpret_cast<const SetRootDescriptorTableArguments*>(
+                stream + kCommandHeaderSizeElements)
+                ->root_parameter_index;
+        if (nr_spd_root < 32) {
+          out->root_mask |= 1u << nr_spd_root;
+        } else {
+          ++out->other;
+        }
         break;
+      }
       case Command::kRSSetViewport:
       case Command::kRSSetScissorRect:
       case Command::kD3DOMSetBlendFactor:

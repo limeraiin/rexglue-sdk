@@ -428,6 +428,33 @@ REXCVAR_DEFINE_BOOL(gpu_nr_span_swap, false, "GPU",
                     "Requires gpu_nr_skip + reuse-fast + the bindings swap; "
                     "verify-off. Off by default.");
 
+// [NR-SPD] Phase 5-4-7-3: the DEDUPED-span revival of 5-4-7-2 (its handoff's
+// option (a), rung 1 of the 2026-08-17 EV ranking). The 4x-measured fps loss
+// of 5-4-7-2 was the RECORD side: every replay paid a preceding FORCED
+// context-free re-emit (+~20 elements emitted + scanned + ~1KB stored) and
+// city keys alternate reusable/miss with period ~2, so rep/rec stuck at 1.2.
+// This mode records the DEDUPED span from the NORMAL emission instead --
+// recording free-rides on work that happens anyway (the 5-4-8 economics, by
+// construction) -- and gates replay on EMISSION-CONTEXT match: the entry
+// dedupe-member state (pipeline/rootsig/topology/root-up-to-date mask/cbuffer
+// addresses+flags/shared-memory flavor) is snapshotted per recording and
+// memcmp'd at replay; the recording's captured EXIT context is applied to the
+// members after a replay so chains keep matching. Store traffic is gated to
+// keys that have proven a reusable execution (the 5-4-8 stability lesson:
+// record only the population that will replay). Modifies BOTH modes: with
+// gpu_nr_span_replay = the compare gate (fresh vs stored under ctx match,
+// city gate = ne=0 lenne=0), with gpu_nr_span_swap = consumption. The store
+// is cleared when this mode flips (deduped and context-free recordings are
+// not comparable). Census basis: naruto_423 -- deduped spans byte-identical
+// under reuse at 99.88%, so the context usually matches; the gate names the
+// residual.
+REXCVAR_DEFINE_BOOL(gpu_nr_span_dedup, false, "GPU",
+                    "[nr-spd] Phase 5-4-7-3: record DEDUPED per-draw spans "
+                    "from normal emission (free record) and gate the replay "
+                    "on emission-context match. Modifies gpu_nr_span_replay "
+                    "(compare) and gpu_nr_span_swap (consume). Off by "
+                    "default.");
+
 // [NR-RUSE-EP] The epoch shortcut is REFUTED as a byte-equivalence at city
 // (naruto_410 verify run: ep_ne ~45% of clean predictions -- same-frame bin
 // repeats DO carry patches whose recorder-hook epoch bump trails the byte

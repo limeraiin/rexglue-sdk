@@ -179,6 +179,7 @@ REXCVAR_DECLARE(bool, gpu_nr_native_pso_bind);
 REXCVAR_DECLARE(bool, gpu_nr_verify);
 REXCVAR_DECLARE(bool, gpu_nr_reuse_fast);
 REXCVAR_DECLARE(bool, gpu_nr_span_swap);
+REXCVAR_DECLARE(bool, gpu_nr_span_dedup);
 // [NR-RUF-V2B] guard: the CPU vertex-shader extent path reads float
 // constants outside the bitmap-packed packs -- refuse upgrades under it.
 REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
@@ -1148,8 +1149,34 @@ struct SprHeader {
                               // alternate reusable/miss keep replaying
                               // (invalidate-on-miss halved city coverage
                               // 49%->27% on exactly that population)
-  uint8_t pad = 0;
+  uint8_t hot = 0;  // [NR-SPD] key has proven a reusable execution -- the
+                    // only population whose recordings can ever serve a
+                    // replay, so the only one dedup mode spends store
+                    // traffic on (the 5-4-8 stability lesson). Survives
+                    // used=0 invalidation (key field kept); reset on
+                    // collision eviction.
 };
+// [NR-SPD] 5-4-7-3: the emission-context snapshot. A DEDUPED span's content
+// depends on the CP's dedupe members at emission time (a command is emitted
+// only when it CHANGES), so a recording is replayable exactly when the
+// current members equal the recording's entry snapshot -- and after a replay
+// the members must become the recording's EXIT snapshot so the next draw's
+// context keeps matching (clearing them, as the context-free mode does,
+// would force a re-record on every following candidate = the period-2 tax
+// again). memcmp-compared whole: field order chosen so there are no padding
+// holes on x64.
+struct SprCtx {
+  const void* guest_pipeline = nullptr;
+  const void* external_pipeline = nullptr;
+  const void* root_signature = nullptr;
+  uint32_t topology = 0;  // D3D_PRIMITIVE_TOPOLOGY
+  uint32_t ru2d = 0;      // current_graphics_root_up_to_date_
+  // Order: fetch, float_v, float_p, system, bool_loop, di_v, di_p.
+  uint64_t cb_addr[7] = {};
+  uint8_t cb_utd[7] = {};
+  uint8_t shm_uav = 2;  // 0/1 = flavor, 2 = nullopt
+};
+static_assert(sizeof(SprCtx) == 96, "SprCtx must be padding-free (memcmp'd)");
 struct SprPayload {
   uint32_t len = 0;
   uint8_t view_count = 0;
@@ -1166,6 +1193,11 @@ struct SprPayload {
   uint32_t ib_size = 0;
   uint64_t smp_heap_ptr = 0;  // record-time heap table bases: a recreated
   uint64_t view_heap_ptr = 0; // heap makes the recorded tables stale
+  // [NR-SPD] dedup-mode extras: which roots the span re-establishes (the
+  // coverage check's whitelist) + the entry/exit context snapshots.
+  uint32_t root_mask = 0;
+  SprCtx entry_ctx;
+  SprCtx exit_ctx;
   uintmax_t data[kSprSlotElements];
 };
 std::vector<SprHeader> g_spr_headers;
@@ -1179,6 +1211,14 @@ uint64_t g_spr_gen = 0;
 bool g_nr_span_consume = false;
 bool g_spr_forced = false;    // this bracket's fresh emission is context-free
 bool g_spr_replayed = false;  // this bracket was served from the store
+// [NR-SPD] 5-4-7-3 per-frame latch + per-draw state. In dedup mode nothing
+// is ever forced; g_spr_record marks a fresh bracket whose span should be
+// stored (reusable, or a key with reuse history -- misses of hot keys
+// re-record for free, which is what keeps period-2 alternating keys
+// replaying without the forced-re-emit tax).
+bool g_nr_span_dedup = false;
+bool g_spr_record = false;
+SprCtx g_spr_entry_ctx;
 // [NR-SPW] record-time capture of the IssueDrawImpl locals a replay's live
 // head needs. Reset at bracket open, filled at the draw tail, consumed at
 // store time in NrSprDrawEnd.
@@ -1198,6 +1238,10 @@ struct SprCapture {
 struct NrSprProbe {
   uint64_t draws = 0, compared = 0, eq = 0, eq_dyn = 0, real_ne = 0, len_ne = 0;
   uint64_t cmp_refused = 0;  // reusable + stored, but fresh span not clean
+  uint64_t ctx_miss = 0;     // [NR-SPD] reusable + stored, entry context
+                             // differs from the recording's snapshot (the
+                             // dedup gate refusing -- re-recorded, not
+                             // compared)
   uint64_t first_seen = 0, collision = 0, stored = 0, too_long = 0, empty = 0,
            reset = 0;
   uint64_t elements = 0, view_sites = 0, dyn_view = 0, dyn_table = 0;
@@ -1213,6 +1257,10 @@ struct NrSpwProbe {
   uint64_t cand = 0, rep = 0;
   uint64_t fb_batch = 0, fb_begin = 0, fb_bundle = 0, fb_heap = 0,
            fb_valve = 0, fb_rt = 0, fb_vf = 0, fb_ib = 0, fb_sys = 0;
+  // [NR-SPD] dedup-mode fall-throughs: entry-context mismatch (the gate) +
+  // post-head coverage refusal (a root the recording does not re-establish
+  // went stale during the head).
+  uint64_t fb_ctx = 0, fb_cover = 0;
   uint64_t rep_elements = 0, rep_patched = 0;
   // [NR-SPWP] stage split of the replay path, gpu_draw_profile-gated (the
   // clean-probe class: a handful of QPC stamps per REPLAYED draw only).
@@ -1233,16 +1281,17 @@ void NrSpwReportIfDue() {
   s_last = now;
   const NrSpwProbe& p = g_spw_probe;
   const uint64_t fb = p.fb_batch + p.fb_begin + p.fb_bundle + p.fb_heap +
-                      p.fb_valve + p.fb_rt + p.fb_vf + p.fb_ib + p.fb_sys;
+                      p.fb_valve + p.fb_rt + p.fb_vf + p.fb_ib + p.fb_sys +
+                      p.fb_ctx + p.fb_cover;
   REXGPU_INFO(
       "[nr-spw] cand={} rep={} ({:.1f}%) el={:.1f} patch={:.2f} | fb={} "
       "(batch={} begin={} bundle={} heap={} valve={} rt={} vf={} ib={} "
-      "sys={})",
+      "sys={} ctx={} cover={})",
       p.cand, p.rep, p.cand ? 100.0 * double(p.rep) / double(p.cand) : 0.0,
       p.rep ? double(p.rep_elements) / double(p.rep) : 0.0,
       p.rep ? double(p.rep_patched) / double(p.rep) : 0.0, fb, p.fb_batch,
       p.fb_begin, p.fb_bundle, p.fb_heap, p.fb_valve, p.fb_rt, p.fb_vf,
-      p.fb_ib, p.fb_sys);
+      p.fb_ib, p.fb_sys, p.fb_ctx, p.fb_cover);
   if (g_draw_prof && p.rep) {
     const double r = double(p.rep) * 1000.0;  // ns -> us/draw
     REXGPU_INFO(
@@ -1268,7 +1317,8 @@ void NrSprReportIfDue() {
   const double c = double(p.compared ? p.compared : 1);
   REXGPU_INFO(
       "[nr-spr] draws={} el={:.1f}/draw | cmp={} eq={} ({:.1f}%) eqdyn={} "
-      "({:.1f}%) ne={} lenne={} real1st={} cmpref={} | replayable={:.1f}% | "
+      "({:.1f}%) ne={} lenne={} real1st={} cmpref={} ctxmiss={} | "
+      "replayable={:.1f}% | "
       "views={:.2f}/draw dynview={} dyntable={} | rec={} 1st={} coll={} "
       "long={} empty={} reset={} | refuse ff={} bar={} comp={} heaps={} "
       "other={}",
@@ -1276,6 +1326,7 @@ void NrSprReportIfDue() {
       p.eq, 100.0 * double(p.eq) / c, p.eq_dyn, 100.0 * double(p.eq_dyn) / c,
       p.real_ne, p.len_ne,
       p.first_real == 0xFFFFFFFFu ? -1 : int32_t(p.first_real), p.cmp_refused,
+      p.ctx_miss,
       100.0 * double(p.eq + p.eq_dyn) / c,
       p.compared ? double(p.view_sites) / c : 0.0, p.dyn_view, p.dyn_table,
       p.stored, p.first_seen, p.collision, p.too_long, p.empty, p.reset,
@@ -4018,6 +4069,17 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // every compare vacuous). Latched once per frame like the bindings swap.
   g_nr_span_consume = REXCVAR_GET(gpu_nr_span_swap) && !g_nr_verify &&
                       g_nr_swap && g_nr_rub_fast && bindless_resources_used_;
+  // [NR-SPD] 5-4-7-3: latch the dedup mode once per frame; a flip clears the
+  // whole store (deduped and context-free recordings are not comparable, and
+  // a stale-mode recording consumed under the other mode's rules would be
+  // silently wrong).
+  {
+    const bool nr_spd_now = REXCVAR_GET(gpu_nr_span_dedup);
+    if (nr_spd_now != g_nr_span_dedup && !g_spr_headers.empty()) {
+      std::fill(g_spr_headers.begin(), g_spr_headers.end(), SprHeader{});
+    }
+    g_nr_span_dedup = nr_spd_now;
+  }
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
   // gate itself is latched base-side (WorkerThreadMain), not here.
   NrFxReportIfDue();
@@ -6738,6 +6800,44 @@ void D3D12CommandProcessor::NrDspDrawEnd() {
   slot.used = 1;
 }
 
+void D3D12CommandProcessor::NrSprCaptureCtx(void* out_ctx) const {
+  // [NR-SPD] every member that gates an emission the whitelist admits:
+  // pipeline sets, root signature (a switch re-emits every root parameter),
+  // topology, the root-up-to-date mask, the 7 bindless cbuffer bindings
+  // (address decides a set's VALUE, up_to_date decides whether a recompose
+  // and hence a set happens at all), and the shared-memory table flavor.
+  SprCtx& c = *static_cast<SprCtx*>(out_ctx);
+  std::memset(&c, 0, sizeof(c));
+  c.guest_pipeline = current_guest_pipeline_;
+  c.external_pipeline = current_external_pipeline_;
+  c.root_signature = current_graphics_root_signature_;
+  c.topology = uint32_t(primitive_topology_);
+  c.ru2d = current_graphics_root_up_to_date_;
+  const ConstantBufferBinding* nr_spd_cbs[7] = {
+      &cbuffer_binding_fetch_,
+      &cbuffer_binding_float_vertex_,
+      &cbuffer_binding_float_pixel_,
+      &cbuffer_binding_system_,
+      &cbuffer_binding_bool_loop_,
+      &cbuffer_binding_descriptor_indices_vertex_,
+      &cbuffer_binding_descriptor_indices_pixel_};
+  for (int i = 0; i < 7; ++i) {
+    c.cb_addr[i] = uint64_t(nr_spd_cbs[i]->address);
+    c.cb_utd[i] = nr_spd_cbs[i]->up_to_date ? 1 : 0;
+  }
+  // [NR-SPD] the system-constants ADDRESS is excluded from the gate: sys is
+  // re-uploaded to a fresh pool address nearly every draw (bin-dependent
+  // NDC, the [nr-rub] sys ne=100% property), so including it reads ctxmiss
+  // ~100% (measured, naruto_450). Excluding it is sound: an EMITTED sys
+  // site is patched with the live address at replay, and an OMITTED one is
+  // covered by the post-head coverage check (the head's sys upload clears
+  // the root bit when the mirror moved). The up_to_date FLAG stays in.
+  c.cb_addr[3] = 0;
+  c.shm_uav = current_shared_memory_binding_is_uav_.has_value()
+                  ? uint8_t(current_shared_memory_binding_is_uav_.value() ? 1 : 0)
+                  : uint8_t(2);
+}
+
 void D3D12CommandProcessor::NrSprDrawBegin(uint32_t key, bool reusable) {
   // [NR-SPR] 5-4-7-1: latch the span anchor, then FORCE the tail-state
   // re-emit so this draw's span is context-free -- the emulated and native
@@ -6761,6 +6861,22 @@ void D3D12CommandProcessor::NrSprDrawBegin(uint32_t key, bool reusable) {
   g_spr_open = true;
   g_spr_replayed = false;
   g_spr_cap = SprCapture{};
+  // [NR-SPD] 5-4-7-3 dedup mode: NOTHING is ever forced -- the recording is
+  // the normal deduped emission, taken for free. Store traffic is gated to
+  // keys with reuse history (hot): a reusable execution always records (its
+  // recording is what the next reusable execution replays), and a MISS of a
+  // hot key re-records instead of invalidating -- that free re-record is
+  // exactly what the period-2 alternating city population needs. Cold keys
+  // (never reusable) cost zero store traffic and zero scan time. The entry
+  // context is snapshotted here, before anything mutates the members.
+  if (g_nr_span_dedup) {
+    SprHeader& s = g_spr_headers[NrSprSlotIndex(key)];
+    g_spr_forced = false;
+    g_spr_record = reusable || (s.key == key && s.hot);
+    if (g_spr_record) NrSprCaptureCtx(&g_spr_entry_ctx);
+    return;
+  }
+  g_spr_record = false;
   // [NR-SPW] consume-mode forcing policy (v2, after the first city A/B read
   // net negative): force + record ONLY a REUSABLE draw without a valid
   // recording -- the one execution whose recording the next reusable
@@ -6821,11 +6937,17 @@ void D3D12CommandProcessor::NrSprDrawEnd() {
     g_spr_replayed = false;
     return;
   }
-  // [NR-SPW] consume mode: only a forced (recording) execution has store
-  // work -- v2-miss invalidation already happened at Begin, fall-through
-  // candidates keep their recording. Skip the span scan for everything
-  // else (it was per-draw cost serving nothing).
-  if (g_nr_span_consume && !g_spr_forced) {
+  // [NR-SPD] dedup mode: only record-intent brackets (reusable or hot key)
+  // have any store work; cold keys exit here with zero scan cost.
+  if (g_nr_span_dedup) {
+    if (!g_spr_record) {
+      return;
+    }
+  } else if (g_nr_span_consume && !g_spr_forced) {
+    // [NR-SPW] consume mode: only a forced (recording) execution has store
+    // work -- v2-miss invalidation already happened at Begin, fall-through
+    // candidates keep their recording. Skip the span scan for everything
+    // else (it was per-draw cost serving nothing).
     return;
   }
   // A Reset inside the draw invalidates the anchor -- reset generation, never
@@ -6861,7 +6983,42 @@ void D3D12CommandProcessor::NrSprDrawEnd() {
   // DEDUPED span -- comparing it against the context-free recording would
   // read as lenne and destroy a valid recording); unforced draws already
   // returned above, so consume mode falls straight to the store.
-  if (!g_nr_span_consume && have_prev && g_spr_reusable) {
+  // [NR-SPD] dedup compare gate (the city-gate mode): a reusable execution
+  // with a stored recording compares fresh-vs-stored ONLY when the entry
+  // context matches the recording's snapshot -- that match is exactly the
+  // production replay condition, so ne/lenne here price the gate's residual
+  // (census basis says ~0). A context miss is counted, not compared. Either
+  // way the code FALLS THROUGH to the record path below: dedup re-records
+  // every fresh execution of a hot key, so the recording always describes
+  // the PREVIOUS execution and the r2 chain stays one link long.
+  if (g_nr_span_dedup && !g_nr_span_consume && have_prev && g_spr_reusable) {
+    if (fresh_clean) {
+      if (std::memcmp(&g_spr_entry_ctx, &pay.entry_ctx, sizeof(SprCtx)) != 0) {
+        ++p.ctx_miss;
+      } else {
+        DeferredCommandList::NrDspDiff d;
+        deferred_command_list_.NrDspCompareSpan(pay.data, pay.len, g_spr_start,
+                                                &d);
+        ++p.compared;
+        p.view_sites += d.view_sites;
+        if (d.length_differs) {
+          ++p.len_ne;
+        } else if (d.real) {
+          ++p.real_ne;
+          if (p.first_real == 0xFFFFFFFFu) p.first_real = d.first_real;
+        } else if (d.dyn_view || d.dyn_table) {
+          ++p.eq_dyn;
+          p.dyn_view += d.dyn_view;
+          p.dyn_table += d.dyn_table;
+        } else {
+          ++p.eq;
+        }
+      }
+    } else {
+      ++p.cmp_refused;
+    }
+    // no return: fall through to the upsert
+  } else if (!g_nr_span_consume && have_prev && g_spr_reusable) {
     if (fresh_clean) {
       // The recording is clean by construction; the fresh span is clean too:
       // lockstep compare with the patch model (root-view addresses at the
@@ -6925,13 +7082,25 @@ void D3D12CommandProcessor::NrSprDrawEnd() {
     hdr.used = 0;
     return;
   }
-  if (hdr.key != g_spr_key) hdr.replay_worthy = 0;  // eviction: new identity
+  if (hdr.key != g_spr_key) {  // eviction: new identity
+    hdr.replay_worthy = 0;
+    hdr.hot = 0;
+  }
   hdr.key = g_spr_key;
   pay.len = uint32_t(len);
   pay.view_count = scan.view_offset_count;
   std::memcpy(pay.view_offsets, scan.view_offsets, sizeof(pay.view_offsets));
   hdr.used = 1;
   ++p.stored;
+  // [NR-SPD] dedup recordings carry the coverage mask + both context
+  // snapshots (entry from bracket Begin, exit from the members right now,
+  // post-emission), and reusable executions mark the key hot.
+  if (g_nr_span_dedup) {
+    pay.root_mask = scan.root_mask;
+    pay.entry_ctx = g_spr_entry_ctx;
+    NrSprCaptureCtx(&pay.exit_ctx);
+    if (g_spr_reusable) hdr.hot = 1;
+  }
   // [NR-SPW] replay metadata. Eligible only when the capture reached the
   // draw tail unrefused, every view site was collected, and every patch
   // site is one of the 7 bindless root CBVs (whitelist again: an unknown
@@ -7066,6 +7235,20 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
   if (!BeginSubmission(true)) {
     ++w.fb_begin;
     return false;
+  }
+  // [NR-SPD] the emission-context gate, AFTER BeginSubmission on purpose: a
+  // submission open resets the dedupe members, and a deduped recording's
+  // omitted commands are only sound when the CURRENT members equal the
+  // recording's entry snapshot (comparing before the reset would false-match
+  // and replay a span that inherits from unbound state). A miss falls
+  // through fresh, which re-records for free.
+  if (g_nr_span_dedup) {
+    SprCtx nr_spd_now;
+    NrSprCaptureCtx(&nr_spd_now);
+    if (std::memcmp(&nr_spd_now, &pay.entry_ctx, sizeof(SprCtx)) != 0) {
+      ++w.fb_ctx;
+      return false;
+    }
   }
   // Heap identity: a recreated bindless heap makes the recorded root
   // descriptor tables stale (never observed live; unit-only class).
@@ -7258,6 +7441,21 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
     ++w.fb_ib;
     return false;
   }
+  // [NR-SPD] post-head coverage: the head (restore, sys upload) may have
+  // cleared root-up-to-date bits; every root the recording's exit context
+  // says must end up bound-and-current has to be either still current or
+  // re-established by the span itself. A root that is neither would replay
+  // into a stale binding -- refuse (fresh path re-runs everything, head
+  // steps idempotent).
+  if (g_nr_span_dedup) {
+    const uint32_t nr_spd_missing = pay.exit_ctx.ru2d &
+                                    ~current_graphics_root_up_to_date_ &
+                                    ~pay.root_mask;
+    if (nr_spd_missing) {
+      ++w.fb_cover;
+      return false;
+    }
+  }
   // Shared memory read state + everything the head queued.
   shared_memory_->UseForReading();
   SubmitBarriers();
@@ -7298,16 +7496,40 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
     }
     DeferredCommandList::NrSprPatchViewAddress(patched, pay.view_offsets[i], nr_patch_addr);
   }
-  // The stream now holds the recording's tail state and the CP's dedupe
-  // members do not know it: clear the same five the forcing clears so the
-  // next fresh draw re-emits (replayed draws never read them). The span
-  // bound the SRV flavor of the shared-memory table.
-  current_guest_pipeline_ = nullptr;
-  current_external_pipeline_ = nullptr;
-  current_graphics_root_signature_ = nullptr;
-  current_graphics_root_up_to_date_ = 0;
-  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  current_shared_memory_binding_is_uav_ = false;
+  if (g_nr_span_dedup) {
+    // [NR-SPD] apply the recording's EXIT context: the members now describe
+    // the stream exactly as the record-time fresh execution left them, so
+    // the NEXT draw's entry context keeps matching its own recording --
+    // clearing instead (the context-free rule below) would force a fresh
+    // re-emit on every following candidate and reintroduce the period-2
+    // tax. Every bit set in exit ru2d is genuinely bound-and-current here:
+    // it was either current before the memcpy or re-established by the span
+    // (the coverage check above is exactly that invariant).
+    const SprCtx& nr_spd_x = pay.exit_ctx;
+    current_guest_pipeline_ = const_cast<void*>(nr_spd_x.guest_pipeline);
+    current_external_pipeline_ = static_cast<ID3D12PipelineState*>(
+        const_cast<void*>(nr_spd_x.external_pipeline));
+    current_graphics_root_signature_ = static_cast<ID3D12RootSignature*>(
+        const_cast<void*>(nr_spd_x.root_signature));
+    current_graphics_root_up_to_date_ = nr_spd_x.ru2d;
+    primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY(nr_spd_x.topology);
+    if (nr_spd_x.shm_uav == 2) {
+      current_shared_memory_binding_is_uav_.reset();
+    } else {
+      current_shared_memory_binding_is_uav_ = nr_spd_x.shm_uav != 0;
+    }
+  } else {
+    // The stream now holds the recording's tail state and the CP's dedupe
+    // members do not know it: clear the same five the forcing clears so the
+    // next fresh draw re-emits (replayed draws never read them). The span
+    // bound the SRV flavor of the shared-memory table.
+    current_guest_pipeline_ = nullptr;
+    current_external_pipeline_ = nullptr;
+    current_graphics_root_signature_ = nullptr;
+    current_graphics_root_up_to_date_ = 0;
+    primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    current_shared_memory_binding_is_uav_ = false;
+  }
   ++w.rep;
   w.rep_elements += pay.len;
   w.rep_patched += pay.view_count;

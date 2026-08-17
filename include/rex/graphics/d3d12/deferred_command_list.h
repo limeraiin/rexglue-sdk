@@ -106,6 +106,11 @@ class DeferredCommandList {
     bool malformed = false;    // stale anchor / truncated tail
     uint8_t view_offset_count = 0;                 // capped at kNrSprMaxViewSites
     uint16_t view_offsets[kNrSprMaxViewSites] = {};  // element offset from span start
+    // [NR-SPD] 5-4-7-3: bit per root parameter index set anywhere in the
+    // span (graphics root CBV/SRV/UAV + descriptor tables). The deduped
+    // replay's coverage check needs to know which roots the recording
+    // re-establishes; an index >= 32 refuses via `other`.
+    uint32_t root_mask = 0;
   };
   void NrSprScanSpan(size_t start_elements, NrSprScan* out) const;
   // [NR-SPW] Phase 5-4-7-2: reserve `len_elements` at the stream tail and

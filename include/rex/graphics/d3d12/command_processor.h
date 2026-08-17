@@ -561,6 +561,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   // false = fall through to the full derivation path (every head step
   // already taken is idempotent there).
   bool NrSpanReplayTry();
+  // [NR-SPD] Phase 5-4-7-3: snapshot the emission-context members (pipeline,
+  // root signature, topology, root-up-to-date mask, cbuffer addresses+flags,
+  // shared-memory flavor) into a cpp-local SprCtx (kept out of this header).
+  // Captured at bracket Begin (entry) and store time (exit); a deduped
+  // recording replays only when the current context memcmp-equals its entry
+  // snapshot, and applies the exit snapshot to the members afterwards.
+  void NrSprCaptureCtx(void* out_ctx) const;
   // [NR-SWP] Phase 5-3b swap: this project's own UpdateBindings (bindless
   // only, same member state machine). *refused_out = fall back to the
   // emulated function for this draw (counted by the caller).
