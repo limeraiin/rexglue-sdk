@@ -402,6 +402,19 @@ bool g_instance = false;
 bool g_instance_dirty = true;
 uint64_t g_instance_draws_in = 0;
 uint64_t g_instance_draws_out = 0;
+// [GPU-INST] Flush-reason census (cmd-proc thread only): what limits batch
+// length at a given scene. fail = why the merge check refused (dirty /
+// shader / prim+count / ib / capacity), site = where a live batch was
+// flushed (merge-fail / copy / submission-end+present), hist = flushed batch
+// size buckets (1 / 2-4 / 5-16 / 17-64 / 65-256 / 257+), dirty_reg_census =
+// which register FIRST broke the float-constants-only invariant (tallied at
+// the merge-fail moment, cumulative).
+uint32_t g_instance_dirty_first_reg = UINT32_MAX;
+uint32_t g_inst_fail_reason = 0;
+uint64_t g_inst_fail[5] = {};
+uint64_t g_inst_flush_site[3] = {};
+uint64_t g_inst_hist[6] = {};
+std::unordered_map<uint32_t, uint64_t> g_inst_dirty_reg_census;
 
 // [NR-NPSO] Phase 5-3a: latched once a frame beside the others, so the draw
 // path never reads a cvar. g_nr_native_pso builds and checks our own pipeline
@@ -3613,10 +3626,16 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // changes between draws. A value-changing write to any register outside the
   // vertex float-constant range breaks the "only the per-instance transform
   // differs" invariant, so the next draw must not merge into the open batch.
+  // VGT_EVENT_INITIATOR is exempt: it is a write strobe (EVENT_WRITE family),
+  // not state any draw consumes, and events already execute while a batch is
+  // open (dirty never flushed the batch at the event) -- the city census
+  // measured it as the top batch breaker (~88k/s, EVENT_WRITE/EXT alternate
+  // initiator values every draw pair).
   if (g_instance && !g_instance_dirty &&
       (index < XE_GPU_REG_SHADER_CONSTANT_000_X || index >= XE_GPU_REG_SHADER_CONSTANT_256_X) &&
-      register_file_->values[index] != value) {
+      index != XE_GPU_REG_VGT_EVENT_INITIATOR && register_file_->values[index] != value) {
     g_instance_dirty = true;
+    g_instance_dirty_first_reg = index;
   }
 
   // [PERF/CONST-DEDUPE] A redundant shader-constant write (value unchanged)
@@ -3723,21 +3742,25 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   if (g_instance && !g_instance_dirty) {
     constexpr uint32_t kVsFloatLo = XE_GPU_REG_SHADER_CONSTANT_000_X;
     constexpr uint32_t kVsFloatHi = XE_GPU_REG_SHADER_CONSTANT_256_X;  // exclusive
-    auto range_value_changed = [&](uint32_t lo, uint32_t hi) -> bool {
+    auto first_changed_in_range = [&](uint32_t lo, uint32_t hi) -> uint32_t {
       for (uint32_t idx = lo; idx <= hi; ++idx) {
         if (memory::load_and_swap<uint32_t>(base + (idx - start_index)) !=
             register_file_->values[idx]) {
-          return true;
+          return idx;
         }
       }
-      return false;
+      return UINT32_MAX;
     };
-    if (start_index < kVsFloatLo &&
-        range_value_changed(start_index, std::min(end_index, kVsFloatLo - 1))) {
+    uint32_t changed = UINT32_MAX;
+    if (start_index < kVsFloatLo) {
+      changed = first_changed_in_range(start_index, std::min(end_index, kVsFloatLo - 1));
+    }
+    if (changed == UINT32_MAX && end_index >= kVsFloatHi) {
+      changed = first_changed_in_range(std::max(start_index, kVsFloatHi), end_index);
+    }
+    if (changed != UINT32_MAX) {
       g_instance_dirty = true;
-    } else if (end_index >= kVsFloatHi &&
-               range_value_changed(std::max(start_index, kVsFloatHi), end_index)) {
-      g_instance_dirty = true;
+      g_instance_dirty_first_reg = changed;
     }
   }
 
@@ -4110,6 +4133,36 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       uint64_t dout = g_instance_draws_out - s_last_out;
       REXGPU_INFO("[gpu-inst] coalesced {} draws -> {} instanced draws (saved {})", din, dout,
                   din >= dout ? din - dout : 0);
+      // [GPU-INST] Census line (per-second deltas; dirtyreg is cumulative
+      // top-4 of the register that FIRST dirtied a batch that then failed to
+      // merge). fail counts are merge refusals by reason; site counts are
+      // where live batches got flushed; hist is flushed batch size.
+      {
+        static uint64_t s_lf[5] = {}, s_ls[3] = {}, s_lh[6] = {};
+        uint64_t df[5], ds[3], dh[6];
+        for (int i = 0; i < 5; ++i) { df[i] = g_inst_fail[i] - s_lf[i]; s_lf[i] = g_inst_fail[i]; }
+        for (int i = 0; i < 3; ++i) { ds[i] = g_inst_flush_site[i] - s_ls[i]; s_ls[i] = g_inst_flush_site[i]; }
+        for (int i = 0; i < 6; ++i) { dh[i] = g_inst_hist[i] - s_lh[i]; s_lh[i] = g_inst_hist[i]; }
+        uint32_t top_reg[4] = {0, 0, 0, 0};
+        uint64_t top_cnt[4] = {0, 0, 0, 0};
+        for (const auto& kv : g_inst_dirty_reg_census) {
+          for (int i = 0; i < 4; ++i) {
+            if (kv.second > top_cnt[i]) {
+              for (int j = 3; j > i; --j) { top_cnt[j] = top_cnt[j - 1]; top_reg[j] = top_reg[j - 1]; }
+              top_cnt[i] = kv.second;
+              top_reg[i] = kv.first;
+              break;
+            }
+          }
+        }
+        REXGPU_INFO(
+            "[gpu-inst] fail dirty={} sh={} prim={} ib={} cap={} | site merge={} copy={} end={} | "
+            "hist 1={} 2-4={} 5-16={} 17-64={} 65-256={} 257+={} | dirtyreg {:04X}:{} {:04X}:{} "
+            "{:04X}:{} {:04X}:{}",
+            df[0], df[1], df[2], df[3], df[4], ds[0], ds[1], ds[2], dh[0], dh[1], dh[2], dh[3],
+            dh[4], dh[5], top_reg[0], top_cnt[0], top_reg[1], top_cnt[1], top_reg[2], top_cnt[2],
+            top_reg[3], top_cnt[3]);
+      }
       s_last_report = now;
       s_last_in = g_instance_draws_in;
       s_last_out = g_instance_draws_out;
@@ -4120,6 +4173,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   PrecordFlush();
   // [GPU-INST] Emit any draw still held in the open instanced batch before the
   // frame is presented.
+  if (instanced_batch_.active) {
+    ++g_inst_flush_site[2];
+  }
   FlushInstancedBatch();
   if (g_draw_prof) {
     static uint64_t s_last[20] = {}, s_last_cnt = 0;
@@ -4751,8 +4807,14 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       InstancedBatchAppend(regs);
       ++g_instance_draws_in;
       g_instance_dirty = false;
+      g_instance_dirty_first_reg = UINT32_MAX;
       return true;
     }
+    ++g_inst_fail[g_inst_fail_reason];
+    if (g_inst_fail_reason == 0 && g_instance_dirty_first_reg != UINT32_MAX) {
+      ++g_inst_dirty_reg_census[g_instance_dirty_first_reg];
+    }
+    ++g_inst_flush_site[0];
     FlushInstancedBatch();
   }
 
@@ -5770,6 +5832,7 @@ void D3D12CommandProcessor::StartInstancedBatch(const RegisterFile& regs, Shader
   InstancedBatchAppend(regs);
   ++g_instance_draws_in;
   g_instance_dirty = false;
+  g_instance_dirty_first_reg = UINT32_MAX;
 }
 
 // [GPU-INST] Whether the current draw can extend the open batch: nothing but the
@@ -5782,24 +5845,33 @@ bool D3D12CommandProcessor::InstancedBatchCanMerge(xenos::PrimitiveType primitiv
                                                    Shader* pixel_shader) const {
   const InstancedBatch& b = instanced_batch_;
   if (!b.active || g_instance_dirty) {
+    g_inst_fail_reason = 0;
     return false;
   }
   if (vertex_shader != b.vs || pixel_shader != b.ps) {
+    g_inst_fail_reason = 1;
     return false;
   }
   if (primitive_type != b.prim || index_count != b.index_count) {
+    g_inst_fail_reason = 2;
     return false;
   }
   bool has_ib = index_buffer_info != nullptr;
   if (has_ib != b.has_ib) {
+    g_inst_fail_reason = 3;
     return false;
   }
   if (has_ib &&
       (index_buffer_info->guest_base != b.ib_base || index_buffer_info->count != b.ib_count ||
        index_buffer_info->format != b.ib_format || index_buffer_info->endianness != b.ib_endian)) {
+    g_inst_fail_reason = 3;
     return false;
   }
-  return b.count < b.max_instances;
+  if (b.count >= b.max_instances) {
+    g_inst_fail_reason = 4;
+    return false;
+  }
+  return true;
 }
 
 // [GPU-INST] Emit the open batch (if any) as a single DrawIndexedInstanced:
@@ -5812,6 +5884,14 @@ void D3D12CommandProcessor::FlushInstancedBatch() {
     return;
   }
   b.active = false;
+  if (b.count) {
+    ++g_inst_hist[b.count == 1 ? 0
+                  : b.count <= 4 ? 1
+                  : b.count <= 16 ? 2
+                  : b.count <= 64 ? 3
+                  : b.count <= 256 ? 4
+                                   : 5];
+  }
   if (b.count == 0 || b.float_count == 0 || !submission_open_) {
     b.data.clear();
     return;
@@ -6015,6 +6095,9 @@ bool D3D12CommandProcessor::IssueCopy() {
   PrecordFlush();
   // [GPU-INST] A resolve/copy must observe all prior draws, so flush the open
   // instanced batch first.
+  if (instanced_batch_.active) {
+    ++g_inst_flush_site[1];
+  }
   FlushInstancedBatch();
   if (!BeginSubmission(true)) {
     return false;
@@ -8188,6 +8271,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   // [GPU-INST] A deferred instanced draw must be emitted into this submission
   // before it closes, otherwise its recorded setup is orphaned and the draw is
   // lost. Flush while the submission is still open.
+  if (instanced_batch_.active) {
+    ++g_inst_flush_site[2];
+  }
   FlushInstancedBatch();
 
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
