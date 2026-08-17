@@ -9,6 +9,9 @@
 
 #include "rex/graphics/nr_context.h"
 
+#include <cstring>
+#include <unordered_map>
+
 // [NR-CTX] See the header. Decode rules mirror the executor exactly
 // (ExecutePacketType0/1/3 in command_processor.cpp), and the walk structure
 // mirrors nr_state_walk.cpp -- same packet subset, same skip rules, so the
@@ -314,9 +317,11 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
         w->range_fn(w->range_user, base,
                     (const uint32_t*)(raw + (j + 1) * 4), cnt,
                     w->buffer_phys + (j + 1) * 4, /*from_memory=*/false)) {
+      if (w->rec) w->rec->push_back({kCtxMemoRange, 0, uint16_t(base), cnt, j + 1, j});
       w->cursor = j + 1 + cnt;
       return false;
     }
+    if (w->rec) w->rec->push_back({kCtxMemoPkt, 0, 0, 0, j, j});
     for (uint32_t m = 0; m < cnt && j + 1 + m < dwords; ++m) {
       CtxWriteReg(w, one_reg ? base : base + m, BE32(raw, j + 1 + m));
     }
@@ -325,6 +330,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
   }
   if (ty == 1) {
     if (j + 2 < dwords) {
+      if (w->rec) w->rec->push_back({kCtxMemoPkt, 0, 0, 0, j, j});
       CtxWriteReg(w, hdr & 0x7FF, BE32(raw, j + 1));
       CtxWriteReg(w, (hdr >> 11) & 0x7FF, BE32(raw, j + 2));
     }
@@ -356,6 +362,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
   // is skipped natively above), before any decode. The cursor stays AT the
   // header for the executor's dispatch; CtxWalkSkipDelegated resumes past it.
   if (delegate_stops && stop && !CtxNativeOp(op)) {
+    if (w->rec) w->rec->push_back({kCtxMemoDeleg, 0, uint16_t(op), 0, j, j});
     w->cursor = j;
     ++w->stats->delegate_stops;
     stop->opcode = op;
@@ -366,6 +373,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     return true;
   }
   if (op == 0x22 || op == 0x36) {
+    if (w->rec) w->rec->push_back({kCtxMemoDraw, 0, uint16_t(op), 0, j, j});
     uint16_t f = 0;
     uint32_t index = 0;
     if (op == 0x22) {
@@ -392,6 +400,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
   }
   StateContext* ctx = w->ctx;
   if (op == 0x27 && cnt >= 2 && j + 2 < dwords) {
+    if (w->rec) w->rec->push_back({kCtxMemoPkt, 0, 0, 0, j, j});
     // IM_LOAD: pointer-based shader load.
     const uint32_t addr_type = BE32(raw, j + 1);
     const uint32_t start_size = BE32(raw, j + 2);
@@ -410,6 +419,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     ++w->stats->im_loads;
     if (w->shader_fn) w->shader_fn(w->shader_user, ref);
   } else if (op == 0x2B && cnt >= 3 && j + 2 < dwords) {
+    if (w->rec) w->rec->push_back({kCtxMemoPkt, 0, 0, 0, j, j});
     // IM_LOAD_IMMEDIATE: ucode inline after the two header dwords.
     const uint32_t type = BE32(raw, j + 1);
     const uint32_t start_size = BE32(raw, j + 2);
@@ -441,8 +451,10 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
           w->range_fn(w->range_user, base,
                       (const uint32_t*)(raw + (j + 2) * 4), cnt - 1,
                       w->buffer_phys + (j + 2) * 4, /*from_memory=*/false)) {
+        if (w->rec) w->rec->push_back({kCtxMemoRange, 0, uint16_t(base), cnt - 1, j + 2, j});
         return false;
       }
+      if (w->rec) w->rec->push_back({kCtxMemoPkt, 0, 0, 0, j, j});
       for (uint32_t m = 0; m + 1 < cnt && j + 2 + m < dwords; ++m) {
         CtxWriteReg(w, base + m, BE32(raw, j + 2 + m));
       }
@@ -452,6 +464,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
                                (j + 2 < dwords) ? BE32(raw, j + 2) : 0)) {
     // SET_BIN_MASK / SET_BIN_SELECT (and the LO/HI halves): which of the
     // following predicated blocks this pass executes.
+    if (w->rec) w->rec->push_back({kCtxMemoPkt, 0, 0, 0, j, j});
     ++w->stats->bin_pkts;
   } else if ((op == 0x55 || op == 0x56) && cnt >= 2 && j + 1 < dwords) {
     // SET_CONSTANT2 / SET_SHADER_CONSTANTS: RAW register index, values
@@ -464,8 +477,10 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
         w->range_fn(w->range_user, base,
                     (const uint32_t*)(raw + (j + 2) * 4), cnt - 1,
                     w->buffer_phys + (j + 2) * 4, /*from_memory=*/false)) {
+      if (w->rec) w->rec->push_back({kCtxMemoRange, 0, uint16_t(base), cnt - 1, j + 2, j});
       return false;
     }
+    if (w->rec) w->rec->push_back({kCtxMemoPkt, 0, 0, 0, j, j});
     for (uint32_t m = 0; m + 1 < cnt && j + 2 + m < dwords; ++m) {
       CtxWriteReg(w, base + m, BE32(raw, j + 2 + m));
     }
@@ -483,9 +498,11 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
       if (w->mem_read && CtxRangeOfferable(w, base, size_dwords) &&
           w->range_fn(w->range_user, base, nullptr, size_dwords, address,
                       /*from_memory=*/true)) {
+        if (w->rec) w->rec->push_back({kCtxMemoRangeMem, 0, uint16_t(base), size_dwords, address, j});
         w->stats->mem_loads += size_dwords;
         return false;
       }
+      if (w->rec) w->rec->push_back({kCtxMemoPkt, 0, 0, 0, j, j});
       for (uint32_t m = 0; m < size_dwords; ++m) {
         const int32_t s = CtxSlot(base + m);
         // A non-mirrored register still has to reach reg_fn: the resource
@@ -504,6 +521,89 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
       }
     }
   }
+  return false;
+}
+
+// ---- [NR-WM] 5-4-8: memo store + replay drive ------------------------------
+// Single-threaded on the CP thread, like the walker. Streams are owned here;
+// the walker only ever holds borrowed pointers between Begin and End.
+
+constexpr size_t kCtxMemoByteCap = 64u << 20;  // op storage; clear-all on hit
+constexpr size_t kCtxMemoStreamsPerBuf = 8;    // bin regimes per buffer
+
+struct CtxMemoBufEntry {
+  uint8_t refused = 0;
+  std::vector<CtxMemoStream> streams;
+};
+
+std::unordered_map<uint32_t, CtxMemoBufEntry> g_memo_store;
+CtxMemoStats g_memo_stats = {};
+std::vector<CtxMemoOp> g_memo_rec;  // one recording at a time (CP thread)
+bool g_memo_rec_busy = false;
+
+// Replay one op stream through the walker's own callbacks. Contract: the
+// caller proved the buffer bytes identical to the recorded execution and the
+// entry bin state matches the stream key, so every re-parse (kCtxMemoPkt /
+// kCtxMemoDraw / declined ranges) decodes the same bytes the recording did.
+// `stop == nullptr` is the finish-drain: draw ops apply without surfacing and
+// delegate ops are skipped, exactly as the parsed CtxWalkFinish behaves past
+// the last stop. A cursor already at the end means the caller aborted the
+// buffer (delegated ExecutePacket failure): nothing further applies, matching
+// the parsed path's abort semantics.
+bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
+  while (w->rep_i < w->rep_n) {
+    if (w->cursor >= w->dwords) return false;
+    const CtxMemoOp& op = w->rep[w->rep_i++];
+    switch (op.kind) {
+      case kCtxMemoRange:
+        if (w->range_fn &&
+            w->range_fn(w->range_user, op.reg,
+                        (const uint32_t*)(w->raw + size_t(op.a) * 4), op.n,
+                        w->buffer_phys + op.a * 4, /*from_memory=*/false)) {
+          break;
+        }
+        // Consumer declined what it consumed at record time (config drift):
+        // re-parse the packet itself, bit-identically to the parsed walk.
+        ++g_memo_stats.fallbacks;
+        w->cursor = op.b;
+        CtxWalkStep(w, nullptr);
+        break;
+      case kCtxMemoRangeMem:
+        // By-ref values are re-read from guest memory at replay, exactly as
+        // the parsed walk re-reads them ([[bindings-inline-constants-byref]]).
+        if (w->mem_read && w->range_fn &&
+            w->range_fn(w->range_user, op.reg, nullptr, op.n, op.a,
+                        /*from_memory=*/true)) {
+          w->stats->mem_loads += op.n;
+          break;
+        }
+        ++g_memo_stats.fallbacks;
+        w->cursor = op.b;
+        CtxWalkStep(w, nullptr);
+        break;
+      case kCtxMemoPkt:
+        w->cursor = op.a;
+        CtxWalkStep(w, nullptr);
+        break;
+      case kCtxMemoDraw: {
+        w->cursor = op.a;
+        const bool got = CtxWalkStep(w, stop);
+        if (stop) return got;
+        break;  // finish-drain: applied, not surfaced
+      }
+      case kCtxMemoDeleg:
+        w->cursor = op.a;
+        if (stop) {
+          CtxWalkStep(w, stop, /*delegate_stops=*/true);
+          return true;
+        }
+        CtxWalkSkipDelegated(w);  // finish-drain skips delegates, as parsed
+        break;
+      default:
+        break;
+    }
+  }
+  w->cursor = w->dwords;
   return false;
 }
 
@@ -545,6 +645,7 @@ void CtxWalkBegin(CtxWalker* w, const uint8_t* raw, uint32_t dwords,
 }
 
 bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop) {
+  if (w->rep) return CtxMemoNext(w, stop);
   while (w->cursor < w->dwords) {
     if (CtxWalkStep(w, stop)) return true;
   }
@@ -552,6 +653,9 @@ bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop) {
 }
 
 bool CtxWalkNextStop(CtxWalker* w, CtxDrawStop* stop) {
+  // [NR-WM] a replay attachment drives from the recorded stream instead of
+  // parsing; the callbacks fire identically from either path.
+  if (w->rep) return CtxMemoNext(w, stop);
   while (w->cursor < w->dwords) {
     if (CtxWalkStep(w, stop, /*delegate_stops=*/true)) return true;
   }
@@ -566,9 +670,168 @@ void CtxWalkSkipDelegated(CtxWalker* w) {
 }
 
 uint32_t CtxWalkFinish(CtxWalker* w) {
+  if (w->rep) {
+    while (CtxMemoNext(w, nullptr)) {
+    }
+    return w->nflags;
+  }
   while (w->cursor < w->dwords) CtxWalkStep(w, nullptr);
   return w->nflags;
 }
+
+// ---- [NR-WM] store API ------------------------------------------------------
+
+const CtxMemoStream* CtxMemoFind(uint32_t ptr, uint32_t dwords,
+                                 uint64_t select, uint64_t mask) {
+  auto it = g_memo_store.find(ptr);
+  if (it == g_memo_store.end()) return nullptr;
+  for (const CtxMemoStream& s : it->second.streams) {
+    if (s.dwords == dwords && s.select == select && s.mask == mask) return &s;
+  }
+  return nullptr;
+}
+
+bool CtxMemoRefused(uint32_t ptr) {
+  auto it = g_memo_store.find(ptr);
+  return it != g_memo_store.end() && it->second.refused;
+}
+
+void CtxMemoRefuse(uint32_t ptr) {
+  CtxMemoBufEntry& e = g_memo_store[ptr];
+  if (!e.refused) ++g_memo_stats.refused;
+  e.refused = 1;
+  for (CtxMemoStream& s : e.streams) {
+    g_memo_stats.bytes -= s.ops.capacity() * sizeof(CtxMemoOp);
+    --g_memo_stats.streams;
+  }
+  if (!e.streams.empty()) {
+    --g_memo_stats.bufs;
+    e.streams.clear();
+  }
+}
+
+void CtxMemoRecordBegin(CtxWalker* w) {
+  if (g_memo_rec_busy) return;  // one at a time; caller nests never
+  g_memo_rec_busy = true;
+  g_memo_rec.clear();
+  w->rec = &g_memo_rec;
+}
+
+void CtxMemoRecordAbandon(CtxWalker* w) {
+  if (w->rec == &g_memo_rec) w->rec = nullptr;
+  g_memo_rec.clear();
+  g_memo_rec_busy = false;
+}
+
+bool CtxMemoRecordCommit(CtxWalker* w, uint32_t ptr, uint32_t dwords,
+                         uint64_t select, uint64_t mask) {
+  if (w->rec != &g_memo_rec) return true;
+  w->rec = nullptr;
+  g_memo_rec_busy = false;
+  bool clean = true;
+  const size_t add = g_memo_rec.size() * sizeof(CtxMemoOp);
+  if (g_memo_stats.bytes + add > kCtxMemoByteCap) {
+    CtxMemoClear();
+    ++g_memo_stats.evicts;
+    clean = false;
+  }
+  CtxMemoBufEntry& e = g_memo_store[ptr];
+  if (e.refused) {
+    g_memo_rec.clear();
+    return clean;
+  }
+  CtxMemoStream* slot = nullptr;
+  for (CtxMemoStream& s : e.streams) {
+    if (s.dwords == dwords && s.select == select && s.mask == mask) {
+      slot = &s;
+      break;
+    }
+  }
+  if (!slot) {
+    if (e.streams.size() >= kCtxMemoStreamsPerBuf) {
+      // Bin regime churn beyond any real tiling: start this buffer over.
+      for (CtxMemoStream& s : e.streams) {
+        g_memo_stats.bytes -= s.ops.capacity() * sizeof(CtxMemoOp);
+        --g_memo_stats.streams;
+      }
+      e.streams.clear();
+    }
+    if (e.streams.empty()) ++g_memo_stats.bufs;
+    e.streams.emplace_back();
+    slot = &e.streams.back();
+    ++g_memo_stats.streams;
+  } else {
+    g_memo_stats.bytes -= slot->ops.capacity() * sizeof(CtxMemoOp);
+  }
+  slot->select = select;
+  slot->mask = mask;
+  slot->dwords = dwords;
+  slot->ops = g_memo_rec;  // copy; scratch reused (shrinks alloc churn)
+  slot->ops.shrink_to_fit();
+  g_memo_stats.bytes += slot->ops.capacity() * sizeof(CtxMemoOp);
+  ++g_memo_stats.commits;
+  g_memo_rec.clear();
+  return clean;
+}
+
+bool CtxMemoRecordMatches(const CtxWalker* w, const CtxMemoStream* s,
+                          uint32_t* first_ne) {
+  if (w->rec != &g_memo_rec || !s) return false;
+  const size_t n = g_memo_rec.size() < s->ops.size() ? g_memo_rec.size()
+                                                     : s->ops.size();
+  for (size_t i = 0; i < n; ++i) {
+    if (std::memcmp(&g_memo_rec[i], &s->ops[i], sizeof(CtxMemoOp)) != 0) {
+      if (first_ne) *first_ne = uint32_t(i);
+      return false;
+    }
+  }
+  if (g_memo_rec.size() != s->ops.size()) {
+    if (first_ne) *first_ne = uint32_t(n);
+    return false;
+  }
+  return true;
+}
+
+void CtxMemoReplayBegin(CtxWalker* w, const CtxMemoStream* s) {
+  w->rep = s->ops.data();
+  w->rep_n = uint32_t(s->ops.size());
+  w->rep_i = 0;
+}
+
+void CtxMemoReplayEnd(CtxWalker* w) {
+  w->rep = nullptr;
+  w->rep_n = w->rep_i = 0;
+}
+
+uint32_t CtxMemoInvalidate(uint32_t ptr) {
+  auto it = g_memo_store.find(ptr);
+  if (it == g_memo_store.end()) return 0;
+  uint32_t n = uint32_t(it->second.streams.size());
+  for (CtxMemoStream& s : it->second.streams) {
+    g_memo_stats.bytes -= s.ops.capacity() * sizeof(CtxMemoOp);
+    --g_memo_stats.streams;
+  }
+  if (n) {
+    --g_memo_stats.bufs;
+    ++g_memo_stats.invals;
+  }
+  // Keep a refused mark; drop plain entries entirely.
+  if (it->second.refused) {
+    it->second.streams.clear();
+  } else {
+    g_memo_store.erase(it);
+  }
+  return n;
+}
+
+void CtxMemoClear() {
+  g_memo_store.clear();
+  g_memo_stats.bytes = 0;
+  g_memo_stats.bufs = 0;
+  g_memo_stats.streams = 0;
+}
+
+CtxMemoStats* CtxMemoStatsPtr() { return &g_memo_stats; }
 
 uint32_t WalkBufferContext(const uint8_t* raw, uint32_t dwords,
                            uint32_t buffer_phys, StateContext* ctx,

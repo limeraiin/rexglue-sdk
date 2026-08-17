@@ -301,6 +301,23 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, true, "GPU",
                     "city validation (naruto_364, pixel-perfect at 13M "
                     "draws).");
 
+// [NR-WM] Phase 5-4-8: the walk memo. A skip-driven buffer whose bytes are
+// identical to its previous compared execution (the ruse shadow compare, on
+// anyway under the fast path) replays the walker's recorded emission stream
+// -- bulk ranges, per-dword packets, shader loads, bin updates, draw and
+// delegate stops -- through the SAME apply callbacks instead of re-parsing
+// the PM4. Keyed per (buffer, entry bin state) so predicated tiles stay
+// exact; anything per-dword or stateful re-parses its one packet, so the
+// semantics cannot drift. Recording free-rides on a walk that happens anyway
+// (the economics the 5-4-7-2 span swap lacked). Under gpu_nr_verify the memo
+// is not consumed: each eligible execution records fresh and byte-compares
+// against the stored stream ([nr-wm] ne must stay 0).
+REXCVAR_DEFINE_BOOL(gpu_nr_walk_memo, false, "GPU",
+                    "[nr-wm] Phase 5-4-8: replay the walker's recorded "
+                    "decode stream on byte-identical buffer replays instead "
+                    "of re-parsing the PM4. Requires gpu_nr_skip + the reuse "
+                    "machinery. Default off until city-gated.");
+
 // [NR-RUSE] Phase 5-4-5 inc 0: the replay state-reuse pricing probe. Buffers
 // are recorded once and replayed many times (once per bin = 3x/frame, and
 // across frames); a draw whose full input state is byte-identical to its
@@ -1220,6 +1237,17 @@ uint64_t g_spp_buf_ns = 0;    // whole NrSkipExecuteBuffer
 uint64_t g_spp_draw_ns = 0;   // ExecutePacket at draw stops (incl. IssueDraw)
 uint64_t g_spp_deleg_ns = 0;  // ExecutePacket at delegated stops
 
+// [NR-WM] Phase 5-4-8: walk-memo master latch + window counters.
+bool g_nr_wm = false;
+uint64_t g_wm_rep = 0;     // buffers replayed from a memo stream
+uint64_t g_wm_rec = 0;     // buffers recorded (no stream for the key yet)
+uint64_t g_wm_cmp = 0;     // verify mode: parse + compare against the stream
+uint64_t g_wm_ne = 0;      // verify mode: stream mismatches (gate: 0)
+uint64_t g_wm_inval = 0;   // buffers invalidated (bytes changed)
+uint64_t g_wm_refuse = 0;  // buffers marked never-memo (nested IB in record)
+uint64_t g_wm_cap = 0;     // commits that hit the byte cap (store cleared)
+uint64_t g_wm_abort = 0;   // recordings dropped on an executor abort
+
 // [NR-PKT] Phase 5-4-1: the non-draw packet census. CP-thread-only. Counted
 // at the executor's own dispatch, AFTER its predicate skip, so the tallies
 // are execution truth (a predicated-out packet never runs and is not listed
@@ -1519,6 +1547,10 @@ constexpr size_t kRuseShadowCap = 128ull << 20;  // clear-all backstop
 uint64_t g_ruse_byref_h = 0;          // chain digest of by-ref payloads so far
 uint32_t g_ruse_first_diff = 0;       // first differing dword vs prev replay
 bool g_ruse_have_prev = false;        // prev replay comparable (size+entry ok)
+// [NR-WM] whole-buffer byte identity vs the previous COMPARED execution --
+// the walk memo's validity gate (the shadow updates only here, so identity
+// chains across executions exactly as the memo needs).
+bool g_ruse_bytes_ident = false;
 bool g_ruse_same_frame = false;
 bool g_ruse_entry_core_eq = false;    // all components eq (bin trio excluded)
 bool g_ruse_bin_ne = false;           // ONLY the bin trio differed
@@ -1989,6 +2021,7 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   ++g_ruse_w_bufs;
   g_ruse_byref_h = 0;
   g_ruse_have_prev = false;
+  g_ruse_bytes_ident = false;
   g_ruse_first_diff = 0;
   // v2 per-replay reset: only the regs actually marked are cleared (a full
   // 20KB memset per replay was measurable at city rates).
@@ -2045,6 +2078,7 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
     // reader).
     ++g_ruse_w_ep_clean;
     g_ruse_first_diff = count;
+    g_ruse_bytes_ident = true;
     const bool sf = b.last_swap == swap_now;
     if (sf) ++g_ruse_w_sf; else ++g_ruse_w_xf;
     g_ruse_same_frame = sf;
@@ -2091,6 +2125,7 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
       // Identical after a full compare: diff-free for the walk's readers
       // (same O(1) per-range no-op the epoch-clean path gets).
       g_ruse_diff_empty = true;
+      g_ruse_bytes_ident = true;
     }
     // [NR-RUSE-EP] verify-run soundness gate: a clean-predicted replay with
     // changed bytes would have been a stale skip. Must stay 0.
@@ -2692,6 +2727,15 @@ void CommandProcessor::WorkerThreadMain() {
   // cvar itself (fast-only runs pay just the v2 verdict).
   g_nr_ruse_v0 = REXCVAR_GET(gpu_nr_reuse_probe) && kNrSkip;
   g_nr_ruse = (g_nr_ruse_v0 || REXCVAR_GET(gpu_nr_reuse_fast)) && kNrSkip;
+  // [NR-WM] 5-4-8: the walk memo needs the skip (the walk is the only
+  // decoder) and the ruse byte compare (its validity gate). Rising edge
+  // clears the store: while the latch was off, byte changes went unobserved
+  // by the invalidator, so no stored stream survives the gap.
+  {
+    const bool wm = REXCVAR_GET(gpu_nr_walk_memo) && kNrSkip && g_nr_ruse;
+    if (wm && !g_nr_wm) nr::CtxMemoClear();
+    g_nr_wm = wm;
+  }
   // [NR-RUSE-EP] the unsound-at-city compare shortcut, deliberate opt-in.
   g_nr_ruse_ep = REXCVAR_GET(gpu_nr_ruse_epoch);
   // [NR-BFC] 5-4-6-0: the buffer-replay census needs the ruse machinery for
@@ -3494,6 +3538,21 @@ void CommandProcessor::WorkerThreadMain() {
           g_skp_exec_fail = g_skp_arm_orphan = 0;
           g_skp_rng = g_skp_rng_dw = g_skp_pdw = 0;
           for (uint32_t op = 0; op < 128; ++op) g_skp_deleg_op[op] = 0;
+        }
+        // [NR-WM] 5-4-8: the walk memo. Gate under verify: ne=0. Perf mode:
+        // rep is the coverage, fb (declined replayed ranges) must stay 0.
+        if (g_nr_wm && (g_wm_rep || g_wm_rec || g_wm_cmp || g_wm_inval ||
+                        g_wm_refuse || g_wm_ne)) {
+          nr::CtxMemoStats* ms = nr::CtxMemoStatsPtr();
+          REXGPU_INFO(
+              "[nr-wm] rep={} rec={} cmp={} ne={} inval={} refuse={} cap={} "
+              "abort={} fb={} | bufs={} streams={} {}KB",
+              g_wm_rep, g_wm_rec, g_wm_cmp, g_wm_ne, g_wm_inval, g_wm_refuse,
+              g_wm_cap, g_wm_abort, ms->fallbacks, ms->bufs, ms->streams,
+              ms->bytes >> 10);
+          ms->fallbacks = 0;
+          g_wm_rep = g_wm_rec = g_wm_cmp = g_wm_ne = 0;
+          g_wm_inval = g_wm_refuse = g_wm_cap = g_wm_abort = 0;
         }
         // [NR-RUSE] 5-4-5 inc 0. Line 1 = buffer replays: id/ch = byte
         // identical vs changed vs previous replay of the same buffer, sf/xf
@@ -4697,6 +4756,42 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     NrBfcBufReset();
     NrBfcBufBegin();
   }
+  // [NR-WM] 5-4-8: mode selection. Byte-identical to the previous compared
+  // execution + a stored stream for this entry bin state => replay (parse
+  // skipped); stored stream under verify => parse + compare (ne gate); no
+  // stream => record (free-rides on the parse). Changed bytes invalidate.
+  // The epoch shortcut is excluded outright: its "identical" is unsound at
+  // city (ep_ne 45%), and the memo must never trust it.
+  // NB: the walker's watch_fn (NrCtxWatch, installed unconditionally) is
+  // safe under the memo: every op that can fire it re-parses its packet
+  // through CtxWalkStep, which sets the packet context itself -- refusing on
+  // watch_fn here would (and once did) refuse every buffer vacuously.
+  bool wm_recording = false, wm_replaying = false, wm_compare = false;
+  const nr::CtxMemoStream* wm_stream = nullptr;
+  uint64_t wm_sel = 0, wm_msk = 0;
+  if (g_nr_wm && !g_nr_ruse_ep) {
+    const uint32_t bufkey = ptr & 0x1FFFFFFFu;
+    wm_sel = g_ctx_walker.bin.select;
+    wm_msk = g_ctx_walker.bin.mask;
+    if (!g_ruse_bytes_ident) {
+      if (nr::CtxMemoInvalidate(bufkey)) ++g_wm_inval;
+    } else {
+      wm_stream = nr::CtxMemoFind(bufkey, count, wm_sel, wm_msk);
+    }
+    if (wm_stream && !g_nr_verify_base) {
+      nr::CtxMemoReplayBegin(&g_ctx_walker, wm_stream);
+      wm_replaying = true;
+      ++g_wm_rep;
+    } else if (wm_stream) {
+      nr::CtxMemoRecordBegin(&g_ctx_walker);
+      wm_compare = wm_recording = g_ctx_walker.rec != nullptr;
+      if (wm_compare) ++g_wm_cmp;
+    } else if (!nr::CtxMemoRefused(bufkey)) {
+      nr::CtxMemoRecordBegin(&g_ctx_walker);
+      wm_recording = g_ctx_walker.rec != nullptr;
+      if (wm_recording) ++g_wm_rec;
+    }
+  }
   nr::CtxDrawStop stop;
   bool aborted = false;
   bool dsp_open = false;  // [NR-DSP] a draw's span bracket is open
@@ -4782,6 +4877,16 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     } else {
       ++g_skp_deleg;
       ++g_skp_deleg_op[stop.opcode & 0x7F];
+      // [NR-WM] a nested indirect buffer's content sits outside the byte
+      // gate and can steer bin state through its own SET_BIN packets: this
+      // buffer never gets a memo (measured zero among byte-identical city
+      // buffers, naruto_420 gate 1).
+      if (wm_recording && (stop.opcode & 0x7F) == PM4_INDIRECT_BUFFER) {
+        nr::CtxMemoRecordAbandon(&g_ctx_walker);
+        wm_recording = wm_compare = false;
+        nr::CtxMemoRefuse(ptr & 0x1FFFFFFFu);
+        ++g_wm_refuse;
+      }
       // [NR-BFC] delegate schedule census: what a buffer-level replay must
       // still run at its stops, and the refuse classes that disqualify a
       // buffer outright (register-writing delegates + XE_SWAP + WAIT on a
@@ -4907,6 +5012,33 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     }
   }
   if (aborted) g_ctx_walker.cursor = g_ctx_walker.dwords;
+  // [NR-WM] finalize: commit a clean recording, compare under verify (ne
+  // re-records so the store self-heals while naming the divergence), drop
+  // aborted recordings (a partially applied buffer must not be trusted).
+  if (wm_recording) {
+    if (aborted) {
+      nr::CtxMemoRecordAbandon(&g_ctx_walker);
+      ++g_wm_abort;
+    } else if (wm_compare) {
+      uint32_t first_ne = 0;
+      if (!nr::CtxMemoRecordMatches(&g_ctx_walker, wm_stream, &first_ne)) {
+        ++g_wm_ne;
+        if (g_wm_ne <= 3) {
+          REXGPU_WARN("[nr-wm] STREAM NE buf={:08X} op={} (re-recorded)",
+                      ptr, first_ne);
+        }
+        nr::CtxMemoRecordCommit(&g_ctx_walker, ptr & 0x1FFFFFFFu, count,
+                                wm_sel, wm_msk);
+      } else {
+        nr::CtxMemoRecordAbandon(&g_ctx_walker);
+      }
+    } else if (!nr::CtxMemoRecordCommit(&g_ctx_walker, ptr & 0x1FFFFFFFu,
+                                        count, wm_sel, wm_msk)) {
+      ++g_wm_cap;
+    }
+  } else if (wm_replaying) {
+    nr::CtxMemoReplayEnd(&g_ctx_walker);
+  }
   // [NR-BFC] fold BEFORE NrRuseBufEnd swaps the by-ref stream: the
   // whole-buffer byref compare must see cur vs prev, not cur vs itself.
   if (g_nr_bfc) NrBfcFold(this);

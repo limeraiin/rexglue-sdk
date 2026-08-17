@@ -11,6 +11,7 @@
 #define REX_GRAPHICS_NR_CONTEXT_H_
 
 #include <cstdint>
+#include <vector>
 
 // [NR-CTX] The RUNNING state context: native-renderer build-out increment 4a.
 //
@@ -313,6 +314,69 @@ struct CtxDrawStop {
                     // executor's own dispatch, then CtxWalkSkipDelegated.
 };
 
+// ---- [NR-WM] 5-4-8: the walk memo ------------------------------------------
+// A parsed walk records its emission stream; a later execution of the SAME
+// buffer bytes under the SAME entry bin state replays that stream through the
+// same callbacks, skipping the PM4 parse. Soundness: the decode is a pure
+// function of (buffer bytes, entry bin state); byte identity is the caller's
+// gate (the ruse shadow compare runs anyway under the skip), bin identity is
+// the store key (predicated tiles resolve per entry state, so one buffer gets
+// one stream per bin regime it executes under). Recording free-rides on a
+// walk that happens regardless -- the record-once/replay-many economics that
+// the 5-4-7-2 span swap lacked hold here by construction.
+//
+// Op inventory (deliberately small; anything per-dword or stateful re-parses
+// its ONE packet through CtxWalkStep so semantics can never drift):
+//   kCtxMemoRange    consumed inline bulk range: range_fn(base, raw+a*4, n)
+//   kCtxMemoRangeMem consumed by-ref bulk range: range_fn(base, null, n, a)
+//                    (a = phys addr; values re-read at replay, per
+//                    [[bindings-inline-constants-byref]])
+//   kCtxMemoPkt      re-parse the single packet at header dword a (per-dword
+//                    type-0/1, truncated/one-reg shapes, SET_CONSTANT
+//                    fallbacks, IM_LOAD*, SET_BIN*)
+//   kCtxMemoDraw     draw stop: re-parse at a (flags/draw_fn/payload/stop
+//                    exactly as the parsed walk)
+//   kCtxMemoDeleg    delegate stop at a (cursor positioned for the caller's
+//                    ExecutePacket dispatch)
+// `b` always holds the packet header dword, so any declined range replays by
+// re-parsing its own packet (counted, never silent).
+
+enum CtxMemoKind : uint8_t {
+  kCtxMemoRange = 1,
+  kCtxMemoRangeMem,
+  kCtxMemoPkt,
+  kCtxMemoDraw,
+  kCtxMemoDeleg,
+};
+
+struct CtxMemoOp {
+  uint8_t kind;
+  uint8_t pad;
+  uint16_t reg;  // range base register (range kinds); 0 otherwise
+  uint32_t n;    // range dword count (range kinds); 0 otherwise
+  uint32_t a;    // payload dword index / phys addr / header dword index
+  uint32_t b;    // header dword index (fallback re-parse anchor)
+};
+
+struct CtxMemoStream {
+  uint64_t select;  // entry bin state this stream was recorded under
+  uint64_t mask;
+  uint32_t dwords;  // buffer length the stream was recorded from
+  std::vector<CtxMemoOp> ops;
+};
+
+struct CtxMemoStats {
+  uint64_t commits;    // streams committed
+  uint64_t replaced;   // verify-mode re-records over a mismatching stream
+  uint64_t fallbacks;  // replayed ranges the consumer declined (re-parsed)
+  uint64_t evicts;     // whole-store clears at the byte cap
+  uint64_t invals;     // buffers dropped because their bytes changed
+  uint64_t refused;    // buffers marked never-memo (nested indirect buffer)
+  size_t bytes;        // op storage held
+  uint32_t bufs;       // buffers with at least one stream
+  uint32_t streams;    // total streams held
+};
+
 // Decoder state. Zero-initialize through CtxWalkBegin, never by hand.
 struct CtxWalker {
   const uint8_t* raw;
@@ -341,6 +405,13 @@ struct CtxWalker {
   uint32_t cursor;   // next dword to decode
   uint32_t nflags;   // flags words written so far
   uint32_t cur_dw, cur_hdr, cur_arg;  // packet being decoded, for watch_fn
+
+  // [NR-WM] 5-4-8 attachments. Zeroed by CtxWalkBegin; the caller attaches
+  // ONE of them afterwards (record via CtxMemoRecordBegin, replay via
+  // CtxMemoReplayBegin). Never both.
+  std::vector<CtxMemoOp>* rec;  // parse emissions append here
+  const CtxMemoOp* rep;         // replay stream (owned by the memo store)
+  uint32_t rep_n, rep_i;
 };
 
 // Same arguments as WalkBufferContext, which is now a wrapper over these three.
@@ -386,6 +457,41 @@ void CtxWalkSkipDelegated(CtxWalker* w);
 
 // Applies the rest of the buffer. Returns the total flags words written.
 uint32_t CtxWalkFinish(CtxWalker* w);
+
+// ---- [NR-WM] memo store + record/replay attachment -------------------------
+// All single-threaded on the CP thread, like the walker itself.
+
+// The stream recorded for {ptr, dwords, entry bin}, or nullptr. Valid only
+// while the caller has independently proven the buffer bytes identical to the
+// execution the stream was recorded from (the ruse shadow-compare chain).
+const CtxMemoStream* CtxMemoFind(uint32_t ptr, uint32_t dwords,
+                                 uint64_t select, uint64_t mask);
+// True when this buffer is marked never-memo (a nested indirect buffer was
+// seen during a record: its content is outside the byte-identity gate and can
+// steer bin state, so no stream from it can be trusted).
+bool CtxMemoRefused(uint32_t ptr);
+void CtxMemoRefuse(uint32_t ptr);
+// Attach the recording scratch to the walker (one recording at a time).
+void CtxMemoRecordBegin(CtxWalker* w);
+// Detach and discard the scratch.
+void CtxMemoRecordAbandon(CtxWalker* w);
+// Detach and store the scratch under {ptr, dwords, select, mask}, replacing
+// any prior stream for that key. False when the byte cap forced a whole-store
+// clear first (the stream is still stored after the clear).
+bool CtxMemoRecordCommit(CtxWalker* w, uint32_t ptr, uint32_t dwords,
+                         uint64_t select, uint64_t mask);
+// Verify mode: does the just-recorded scratch equal the stored stream?
+// Sets *first_ne to the first differing op index (or the shorter length).
+bool CtxMemoRecordMatches(const CtxWalker* w, const CtxMemoStream* s,
+                          uint32_t* first_ne);
+// Attach a stream for replay. CtxWalkNextStop / CtxWalkFinish then drive from
+// it instead of parsing.
+void CtxMemoReplayBegin(CtxWalker* w, const CtxMemoStream* s);
+void CtxMemoReplayEnd(CtxWalker* w);
+// Drop every stream for this buffer (its bytes changed). Returns how many.
+uint32_t CtxMemoInvalidate(uint32_t ptr);
+void CtxMemoClear();
+CtxMemoStats* CtxMemoStatsPtr();
 
 // [NR-RING] Increment 4b-0: the ring-side observer's apply. The 4a city
 // verdict proved exactly 4 recovery registers arrive OUTSIDE the depth-1 IB
