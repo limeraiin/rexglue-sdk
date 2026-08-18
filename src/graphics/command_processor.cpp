@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>  // [NR-ORC] oracle-dump directory creation
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -513,6 +514,22 @@ REXCVAR_DEFINE_STRING(gpu_nr_shaderdb_dump, "", "GPU",
                       "File for [nr-sdb] to write the raw ucode of every "
                       "distinct shader MISSING from the database, so its "
                       "real source can be found offline. Empty disables.");
+
+// [NR-ORC] N-1 template-capture oracle dump. A capture run pairs this with
+// the game-side nr_tcap record dump; tools/nr-template-analyze.py joins the
+// two offline by packet address and iterates the record->decode translation
+// model with no further live runs. A private walker decodes each depth-1
+// indirect buffer to the file BEFORE any live mode touches it, so the dump is
+// independent of skip/ruse/memo and changes no behavior. Capture-only cost.
+REXCVAR_DEFINE_BOOL(gpu_nr_oracle_dump, false, "GPU",
+                    "DEV [nr-orc]: dump every executed depth-1 indirect "
+                    "buffer's decoded stream (register writes, shader loads, "
+                    "draw and delegate stops, raw bytes on change) to "
+                    "gpu_nr_oracle_path. Pair with the game's nr_tcap. Off by "
+                    "default.");
+
+REXCVAR_DEFINE_STRING(gpu_nr_oracle_path, "D:\\nr-capture\\oracle.bin", "GPU",
+                      "Output file for the [nr-orc] oracle dump.");
 
 REXCVAR_DEFINE_BOOL(gpu_rb_incremental_readptr, false, "GPU",
                     "Write the ring-buffer read pointer back to the guest incrementally "
@@ -1054,6 +1071,196 @@ uint32_t CtxMemRead(void* user, uint32_t phys) {
   auto* mem = static_cast<memory::Memory*>(user);
   return __builtin_bswap32(
       *reinterpret_cast<const uint32_t*>(mem->TranslatePhysical(phys)));
+}
+
+// ---- [NR-ORC] N-1 template-capture oracle dump ------------------------------
+// The consumer half of the N-1 capture (record half: the game's nr_tcap).
+// A PRIVATE walker decodes each executed depth-1 indirect buffer into a flat
+// binary stream: every register write per-dword (no range_fn, so constants
+// arrive as individual writes), the vs/ps refs after each shader load, every
+// draw and delegate stop with its dword index (packet address = ptr + dword*4,
+// the join key against nr_tcap's located DRAW headers), and the raw buffer
+// bytes whenever their hash changes. Nothing here touches the live walker,
+// g_ctx_state, or any mode latch: the dump is observation-only and runs
+// before them. CP-thread only, plain fwrite on a large stdio buffer -- this
+// is a capture-run cost, not a play-mode path.
+
+bool g_nr_orc = false;
+FILE* g_orc_file = nullptr;
+bool g_orc_failed = false;
+nr::StateContext g_orc_ctx;  // private mirror; never the live g_ctx_state
+uint64_t g_orc_bufs = 0, g_orc_regs = 0, g_orc_draws = 0, g_orc_delegs = 0;
+uint64_t g_orc_bytes_dumped = 0, g_orc_nested = 0;
+
+constexpr uint32_t kOrcTagBufBegin = 0xB1000001;
+constexpr uint32_t kOrcTagReg = 0xB1000002;
+constexpr uint32_t kOrcTagShader = 0xB1000003;
+constexpr uint32_t kOrcTagDraw = 0xB1000004;
+constexpr uint32_t kOrcTagDeleg = 0xB1000005;
+constexpr uint32_t kOrcTagBufEnd = 0xB1000006;
+constexpr uint32_t kOrcTagRange = 0xB1000007;
+constexpr uint32_t kOrcFileMagic = 0x4E4F4331;  // "NOC1"
+
+// Per-buffer byte hashes: raw bytes ride the dump only when they changed.
+constexpr uint32_t kOrcHashSlots = 8192;  // open addressing; ptr==0 empty
+struct OrcHashEntry {
+  uint32_t ptr;
+  uint64_t h;
+};
+OrcHashEntry g_orc_hash[kOrcHashSlots] = {};
+
+inline void OrcWrite(const void* p, size_t n) { fwrite(p, 1, n, g_orc_file); }
+
+void OrcRegWrite(void*, uint32_t reg, uint32_t value, bool from_memory) {
+  const uint32_t rec[4] = {kOrcTagReg, reg, value, from_memory ? 1u : 0u};
+  OrcWrite(rec, sizeof(rec));
+  ++g_orc_regs;
+}
+
+// Bulk ranges are consumed as ranges so the dump keeps their POSITION: for an
+// inline range, `phys` is the payload's physical address inside the buffer,
+// which is what segments a draw group against nr_tcap's recorder spans. The
+// values are normalized to host order (inline payloads arrive big-endian; a
+// by-ref range is read through CtxMemRead, which already swaps). REG records
+// keep covering whatever the walker does not offer in bulk (mirrored-slot
+// ranges, one-reg and truncated shapes), exactly the walker's own split.
+bool OrcRegRange(void* user, uint32_t base, const uint32_t* values_be,
+                 uint32_t n, uint32_t phys, bool from_memory) {
+  uint32_t rec[6] = {kOrcTagRange, base, n, phys, from_memory ? 1u : 0u, 0};
+  OrcWrite(rec, sizeof(rec));
+  uint32_t chunk[256];
+  uint32_t done = 0;
+  while (done < n) {
+    const uint32_t m = std::min(n - done, 256u);
+    for (uint32_t i = 0; i < m; ++i) {
+      chunk[i] = values_be
+                     ? __builtin_bswap32(values_be[done + i])
+                     : CtxMemRead(user, phys + (done + i) * 4);
+    }
+    OrcWrite(chunk, m * 4);
+    done += m;
+  }
+  g_orc_regs += n;
+  return true;
+}
+
+void OrcShaderSeen(void*, const nr::ShaderRef&) {
+  // ShaderRef does not carry the stage; the walker has already updated the
+  // private context, so dump BOTH current refs and let the analyzer diff.
+  const nr::ShaderRef& vs = g_orc_ctx.vs;
+  const nr::ShaderRef& ps = g_orc_ctx.ps;
+  const uint32_t rec[7] = {kOrcTagShader,
+                           vs.addr,
+                           vs.size_dwords,
+                           uint32_t(vs.immediate) | (uint32_t(vs.valid) << 8),
+                           ps.addr,
+                           ps.size_dwords,
+                           uint32_t(ps.immediate) | (uint32_t(ps.valid) << 8)};
+  OrcWrite(rec, sizeof(rec));
+}
+
+void NrOracleOpen() {
+  if (g_orc_file || g_orc_failed) return;
+  const std::string path = REXCVAR_GET(gpu_nr_oracle_path);
+  std::error_code ec;
+  const auto parent = std::filesystem::path(path).parent_path();
+  if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+  g_orc_file = fopen(path.c_str(), "wb");
+  if (!g_orc_file) {
+    g_orc_failed = true;
+    REXGPU_INFO("[nr-orc] DISARMED: cannot open {}", path);
+    return;
+  }
+  setvbuf(g_orc_file, nullptr, _IOFBF, 4 << 20);
+  const uint32_t hdr[4] = {kOrcFileMagic, 1 /*version*/, 0, 0};
+  OrcWrite(hdr, sizeof(hdr));
+  REXGPU_INFO("[nr-orc] ON -> {}", path);
+}
+
+void NrOracleDumpBuffer(const uint8_t* raw, uint32_t ptr, uint32_t count,
+                        uint64_t bin_select, uint64_t bin_mask, uint32_t swap,
+                        memory::Memory* mem) {
+  if (!g_orc_file) return;
+  ++g_orc_bufs;
+
+  // FNV-1a over the buffer dwords: cheap, and only gates raw-byte inclusion.
+  uint64_t h = 1469598103934665603ull;
+  const size_t nbytes = size_t(count) * 4;
+  for (size_t i = 0; i < nbytes; ++i) {
+    h = (h ^ raw[i]) * 1099511628211ull;
+  }
+  bool dump_bytes = true;
+  {
+    uint32_t s = (ptr >> 2) * 2654435761u % kOrcHashSlots;
+    for (uint32_t probe = 0; probe < kOrcHashSlots; ++probe) {
+      OrcHashEntry& e = g_orc_hash[(s + probe) % kOrcHashSlots];
+      if (e.ptr == ptr) {
+        dump_bytes = e.h != h;
+        e.h = h;
+        break;
+      }
+      if (!e.ptr) {
+        e.ptr = ptr;
+        e.h = h;
+        break;
+      }
+    }
+  }
+
+  const uint32_t bb[12] = {kOrcTagBufBegin,
+                           ptr,
+                           count,
+                           uint32_t(bin_select),
+                           uint32_t(bin_select >> 32),
+                           uint32_t(bin_mask),
+                           uint32_t(bin_mask >> 32),
+                           swap,
+                           uint32_t(h),
+                           uint32_t(h >> 32),
+                           dump_bytes ? 1u : 0u,
+                           0};
+  OrcWrite(bb, sizeof(bb));
+  if (dump_bytes) {
+    OrcWrite(raw, nbytes);
+    g_orc_bytes_dumped += nbytes;
+  }
+
+  static uint16_t orc_flags[4096];
+  nr::CtxWalkStats st;
+  nr::CtxWalker w;
+  nr::CtxWalkBegin(&w, raw, count, ptr, &g_orc_ctx, orc_flags, 4096, &st,
+                   CtxMemRead, mem, OrcShaderSeen, nullptr, nullptr, nullptr,
+                   bin_select, bin_mask, OrcRegWrite, nullptr, nullptr,
+                   nullptr);
+  // Ranges as ranges: keeps the payload position in the dump (see OrcRegRange).
+  w.range_fn = OrcRegRange;
+  w.range_user = mem;
+  nr::CtxDrawStop stop;
+  while (nr::CtxWalkNextStop(&w, &stop)) {
+    if (stop.delegate) {
+      const uint32_t rec[3] = {kOrcTagDeleg, stop.opcode, stop.dword};
+      OrcWrite(rec, sizeof(rec));
+      ++g_orc_delegs;
+      // A nested indirect buffer is recorded as a stop but NOT entered: its
+      // content is outside this buffer's bytes and outside the N-1 class.
+      if ((stop.opcode & 0x7F) == 0x3F) ++g_orc_nested;
+      nr::CtxWalkSkipDelegated(&w);
+    } else {
+      const uint32_t rec[5] = {kOrcTagDraw, stop.opcode, stop.dword, stop.flags,
+                               stop.index};
+      OrcWrite(rec, sizeof(rec));
+      ++g_orc_draws;
+    }
+  }
+  const uint32_t be[2] = {kOrcTagBufEnd, 0};
+  OrcWrite(be, sizeof(be));
+
+  if ((g_orc_bufs & 0xFFF) == 0) {
+    REXGPU_INFO(
+        "[nr-orc] bufs={} draws={} delegs={} regs={} raw={}MB nested={}",
+        g_orc_bufs, g_orc_draws, g_orc_delegs, g_orc_regs,
+        g_orc_bytes_dumped >> 20, g_orc_nested);
+  }
 }
 
 // [NR-RING] Called from CommandProcessor::WriteRegister (CP thread, same as
@@ -2793,6 +3000,10 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-PKT] 5-4-1: executor-side census, independent of the walk.
   const bool kNrPkt = REXCVAR_GET(gpu_nr_pkt_census);
   g_nr_pkt = kNrPkt;
+  // [NR-ORC] N-1 oracle dump: independent of every mode (private walker,
+  // observation only). Opens the file here, on the thread that writes it.
+  g_nr_orc = REXCVAR_GET(gpu_nr_oracle_dump);
+  if (g_nr_orc) NrOracleOpen();
   // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
   const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue || kNrWalkFx;
   g_nr_draw = kNrDraw;
@@ -4254,6 +4465,14 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   if (g_pm4_census) { ++g_pm4_ib_count; g_pm4_ib_dwords += count; }
   // [NR-PKT] 5-4-1: open the per-execution census record for depth-1 buffers.
   if (g_nr_pkt && g_pm4_ib_depth == 1) NrPktBufBegin();
+
+  // [NR-ORC] N-1: dump this buffer's decoded stream through a private walker
+  // BEFORE any live mode reads it. Depth-1 only: a nested buffer appears in
+  // its parent's dump as a delegate stop and is out of the N-1 class.
+  if (g_nr_orc && g_pm4_ib_depth == 1) {
+    NrOracleDumpBuffer(memory_->TranslatePhysical(ptr), ptr, count, bin_select_,
+                       bin_mask_, swap_counter(), memory_);
+  }
 
   // [NR-SKP] 5-4-2: set inside the [NR-CTX] depth-1 branch below when this
   // buffer execution runs walk-only; consumed where the executor loop would
