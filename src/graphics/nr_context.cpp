@@ -554,9 +554,60 @@ bool g_memo_rec_busy = false;
 // buffer (delegated ExecutePacket failure): nothing further applies, matching
 // the parsed path's abort semantics.
 bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
+  const bool deleg = w->rep_stops != 0;
+  const uint32_t stream_end = w->rep_end ? w->rep_end : w->dwords;
   while (w->rep_i < w->rep_n) {
-    if (w->cursor >= w->dwords) return false;
-    const CtxMemoOp& op = w->rep[w->rep_i++];
+    if (w->cursor >= stream_end) return false;
+    const CtxMemoOp& op = w->rep[w->rep_i];
+    const bool scan = op.kind == kCtxMemoScan;
+    // Where this op expects the cursor to be. In sync, every op leaves the
+    // cursor exactly on the next op's anchor -- that invariant IS the framing
+    // check, and it costs one compare per op.
+    const uint32_t anchor = scan ? op.a : op.b;
+    const uint32_t wend =
+        scan ? ((op.a + op.n < w->dwords) ? op.a + op.n : w->dwords) : anchor;
+    // [NR-TMPL] N-2 rung 1: FRAMING RESYNC. The in-place finalize can change
+    // a span's framing, not just its values: a packet nop'd out leaves the
+    // live parse SHORT of the next op, and a finalize longer than the
+    // placeholder run it replaced leaves it PAST one. Neither may silently
+    // skip or double-decode dwords -- the walk is the oracle. Behind: parse
+    // live until the cursor reaches the anchor (the walker's own decode, so
+    // the catch-up is bit-identical to a full parse). Ahead: drop the ops the
+    // live framing already covered. Both resync at the very next op, so one
+    // drifted packet costs its own neighbourhood, never the rest of the span.
+    if (w->cursor > anchor && !(scan && w->cursor < wend)) {
+      ++w->rep_i;
+      ++w->stats->rep_ahead;
+      continue;
+    }
+    if (w->cursor < anchor) {
+      while (w->cursor < anchor) {
+        ++w->stats->rep_catchup;
+        if (CtxWalkStep(w, stop, deleg) && stop) return true;
+      }
+      continue;  // re-evaluate this op against the resynced cursor
+    }
+    // A live-scan window is RE-ENTRANT -- peeked, not consumed, until its
+    // dwords are exhausted, so a stop inside the window resumes in the window
+    // instead of skipping the rest of it. The window is the finalize class's
+    // home: dwords that were placeholders when the template was built and may
+    // be real packets now. Still-placeholder dwords are skipped by the same
+    // rules CtxWalkStep applies, without the call.
+    if (scan) {
+      while (w->cursor < wend) {
+        const uint32_t h = BE32(w->raw, w->cursor);
+        if (!h || (h >> 30) == 2) {
+          ++w->cursor;
+          continue;
+        }
+        ++w->stats->scan_pkts;
+        if (CtxWalkStep(w, stop, deleg) && stop) return true;
+      }
+      if (w->cursor > wend) ++w->stats->scan_over;
+      ++w->rep_i;
+      continue;
+    }
+    ++w->rep_i;
     // [NR-TMPL] Refresh the packet context for the range kinds (the re-parse
     // kinds set it through CtxWalkStep): range_fn consumers that read
     // cur_dw/cur_hdr (the N-2 template compare tags emissions by packet)
@@ -566,19 +617,27 @@ bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
       w->cur_hdr = BE32(w->raw, op.b);
       w->cur_arg = (op.b + 1 < w->dwords) ? BE32(w->raw, op.b + 1) : 0;
     }
+    // [NR-TMPL] Both range kinds consume their whole packet without a
+    // re-parse, so they must advance the cursor themselves: the framing
+    // resync above reads the cursor as the walk's position, and until rung 1
+    // nothing did (the ops carry absolute positions, so a stale cursor was
+    // invisible). Type-0 and type-3 share the count encoding, and the header
+    // is read LIVE, so the length is the live framing's, not the record's.
+    const uint32_t pkt_end = op.b + 2 + ((BE32(w->raw, op.b) >> 16) & 0x3FFF);
     switch (op.kind) {
       case kCtxMemoRange:
         if (w->range_fn &&
             w->range_fn(w->range_user, op.reg,
                         (const uint32_t*)(w->raw + size_t(op.a) * 4), op.n,
                         w->buffer_phys + op.a * 4, /*from_memory=*/false)) {
+          w->cursor = pkt_end;
           break;
         }
         // Consumer declined what it consumed at record time (config drift):
         // re-parse the packet itself, bit-identically to the parsed walk.
         ++g_memo_stats.fallbacks;
         w->cursor = op.b;
-        CtxWalkStep(w, nullptr);
+        if (CtxWalkStep(w, stop, deleg) && stop) return true;
         break;
       case kCtxMemoRangeMem:
         // By-ref values are re-read from guest memory at replay, exactly as
@@ -587,19 +646,26 @@ bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
             w->range_fn(w->range_user, op.reg, nullptr, op.n, op.a,
                         /*from_memory=*/true)) {
           w->stats->mem_loads += op.n;
+          w->cursor = pkt_end;
           break;
         }
         ++g_memo_stats.fallbacks;
         w->cursor = op.b;
-        CtxWalkStep(w, nullptr);
+        if (CtxWalkStep(w, stop, deleg) && stop) return true;
         break;
       case kCtxMemoPkt:
         w->cursor = op.a;
-        CtxWalkStep(w, nullptr);
+        // [NR-TMPL] Every re-parse gets the caller's stop and delegate rules,
+        // not a bare apply: under the in-place finalize the packet recorded
+        // here can BE a draw or a delegate today (a register write patched
+        // into a DRAW_INDX is a measured class), and applying it silently
+        // would swallow the stop the live walk surfaces. Byte-identical
+        // replay never reaches this -- a pkt op decoded neither at record.
+        if (CtxWalkStep(w, stop, deleg) && stop) return true;
         break;
       case kCtxMemoDraw: {
         w->cursor = op.a;
-        const bool got = CtxWalkStep(w, stop);
+        const bool got = CtxWalkStep(w, stop, deleg);
         // [NR-TMPL] Under the memo's bin-identical contract a recorded draw
         // always executes at replay, so `got` used to be returned directly.
         // The N-2 template replay drives these ops under a DIFFERENT bin
@@ -625,7 +691,15 @@ bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
         break;
     }
   }
-  w->cursor = w->dwords;
+  // [NR-TMPL] Ops exhausted with buffer left: in sync that is only the
+  // trailing no-ops (every packet has an op, every no-op run has a window),
+  // but under drift it can be real packets. Parse them rather than jumping
+  // the cursor to the end -- dropping live packets is exactly the silent
+  // divergence this whole gate exists to catch.
+  while (w->cursor < stream_end) {
+    ++w->stats->rep_catchup;
+    if (CtxWalkStep(w, stop, deleg) && stop) return true;
+  }
   return false;
 }
 
@@ -667,7 +741,10 @@ void CtxWalkBegin(CtxWalker* w, const uint8_t* raw, uint32_t dwords,
 }
 
 bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop) {
-  if (w->rep) return CtxMemoNext(w, stop);
+  if (w->rep) {
+    w->rep_stops = 0;
+    return CtxMemoNext(w, stop);
+  }
   while (w->cursor < w->dwords) {
     if (CtxWalkStep(w, stop)) return true;
   }
@@ -677,7 +754,10 @@ bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop) {
 bool CtxWalkNextStop(CtxWalker* w, CtxDrawStop* stop) {
   // [NR-WM] a replay attachment drives from the recorded stream instead of
   // parsing; the callbacks fire identically from either path.
-  if (w->rep) return CtxMemoNext(w, stop);
+  if (w->rep) {
+    w->rep_stops = 1;
+    return CtxMemoNext(w, stop);
+  }
   while (w->cursor < w->dwords) {
     if (CtxWalkStep(w, stop, /*delegate_stops=*/true)) return true;
   }

@@ -4500,25 +4500,49 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     nr::TmplStats* ts = nr::TmplStatsPtr();
     if (ts->bufs && (ts->bufs & 0x7FF) == 0) {
       REXGPU_INFO(
-          "[nr-tmpl] bufs={} (abort={}) spans hit={} eq={} ne={} stale={} "
-          "(hdrEq={} hdrNe={}) cross={} cover={}/{}dw gapPkts={} emi eq={} "
-          "ne={} (reg={} rng={} sh={} stop={} aExtra={} bExtra={} aUncov={}) "
-          "lkStale={} | feed={} built={} rebuilt={} same={} rej={} pfail={} "
-          "wraps={} evict={}",
-          ts->bufs, ts->bufs_aborted, ts->spans_hit, ts->spans_eq,
-          ts->spans_ne, ts->spans_stale, ts->stale_hdr_eq, ts->stale_hdr_ne,
-          ts->spans_cross, ts->dwords_covered,
+          "[nr-tmpl] bufs={} (abort={} big={}) spans hit={} eq={} ne={} "
+          "stale={} (eq={} ne={} dead={} hdrEq={} hdrNe={}) cross={} "
+          "cover={}/{}dw gapPkts={} emi eq={} ne={} (reg={} rng={} sh={} "
+          "stop={} byref={} aExtra={} bExtra={} aUncov={}) lkStale={} | "
+          "feed={} built={} rebuilt={} same={} rej={} pfail={} wraps={} "
+          "evict={}",
+          ts->bufs, ts->bufs_aborted, ts->bufs_toobig, ts->spans_hit,
+          ts->spans_eq, ts->spans_ne, ts->spans_stale, ts->spans_stale_eq,
+          ts->spans_stale_ne, ts->spans_dead, ts->stale_hdr_eq,
+          ts->stale_hdr_ne, ts->spans_cross, ts->dwords_covered,
           ts->dwords_covered + ts->dwords_gap, ts->gap_pkts, ts->emi_eq,
           ts->emi_ne, ts->emi_ne_reg, ts->emi_ne_range, ts->emi_ne_shader,
-          ts->emi_ne_stop, ts->a_extra, ts->b_extra, ts->a_uncovered,
-          ts->lookup_stale, ts->feed, ts->built, ts->rebuilt, ts->unchanged,
-          ts->feed_reject, ts->parse_fail, ts->arena_wraps, ts->slot_evict);
+          ts->emi_ne_stop, ts->emi_ne_byref, ts->a_extra, ts->b_extra,
+          ts->a_uncovered, ts->lookup_stale, ts->feed, ts->built,
+          ts->rebuilt, ts->unchanged, ts->feed_reject, ts->parse_fail,
+          ts->arena_wraps, ts->slot_evict);
+      // [NR-TMPL] rung 1: the finalize class, from both sides -- what the
+      // template recorded as placeholder windows, what those windows decoded
+      // to at replay, and what the in-place patches did to the ops -- plus
+      // the producer's mid-execution writes into the buffer we just compared.
+      REXGPU_INFO(
+          "[nr-tmpl] finalize: scanOps={} scanDw={} scanPkts={} scanOver={} "
+          "opDrift={} (rangeDemoted={}) resync catchup={} ahead={} "
+          "spanOver={} | neBy scan={} ahead={} catchup={} over={} plain={} | "
+          "mutBufs={} mutDw={}",
+          ts->scan_ops, ts->scan_dw, ts->scan_pkts, ts->scan_over,
+          ts->op_drift, ts->op_drift_range, ts->rep_catchup, ts->rep_ahead,
+          ts->span_overrun, ts->ne_scan, ts->ne_ahead, ts->ne_catchup,
+          ts->ne_over, ts->ne_plain, ts->bufs_mutated, ts->mut_dwords);
+      if (ts->mu_armed) {
+        REXGPU_INFO(
+            "[nr-tmpl] first-mutation: dw{} snapshot=0x{:08X} live=0x{:08X}",
+            ts->mu_dw, ts->mu_before, ts->mu_after);
+        ts->mu_armed = 0;
+      }
       if (ts->ne_armed) {
         REXGPU_INFO(
-            "[nr-tmpl] first-ne: kind={} dw={} span=0x{:08X} live "
-            "reg=0x{:04X} val=0x{:08X} tmpl reg=0x{:04X} val=0x{:08X}",
-            ts->ne_kind, ts->ne_dw, ts->ne_key, ts->ne_a_reg, ts->ne_a_val,
-            ts->ne_b_reg, ts->ne_b_val);
+            "[nr-tmpl] first-ne: span=0x{:08X} tmpl kind={} dw={} "
+            "reg=0x{:04X} val=0x{:08X} | live kind={} dw={} reg=0x{:04X} "
+            "val=0x{:08X} | hdr live=0x{:08X} stored=0x{:08X}",
+            ts->ne_key, ts->ne_kind, ts->ne_dw, ts->ne_b_reg, ts->ne_b_val,
+            ts->ne_a_kind, ts->ne_a_dw, ts->ne_a_reg, ts->ne_a_val,
+            ts->ne_hdr_live, ts->ne_hdr_stored);
         ts->ne_armed = 0;  // re-arm: one named mismatch per report window
       }
       if (ts->st_armed) {

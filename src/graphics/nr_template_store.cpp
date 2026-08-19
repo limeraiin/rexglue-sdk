@@ -88,6 +88,7 @@ inline uint32_t LoadBE32(const uint8_t* base, uint32_t at) {
 // ---- Build side (guest producer thread) -------------------------------------
 
 std::vector<CtxMemoOp> g_build_ops;  // capacity reserved at init, never grows
+std::vector<CtxMemoOp> g_build_ops2;  // ...and the scan-merged stream
 StateContext g_build_ctx = {};       // scratch: ops do not depend on it
 CtxWalkStats g_build_stats;
 
@@ -126,6 +127,46 @@ bool FrameSpan(const uint8_t* base, uint32_t entry, uint32_t end,
   return false;
 }
 
+// [NR-TMPL] N-2 rung 1 item 2 -- the FINALIZE CLASS.
+// Rung 0 measured that the recorder finalizes buffers IN PLACE at kick time,
+// pointer-neutrally: placeholder no-op dwords become SET_BIN / WAIT_REG_MEM /
+// EVENT_WRITE / bin-window packets, real packets are nop'd back out, and
+// constant payloads are patched -- all invisible to a pointer-moving record
+// hook, and the dominant cause of stale templates (264k of 396k stale spans
+// at menu, 1.07M of 1.30M at city). The answer is not to store those bytes
+// but to record where they LIVE: every run of top-level no-op dwords becomes
+// a kCtxMemoScan window in stream position, and the replay parses that window
+// from the live buffer. Constant patches need nothing extra -- the replay
+// reads values from the live bytes at the recorded positions.
+// Framing here is the WALKER's, identical to FrameSpan's, so the merge
+// positions cannot drift from the op stream's anchors.
+uint32_t MergeScanOps(const uint8_t* raw, uint32_t ndwords,
+                      const std::vector<CtxMemoOp>& in,
+                      std::vector<CtxMemoOp>* out, uint32_t* scan_dw) {
+  out->clear();
+  size_t k = 0;
+  uint32_t j = 0, nscan = 0;
+  while (j < ndwords) {
+    const uint32_t h = LoadBE32(raw, j * 4);
+    if (!h || (h >> 30) == 2) {
+      const uint32_t run = j;
+      while (j < ndwords) {
+        const uint32_t g = LoadBE32(raw, j * 4);
+        if (g && (g >> 30) != 2) break;
+        ++j;
+      }
+      while (k < in.size() && in[k].b < run) out->push_back(in[k++]);
+      out->push_back({kCtxMemoScan, 0, 0, j - run, run, run});
+      *scan_dw += j - run;
+      ++nscan;
+      continue;
+    }
+    j += ((h >> 30) == 1) ? 3 : (2 + ((h >> 16) & 0x3FFF));
+  }
+  while (k < in.size()) out->push_back(in[k++]);
+  return nscan;
+}
+
 // Predicated packets must stay packet-ops (kCtxMemoPkt) so predication
 // resolves against the bin state in effect at REPLAY; only unpredicated
 // packets become range ops. The same rule runs in both compare passes so the
@@ -159,6 +200,7 @@ extern "C" bool rex_nr_tmpl_active() {
       g_arena = static_cast<uint8_t*>(std::malloc(kArenaBytes));
       if (g_arena) {
         g_build_ops.reserve(kBuildOpCap);
+        g_build_ops2.reserve(kBuildOpCap);
         g_active = true;
       }
     }
@@ -239,14 +281,29 @@ extern "C" void rex_nr_tmpl_span(uint32_t entry_va, uint32_t end_va,
   while (CtxWalkNextStop(&w, &st)) {
     if (st.delegate) CtxWalkSkipDelegated(&w);
   }
-  if (w.cursor != ndwords || g_build_ops.size() > kBuildOpCap) {
-    // Framing guaranteed the landing, so neither should happen; counted so a
+  if (w.cursor != ndwords) {
+    // Framing guaranteed the landing, so this should not happen; counted so a
     // violation can never hide.
-    ++(w.cursor != ndwords ? s.parse_fail : s.ops_overflow);
+    ++s.parse_fail;
+    return;
+  }
+  // [NR-TMPL] rung 1: fold the placeholder runs in as live-scan windows.
+  // One op per no-op RUN and one per packet, so the merged stream is still
+  // bounded by the span's dword count.
+  {
+    uint32_t scan_dw = 0;
+    const uint32_t nscan =
+        MergeScanOps(base + start, ndwords, g_build_ops, &g_build_ops2,
+                     &scan_dw);
+    s.scan_ops += nscan;
+    s.scan_dw += scan_dw;
+  }
+  if (g_build_ops2.size() > kBuildOpCap) {
+    ++s.ops_overflow;
     return;
   }
 
-  const uint32_t nops = uint32_t(g_build_ops.size());
+  const uint32_t nops = uint32_t(g_build_ops2.size());
   const uint32_t ops_bytes = nops * uint32_t(sizeof(CtxMemoOp));
   const uint32_t need = kBlobHdr + ops_bytes + ndwords * 4;
   if (g_cursor + need > kArenaBytes) {
@@ -263,7 +320,7 @@ extern "C" void rex_nr_tmpl_span(uint32_t entry_va, uint32_t end_va,
   uint8_t* blob = g_arena + off;
   const uint32_t hdr3[3] = {key, ndwords, nops};
   std::memcpy(blob, hdr3, kBlobHdr);
-  if (ops_bytes) std::memcpy(blob + kBlobHdr, g_build_ops.data(), ops_bytes);
+  if (ops_bytes) std::memcpy(blob + kBlobHdr, g_build_ops2.data(), ops_bytes);
   std::memcpy(blob + kBlobHdr + ops_bytes, base + start, size_t(ndwords) * 4);
   g_cursor += (need + 15u) & ~15u;
 
@@ -287,9 +344,17 @@ namespace {
 struct TmplView {
   uint32_t ndwords;
   uint32_t nops;
-  const CtxMemoOp* ops;
+  CtxMemoOp* ops;  // in CP-thread scratch: the drift pre-pass rewrites ops
   const uint8_t* bytes;
 };
+
+// [NR-TMPL] rung 1 item 1: the buffer snapshot. Both compare passes read it,
+// so a producer write landing between pass A's walk and pass B's replay can
+// no longer masquerade as a decode mismatch (rung 0's city residual, 0.0054%,
+// read exactly like that). The mutation itself is then measured directly, by
+// re-comparing the live buffer against the snapshot when the compare is done.
+constexpr size_t kMaxSnapBytes = 64u << 20;
+std::vector<uint8_t> g_snap;
 
 uint8_t g_view_scratch[kBlobHdr + kBuildOpCap * sizeof(CtxMemoOp) +
                        kMaxSpanBytes];
@@ -324,7 +389,7 @@ bool Lookup(uint32_t key, TmplView* v, Slot** out_slot) {
     }
     v->ndwords = nd;
     v->nops = no;
-    v->ops = reinterpret_cast<const CtxMemoOp*>(g_view_scratch + kBlobHdr);
+    v->ops = reinterpret_cast<CtxMemoOp*>(g_view_scratch + kBlobHdr);
     v->bytes = g_view_scratch + kBlobHdr + no * sizeof(CtxMemoOp);
     *out_slot = &c;
     return true;
@@ -404,6 +469,11 @@ void AShader(void*, const ShaderRef& ref) {
 
 // ---- Pass B: replay templates, comparing in-stream --------------------------
 
+// This span's bytes, for the first-ne read-out only.
+const uint8_t* g_span_live = nullptr;
+const uint8_t* g_span_stored = nullptr;
+uint32_t g_span_nd = 0;
+
 CtxWalker g_wb;
 StateContext g_ctx_b;  // persistent, fed by replayed spans only
 CtxWalkStats g_stats_b;
@@ -414,7 +484,8 @@ uint32_t g_span_key = 0;
 uint32_t g_span_ne = 0;
 
 void NoteNe(uint8_t kind, uint32_t dw, uint32_t a_reg, uint32_t a_val,
-            uint32_t b_reg, uint32_t b_val) {
+            uint32_t b_reg, uint32_t b_val, uint8_t a_kind = 0,
+            uint32_t a_dw = 0) {
   TmplStats& s = g_stats;
   switch (kind) {
     case kEmiReg: ++s.emi_ne_reg; break;
@@ -431,6 +502,15 @@ void NoteNe(uint8_t kind, uint32_t dw, uint32_t a_reg, uint32_t a_val,
   s.ne_a_val = a_val;
   s.ne_b_reg = b_reg;
   s.ne_b_val = b_val;
+  s.ne_a_kind = a_kind;
+  s.ne_a_dw = a_dw;
+  // The packet the template thinks it decoded, live and as recorded: a
+  // difference here says framing, an agreement says values.
+  const uint32_t idx = dw - g_dw0;
+  s.ne_hdr_live =
+      (g_span_live && idx < g_span_nd) ? LoadBE32(g_span_live, idx * 4) : 0;
+  s.ne_hdr_stored =
+      (g_span_stored && idx < g_span_nd) ? LoadBE32(g_span_stored, idx * 4) : 0;
 }
 
 void BCompare(const Emi& e) {
@@ -446,7 +526,14 @@ void BCompare(const Emi& e) {
     }
     ++s.emi_ne;
     ++g_span_ne;
-    NoteNe(e.kind, e.dw, a.reg, a.a, e.reg, e.a);
+    // A by-ref range whose whole descriptor matches and whose VALUES differ is
+    // guest memory moving between the two passes' reads, not a decode gap:
+    // named so the decode verdict is never read through it.
+    if (a.kind == kEmiRange && e.kind == kEmiRange && a.fm && e.fm &&
+        a.reg == e.reg && a.dw == e.dw && a.a == e.a && a.n == e.n) {
+      ++s.emi_ne_byref;
+    }
+    NoteNe(e.kind, e.dw, a.reg, a.a, e.reg, e.a, a.kind, a.dw);
     return;
   }
   // The live walk produced nothing (left) in this window for this emission.
@@ -550,22 +637,12 @@ bool ClassifySpan(const uint8_t* raw, uint32_t ndwords, uint8_t* cls) {
   return j == ndwords;
 }
 
+// The caller has already run the density split (a recycled region differs
+// nearly everywhere and its per-dword classes would be noise wearing names),
+// so everything reaching here is a patch/finalize-shaped diff.
 void AttributeStale(const uint8_t* live, const uint8_t* stored,
                     uint32_t ndwords, uint32_t span_key) {
   TmplStats& s = g_stats;
-  // Density split first: a finalize/patch touches a few dwords; a recycled
-  // region (dead key) differs nearly everywhere, and attributing its diffs
-  // to packet classes would just be noise wearing names.
-  uint32_t ndiff = 0;
-  for (uint32_t i = 0; i < ndwords; ++i) {
-    if (std::memcmp(live + size_t(i) * 4, stored + size_t(i) * 4, 4) != 0) {
-      ++ndiff;
-    }
-  }
-  if (ndiff * 2 > ndwords) {
-    ++s.stale_cls[kTmplScDead];
-    return;
-  }
   bool framed = ClassifySpan(live, ndwords, g_cls_scratch);
   if (!framed) framed = ClassifySpan(stored, ndwords, g_cls_scratch);
   uint32_t touched = 0;  // class bitmask: one count per span per class
@@ -593,8 +670,11 @@ void AttributeStale(const uint8_t* live, const uint8_t* stored,
 
 // Frame the live window packet-by-packet applying only bin packets, so a
 // stale or missing span cannot desync predication for the spans after it.
-void FrameWindowBins(const uint8_t* raw, uint32_t dw, uint32_t dw_end,
-                     uint32_t count, CtxBinState* bin) {
+// Returns where the live framing actually landed: the last packet can straddle
+// the window's end, and resuming the sweep mid-payload would decode payload
+// dwords as headers -- the live walk's framing is the only framing there is.
+uint32_t FrameWindowBins(const uint8_t* raw, uint32_t dw, uint32_t dw_end,
+                         uint32_t count, CtxBinState* bin) {
   while (dw < dw_end && dw < count) {
     const uint32_t h = __builtin_bswap32(
         *reinterpret_cast<const uint32_t*>(raw + size_t(dw) * 4));
@@ -625,11 +705,37 @@ void FrameWindowBins(const uint8_t* raw, uint32_t dw, uint32_t dw_end,
       ++dw;
     }
   }
+  return dw;
+}
+
+// [NR-TMPL] rung 1 item 2, apply side: the template is a DECODE PLAN over the
+// buffer's live bytes, not a byte snapshot. Values (constants, draw payloads,
+// by-ref addresses) are read at replay from the executing buffer, so the
+// recorder's in-place patches ride along for free; the scan windows cover the
+// placeholder sites; and this pre-pass names what the finalize did to the
+// PACKETS. A bulk-range op is the one kind that never re-reads its header, so
+// a drifted range (a nop'd-out packet, most often) is demoted to a live
+// re-parse -- otherwise it would emit a range that the buffer no longer has.
+void DriftPrePass(const uint8_t* live, const TmplView& v) {
+  TmplStats& s = g_stats;
+  for (uint32_t i = 0; i < v.nops; ++i) {
+    CtxMemoOp& op = v.ops[i];
+    if (op.kind == kCtxMemoScan || op.b >= v.ndwords) continue;
+    if (LoadBE32(live, op.b * 4) == LoadBE32(v.bytes, op.b * 4)) continue;
+    ++s.op_drift;
+    if (op.kind == kCtxMemoRange || op.kind == kCtxMemoRangeMem) {
+      ++s.op_drift_range;
+      op.kind = kCtxMemoPkt;
+      op.reg = 0;
+      op.n = 0;
+      op.a = op.b;
+    }
+  }
 }
 
 }  // namespace
 
-void TmplCompareBuffer(const uint8_t* raw, uint32_t ptr, uint32_t count,
+void TmplCompareBuffer(const uint8_t* raw_live, uint32_t ptr, uint32_t count,
                        uint64_t bin_select, uint64_t bin_mask,
                        CtxMemReadFn mem_read, void* mem_user) {
   if (!g_active || !count) return;
@@ -637,6 +743,18 @@ void TmplCompareBuffer(const uint8_t* raw, uint32_t ptr, uint32_t count,
   g_mem_read = mem_read;
   g_mem_user = mem_user;
   const uint32_t pbase = ptr & kPhysMask;
+
+  // One snapshot, both passes: see kMaxSnapBytes. `raw` is the snapshot from
+  // here down -- the live buffer is read again only at the very end, to
+  // measure whether the producer wrote into it while we compared.
+  const size_t nbytes = size_t(count) * 4;
+  if (nbytes > kMaxSnapBytes) {
+    ++s.bufs_toobig;
+    return;
+  }
+  if (g_snap.size() < nbytes) g_snap.resize(nbytes);
+  std::memcpy(g_snap.data(), raw_live, nbytes);
+  const uint8_t* raw = g_snap.data();
 
   // Pass A: the private live walk's full emission log, dword-tagged.
   if (g_a.capacity() == 0) g_a.reserve(kEmiCap);
@@ -678,49 +796,77 @@ void TmplCompareBuffer(const uint8_t* raw, uint32_t ptr, uint32_t count,
           ++s.a_uncovered;  // emissions from the gap before this span
           ++g_acur;
         }
-        if (std::memcmp(raw + size_t(dw) * 4, v.bytes,
-                        size_t(v.ndwords) * 4) != 0) {
-          // Bytes differ from the build. Two very different causes hide
-          // here, so discriminate: a surviving first header (layout intact,
-          // payload changed) smells like a re-record the feed missed -- a
-          // correctness hole; a different first header means the ring
-          // recycled this region and the key is dead -- store hygiene.
+        const uint8_t* live = raw + size_t(dw) * 4;
+        bool dead = false;
+        const bool stale =
+            std::memcmp(live, v.bytes, size_t(v.ndwords) * 4) != 0;
+        if (stale) {
+          // Bytes differ from the build. Rung 0 named the two causes and rung
+          // 1 treats them completely differently. (a) The recorder finalized
+          // this span IN PLACE -- a few dwords, at placeholder or payload
+          // positions: the template is still THIS span's plan, and the live
+          // replay below is exactly the answer to it. (b) The ring recycled
+          // the region and the key is dead: >50% of the dwords differ, the
+          // "template" describes some other span entirely, and replaying it
+          // would measure nothing. The density split is the discriminator.
           ++s.spans_stale;
-          uint32_t idx = 0;
-          while (idx < v.ndwords &&
-                 std::memcmp(raw + size_t(dw + idx) * 4,
-                             v.bytes + size_t(idx) * 4, 4) == 0) {
-            ++idx;
+          uint32_t ndiff = 0, idx = v.ndwords;
+          for (uint32_t i = 0; i < v.ndwords; ++i) {
+            if (std::memcmp(live + size_t(i) * 4, v.bytes + size_t(i) * 4,
+                            4) != 0) {
+              if (idx == v.ndwords) idx = i;
+              ++ndiff;
+            }
           }
-          const bool hdr_eq =
-              std::memcmp(raw + size_t(dw) * 4, v.bytes, 4) == 0;
+          dead = ndiff * 2 > v.ndwords;
+          const bool hdr_eq = std::memcmp(live, v.bytes, 4) == 0;
           ++(hdr_eq ? s.stale_hdr_eq : s.stale_hdr_ne);
-          AttributeStale(raw + size_t(dw) * 4, v.bytes, v.ndwords,
-                         g_span_key);
+          if (dead) {
+            ++s.spans_dead;
+            ++s.stale_cls[kTmplScDead];
+          } else {
+            AttributeStale(live, v.bytes, v.ndwords, g_span_key);
+          }
           if (!s.st_armed && idx < v.ndwords) {
             s.st_armed = 1;
             s.st_key = g_span_key;
             s.st_idx = idx;
             uint32_t sd, ld;
             std::memcpy(&sd, v.bytes + size_t(idx) * 4, 4);
-            std::memcpy(&ld, raw + size_t(dw + idx) * 4, 4);
+            std::memcpy(&ld, live + size_t(idx) * 4, 4);
             s.st_stored = __builtin_bswap32(sd);
             s.st_live = __builtin_bswap32(ld);
           }
+        }
+        if (dead) {
           // Kill the dead key so one recycled region cannot report itself
           // once per execution forever. A racing producer publish can lose a
           // fresh template here; the next feed of that span republishes it
           // (the unchanged-check needs a key match, so it misses and
           // rebuilds).
           vslot->key.store(0, std::memory_order_relaxed);
-          FrameWindowBins(raw, g_dw0, g_dw1, count, &bbin);
-          while (g_acur < g_a.size() && g_a[g_acur].dw < g_dw1) {
+          const uint32_t landed =
+              FrameWindowBins(raw, g_dw0, g_dw1, count, &bbin);
+          while (g_acur < g_a.size() && g_a[g_acur].dw < landed) {
             ++s.a_uncovered;
             ++g_acur;
           }
+          if (landed > g_dw1) {
+            ++s.span_overrun;
+            dw = landed;
+            continue;
+          }
         } else {
           g_span_ne = 0;
-          CtxWalkBegin(&g_wb, v.bytes, v.ndwords, g_span_key, &g_ctx_b,
+          g_span_live = live;
+          g_span_stored = v.bytes;
+          g_span_nd = v.ndwords;
+          if (stale) DriftPrePass(live, v);
+          // Decode bound = the rest of the BUFFER, stream bound = this span.
+          // A finalize can lengthen a packet at the span's edge so its payload
+          // sits in the next span's dwords; the live walk reads it, so the
+          // replay must too (see CtxWalker::rep_end).
+          CtxWalkBegin(&g_wb, live, count - dw, g_span_key, &g_ctx_b,
                        nullptr, 0, &g_stats_b, mem_read, mem_user, BShader,
                        nullptr, nullptr, nullptr, bbin.select, bbin.mask,
                        BReg, nullptr, nullptr, nullptr);
@@ -729,6 +875,7 @@ void TmplCompareBuffer(const uint8_t* raw, uint32_t ptr, uint32_t count,
           g_wb.rep = v.ops;
           g_wb.rep_n = v.nops;
           g_wb.rep_i = 0;
+          g_wb.rep_end = v.ndwords;
           CtxDrawStop bst;
           while (CtxWalkNextStop(&g_wb, &bst)) {
             BCompare({kEmiStop, bst.delegate, uint16_t(bst.opcode),
@@ -743,8 +890,40 @@ void TmplCompareBuffer(const uint8_t* raw, uint32_t ptr, uint32_t count,
                    g_a[g_acur].a, 0, 0);
             ++g_acur;
           }
-          ++(g_span_ne ? s.spans_ne : s.spans_eq);
+          s.scan_pkts += g_stats_b.scan_pkts;
+          s.scan_over += g_stats_b.scan_over;
+          s.rep_catchup += g_stats_b.rep_catchup;
+          s.rep_ahead += g_stats_b.rep_ahead;
+          if (stale) {
+            ++(g_span_ne ? s.spans_stale_ne : s.spans_stale_eq);
+          } else {
+            ++(g_span_ne ? s.spans_ne : s.spans_eq);
+          }
+          // Name the mechanism behind every mismatching span, so a residual
+          // can never be reported as an unexplained percentage.
+          if (g_span_ne) {
+            if (g_stats_b.scan_pkts) ++s.ne_scan;
+            if (g_stats_b.rep_ahead) ++s.ne_ahead;
+            if (g_stats_b.rep_catchup) ++s.ne_catchup;
+            if (g_wb.cursor > v.ndwords) ++s.ne_over;
+            if (!g_stats_b.scan_pkts && !g_stats_b.rep_ahead &&
+                !g_stats_b.rep_catchup && g_wb.cursor <= v.ndwords) {
+              ++s.ne_plain;
+            }
+          }
           bbin = g_wb.bin;
+          // The sweep follows the LIVE framing: a straddling packet consumed
+          // dwords of the next span, and re-entering the sweep mid-payload
+          // would decode payload as headers.
+          if (g_wb.cursor > v.ndwords) {
+            ++s.span_overrun;
+            dw = g_dw0 + g_wb.cursor;
+            while (g_acur < g_a.size() && g_a[g_acur].dw < dw) {
+              ++s.a_uncovered;  // payload dwords emit nothing; counted anyway
+              ++g_acur;
+            }
+            continue;
+          }
         }
         dw = g_dw1;
         continue;
@@ -791,6 +970,27 @@ void TmplCompareBuffer(const uint8_t* raw, uint32_t ptr, uint32_t count,
     ++g_acur;
   }
   ++s.bufs;
+
+  // The producer's window on us: did the buffer change under the compare?
+  // Both passes read the snapshot, so this can no longer skew the decode
+  // verdict -- it is now a measurement in its own right, and one every
+  // consuming design has to answer (a native re-emit reads the same bytes
+  // this compare just read).
+  if (std::memcmp(raw_live, raw, nbytes) != 0) {
+    ++s.bufs_mutated;
+    for (uint32_t i = 0; i < count; ++i) {
+      if (std::memcmp(raw_live + size_t(i) * 4, raw + size_t(i) * 4, 4) == 0) {
+        continue;
+      }
+      ++s.mut_dwords;
+      if (!s.mu_armed) {
+        s.mu_armed = 1;
+        s.mu_dw = i;
+        s.mu_before = LoadBE32(raw, i * 4);
+        s.mu_after = LoadBE32(raw_live, i * 4);
+      }
+    }
+  }
 }
 
 }  // namespace nr

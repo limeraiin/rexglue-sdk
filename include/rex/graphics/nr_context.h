@@ -179,6 +179,18 @@ struct CtxWalkStats {
                             // outside, i.e. per-tile replay of one buffer)
   uint32_t delegate_stops;  // [NR-SKP] non-native type-3 packets surfaced as
                             // delegate stops by CtxWalkNextStop
+  uint32_t scan_pkts;       // [NR-TMPL] packets decoded inside live-scan
+                            // windows (the finalize class, seen at replay)
+  uint32_t scan_over;       // scan windows whose live framing ran PAST the
+                            // window end: the finalize changed the length,
+                            // and the ops after it re-anchor over decoded
+                            // dwords. Never silent, never zero-checked away.
+  uint32_t rep_catchup;     // [NR-TMPL] packets parsed live to resync the
+                            // replay after the live framing landed SHORT of
+                            // the next op (a packet nop'd out in place)
+  uint32_t rep_ahead;       // ops dropped because the live framing had
+                            // already passed them (a finalize longer than
+                            // the placeholder run it replaced)
 };
 
 // Optional reader for LOAD_ALU_CONSTANT values (they live in guest memory,
@@ -338,6 +350,17 @@ struct CtxDrawStop {
 //                    exactly as the parsed walk)
 //   kCtxMemoDeleg    delegate stop at a (cursor positioned for the caller's
 //                    ExecutePacket dispatch)
+//   kCtxMemoScan     [NR-TMPL] N-2 rung 1: LIVE-SCAN WINDOW -- parse the
+//                    dwords [a, a+n) as they stand at replay, packet by
+//                    packet, instead of assuming the record-time decode.
+//                    Recorded over every run of top-level no-op dwords,
+//                    because the recorder FINALIZES buffers in place: at kick
+//                    time placeholder nops become SET_BIN / WAIT_REG_MEM /
+//                    EVENT_WRITE / bin-window packets (and real packets are
+//                    nop'd back out), pointer-neutrally, so no record-side
+//                    hook ever sees it. Those sites are known by POSITION at
+//                    record time and only by VALUE at execute time: the
+//                    template stores the window, never the bytes.
 // `b` always holds the packet header dword, so any declined range replays by
 // re-parsing its own packet (counted, never silent).
 
@@ -347,6 +370,7 @@ enum CtxMemoKind : uint8_t {
   kCtxMemoPkt,
   kCtxMemoDraw,
   kCtxMemoDeleg,
+  kCtxMemoScan,
 };
 
 struct CtxMemoOp {
@@ -412,6 +436,16 @@ struct CtxWalker {
   std::vector<CtxMemoOp>* rec;  // parse emissions append here
   const CtxMemoOp* rep;         // replay stream (owned by the memo store)
   uint32_t rep_n, rep_i;
+  // [NR-TMPL] The op stream may describe a WINDOW (one record-time span) of a
+  // longer buffer: `dwords` then bounds the DECODE (a packet whose payload
+  // runs past the window must still read its real bytes -- a SET_BIN read as
+  // mask 0 because the payload fell outside would diverge the bin state for
+  // everything after it), while rep_end bounds the STREAM. Zero = the stream
+  // covers the whole buffer, which is what the 5-4-8 memo always does.
+  uint32_t rep_end;
+  uint8_t rep_stops;  // [NR-TMPL] the replay's catch-up parse surfaces
+                      // delegate stops iff the caller asked for them; set by
+                      // CtxWalkNextStop / CtxWalkNextDraw, never by hand.
 };
 
 // Same arguments as WalkBufferContext, which is now a wrapper over these three.

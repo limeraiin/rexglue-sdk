@@ -55,6 +55,8 @@ struct TmplStats {
   uint64_t feed_reject = 0;     // zero/backwards/oversize span
   uint64_t parse_fail = 0;      // neither cursor convention lands exactly
   uint64_t ops_overflow = 0;    // op stream exceeded the build cap
+  uint64_t scan_ops = 0;        // live-scan windows recorded (placeholder runs)
+  uint64_t scan_dw = 0;         // dwords inside them
   uint64_t arena_wraps = 0;     // arena filled: epoch bumped, store restarted
   uint64_t slot_evict = 0;      // probe chain full: a live template displaced
   // Compare side (CP thread).
@@ -64,6 +66,11 @@ struct TmplStats {
   uint64_t spans_eq = 0;        // ...replayed with every emission equal
   uint64_t spans_ne = 0;        // ...replayed with at least one mismatch
   uint64_t spans_stale = 0;     // ...bytes differ from the live buffer
+  uint64_t spans_stale_eq = 0;  // ...of those, REPLAYED with every emission
+                                //    equal: the finalize class, absorbed
+  uint64_t spans_stale_ne = 0;  // ...replayed with at least one mismatch
+  uint64_t spans_dead = 0;      // ...refused: >50% of dwords differ (the ring
+                                //    recycled the region; the key is dead)
   uint64_t stale_hdr_eq = 0;    // ...stale with the FIRST HEADER intact: the
                                 //    layout survived, payload changed -- the
                                 //    smell of a re-record the feed missed
@@ -83,6 +90,43 @@ struct TmplStats {
   uint64_t a_extra = 0;         // live emissions a hit span did not produce
   uint64_t b_extra = 0;         // template emissions the live walk lacked
   uint64_t lookup_stale = 0;    // slot epoch/key changed mid-read (race)
+  uint64_t emi_ne_byref = 0;    // of emi_ne: a by-ref range whose descriptor
+                                // (base/phys/count/dword) matched and only the
+                                // VALUES differed -- guest memory moved between
+                                // the two passes' reads, not a decode gap
+  uint64_t op_drift = 0;        // replayed ops whose live anchor header differs
+                                // from the recorded one (the finalize class
+                                // seen from the op side)
+  uint64_t op_drift_range = 0;  // ...of those, bulk-range ops demoted to a live
+                                // re-parse (a range op skips the header, so a
+                                // nop'd-out packet would otherwise still emit)
+  uint64_t scan_pkts = 0;       // packets decoded inside live-scan windows
+  uint64_t scan_over = 0;       // scan windows whose live framing overran
+  uint64_t rep_catchup = 0;     // packets parsed live to resync the replay
+                                // after the finalize shortened the framing
+  uint64_t rep_ahead = 0;       // ops dropped because the live framing had
+                                // already covered them (finalize lengthened)
+  uint64_t span_overrun = 0;    // spans whose last packet consumed dwords past
+                                // the span end (the sweep follows live framing)
+  // Mismatching spans by mechanism: every ne span lands in at least one, so
+  // a residual always carries a name (a span can carry several).
+  uint64_t ne_scan = 0;         // decoded a packet in a placeholder window
+  uint64_t ne_ahead = 0;        // dropped ops the live framing had passed
+  uint64_t ne_catchup = 0;      // parsed live to resync a shortened framing
+  uint64_t ne_over = 0;         // last packet straddled the span end
+  uint64_t ne_plain = 0;        // none of the above: a real modeling gap
+  // Buffer mutation DURING the compare (rung 1 item 1). Both passes read one
+  // snapshot taken at entry, so a mid-compare write can no longer forge a
+  // decode mismatch; this counts how often the producer writes into a buffer
+  // the command processor is already executing -- a first-class fact for any
+  // consuming design, not just for this gate.
+  uint64_t bufs_mutated = 0;
+  uint64_t mut_dwords = 0;
+  uint64_t bufs_toobig = 0;     // buffer larger than the snapshot cap
+  uint32_t mu_armed = 0;
+  uint32_t mu_dw = 0;
+  uint32_t mu_before = 0;
+  uint32_t mu_after = 0;
   // First mismatch this report window (the gate's deliverable is a NAME).
   uint32_t ne_armed = 0;  // 0 => the next mismatch fills the fields below
   uint32_t ne_kind = 0;
@@ -90,6 +134,10 @@ struct TmplStats {
   uint32_t ne_key = 0;     // span key (first packet phys address)
   uint32_t ne_a_reg = 0, ne_a_val = 0;  // live side (reg/opcode, value/dword)
   uint32_t ne_b_reg = 0, ne_b_val = 0;  // template side
+  uint32_t ne_a_kind = 0;      // the live emission's kind and dword: a shifted
+  uint32_t ne_a_dw = 0;        // pairing names itself here
+  uint32_t ne_hdr_live = 0;    // header dword at the template's emission
+  uint32_t ne_hdr_stored = 0;  // ...and the recorded one
   // Stale-diff attribution: every differing dword of a stale span is
   // attributed to its covering packet's class (live framing first, stored as
   // the fallback). A span increments each class it touches once. The point:
