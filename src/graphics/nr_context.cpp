@@ -557,6 +557,15 @@ bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
   while (w->rep_i < w->rep_n) {
     if (w->cursor >= w->dwords) return false;
     const CtxMemoOp& op = w->rep[w->rep_i++];
+    // [NR-TMPL] Refresh the packet context for the range kinds (the re-parse
+    // kinds set it through CtxWalkStep): range_fn consumers that read
+    // cur_dw/cur_hdr (the N-2 template compare tags emissions by packet)
+    // must see this op's packet, not whichever packet re-parsed last.
+    if (op.kind == kCtxMemoRange || op.kind == kCtxMemoRangeMem) {
+      w->cur_dw = op.b;
+      w->cur_hdr = BE32(w->raw, op.b);
+      w->cur_arg = (op.b + 1 < w->dwords) ? BE32(w->raw, op.b + 1) : 0;
+    }
     switch (op.kind) {
       case kCtxMemoRange:
         if (w->range_fn &&
@@ -591,14 +600,24 @@ bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
       case kCtxMemoDraw: {
         w->cursor = op.a;
         const bool got = CtxWalkStep(w, stop);
-        if (stop) return got;
-        break;  // finish-drain: applied, not surfaced
+        // [NR-TMPL] Under the memo's bin-identical contract a recorded draw
+        // always executes at replay, so `got` used to be returned directly.
+        // The N-2 template replay drives these ops under a DIFFERENT bin
+        // state than the record (bin-agnostic streams, predication resolved
+        // live), where a recorded draw can be predicated out: CtxWalkStep
+        // then returns false with the cursor already past the packet, and
+        // the stream must continue rather than report end-of-buffer.
+        if (got && stop) return true;
+        break;  // finish-drain or predicated-out: applied/skipped, not surfaced
       }
       case kCtxMemoDeleg:
         w->cursor = op.a;
         if (stop) {
-          CtxWalkStep(w, stop, /*delegate_stops=*/true);
-          return true;
+          // [NR-TMPL] Same rule: a predicated-out delegate at replay is
+          // skipped natively by CtxWalkStep (false, cursor advanced) and the
+          // stream continues.
+          if (CtxWalkStep(w, stop, /*delegate_stops=*/true)) return true;
+          break;
         }
         CtxWalkSkipDelegated(w);  // finish-drain skips delegates, as parsed
         break;

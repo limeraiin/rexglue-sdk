@@ -23,6 +23,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     nr_buffer_cache.cpp
     nr_state_walk.cpp
     nr_context.cpp
+    nr_template_store.cpp
     nr_regfile.cpp
     nr_resource.cpp
     nr_shader_db.cpp

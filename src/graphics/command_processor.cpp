@@ -37,6 +37,7 @@
 #include <rex/graphics/nr_regfile.h>
 #include <rex/graphics/nr_resource.h>
 #include <rex/graphics/nr_shader_db.h>
+#include <rex/graphics/nr_template_store.h>  // [NR-TMPL] N-2 rung 0
 #include <rex/hash.h>  // [NR-RUSE] XXH3, header-only (XXH_INLINE_ALL)
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
@@ -521,6 +522,11 @@ REXCVAR_DEFINE_STRING(gpu_nr_shaderdb_dump, "", "GPU",
 // model with no further live runs. A private walker decodes each depth-1
 // indirect buffer to the file BEFORE any live mode touches it, so the dump is
 // independent of skip/ruse/memo and changes no behavior. Capture-only cost.
+// [NR-TMPL] N-2 rung 0: gpu_nr_tmpl is DEFINED in nr_template_store.cpp
+// (one flag arms the game-side feed and the compare); declared here for the
+// disarm diagnostic only.
+REXCVAR_DECLARE(bool, gpu_nr_tmpl);
+
 REXCVAR_DEFINE_BOOL(gpu_nr_oracle_dump, false, "GPU",
                     "DEV [nr-orc]: dump every executed depth-1 indirect "
                     "buffer's decoded stream (register writes, shader loads, "
@@ -1086,6 +1092,8 @@ uint32_t CtxMemRead(void* user, uint32_t phys) {
 // is a capture-run cost, not a play-mode path.
 
 bool g_nr_orc = false;
+// [NR-TMPL] N-2 rung 0: compare latch (store + gate in nr_template_store.cpp).
+bool g_nr_tmpl = false;
 FILE* g_orc_file = nullptr;
 bool g_orc_failed = false;
 nr::StateContext g_orc_ctx;  // private mirror; never the live g_ctx_state
@@ -3004,6 +3012,15 @@ void CommandProcessor::WorkerThreadMain() {
   // observation only). Opens the file here, on the thread that writes it.
   g_nr_orc = REXCVAR_GET(gpu_nr_oracle_dump);
   if (g_nr_orc) NrOracleOpen();
+  // [NR-TMPL] N-2 rung 0: record-time span-template store + execute-time
+  // compare gate (nr_template_store.cpp). Observation only, like the oracle.
+  // The same call arms the game-side span feed at its own startup latch.
+  g_nr_tmpl = rex_nr_tmpl_active();
+  if (g_nr_tmpl) {
+    REXGPU_INFO("[nr-tmpl] ON: span-template store armed (compare at depth-1)");
+  } else if (REXCVAR_GET(gpu_nr_tmpl)) {
+    REXGPU_INFO("[nr-tmpl] DISARMED: store arena allocation failed");
+  }
   // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
   const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue || kNrWalkFx;
   g_nr_draw = kNrDraw;
@@ -4472,6 +4489,66 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   if (g_nr_orc && g_pm4_ib_depth == 1) {
     NrOracleDumpBuffer(memory_->TranslatePhysical(ptr), ptr, count, bin_select_,
                        bin_mask_, swap_counter(), memory_);
+  }
+
+  // [NR-TMPL] N-2 rung 0: compare this buffer's walk against the record-time
+  // span templates. Observation only, depth-1 only, before any live mode --
+  // exactly the oracle's placement, for the oracle's reasons.
+  if (g_nr_tmpl && g_pm4_ib_depth == 1) {
+    nr::TmplCompareBuffer(memory_->TranslatePhysical(ptr), ptr, count,
+                          bin_select_, bin_mask_, CtxMemRead, memory_);
+    nr::TmplStats* ts = nr::TmplStatsPtr();
+    if (ts->bufs && (ts->bufs & 0x7FF) == 0) {
+      REXGPU_INFO(
+          "[nr-tmpl] bufs={} (abort={}) spans hit={} eq={} ne={} stale={} "
+          "(hdrEq={} hdrNe={}) cross={} cover={}/{}dw gapPkts={} emi eq={} "
+          "ne={} (reg={} rng={} sh={} stop={} aExtra={} bExtra={} aUncov={}) "
+          "lkStale={} | feed={} built={} rebuilt={} same={} rej={} pfail={} "
+          "wraps={} evict={}",
+          ts->bufs, ts->bufs_aborted, ts->spans_hit, ts->spans_eq,
+          ts->spans_ne, ts->spans_stale, ts->stale_hdr_eq, ts->stale_hdr_ne,
+          ts->spans_cross, ts->dwords_covered,
+          ts->dwords_covered + ts->dwords_gap, ts->gap_pkts, ts->emi_eq,
+          ts->emi_ne, ts->emi_ne_reg, ts->emi_ne_range, ts->emi_ne_shader,
+          ts->emi_ne_stop, ts->a_extra, ts->b_extra, ts->a_uncovered,
+          ts->lookup_stale, ts->feed, ts->built, ts->rebuilt, ts->unchanged,
+          ts->feed_reject, ts->parse_fail, ts->arena_wraps, ts->slot_evict);
+      if (ts->ne_armed) {
+        REXGPU_INFO(
+            "[nr-tmpl] first-ne: kind={} dw={} span=0x{:08X} live "
+            "reg=0x{:04X} val=0x{:08X} tmpl reg=0x{:04X} val=0x{:08X}",
+            ts->ne_kind, ts->ne_dw, ts->ne_key, ts->ne_a_reg, ts->ne_a_val,
+            ts->ne_b_reg, ts->ne_b_val);
+        ts->ne_armed = 0;  // re-arm: one named mismatch per report window
+      }
+      if (ts->st_armed) {
+        REXGPU_INFO(
+            "[nr-tmpl] first-stale: span=0x{:08X} diff@dw{} stored=0x{:08X} "
+            "live=0x{:08X}",
+            ts->st_key, ts->st_idx, ts->st_stored, ts->st_live);
+        ts->st_armed = 0;
+      }
+      REXGPU_INFO(
+          "[nr-tmpl] stale-cls (spans touching): plc={} win={} sciscp={} "
+          "alu={} ftc={} bl={} regOther={} setbin={} wait={} evw={} draw={} "
+          "otherOp={} unframed={}",
+          ts->stale_cls[nr::kTmplScPlaceholder], ts->stale_cls[nr::kTmplScWin],
+          ts->stale_cls[nr::kTmplScScissorCopy], ts->stale_cls[nr::kTmplScAlu],
+          ts->stale_cls[nr::kTmplScFetch], ts->stale_cls[nr::kTmplScBoolLoop],
+          ts->stale_cls[nr::kTmplScRegOther], ts->stale_cls[nr::kTmplScSetBin],
+          ts->stale_cls[nr::kTmplScWait], ts->stale_cls[nr::kTmplScEvent],
+          ts->stale_cls[nr::kTmplScDraw], ts->stale_cls[nr::kTmplScOtherOp],
+          ts->stale_cls[nr::kTmplScUnframed]);
+      REXGPU_INFO("[nr-tmpl] stale-dead (recycled region, >50% diff): {}",
+                  ts->stale_cls[nr::kTmplScDead]);
+      if (ts->su_armed) {
+        REXGPU_INFO(
+            "[nr-tmpl] first-surprise: cls={} span=0x{:08X} diff@dw{} "
+            "stored=0x{:08X} live=0x{:08X}",
+            ts->su_cls, ts->su_key, ts->su_idx, ts->su_stored, ts->su_live);
+        ts->su_armed = 0;
+      }
+    }
   }
 
   // [NR-SKP] 5-4-2: set inside the [NR-CTX] depth-1 branch below when this
