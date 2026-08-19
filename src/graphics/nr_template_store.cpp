@@ -721,9 +721,32 @@ void DriftPrePass(const uint8_t* live, const TmplView& v) {
   for (uint32_t i = 0; i < v.nops; ++i) {
     CtxMemoOp& op = v.ops[i];
     if (op.kind == kCtxMemoScan || op.b >= v.ndwords) continue;
-    if (LoadBE32(live, op.b * 4) == LoadBE32(v.bytes, op.b * 4)) continue;
+    const uint32_t hdr = LoadBE32(live, op.b * 4);
+    bool drift = hdr != LoadBE32(v.bytes, op.b * 4);
+    // A range op carries a DESCRIPTOR the walk derives from the packet, and
+    // for the type-3 shapes that descriptor lives in the PAYLOAD, not the
+    // header: 0x2D/0x55/0x56 take the base register from dw+1, and 0x2F
+    // (LOAD_ALU_CONSTANT) takes address/type/size from dw+1..dw+3. The city
+    // patches those dwords in place -- a by-ref load whose ADDRESS moved with
+    // an unchanged header was the whole city residual (1,426 of 229.6M
+    // emissions, every one a range). Values need no check: the range op
+    // already reads them live.
+    if (!drift && (hdr >> 30) == 3 &&
+        (op.kind == kCtxMemoRange || op.kind == kCtxMemoRangeMem)) {
+      const uint32_t nd = op.kind == kCtxMemoRangeMem ? 3u : 1u;
+      for (uint32_t k = 1; k <= nd && op.b + k < v.ndwords; ++k) {
+        if (LoadBE32(live, (op.b + k) * 4) !=
+            LoadBE32(v.bytes, (op.b + k) * 4)) {
+          drift = true;
+          break;
+        }
+      }
+    }
+    if (!drift) continue;
     ++s.op_drift;
     if (op.kind == kCtxMemoRange || op.kind == kCtxMemoRangeMem) {
+      // Re-parse: the walker re-derives the descriptor from the live packet,
+      // so there is exactly one decoder and it cannot drift from the walk.
       ++s.op_drift_range;
       op.kind = kCtxMemoPkt;
       op.reg = 0;
