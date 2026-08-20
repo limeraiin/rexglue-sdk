@@ -401,16 +401,23 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_probe, false, "GPU",
 // probe's v2 verdict into the driver of the backend's per-draw state reuse
 // (the D3D12 side latches its own eligibility beside the bindings swap).
 // Implies gpu_nr_reuse_probe: the verdict machinery is the classification
-// source. DEFAULT ON since 2026-08-13 (user decision): city gate run
-// naruto_410 ne=0 on every restored component, sound A/B naruto_412 = +3-4
-// fps at matched heavy load, pixel-clean runs 405/409/412.
-REXCVAR_DEFINE_BOOL(gpu_nr_reuse_fast, true, "GPU",
+// source. Was DEFAULT ON 2026-08-13..2026-08-20 (the 5-4-5 pricing: +3-4 fps
+// at matched heavy load, pre-item-0 / pre-skip_direct stack).
+// ⛔ DEFAULT FLIPPED OFF 2026-08-20 by a paired city A/B (naruto_495 on vs
+// naruto_499 off, matched 9.4k draws/frame, user drive, pixel-clean):
+// OFF is +8.6 fps (26.95 -> 35.51). The verdict feed costs ~0.72 us/draw
+// (122 range dwords/draw through NrRuseStaleMark at ~5.9ns each) and the
+// fast path's UpdateBindings skip no longer pays for it under the current
+// stack (drawstop measured LOWER with reuse off: 1.894 -> 1.713 us/draw --
+// skip_direct + the bindings swap already made per-draw recompose cheap).
+REXCVAR_DEFINE_BOOL(gpu_nr_reuse_fast, false, "GPU",
                     "[nr-ruse] Phase 5-4-5-2: reuse a draw's previously "
                     "derived state when the v2 verdict proves its inputs "
                     "unchanged (bindings restored from the bundle instead of "
                     "recomposed). Implies gpu_nr_reuse_probe and requires "
-                    "the bindings swap + bundle gate machinery. Default on "
-                    "(city-gated + pixel-validated).");
+                    "the bindings swap + bundle gate machinery. Default off "
+                    "since 2026-08-20 (city A/B: the verdict feed costs more "
+                    "than the reuse saves).");
 
 // [NR-BFC] Phase 5-4-6-0: the buffer-level native-replay census. For every
 // skip-driven buffer execution, split candidate (the measured bufid rule:
