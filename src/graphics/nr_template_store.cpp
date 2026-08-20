@@ -1122,9 +1122,10 @@ void TmplCompareBuffer(const uint8_t* raw_live, uint32_t ptr, uint32_t count,
 TmplSwapStats* TmplSwapStatsPtr() { return &g_swap; }
 bool TmplPlanMode() { return g_active && g_plan_mode; }
 
-bool TmplPlanAttach(CtxWalker* w, uint32_t pbase, uint32_t dw, uint32_t count,
-                    const uint8_t* raw) {
-  if (!g_active || !g_plan_mode) return false;
+// `w == nullptr` runs everything except the attach: the probe.
+static uint32_t TmplPlanFind(CtxWalker* w, uint32_t pbase, uint32_t dw,
+                             uint32_t count, const uint8_t* raw) {
+  if (!g_active || !g_plan_mode) return 0;
   const uint32_t key = (pbase + dw * 4) & kPhysMask;
   const uint32_t h = SlotIndex(key);
   for (uint32_t p = 0; p < kProbe; ++p) {
@@ -1181,13 +1182,23 @@ bool TmplPlanAttach(CtxWalker* w, uint32_t pbase, uint32_t dw, uint32_t count,
       ++g_swap.dead;
       break;
     }
-    CtxPlanBegin(w, plan, npl, dw, nd);
+    if (w) CtxPlanBegin(w, plan, npl, dw, nd);
     ++g_swap.spans;
     g_swap.dwords += nd;
-    return true;
+    return nd;
   }
   ++g_swap.miss;
-  return false;
+  return 0;
+}
+
+bool TmplPlanAttach(CtxWalker* w, uint32_t pbase, uint32_t dw, uint32_t count,
+                    const uint8_t* raw) {
+  return TmplPlanFind(w, pbase, dw, count, raw) != 0;
+}
+
+uint32_t TmplPlanProbe(uint32_t pbase, uint32_t dw, uint32_t count,
+                       const uint8_t* raw) {
+  return TmplPlanFind(nullptr, pbase, dw, count, raw);
 }
 
 }  // namespace nr

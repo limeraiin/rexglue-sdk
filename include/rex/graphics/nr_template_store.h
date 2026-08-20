@@ -214,6 +214,15 @@ struct TmplSwapStats {
 
 bool TmplPlanAttach(CtxWalker* w, uint32_t pbase, uint32_t dw, uint32_t count,
                     const uint8_t* raw);
+// Same lookup + guard pass, but the plan is NOT attached: the caller walks
+// the span live and skips re-offering until it ends. This is the swap's cost
+// half measured ALONE (gpu_nr_tmpl_swap_probe) -- the store lookup is a hash
+// probe into a 7MB table plus a read of a blob the producer wrote a frame
+// ago, i.e. two near-certain cache misses per span, and a swap can only pay
+// for itself if the parse it removes is worth more than that. Returns the
+// span's dword length, or 0 on a miss.
+uint32_t TmplPlanProbe(uint32_t pbase, uint32_t dw, uint32_t count,
+                       const uint8_t* raw);
 TmplSwapStats* TmplSwapStatsPtr();
 // True when the store holds plans (gpu_nr_tmpl_plan) rather than memo ops.
 bool TmplPlanMode();

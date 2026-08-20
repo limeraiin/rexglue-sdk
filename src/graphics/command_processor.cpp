@@ -329,6 +329,12 @@ REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap, false, "GPU",
                     "Requires gpu_nr_skip + gpu_nr_tmpl + gpu_nr_tmpl_plan. "
                     "Off by default.");
 
+REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
+                    "DEV [nr-swap] N-2-2: run the swap's store lookup and "
+                    "guard pass per span but NOT the replay, so the cost "
+                    "half is measured alone against the same baseline. "
+                    "Requires gpu_nr_tmpl_swap. Off by default.");
+
 REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, true, "GPU",
                     "[nr-pb] N-2-2 item 0: under gpu_nr_skip, bulk-apply "
                     "full-fit multi-register writes to PLAIN state registers "
@@ -1516,6 +1522,7 @@ uint64_t g_skp_plain_rng = 0;
 uint64_t g_skp_plain_dw = 0;
 // [NR-PLAN] N-2-2 item 2: the consuming swap latch.
 bool g_nr_tmpl_swap = false;
+bool g_nr_tmpl_swap_probe = false;
 // [NR-SPP] 5-4-4 step 0b: skip-path timing (CP-thread-only, gated on
 // gpu_nr_skip_profile; one bool test per stop when off).
 bool g_skp_prof = false;
@@ -3086,6 +3093,13 @@ void CommandProcessor::WorkerThreadMain() {
   // would read as "the plan is fps-neutral" when it never ran.
   g_nr_tmpl_swap = REXCVAR_GET(gpu_nr_tmpl_swap) && kNrSkip && g_nr_tmpl &&
                    nr::TmplPlanMode();
+  g_nr_tmpl_swap_probe =
+      REXCVAR_GET(gpu_nr_tmpl_swap_probe) && g_nr_tmpl_swap;
+  if (g_nr_tmpl_swap_probe) {
+    REXGPU_INFO(
+        "[nr-swap] COST PROBE: lookup + guards per span, no replay (this run "
+        "measures the swap's overhead alone, never its win)");
+  }
   if (REXCVAR_GET(gpu_nr_tmpl_swap)) {
     if (g_nr_tmpl_swap) {
       REXGPU_INFO(
@@ -5197,6 +5211,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 namespace {
 bool NrSwapNextStop(uint32_t pbase, const uint8_t* raw,
                     nr::CtxDrawStop* stop) {
+  static uint32_t probe_until = 0;
+  if (!g_ctx_walker.cursor) probe_until = 0;
   for (;;) {
     if (g_ctx_walker.plan) {
       if (nr::CtxWalkNextStop(&g_ctx_walker, stop)) return true;
@@ -5204,11 +5220,20 @@ bool NrSwapNextStop(uint32_t pbase, const uint8_t* raw,
       continue;
     }
     if (g_ctx_walker.cursor >= g_ctx_walker.dwords) return false;
-    if (nr::TmplPlanAttach(&g_ctx_walker, pbase, g_ctx_walker.cursor,
-                           g_ctx_walker.dwords, raw)) {
+    if (g_nr_tmpl_swap_probe) {
+      // Cost half alone: pay the lookup, then walk the span live. The
+      // suppression window keeps the offer RATE identical to the real swap's
+      // (one per span, plus one per gap packet), which is the whole point.
+      if (g_ctx_walker.cursor >= probe_until) {
+        const uint32_t nd = nr::TmplPlanProbe(pbase, g_ctx_walker.cursor,
+                                              g_ctx_walker.dwords, raw);
+        if (nd) probe_until = g_ctx_walker.cursor + nd;
+      }
+    } else if (nr::TmplPlanAttach(&g_ctx_walker, pbase, g_ctx_walker.cursor,
+                                  g_ctx_walker.dwords, raw)) {
       continue;
     }
-    ++nr::TmplSwapStatsPtr()->gap_pkts;
+    if (!g_nr_tmpl_swap_probe) ++nr::TmplSwapStatsPtr()->gap_pkts;
     if (nr::CtxWalkStepOne(&g_ctx_walker, stop)) return true;
   }
 }
