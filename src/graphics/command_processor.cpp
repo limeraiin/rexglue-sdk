@@ -4586,6 +4586,20 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           ts->op_drift, ts->op_drift_range, ts->rep_catchup, ts->rep_ahead,
           ts->span_overrun, ts->ne_scan, ts->ne_ahead, ts->ne_catchup,
           ts->ne_over, ts->ne_plain, ts->bufs_mutated, ts->mut_dwords);
+      // [NR-PLAN] N-2-2: the flat apply plan's own economics. planSpans is
+      // how many spans the compare replayed FROM a plan (vs the memo stream);
+      // demoted is how many ops a failing structure guard sent back to a live
+      // re-parse -- the plan's equivalent of rangeDemoted, and never zero at
+      // city if the guards are doing their job.
+      if (ts->plan_built || ts->plan_spans) {
+        REXGPU_INFO(
+            "[nr-plan] built={} fail={} ops={} guards={} (ops/span={} "
+            "guards/span={}) | spans={} guarded={} demoted={}",
+            ts->plan_built, ts->plan_fail, ts->plan_ops, ts->plan_guards,
+            ts->plan_built ? ts->plan_ops / ts->plan_built : 0,
+            ts->plan_built ? ts->plan_guards / ts->plan_built : 0,
+            ts->plan_spans, ts->plan_guard_spans, ts->plan_demoted);
+      }
       if (ts->mu_armed) {
         REXGPU_INFO(
             "[nr-tmpl] first-mutation: dw{} snapshot=0x{:08X} live=0x{:08X}",

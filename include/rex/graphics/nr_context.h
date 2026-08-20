@@ -389,6 +389,98 @@ struct CtxMemoStream {
   std::vector<CtxMemoOp> ops;
 };
 
+// ---- [NR-PLAN] N-2-2: the FLAT APPLY PLAN -----------------------------------
+// The memo stream (above) is a list of "re-parse this packet" instructions:
+// CtxMemoNext skips the PM4 parse for exactly the two range kinds and calls
+// CtxWalkStep for everything else, so a memo replay still re-parses ~2/3 of
+// city packets (naruto_483 op mix). That is why 5-4-8 measured fps NEUTRAL,
+// and no amount of coverage changes the mechanism.
+//
+// The plan is the answer: one op per PACKET, compiled ONCE at record time on
+// the guest producer thread (70% idle at city per N-0), carrying everything
+// the walk DERIVES from the packet -- kind, base register, run length, packet
+// length, mirrored slot, predicate bit -- so replay does ZERO header decoding
+// and zero type dispatch for the common kinds. What it deliberately does NOT
+// carry is VALUES: every value (constants, draw payloads, by-ref addresses,
+// shader addr/size, bin masks) is read from the LIVE buffer at replay, which
+// is what makes the plan survive the recorder's in-place finalize exactly as
+// the N-2-1 decode plan does.
+//
+// Soundness rests on one claim per op -- "the packet at `hdr` still has the
+// header it had at compile" -- and that claim is CHECKED, not assumed: the
+// compiler emits a guard {position, expected dword} for the header and for
+// every payload dword a descriptor is derived from (SET_CONSTANT's typed
+// offset, SET_CONSTANT2's raw base, LOAD_ALU_CONSTANT's type and size). A
+// failing guard demotes that ONE op to kPlanPkt (a live re-parse), exactly as
+// N-2-1's DriftPrePass demotes a drifted range. The values a guard does not
+// cover are precisely the ones read live. See the [[GENERAL LESSON]] in
+// CLAUDE.md: anything the walk derives from a packet is re-read or checked.
+//
+// Placeholder runs stay live-scan windows (kPlanScan), same as the memo.
+
+enum CtxPlanKind : uint8_t {
+  kPlanSkip = 1,   // native packet the walk decodes to nothing (NOP, 0x3B,
+                   // a constant writer whose typed base is unknown)
+  kPlanRange,      // register run offerable in bulk (touches no mirror slot)
+  kPlanRegs,       // register run applied per dword (touches the mirror)
+  kPlanRegRep,     // type-0 one_reg: n stores to the SAME register
+  kPlanReg,        // one register write (the two halves of a type-1 packet)
+  kPlanRangeMem,   // by-ref range: LOAD_ALU_CONSTANT, address read live
+  kPlanShader,     // IM_LOAD (0x27) / IM_LOAD_IMMEDIATE (0x2B)
+  kPlanBin,        // SET_BIN_MASK/SELECT family
+  kPlanDraw,       // draw stop (0x22 / 0x36)
+  kPlanDeleg,      // delegate stop (the packet the executor must run)
+  kPlanScan,       // live-scan window over a placeholder run
+  kPlanPkt,        // re-parse this one packet through CtxWalkStep
+};
+
+constexpr uint8_t kPlanFlagPred = 1;       // type-3 predicate bit was set
+constexpr uint8_t kPlanFlagSetConst2 = 2;  // 0x55/0x56: count set_const2
+constexpr uint8_t kPlanFlagImm = 4;        // kPlanShader: IM_LOAD_IMMEDIATE
+
+// 16 bytes. `hdr` is the packet header's dword index relative to the SPAN the
+// plan was compiled from; the replay adds CtxWalker::plan_base to reach the
+// executing buffer's coordinates (the memo's positions were absolute, which
+// is why a span-based replay needed a base bias here).
+struct CtxPlanOp {
+  uint8_t kind;
+  int8_t slot;    // kPlanReg: mirrored slot, or -1
+  uint8_t poff;   // payload start, in dwords from `hdr`
+  uint8_t flags;
+  uint16_t reg;   // base register, or the type-3 opcode for stops/bin/shader
+  uint16_t n;     // run dwords (register kinds) / window dwords (kPlanScan)
+  uint16_t len;   // packet dwords: the cursor advance
+  uint16_t pad;
+  uint32_t hdr;
+};
+
+struct CtxPlanGuard {
+  uint32_t pos;  // dword index, span-relative
+  uint32_t val;  // the dword as it stood when the plan was compiled
+  uint32_t op;   // plan op to demote if it no longer matches
+};
+
+struct CtxPlanCompileStats {
+  uint32_t ops, guards, scans, ranges, regs, draws, delegs, pkts, skips;
+};
+
+// Compile one span's bytes into a flat plan. Frames the span with the
+// walker's own rules and fails (returns 0) unless the framing lands exactly
+// on `ndwords` -- the same exactness [[pm4-span-parse-conventions]] demands
+// of the feed. `*nguard` receives the guard count. Pure function of the
+// bytes: safe on the producer thread, no allocation, no globals.
+uint32_t CtxPlanCompile(const uint8_t* raw, uint32_t ndwords, CtxPlanOp* out,
+                        uint32_t out_cap, CtxPlanGuard* guards,
+                        uint32_t guard_cap, uint32_t* nguard,
+                        CtxPlanCompileStats* st);
+
+// Check every guard against the live span and demote each op whose structure
+// moved to kPlanPkt. Returns the number demoted (0 = the plan is exact for
+// these bytes). `ops` must be the caller's own copy: this rewrites it.
+uint32_t CtxPlanApplyGuards(const uint8_t* live, uint32_t live_dwords,
+                            CtxPlanOp* ops, uint32_t nops,
+                            const CtxPlanGuard* guards, uint32_t nguard);
+
 struct CtxMemoStats {
   uint64_t commits;    // streams committed
   uint64_t replaced;   // verify-mode re-records over a mismatching stream
@@ -446,6 +538,16 @@ struct CtxWalker {
   uint8_t rep_stops;  // [NR-TMPL] the replay's catch-up parse surfaces
                       // delegate stops iff the caller asked for them; set by
                       // CtxWalkNextStop / CtxWalkNextDraw, never by hand.
+
+  // [NR-PLAN] N-2-2. Attached by CtxPlanBegin, never by hand; exclusive with
+  // `rep`. Positions in the plan are SPAN-relative, so plan_base carries the
+  // span's dword offset inside the executing buffer (0 when the walker was
+  // begun at the span itself, as the N-2 compare gate does). plan_end bounds
+  // the STREAM exactly as rep_end does; the DECODE stays bounded by `dwords`,
+  // because a packet finalized longer at the span edge must still read its
+  // real bytes.
+  const CtxPlanOp* plan;
+  uint32_t plan_n, plan_i, plan_base, plan_end;
 };
 
 // Same arguments as WalkBufferContext, which is now a wrapper over these three.
@@ -522,6 +624,11 @@ bool CtxMemoRecordMatches(const CtxWalker* w, const CtxMemoStream* s,
 // it instead of parsing.
 void CtxMemoReplayBegin(CtxWalker* w, const CtxMemoStream* s);
 void CtxMemoReplayEnd(CtxWalker* w);
+// [NR-PLAN] Attach a compiled plan covering [base_dw, base_dw + end_dw) of
+// the walker's buffer. CtxWalkNextStop / CtxWalkFinish then drive from it.
+void CtxPlanBegin(CtxWalker* w, const CtxPlanOp* ops, uint32_t nops,
+                  uint32_t base_dw, uint32_t end_dw);
+void CtxPlanEnd(CtxWalker* w);
 // Drop every stream for this buffer (its bytes changed). Returns how many.
 uint32_t CtxMemoInvalidate(uint32_t ptr);
 void CtxMemoClear();

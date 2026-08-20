@@ -120,6 +120,14 @@ struct TmplStats {
   // decode mismatch; this counts how often the producer writes into a buffer
   // the command processor is already executing -- a first-class fact for any
   // consuming design, not just for this gate.
+  // [NR-PLAN] N-2-2: the flat apply plan, compiled at record time.
+  uint64_t plan_built = 0;      // spans whose plan compiled and published
+  uint64_t plan_fail = 0;       // ...whose compile refused (framing/cap)
+  uint64_t plan_ops = 0;        // plan ops published
+  uint64_t plan_guards = 0;     // structure guards published
+  uint64_t plan_spans = 0;      // spans replayed FROM a plan at execute time
+  uint64_t plan_guard_spans = 0;  // ...that needed the guard pass (stale)
+  uint64_t plan_demoted = 0;    // ops a failing guard sent back to a re-parse
   uint64_t bufs_mutated = 0;
   uint64_t mut_dwords = 0;
   uint64_t bufs_toobig = 0;     // buffer larger than the snapshot cap

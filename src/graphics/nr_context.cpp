@@ -716,6 +716,234 @@ bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
   return false;
 }
 
+
+// ---- [NR-PLAN] N-2-2: the flat plan interpreter -----------------------------
+// One op per packet, no header decode, no type dispatch, no offerable test --
+// everything the walk DERIVES from a packet was resolved once at record time
+// and is guarded (nr_context.h [NR-PLAN]). Everything the walk READS is read
+// here, from the live buffer, at replay.
+//
+// The drift machinery is CtxMemoNext's, unchanged and for the same reasons:
+// in sync every op leaves the cursor on the next op's anchor, and that
+// invariant IS the framing check. A scan window can still lengthen or shorten
+// the live framing, so behind => parse live to the anchor, ahead => drop the
+// ops the live framing already covered.
+bool CtxPlanNext(CtxWalker* w, CtxDrawStop* stop) {
+  const bool deleg = w->rep_stops != 0;
+  const uint8_t* raw = w->raw;
+  const uint32_t dwords = w->dwords;
+  const uint32_t pbase = w->plan_base;
+  const uint32_t stream_end =
+      w->plan_end ? (pbase + w->plan_end < dwords ? pbase + w->plan_end : dwords)
+                  : dwords;
+  StateContext* ctx = w->ctx;
+  while (w->plan_i < w->plan_n) {
+    if (w->cursor >= stream_end) return false;
+    const CtxPlanOp& op = w->plan[w->plan_i];
+    const uint32_t at = pbase + op.hdr;
+    const bool scan = op.kind == kPlanScan;
+    const uint32_t wend =
+        scan ? ((at + op.n < dwords) ? at + op.n : dwords) : at;
+    if (w->cursor > at && !(scan && w->cursor < wend)) {
+      ++w->plan_i;
+      ++w->stats->rep_ahead;
+      continue;
+    }
+    if (w->cursor < at) {
+      while (w->cursor < at) {
+        ++w->stats->rep_catchup;
+        if (CtxWalkStep(w, stop, deleg) && stop) return true;
+      }
+      continue;  // re-evaluate this op against the resynced cursor
+    }
+    if (scan) {
+      // Re-entrant, exactly as the memo's window: peeked until exhausted, so
+      // a stop inside the window resumes inside the window.
+      while (w->cursor < wend) {
+        const uint32_t h = BE32(raw, w->cursor);
+        if (!h || (h >> 30) == 2) {
+          ++w->cursor;
+          continue;
+        }
+        ++w->stats->scan_pkts;
+        if (CtxWalkStep(w, stop, deleg) && stop) return true;
+      }
+      if (w->cursor > wend) ++w->stats->scan_over;
+      ++w->plan_i;
+      continue;
+    }
+    ++w->plan_i;
+    if (op.kind == kPlanPkt) {
+      // Guard-demoted or an odd shape: one full parse, so there is exactly
+      // one decoder and it cannot drift from the walk.
+      w->cursor = at;
+      if (CtxWalkStep(w, stop, deleg) && stop) return true;
+      continue;
+    }
+    const uint32_t hdr = BE32(raw, at);
+    w->cur_dw = at;
+    w->cur_hdr = hdr;
+    w->cur_arg = (at + 1 < dwords) ? BE32(raw, at + 1) : 0;
+    w->cursor = at + op.len;
+    if (op.flags & kPlanFlagPred) {
+      // Bin-agnostic: predication resolves against the state in effect NOW.
+      if (!(w->bin.select & w->bin.mask)) {
+        ++w->stats->pred_skipped;
+        if (op.kind == kPlanDraw && op.reg == 0x22) ++w->stats->pred_draws;
+        continue;
+      }
+      if (op.kind == kPlanDraw && op.reg == 0x22) ++w->stats->pred_draws_run;
+    }
+    const uint32_t payload = at + op.poff;
+    if (op.flags & kPlanFlagSetConst2) ++w->stats->set_const2;
+    switch (op.kind) {
+      case kPlanRange:
+        // Compiled as bulk-offerable: the run touches no mirrored slot, so a
+        // declined offer costs exactly the reg_fn calls and nothing else --
+        // the same equivalence CtxRangeOfferable rests on.
+        if (w->range_fn && op.n &&
+            w->range_fn(w->range_user, op.reg,
+                        (const uint32_t*)(raw + size_t(payload) * 4), op.n,
+                        w->buffer_phys + payload * 4, /*from_memory=*/false)) {
+          break;
+        }
+        if (w->reg_fn) {
+          for (uint32_t m = 0; m < op.n && payload + m < dwords; ++m) {
+            w->reg_fn(w->reg_user, op.reg + m, BE32(raw, payload + m), false);
+          }
+        }
+        break;
+      case kPlanRegs:
+        for (uint32_t m = 0; m < op.n && payload + m < dwords; ++m) {
+          CtxWriteReg(w, op.reg + m, BE32(raw, payload + m));
+        }
+        break;
+      case kPlanRegRep:
+        for (uint32_t m = 0; m < op.n && payload + m < dwords; ++m) {
+          CtxWriteReg(w, op.reg, BE32(raw, payload + m));
+        }
+        break;
+      case kPlanReg: {
+        const uint32_t v = BE32(raw, payload);
+        if (w->reg_fn) w->reg_fn(w->reg_user, op.reg, v, false);
+        if (op.slot >= 0) {
+          ctx->values[op.slot] = v;
+          ctx->defined[op.slot] = 1;
+          ctx->in_buffer[op.slot] = 1;
+          if (w->watch_fn) {
+            w->watch_fn(w->watch_user, op.reg, v, at, hdr, w->cur_arg);
+          }
+        }
+      } break;
+      case kPlanRangeMem: {
+        // The ADDRESS is patched in place by the recorder (the whole N-2-1
+        // city residual was exactly this), so it is read live and never
+        // guarded; type and size are guarded and compiled.
+        const uint32_t address = BE32(raw, at + 1) & 0x1FFFFFFF;
+        if (w->mem_read && w->range_fn && op.n &&
+            w->range_fn(w->range_user, op.reg, nullptr, op.n, address,
+                        /*from_memory=*/true)) {
+          w->stats->mem_loads += op.n;
+          break;
+        }
+        for (uint32_t m = 0; m < op.n; ++m) {
+          if (!w->mem_read) {
+            const int32_t sl = CtxSlot(op.reg + m);
+            if (sl >= 0) {
+              ctx->defined[sl] = 0;
+              ctx->in_buffer[sl] = 0;
+            }
+            ++w->stats->mem_poisoned;
+            continue;
+          }
+          CtxWriteReg(w, op.reg + m, w->mem_read(w->mem_user, address + m * 4),
+                      /*from_memory=*/true);
+          ++w->stats->mem_loads;
+        }
+      } break;
+      case kPlanShader: {
+        const uint32_t a1 = BE32(raw, at + 1);
+        const uint32_t a2 = BE32(raw, at + 2);
+        ShaderRef ref;
+        ref.size_dwords = a2 & 0xFFFF;
+        ref.valid = 1;
+        bool is_ps;
+        if (op.flags & kPlanFlagImm) {
+          ref.addr = (w->buffer_phys & 0x1FFFFFFF) + (at + 3) * 4;
+          ref.immediate = 1;
+          is_ps = a1 != 0;
+          ++w->stats->im_load_imms;
+        } else {
+          ref.addr = (a1 & ~3u) & 0x1FFFFFFF;
+          ref.immediate = 0;
+          is_ps = (a1 & 3u) != 0;
+          ++w->stats->im_loads;
+        }
+        if (is_ps) {
+          ctx->ps = ref;
+          ctx->ps_in_buffer = 1;
+        } else {
+          ctx->vs = ref;
+          ctx->vs_in_buffer = 1;
+        }
+        if (w->shader_fn) w->shader_fn(w->shader_user, ref);
+      } break;
+      case kPlanBin: {
+        const uint32_t p0 = (at + 1 < dwords) ? BE32(raw, at + 1) : 0;
+        const uint32_t p1 = (at + 2 < dwords) ? BE32(raw, at + 2) : 0;
+        CtxApplyBinPacket(&w->bin, op.reg, p0, p1);
+        ++w->stats->bin_pkts;
+      } break;
+      case kPlanDraw: {
+        uint16_t f = 0;
+        uint32_t index = 0;
+        if (op.reg == 0x22) {
+          ++w->stats->draws22;
+          f = CtxFlagDraw(w);
+          index = w->stats->draws22 - 1;
+          if (w->draw_fn) w->draw_fn(w->draw_user);
+        } else {
+          ++w->stats->draws36;
+        }
+        CtxApplyDrawPayload(w, op.reg, at, uint32_t(op.len) - 1);
+        if (stop) {
+          stop->opcode = op.reg;
+          stop->dword = at;
+          stop->flags = f;
+          stop->index = index;
+          stop->delegate = 0;
+          return true;
+        }
+      } break;
+      case kPlanDeleg:
+        if (stop) {
+          // Cursor stays AT the header for the caller's ExecutePacket
+          // dispatch; CtxWalkSkipDelegated resumes past it.
+          w->cursor = at;
+          ++w->stats->delegate_stops;
+          stop->opcode = op.reg;
+          stop->dword = at;
+          stop->flags = 0;
+          stop->index = 0;
+          stop->delegate = 1;
+          return true;
+        }
+        break;  // finish-drain skips delegates, as the parsed walk does
+      case kPlanSkip:
+      default:
+        break;
+    }
+  }
+  // Ops exhausted with stream left: in sync only trailing no-ops remain, but
+  // under drift these can be real packets. Parse them; dropping live packets
+  // is exactly the silent divergence the gates exist to catch.
+  while (w->cursor < stream_end) {
+    ++w->stats->rep_catchup;
+    if (CtxWalkStep(w, stop, deleg) && stop) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 void CtxWalkBegin(CtxWalker* w, const uint8_t* raw, uint32_t dwords,
@@ -754,6 +982,10 @@ void CtxWalkBegin(CtxWalker* w, const uint8_t* raw, uint32_t dwords,
 }
 
 bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop) {
+  if (w->plan) {
+    w->rep_stops = 0;
+    return CtxPlanNext(w, stop);
+  }
   if (w->rep) {
     w->rep_stops = 0;
     return CtxMemoNext(w, stop);
@@ -765,8 +997,12 @@ bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop) {
 }
 
 bool CtxWalkNextStop(CtxWalker* w, CtxDrawStop* stop) {
-  // [NR-WM] a replay attachment drives from the recorded stream instead of
-  // parsing; the callbacks fire identically from either path.
+  // [NR-PLAN] a compiled plan drives first; [NR-WM] a memo stream second.
+  // The callbacks fire identically from all three paths.
+  if (w->plan) {
+    w->rep_stops = 1;
+    return CtxPlanNext(w, stop);
+  }
   if (w->rep) {
     w->rep_stops = 1;
     return CtxMemoNext(w, stop);
@@ -785,6 +1021,11 @@ void CtxWalkSkipDelegated(CtxWalker* w) {
 }
 
 uint32_t CtxWalkFinish(CtxWalker* w) {
+  if (w->plan) {
+    while (CtxPlanNext(w, nullptr)) {
+    }
+    return w->nflags;
+  }
   if (w->rep) {
     while (CtxMemoNext(w, nullptr)) {
     }
@@ -946,6 +1187,256 @@ void CtxMemoClear() {
 }
 
 CtxMemoStats* CtxMemoStatsPtr() { return &g_memo_stats; }
+
+// ---- [NR-PLAN] compile + guard ---------------------------------------------
+
+void CtxPlanBegin(CtxWalker* w, const CtxPlanOp* ops, uint32_t nops,
+                  uint32_t base_dw, uint32_t end_dw) {
+  w->plan = ops;
+  w->plan_n = nops;
+  w->plan_i = 0;
+  w->plan_base = base_dw;
+  w->plan_end = end_dw;
+}
+
+void CtxPlanEnd(CtxWalker* w) {
+  w->plan = nullptr;
+  w->plan_n = w->plan_i = w->plan_base = w->plan_end = 0;
+}
+
+uint32_t CtxPlanCompile(const uint8_t* raw, uint32_t ndwords, CtxPlanOp* out,
+                        uint32_t out_cap, CtxPlanGuard* guards,
+                        uint32_t guard_cap, uint32_t* nguard,
+                        CtxPlanCompileStats* st) {
+  uint32_t np = 0, ng = 0, j = 0;
+  if (st) *st = CtxPlanCompileStats{};
+  if (nguard) *nguard = 0;
+  bool full = false;
+  auto emit = [&](uint8_t kind, int32_t slot, uint8_t poff, uint8_t flags,
+                  uint32_t reg, uint32_t n, uint32_t len, uint32_t hdr) {
+    if (np >= out_cap) {
+      full = true;
+      return;
+    }
+    CtxPlanOp& o = out[np++];
+    o.kind = kind;
+    o.slot = int8_t(slot);
+    o.poff = poff;
+    o.flags = flags;
+    o.reg = uint16_t(reg);
+    o.n = uint16_t(n);
+    o.len = uint16_t(len);
+    o.pad = 0;
+    o.hdr = hdr;
+  };
+  // Guards attach to the op just emitted; a header two ops share (the type-1
+  // pair) gets one guard each, so a demotion covers both halves.
+  auto guard = [&](uint32_t pos, uint32_t val) {
+    if (ng >= guard_cap || !np) {
+      full = true;
+      return;
+    }
+    guards[ng].pos = pos;
+    guards[ng].val = val;
+    guards[ng].op = np - 1;
+    ++ng;
+  };
+  while (j < ndwords && !full) {
+    const uint32_t h = BE32(raw, j);
+    if (!h || (h >> 30) == 2) {
+      // A placeholder run: the finalize's home. Stored as a window, never as
+      // bytes -- the replay parses whatever stands there (see kCtxMemoScan).
+      const uint32_t run = j;
+      while (j < ndwords) {
+        const uint32_t g = BE32(raw, j);
+        if (g && (g >> 30) != 2) break;
+        ++j;
+      }
+      emit(kPlanScan, -1, 0, 0, 0, j - run, j - run, run);
+      if (st) ++st->scans;
+      continue;
+    }
+    const uint32_t ty = h >> 30;
+    if (ty == 1) {
+      if (j + 3 > ndwords) return 0;
+      const uint32_t r0 = h & 0x7FF, r1 = (h >> 11) & 0x7FF;
+      emit(kPlanReg, CtxSlot(r0), 1, 0, r0, 1, 3, j);
+      guard(j, h);
+      emit(kPlanReg, CtxSlot(r1), 2, 0, r1, 1, 3, j);
+      guard(j, h);
+      if (st) st->regs += 2;
+      j += 3;
+      continue;
+    }
+    const uint32_t cnt = ((h >> 16) & 0x3FFF) + 1;
+    const uint32_t len = 1 + cnt;
+    if (j + len > ndwords) return 0;
+    if (ty == 0) {
+      const uint32_t base = h & 0x7FFF;
+      const bool one_reg = (h >> 15) & 1;
+      if (one_reg) {
+        // n stores to ONE register: a multiplicity a bulk store cannot
+        // express, exactly as CtxWalkStep refuses to offer it.
+        emit(kPlanRegRep, -1, 1, 0, base, cnt, len, j);
+        if (st) st->regs += cnt;
+      } else if (CtxRangeTouchesMirror(base, cnt)) {
+        emit(kPlanRegs, -1, 1, 0, base, cnt, len, j);
+        if (st) st->regs += cnt;
+      } else {
+        emit(kPlanRange, -1, 1, 0, base, cnt, len, j);
+        if (st) ++st->ranges;
+      }
+      guard(j, h);
+      j += len;
+      continue;
+    }
+    const uint32_t op = (h >> 8) & 0x7F;
+    const uint8_t pf = (h & 1) ? kPlanFlagPred : 0;
+    switch (op) {
+      case 0x22:
+      case 0x36:
+        emit(kPlanDraw, -1, 0, pf, op, 0, len, j);
+        guard(j, h);
+        if (st) ++st->draws;
+        break;
+      case 0x27:
+        if (cnt >= 2) {
+          emit(kPlanShader, -1, 0, pf, op, 0, len, j);
+        } else {
+          emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+        }
+        guard(j, h);
+        break;
+      case 0x2B:
+        if (cnt >= 3) {
+          emit(kPlanShader, -1, 0, uint8_t(pf | kPlanFlagImm), op, 0, len, j);
+        } else {
+          emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+        }
+        guard(j, h);
+        break;
+      case 0x2D: {
+        if (cnt < 2) {
+          emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+          guard(j, h);
+          break;
+        }
+        const uint32_t ot = BE32(raw, j + 1);
+        const uint32_t b = CtxConstantBase(ot);
+        const uint32_t n = cnt - 1;
+        if (b == kCtxNoBase) {
+          emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+        } else if (CtxRangeTouchesMirror(b, n)) {
+          emit(kPlanRegs, -1, 2, pf, b, n, len, j);
+          if (st) st->regs += n;
+        } else {
+          emit(kPlanRange, -1, 2, pf, b, n, len, j);
+          if (st) ++st->ranges;
+        }
+        guard(j, h);
+        guard(j + 1, ot);  // the typed offset the base is derived from
+        break;
+      }
+      case 0x55:
+      case 0x56: {
+        if (cnt < 2) {
+          emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+          guard(j, h);
+          break;
+        }
+        const uint32_t b1 = BE32(raw, j + 1);
+        const uint32_t b = b1 & 0xFFFF;
+        const uint32_t n = cnt - 1;
+        const uint8_t fl = uint8_t(pf | kPlanFlagSetConst2);
+        if (CtxRangeTouchesMirror(b, n)) {
+          emit(kPlanRegs, -1, 2, fl, b, n, len, j);
+          if (st) st->regs += n;
+        } else {
+          emit(kPlanRange, -1, 2, fl, b, n, len, j);
+          if (st) ++st->ranges;
+        }
+        guard(j, h);
+        guard(j + 1, b1);  // the RAW register base
+        break;
+      }
+      case 0x2F: {
+        if (cnt < 3 || j + 3 >= ndwords) {
+          emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+          guard(j, h);
+          break;
+        }
+        const uint32_t ot = BE32(raw, j + 2);
+        const uint32_t szd = BE32(raw, j + 3);
+        const uint32_t b = CtxConstantBase(ot);
+        const uint32_t n = szd & 0xFFF;
+        if (b == kCtxNoBase) {
+          emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+        } else if (!n || CtxRangeTouchesMirror(b, n)) {
+          // The walker's per-dword by-ref path poisons/writes slot by slot;
+          // one re-parse is cheaper than reproducing it, and it is rare.
+          emit(kPlanPkt, -1, 0, pf, 0, 0, len, j);
+          if (st) ++st->pkts;
+        } else {
+          emit(kPlanRangeMem, -1, 0, pf, b, n, len, j);
+          if (st) ++st->ranges;
+        }
+        guard(j, h);
+        guard(j + 2, ot);   // offset|type
+        guard(j + 3, szd);  // size_dwords  (dw+1, the ADDRESS, is read live)
+        break;
+      }
+      case 0x50:
+      case 0x51:
+      case 0x60:
+      case 0x61:
+      case 0x62:
+      case 0x63:
+        emit(kPlanBin, -1, 0, pf, op, 0, len, j);
+        guard(j, h);
+        break;
+      case 0x10:  // NOP: the executor skips by count
+      case 0x3B:  // INVALIDATE_STATE: the executor reads and ignores
+        emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+        guard(j, h);
+        if (st) ++st->skips;
+        break;
+      default:
+        emit(kPlanDeleg, -1, 0, pf, op, 0, len, j);
+        guard(j, h);
+        if (st) ++st->delegs;
+        break;
+    }
+    j += len;
+  }
+  if (full || j != ndwords) return 0;
+  if (nguard) *nguard = ng;
+  if (st) {
+    st->ops = np;
+    st->guards = ng;
+  }
+  return np;
+}
+
+uint32_t CtxPlanApplyGuards(const uint8_t* live, uint32_t live_dwords,
+                            CtxPlanOp* ops, uint32_t nops,
+                            const CtxPlanGuard* guards, uint32_t nguard) {
+  uint32_t demoted = 0;
+  for (uint32_t k = 0; k < nguard; ++k) {
+    const CtxPlanGuard& g = guards[k];
+    if (g.pos < live_dwords && BE32(live, g.pos) == g.val) continue;
+    if (g.op >= nops) continue;
+    CtxPlanOp& o = ops[g.op];
+    if (o.kind == kPlanPkt) continue;  // already demoted by a sibling guard
+    o.kind = kPlanPkt;
+    o.slot = -1;
+    o.poff = 0;
+    o.flags = 0;
+    o.reg = 0;
+    o.n = 0;
+    ++demoted;
+  }
+  return demoted;
+}
 
 uint32_t WalkBufferContext(const uint8_t* raw, uint32_t dwords,
                            uint32_t buffer_phys, StateContext* ctx,

@@ -26,6 +26,14 @@ REXCVAR_DEFINE_BOOL(
     "Observation-only, no consumption. One flag arms both the game-side feed "
     "and the SDK-side compare. Off by default.");
 
+REXCVAR_DEFINE_BOOL(
+    gpu_nr_tmpl_plan, false, "GPU",
+    "DEV [nr-plan] N-2-2: compile each span template into a FLAT APPLY PLAN "
+    "(one op per packet, everything the walk derives resolved once, every "
+    "value read live, structure guarded) instead of the walker's memo op "
+    "stream, and drive the [nr-tmpl] compare from it. Requires gpu_nr_tmpl. "
+    "Off by default.");
+
 namespace rex {
 namespace graphics {
 namespace nr {
@@ -40,6 +48,11 @@ constexpr uint32_t kMaxSpanDwords = kMaxSpanBytes / 4;
 // never outgrow the span's dword count. Reserved once so the producer-thread
 // push_backs never allocate (record-side rule: no host mutexes).
 constexpr uint32_t kBuildOpCap = kMaxSpanDwords + 8;
+// [NR-PLAN] One plan op per PACKET and at most 0.75 guards per dword (the
+// densest shape is LOAD_ALU_CONSTANT: 4 dwords, 3 guards), so the span's
+// dword count bounds both. Reserved statically; the producer never allocates.
+constexpr uint32_t kPlanOpCap = kMaxSpanDwords + 8;
+constexpr uint32_t kPlanGuardCap = kMaxSpanDwords + 8;
 
 constexpr uint32_t kArenaBytes = 256u << 20;
 constexpr uint32_t kTblBits = 18;
@@ -59,19 +72,30 @@ struct Slot {
   uint32_t off = 0;  // arena byte offset of the blob
   uint32_t ndwords = 0;
   uint32_t nops = 0;
+  uint32_t nplan = 0;   // [NR-PLAN] plan ops (0 in memo mode)
+  uint32_t nguard = 0;  // [NR-PLAN] structure guards
 };
 
-// Blob layout at `off`: u32 key, u32 ndwords, u32 nops, then the ops
-// (nops * sizeof(CtxMemoOp)), then the span byte copy (ndwords * 4). The
-// header duplicates the slot so the reader can prove the copy it took is the
-// blob the slot meant.
-constexpr uint32_t kBlobHdr = 12;
+// Blob layout at `off`: u32 key, ndwords, nops, nplan, nguard, then the memo
+// ops (nops * sizeof(CtxMemoOp)), the plan ops, the guards, and last the span
+// byte copy (ndwords * 4) -- last so the byte-identity check's offset is one
+// addition. The header duplicates the slot so the reader can prove the copy
+// it took is the blob the slot meant. Exactly one of {nops, nplan} is
+// nonzero: gpu_nr_tmpl_plan picks the shape at startup.
+constexpr uint32_t kBlobHdr = 20;
+
+inline uint32_t BlobBytesOff(uint32_t nops, uint32_t nplan, uint32_t nguard) {
+  return kBlobHdr + nops * uint32_t(sizeof(CtxMemoOp)) +
+         nplan * uint32_t(sizeof(CtxPlanOp)) +
+         nguard * uint32_t(sizeof(CtxPlanGuard));
+}
 
 Slot g_tbl[kTblSize];
 uint8_t* g_arena = nullptr;
 uint32_t g_cursor = 0;  // producer-private
 std::atomic<uint32_t> g_epoch{1};
 bool g_active = false;
+bool g_plan_mode = false;
 
 TmplStats g_stats;
 
@@ -89,6 +113,9 @@ inline uint32_t LoadBE32(const uint8_t* base, uint32_t at) {
 
 std::vector<CtxMemoOp> g_build_ops;  // capacity reserved at init, never grows
 std::vector<CtxMemoOp> g_build_ops2;  // ...and the scan-merged stream
+// [NR-PLAN] producer-thread compile scratch (static: the feed never allocates)
+CtxPlanOp g_build_plan[kPlanOpCap];
+CtxPlanGuard g_build_guards[kPlanGuardCap];
 StateContext g_build_ctx = {};       // scratch: ops do not depend on it
 CtxWalkStats g_build_stats;
 
@@ -201,6 +228,7 @@ extern "C" bool rex_nr_tmpl_active() {
       if (g_arena) {
         g_build_ops.reserve(kBuildOpCap);
         g_build_ops2.reserve(kBuildOpCap);
+        g_plan_mode = REXCVAR_GET(gpu_nr_tmpl_plan);
         g_active = true;
       }
     }
@@ -245,8 +273,8 @@ extern "C" void rex_nr_tmpl_span(uint32_t entry_va, uint32_t end_va,
       const uint32_t k = c.key.load(std::memory_order_relaxed);
       if (k == key) {
         if (c.epoch == epoch && c.ndwords == ndwords &&
-            std::memcmp(g_arena + c.off + kBlobHdr +
-                            size_t(c.nops) * sizeof(CtxMemoOp),
+            std::memcmp(g_arena + c.off +
+                            BlobBytesOff(c.nops, c.nplan, c.nguard),
                         base + start, size_t(ndwords) * 4) == 0) {
           ++s.unchanged;
           return;
@@ -264,48 +292,71 @@ extern "C" void rex_nr_tmpl_span(uint32_t entry_va, uint32_t end_va,
     }
   }
 
+  // [NR-PLAN] N-2-2: the flat apply plan. One framing pass over the span
+  // bytes -- no walker, no memo vector, no scan merge -- emitting one op per
+  // packet plus the structure guards. Strictly cheaper on the producer than
+  // the memo build it replaces, which matters: this runs on the guest thread.
+  uint32_t nplan = 0, nguard = 0;
+  if (g_plan_mode) {
+    CtxPlanCompileStats cst;
+    nplan = CtxPlanCompile(base + start, ndwords, g_build_plan, kPlanOpCap,
+                           g_build_guards, kPlanGuardCap, &nguard, &cst);
+    if (!nplan) {
+      ++s.plan_fail;
+      return;
+    }
+    s.plan_ops += nplan;
+    s.plan_guards += nguard;
+    s.scan_ops += cst.scans;
+    ++s.plan_built;
+  }
   // One parse of the just-written span through the real walker, its own memo
   // recorder attached: build-side decode semantics are the walk's by
   // construction. Bin state all-ones so every packet (all three tiles'
   // predicated blocks included) is decoded and recorded.
   g_build_ops.clear();
-  CtxWalker w;
-  CtxWalkBegin(&w, base + start, ndwords, key, &g_build_ctx, nullptr, 0,
-               &g_build_stats, BuildMemRead, nullptr, nullptr, nullptr,
-               nullptr, nullptr, ~0ull, ~0ull, nullptr, nullptr, nullptr,
-               nullptr);
-  w.range_fn = BuildRangeFn;
-  w.range_user = &w;
-  w.rec = &g_build_ops;
-  CtxDrawStop st;
-  while (CtxWalkNextStop(&w, &st)) {
-    if (st.delegate) CtxWalkSkipDelegated(&w);
-  }
-  if (w.cursor != ndwords) {
-    // Framing guaranteed the landing, so this should not happen; counted so a
-    // violation can never hide.
-    ++s.parse_fail;
-    return;
-  }
-  // [NR-TMPL] rung 1: fold the placeholder runs in as live-scan windows.
-  // One op per no-op RUN and one per packet, so the merged stream is still
-  // bounded by the span's dword count.
-  {
+  if (!g_plan_mode) {
+    CtxWalker w;
+    CtxWalkBegin(&w, base + start, ndwords, key, &g_build_ctx, nullptr, 0,
+                 &g_build_stats, BuildMemRead, nullptr, nullptr, nullptr,
+                 nullptr, nullptr, ~0ull, ~0ull, nullptr, nullptr, nullptr,
+                 nullptr);
+    w.range_fn = BuildRangeFn;
+    w.range_user = &w;
+    w.rec = &g_build_ops;
+    CtxDrawStop st;
+    while (CtxWalkNextStop(&w, &st)) {
+      if (st.delegate) CtxWalkSkipDelegated(&w);
+    }
+    if (w.cursor != ndwords) {
+      // Framing guaranteed the landing, so this should not happen; counted so
+      // a violation can never hide.
+      ++s.parse_fail;
+      return;
+    }
+    // [NR-TMPL] rung 1: fold the placeholder runs in as live-scan windows.
+    // One op per no-op RUN and one per packet, so the merged stream is still
+    // bounded by the span's dword count.
     uint32_t scan_dw = 0;
     const uint32_t nscan =
         MergeScanOps(base + start, ndwords, g_build_ops, &g_build_ops2,
                      &scan_dw);
     s.scan_ops += nscan;
     s.scan_dw += scan_dw;
-  }
-  if (g_build_ops2.size() > kBuildOpCap) {
-    ++s.ops_overflow;
-    return;
+    if (g_build_ops2.size() > kBuildOpCap) {
+      ++s.ops_overflow;
+      return;
+    }
+  } else {
+    g_build_ops2.clear();
   }
 
   const uint32_t nops = uint32_t(g_build_ops2.size());
   const uint32_t ops_bytes = nops * uint32_t(sizeof(CtxMemoOp));
-  const uint32_t need = kBlobHdr + ops_bytes + ndwords * 4;
+  const uint32_t plan_bytes = nplan * uint32_t(sizeof(CtxPlanOp));
+  const uint32_t guard_bytes = nguard * uint32_t(sizeof(CtxPlanGuard));
+  const uint32_t need =
+      kBlobHdr + ops_bytes + plan_bytes + guard_bytes + ndwords * 4;
   if (g_cursor + need > kArenaBytes) {
     // Wrap: bump the epoch first (every reader-visible template goes stale
     // at once -- nothing is ever overwritten inside a live epoch), restart.
@@ -318,10 +369,18 @@ extern "C" void rex_nr_tmpl_span(uint32_t entry_va, uint32_t end_va,
   const uint32_t pub_epoch = g_epoch.load(std::memory_order_relaxed);
   const uint32_t off = g_cursor;
   uint8_t* blob = g_arena + off;
-  const uint32_t hdr3[3] = {key, ndwords, nops};
-  std::memcpy(blob, hdr3, kBlobHdr);
+  const uint32_t hdr5[5] = {key, ndwords, nops, nplan, nguard};
+  std::memcpy(blob, hdr5, kBlobHdr);
   if (ops_bytes) std::memcpy(blob + kBlobHdr, g_build_ops2.data(), ops_bytes);
-  std::memcpy(blob + kBlobHdr + ops_bytes, base + start, size_t(ndwords) * 4);
+  if (plan_bytes) {
+    std::memcpy(blob + kBlobHdr + ops_bytes, g_build_plan, plan_bytes);
+  }
+  if (guard_bytes) {
+    std::memcpy(blob + kBlobHdr + ops_bytes + plan_bytes, g_build_guards,
+                guard_bytes);
+  }
+  std::memcpy(blob + BlobBytesOff(nops, nplan, nguard), base + start,
+              size_t(ndwords) * 4);
   g_cursor += (need + 15u) & ~15u;
 
   target->key.store(0, std::memory_order_relaxed);
@@ -329,6 +388,8 @@ extern "C" void rex_nr_tmpl_span(uint32_t entry_va, uint32_t end_va,
   target->off = off;
   target->ndwords = ndwords;
   target->nops = nops;
+  target->nplan = nplan;
+  target->nguard = nguard;
   target->key.store(key, std::memory_order_release);
   ++(existed ? s.rebuilt : s.built);
 }
@@ -344,7 +405,11 @@ namespace {
 struct TmplView {
   uint32_t ndwords;
   uint32_t nops;
+  uint32_t nplan;
+  uint32_t nguard;
   CtxMemoOp* ops;  // in CP-thread scratch: the drift pre-pass rewrites ops
+  CtxPlanOp* plan;  // ...and the guard pass rewrites plan ops
+  const CtxPlanGuard* guards;
   const uint8_t* bytes;
 };
 
@@ -357,7 +422,8 @@ constexpr size_t kMaxSnapBytes = 64u << 20;
 std::vector<uint8_t> g_snap;
 
 uint8_t g_view_scratch[kBlobHdr + kBuildOpCap * sizeof(CtxMemoOp) +
-                       kMaxSpanBytes];
+                       kPlanOpCap * sizeof(CtxPlanOp) +
+                       kPlanGuardCap * sizeof(CtxPlanGuard) + kMaxSpanBytes];
 
 bool Lookup(uint32_t key, TmplView* v, Slot** out_slot) {
   const uint32_t h = SlotIndex(key);
@@ -368,10 +434,13 @@ bool Lookup(uint32_t key, TmplView* v, Slot** out_slot) {
     const uint32_t off = c.off;
     const uint32_t nd = c.ndwords;
     const uint32_t no = c.nops;
-    if (c.epoch != e1 || !nd || nd > kMaxSpanDwords || no > kBuildOpCap) {
+    const uint32_t npl = c.nplan;
+    const uint32_t ngd = c.nguard;
+    if (c.epoch != e1 || !nd || nd > kMaxSpanDwords || no > kBuildOpCap ||
+        npl > kPlanOpCap || ngd > kPlanGuardCap) {
       continue;
     }
-    const uint32_t bytes = kBlobHdr + no * uint32_t(sizeof(CtxMemoOp)) + nd * 4;
+    const uint32_t bytes = BlobBytesOff(no, npl, ngd) + nd * 4;
     if (uint64_t(off) + bytes > kArenaBytes) continue;
     std::memcpy(g_view_scratch, g_arena + off, bytes);
     // Revalidate: the arena is append-only inside an epoch and slots publish
@@ -381,16 +450,24 @@ bool Lookup(uint32_t key, TmplView* v, Slot** out_slot) {
       ++g_stats.lookup_stale;
       continue;
     }
-    uint32_t hdr3[3];
-    std::memcpy(hdr3, g_view_scratch, kBlobHdr);
-    if (hdr3[0] != key || hdr3[1] != nd || hdr3[2] != no) {
+    uint32_t hdr5[5];
+    std::memcpy(hdr5, g_view_scratch, kBlobHdr);
+    if (hdr5[0] != key || hdr5[1] != nd || hdr5[2] != no || hdr5[3] != npl ||
+        hdr5[4] != ngd) {
       ++g_stats.lookup_stale;
       continue;
     }
     v->ndwords = nd;
     v->nops = no;
+    v->nplan = npl;
+    v->nguard = ngd;
     v->ops = reinterpret_cast<CtxMemoOp*>(g_view_scratch + kBlobHdr);
-    v->bytes = g_view_scratch + kBlobHdr + no * sizeof(CtxMemoOp);
+    v->plan = reinterpret_cast<CtxPlanOp*>(g_view_scratch + kBlobHdr +
+                                           no * sizeof(CtxMemoOp));
+    v->guards = reinterpret_cast<const CtxPlanGuard*>(
+        g_view_scratch + kBlobHdr + no * sizeof(CtxMemoOp) +
+        npl * sizeof(CtxPlanOp));
+    v->bytes = g_view_scratch + BlobBytesOff(no, npl, ngd);
     *out_slot = &c;
     return true;
   }
@@ -884,7 +961,19 @@ void TmplCompareBuffer(const uint8_t* raw_live, uint32_t ptr, uint32_t count,
           g_span_live = live;
           g_span_stored = v.bytes;
           g_span_nd = v.ndwords;
-          if (stale) DriftPrePass(live, v);
+          if (stale) {
+            // [NR-PLAN] The plan's ONLY structural claim is guarded, so the
+            // guard pass replaces the drift pre-pass entirely: values are
+            // read live and need no check, structure is checked and demoted.
+            if (g_plan_mode) {
+              ++s.plan_guard_spans;
+              s.plan_demoted += CtxPlanApplyGuards(live, v.ndwords, v.plan,
+                                                   v.nplan, v.guards,
+                                                   v.nguard);
+            } else {
+              DriftPrePass(live, v);
+            }
+          }
           // Decode bound = the rest of the BUFFER, stream bound = this span.
           // A finalize can lengthen a packet at the span's edge so its payload
           // sits in the next span's dwords; the live walk reads it, so the
@@ -895,10 +984,15 @@ void TmplCompareBuffer(const uint8_t* raw_live, uint32_t ptr, uint32_t count,
                        BReg, nullptr, nullptr, nullptr);
           g_wb.range_fn = BRange;
           g_wb.range_user = &g_wb;
-          g_wb.rep = v.ops;
-          g_wb.rep_n = v.nops;
-          g_wb.rep_i = 0;
-          g_wb.rep_end = v.ndwords;
+          if (g_plan_mode) {
+            ++s.plan_spans;
+            CtxPlanBegin(&g_wb, v.plan, v.nplan, 0, v.ndwords);
+          } else {
+            g_wb.rep = v.ops;
+            g_wb.rep_n = v.nops;
+            g_wb.rep_i = 0;
+            g_wb.rep_end = v.ndwords;
+          }
           CtxDrawStop bst;
           while (CtxWalkNextStop(&g_wb, &bst)) {
             BCompare({kEmiStop, bst.delegate, uint16_t(bst.opcode),
