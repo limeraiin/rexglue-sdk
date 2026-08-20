@@ -199,12 +199,25 @@ void CtxWriteReg(CtxWalker* w, uint32_t reg, uint32_t value,
 }
 
 // [NR-SKP] 5-4-3: a range may be offered in bulk only when it cannot touch
-// the 27-reg recovery mirror (every mirrored slot lives in [0x2000, 0x2322)).
-// For such a range, per-dword CtxWriteReg would have done nothing but the
-// reg_fn call (mirror store and watch_fn both fire only for mirrored slots),
-// so a consumed range skips exactly the reg_fn calls and nothing else.
+// the 27-reg recovery mirror. For such a range, per-dword CtxWriteReg would
+// have done nothing but the reg_fn call (mirror store and watch_fn both fire
+// only for mirrored slots), so a consumed range skips exactly the reg_fn
+// calls and nothing else.
+// [NR-PB] N-2-2 item 0: the check is per-slot, not the whole [0x2000, 0x2322)
+// window -- a state range that misses all 27 mirrored slots (and so all 4
+// watched registers, each of which IS a mirrored slot) is offerable. Whether
+// the consumer takes a state range is its own gate (gpu_nr_plain_bulk in
+// NrWalkRegRange); a declined offer falls to the per-dword path unchanged.
+inline bool CtxRangeTouchesMirror(uint32_t base, uint32_t n) {
+  for (const SlotRange& r : kRanges) {
+    if (base < r.first_reg + r.count && base + n > r.first_reg) return true;
+  }
+  return false;
+}
 inline bool CtxRangeOfferable(const CtxWalker* w, uint32_t base, uint32_t n) {
-  return w->range_fn && n != 0 && (base >= 0x2322u || base + n <= 0x2000u);
+  if (!w->range_fn || n == 0) return false;
+  if (base >= 0x2322u || base + n <= 0x2000u) return true;
+  return !CtxRangeTouchesMirror(base, n);
 }
 
 uint16_t CtxGroupBits(const StateContext* ctx, uint32_t first, uint32_t n,

@@ -233,6 +233,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  // [NR-PB] N-2-2 item 0: plain bulk store + the gpu_instance dirty semantic
+  // (the only D3D12 tail a plain register has).
+  void WriteRegisterRangePlain(uint32_t base, uint32_t* values_be, uint32_t n) override;
   // [NR-FX] Phase 5-4-0: WriteRegister's dirty-tracking tail for the three
   // constant ranges, fired from the lockstep walk's decoded write stream. No
   // value store, no dedupe. Keep in sync with WriteRegister / PrecordApplyWrite.

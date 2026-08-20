@@ -3877,6 +3877,30 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
 }
 
+// [NR-PB] N-2-2 item 0: a plain state range's ONLY D3D12 tail is the
+// gpu_instance dirty check. The caller proved the range wholly outside the
+// vertex float-constant window (plain ranges never intersect any constant
+// window), so any value change breaks the open batch -- the same rule the
+// WriteRegistersFromMem override applies outside [kVsFloatLo, kVsFloatHi).
+// Precord capture cannot be live here (NrSkipBackendEligible vetoes it) and
+// const-dedupe is constant-window-only, so neither branch is owed.
+void D3D12CommandProcessor::WriteRegisterRangePlain(uint32_t base, uint32_t* values_be,
+                                                    uint32_t n) {
+  if (g_instance && !g_instance_dirty) {
+    for (uint32_t i = 0; i < n; ++i) {
+      // VGT_EVENT_INITIATOR keeps the per-dword path's write-strobe
+      // exemption: the widening replaces that path, so it is the reference.
+      if (base + i == XE_GPU_REG_VGT_EVENT_INITIATOR) continue;
+      if (memory::load_and_swap<uint32_t>(values_be + i) != register_file_->values[base + i]) {
+        g_instance_dirty = true;
+        g_instance_dirty_first_reg = base + i;
+        break;
+      }
+    }
+  }
+  CommandProcessor::WriteRegisterRangePlain(base, values_be, n);
+}
+
 void D3D12CommandProcessor::OnGammaRamp256EntryTableValueWritten() {
   gamma_ramp_256_entry_table_up_to_date_ = false;
 }

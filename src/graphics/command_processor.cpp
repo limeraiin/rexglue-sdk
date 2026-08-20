@@ -303,6 +303,25 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, true, "GPU",
                     "city validation (naruto_364, pixel-perfect at 13M "
                     "draws).");
 
+// [NR-PB] N-2-2 item 0: the widened bulk apply. NrWalkRegRange used to accept
+// only the three pure constant windows; every multi-register write to the
+// state file (0x2000+) fell to the per-dword virtual WriteRegister, which for
+// a plain register does nothing beyond the value store (both backend
+// overrides add dirty tails ONLY for the constant windows; state registers
+// are consumed by draw-time reads of the register file). All stateful ports
+// -- scratch writeback 0x578-0x57F (+UMSK/ADDR 0x1DC/0x1DD), COHER 0xA31,
+// the DC_LUT machine 0x1922-0x1925 -- sit below 0x2000, so "base >= 0x2000,
+// wholly outside the constant windows, inside the register file" is a static
+// proof of plainness. City measured 2.84M such writes/s slow-pathed by packet
+// shape ([nr-bfc] pdwsf plain=99.5%). Priced 2026-08-20: sound; this cvar is
+// the prerequisite the N-2-2 flat apply plan compiles against.
+REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, false, "GPU",
+                    "[nr-pb] N-2-2 item 0: under gpu_nr_skip, bulk-apply "
+                    "full-fit multi-register writes to PLAIN state registers "
+                    "(0x2000+, outside the constant windows) instead of the "
+                    "per-dword virtual WriteRegister. Stateful ports and "
+                    "mirror-window ranges keep the per-dword path.");
+
 // [NR-WM] Phase 5-4-8: the walk memo. A skip-driven buffer whose bytes are
 // identical to its previous compared execution (the ruse shadow compare, on
 // anyway under the fast path) replays the walker's recorded emission stream
@@ -1472,6 +1491,12 @@ uint64_t g_skp_pdw = 0;
 bool g_nr_skip_direct = false;
 uint64_t g_skp_direct = 0;
 uint64_t g_skp_direct_fb = 0;
+// [NR-PB] N-2-2 item 0: widened plain-register bulk apply (see the cvar).
+// plain_rng/plain_dw count the ranges the widening accepted that the old
+// constant-window gate would have refused into the per-dword path.
+bool g_nr_plain_bulk = false;
+uint64_t g_skp_plain_rng = 0;
+uint64_t g_skp_plain_dw = 0;
 // [NR-SPP] 5-4-4 step 0b: skip-path timing (CP-thread-only, gated on
 // gpu_nr_skip_profile; one bool test per stop when off).
 bool g_skp_prof = false;
@@ -2672,7 +2697,20 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
          end <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
         (base >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
          end <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
-    return false;
+    // [NR-PB] N-2-2 item 0: a range of PLAIN registers -- inside the register
+    // file, at or above 0x2000 (every stateful port is below), and wholly
+    // outside the constant windows (a range that INTERSECTS one would need
+    // that window's dirty tail for part of itself; full-fit inside was
+    // matched above). NrSkipApplyRegRange routes it to the bulk plain store.
+    // The walker has already refused mirror-window overlaps
+    // (CtxRangeOfferable), so the 27 mirrored slots and the 4 watched
+    // registers never arrive here.
+    if (!(g_nr_plain_bulk && base >= 0x2000u &&
+          end < RegisterFile::kRegisterCount &&
+          (end < XE_GPU_REG_SHADER_CONSTANT_000_X ||
+           base > XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
+      return false;
+    }
   }
   return static_cast<CommandProcessor*>(user)->NrSkipApplyRegRange(
       base, values_be, n, phys, from_memory);
@@ -2962,6 +3000,9 @@ void CommandProcessor::WorkerThreadMain() {
   g_skp_prof = kSkpProf;
   // [NR-SKP] 5-4-4a: the direct draw path only exists under the skip.
   g_nr_skip_direct = REXCVAR_GET(gpu_nr_skip_direct) && kNrSkip;
+  // [NR-PB] N-2-2 item 0: the plain bulk apply only exists under the skip
+  // (NrWalkRegRange is dead everywhere else).
+  g_nr_plain_bulk = REXCVAR_GET(gpu_nr_plain_bulk) && kNrSkip;
   // [NR-RUSE] 5-4-5 inc 0: the reuse pricing probe rides the skip (the walk
   // is the only decoder there, so buffer bytes ARE the input stream).
   // 5-4-5-2: the fast path consumes the verdict, so it implies the probe
@@ -3784,14 +3825,16 @@ void CommandProcessor::WorkerThreadMain() {
           }
           REXGPU_INFO(
               "[nr-skp] bufs={} fb={} draws={} direct={} dfb={} deleg={} "
-              "exec_fail={} orphan={} rng={}/{}dw pdw={} |{}",
+              "exec_fail={} orphan={} rng={}/{}dw pdw={} plain={}/{}dw |{}",
               g_skp_bufs, g_skp_fb, g_skp_draws, g_skp_direct, g_skp_direct_fb,
               g_skp_deleg, g_skp_exec_fail, g_skp_arm_orphan, g_skp_rng,
-              g_skp_rng_dw, g_skp_pdw, n ? ops : " deleg none");
+              g_skp_rng_dw, g_skp_pdw, g_skp_plain_rng, g_skp_plain_dw,
+              n ? ops : " deleg none");
           g_skp_bufs = g_skp_fb = g_skp_draws = g_skp_deleg = 0;
           g_skp_direct = g_skp_direct_fb = 0;
           g_skp_exec_fail = g_skp_arm_orphan = 0;
           g_skp_rng = g_skp_rng_dw = g_skp_pdw = 0;
+          g_skp_plain_rng = g_skp_plain_dw = 0;
           for (uint32_t op = 0; op < 128; ++op) g_skp_deleg_op[op] = 0;
         }
         // [NR-WM] 5-4-8: the walk memo. Gate under verify: ne=0. Perf mode:
@@ -4268,6 +4311,17 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       } break;
     }
   }
+}
+
+// [NR-PB] N-2-2 item 0: plain bulk store. The caller proved the range free of
+// stateful ports, constant windows, extended registers and mirror/watch slots
+// (NrWalkRegRange + CtxRangeOfferable), so the per-dword virtual
+// WriteRegister would have been n value stores and nothing else. Same
+// copy_and_swap the constant windows use; same thread as every register
+// consumer (WAIT_REG_MEM polls from this thread), so the volatile per-dword
+// store buys nothing here.
+void CommandProcessor::WriteRegisterRangePlain(uint32_t base, uint32_t* values_be, uint32_t n) {
+  memory::copy_and_swap(register_file_->values + base, values_be, n);
 }
 
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
@@ -5444,7 +5498,20 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
     if (g_nr_ruse_v0 && from_memory) NrRuseFeedByrefRange(base, be, n);
     NrRuseRange(base, be, n, from_memory);
   }
-  WriteRegistersFromMem(base, be, n);
+  // [NR-PB] N-2-2 item 0: a plain state range (see NrWalkRegRange) must NOT
+  // go through the virtual WriteRegistersFromMem -- for a non-constant range
+  // both backend overrides fall through to the base per-dword loop, which is
+  // exactly the slow path the widening exists to remove. The plain store is
+  // its own virtual: value copy + the D3D12 gpu_instance dirty semantic.
+  const uint32_t pb_end = base + n - 1;
+  if (pb_end < XE_GPU_REG_SHADER_CONSTANT_000_X ||
+      base > XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    WriteRegisterRangePlain(base, be, n);
+    ++g_skp_plain_rng;
+    g_skp_plain_dw += n;
+  } else {
+    WriteRegistersFromMem(base, be, n);
+  }
   const uint32_t* host = &register_file_->values[base];
   if (g_nr_res) {
     nr::ResApplyRange(&g_res_state, &g_res_stats, base, host, n, from_memory);

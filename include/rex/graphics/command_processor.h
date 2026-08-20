@@ -275,6 +275,15 @@ class CommandProcessor {
   virtual void WriteRegister(uint32_t index, uint32_t value);
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+  // [NR-PB] N-2-2 item 0: bulk value store for a range of PLAIN registers --
+  // no stateful port (scratch writeback, COHER, DC_LUT: all indices below
+  // 0x2000), no constant-window dirty tail, no extended registers. The caller
+  // (NrSkipApplyRegRange) guarantees base >= 0x2000, base + n <=
+  // kRegisterCount, and no intersection with the three constant windows, so
+  // the full virtual WriteRegister would have done nothing but the value
+  // store for every dword. Overridden by D3D12 for the gpu_instance
+  // dirty-tracking semantic only.
+  virtual void WriteRegisterRangePlain(uint32_t base, uint32_t* values_be, uint32_t n);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                           uint32_t num_registers);
   void WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
