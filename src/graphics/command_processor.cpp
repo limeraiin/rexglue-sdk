@@ -340,6 +340,21 @@ REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap, false, "GPU",
 // register in the blocks it spans is currently stale (a per-64-register
 // stale count), which is exactly the condition under which every one of
 // those 64 NrRuseStaleMark calls would have been a no-op.
+// [NR-ISSUE-LIVE] N-2-2 follow-up (2026-08-20). Under the skip the replay
+// file is a strict mirror of the live register file: every walk write goes
+// through the full virtual WriteRegister into register_file_ FIRST and is
+// then memcpy'd into g_nri_file (~122 range dwords + 3.2 singles per draw at
+// city), and the one-time seed with an unfed shadow is a pure live-file
+// copy. Pointing nr_issue_file_ at the live file removes that second copy.
+// Gated to the exact configuration where the identity holds by construction:
+// skip on (lockstep), verify off (shadow unfed), reuse off (the only other
+// g_nri_file reader). Delegate-side register writes bypass the mirror, so
+// live is strictly MORE current, never less.
+REXCVAR_DEFINE_BOOL(gpu_nr_issue_live, false, "GPU",
+                    "[nr-issue] point the draw-issue register source at the "
+                    "live register file instead of the mirrored replay file. "
+                    "Requires skip + verify off + reuse off. Default off.");
+
 REXCVAR_DEFINE_BOOL(gpu_nr_reuse_blk, false, "GPU",
                     "[nr-ruse] block-skip the per-dword stale feed for "
                     "register runs that neither changed nor hold a stale "
@@ -1732,6 +1747,9 @@ uint64_t g_nri_sh_mismatch = 0;  // window: walk-resolved shader != live active
 // because it is six loads, not a policy.
 RegisterFile g_nri_file;
 bool g_nri_seeded = false;
+// [NR-ISSUE-LIVE] latched per config epoch: mirror writes are skipped and
+// the arm points nr_issue_file_ at the live file.
+bool g_nri_live = false;
 constexpr uint32_t kNriNonStreamRegs[] = {
     0x0081,  // SCLK_PWRMGT_CNTL2_REG   extern, power
     0x01C5,  // CP_RB_WPTR              extern, ring bookkeeping
@@ -2771,7 +2789,8 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   // [NR-ISSUE] Increment 4e: the replay file takes every decoded write as it
   // happens (execution order -- the walk is in lockstep). Same range rule as
   // the shadow: out-of-range is dropped, never clamped onto a real register.
-  if (g_nr_issue && g_nri_seeded && reg < RegisterFile::kRegisterCount) {
+  if (g_nr_issue && g_nri_seeded && !g_nri_live &&
+      reg < RegisterFile::kRegisterCount) {
     g_nri_file.values[reg] = value;
   }
   // [NR-SKP] Phase 5-4-2: while the skip loop drives this buffer, the
@@ -3167,6 +3186,11 @@ void CommandProcessor::WorkerThreadMain() {
   g_nr_issue = kNrIssue;
   g_nri_from = REXCVAR_GET(gpu_nr_issue_from);
   g_nri_count = REXCVAR_GET(gpu_nr_issue_count);
+  // [NR-ISSUE-LIVE] only in the lockstep-identity configuration; any other
+  // mode keeps the mirror (walk-ahead arms, the verify shadow compose, and
+  // the reuse entry components all read g_nri_file).
+  g_nri_live = REXCVAR_GET(gpu_nr_issue_live) && kNrSkip &&
+               !g_nr_verify_base && !g_nr_ruse;
   // [NR-ISSUE] Increment 4e: while issue is off the replay file receives no
   // writes, so a later enable must reseed rather than trust a stale file.
   if (!kNrIssue) g_nri_seeded = false;
@@ -5757,7 +5781,7 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
   if (g_nr_draw && g_nr_verify_base) {
     nr::RegShadowApplyRange(&g_reg_shadow, &g_reg_stats, base, host, n);
   }
-  if (g_nr_issue && g_nri_seeded) {
+  if (g_nr_issue && g_nri_seeded && !g_nri_live) {
     std::memcpy(&g_nri_file.values[base], host, n * sizeof(uint32_t));
   }
   // [NR-BFC] bulk ranges feed the census (end-state size + class split).
@@ -6830,6 +6854,11 @@ void CommandProcessor::ExecutePacketType3DrawTail(
                 // the compose loses nothing to the pre-seed window), then
                 // rely on the incremental applies. Per arm, only the six
                 // non-stream registers are re-read from live.
+                if (g_nri_live) {
+                  // [NR-ISSUE-LIVE] the live file IS the replay state in
+                  // lockstep; no seed, no mirror, no non-stream re-read.
+                  nr_issue_file_ = register_file_;
+                } else {
                 if (!g_nri_seeded) {
                   nr::RegShadowCompose(&g_reg_shadow, register_file_->values,
                                        g_nri_file.values);
@@ -6839,6 +6868,7 @@ void CommandProcessor::ExecutePacketType3DrawTail(
                   g_nri_file.values[r] = register_file_->values[r];
                 }
                 nr_issue_file_ = &g_nri_file;
+                }
                 nr_issue_vertex_shader_ = vs;
                 nr_issue_pixel_shader_ = ps;
                 nr_issue_shaders_active_ = true;
