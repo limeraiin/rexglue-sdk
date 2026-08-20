@@ -1013,6 +1013,11 @@ bool CtxWalkNextStop(CtxWalker* w, CtxDrawStop* stop) {
   return false;
 }
 
+bool CtxWalkStepOne(CtxWalker* w, CtxDrawStop* stop) {
+  if (w->cursor >= w->dwords) return false;
+  return CtxWalkStep(w, stop, /*delegate_stops=*/true);
+}
+
 void CtxWalkSkipDelegated(CtxWalker* w) {
   if (w->cursor >= w->dwords) return;
   const uint32_t hdr = BE32(w->raw, w->cursor);

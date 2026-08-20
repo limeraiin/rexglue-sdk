@@ -190,6 +190,34 @@ enum TmplStaleCls : uint32_t {
   kTmplScCount
 };
 
+// [NR-PLAN] N-2-2 item 2: the CONSUMING swap. Everything above this line is
+// a gate; this is the consumer. At a packet boundary of an executing buffer,
+// look up the span template whose key is that packet's address, check its
+// structure guards against the live bytes (demoting any op whose packet the
+// recorder finalized out from under it), and attach the plan to `w` so the
+// skip loop replays it instead of parsing. Returns false when there is no
+// usable template at `dw`, and the caller steps one packet live and re-asks.
+//
+// The span byte copy is deliberately NOT read here: the guards are the
+// structural claim, the values are read live, and the framing is enforced by
+// the walker's cursor invariant -- so the swap needs no byte compare at all.
+struct TmplSwapStats {
+  uint64_t spans = 0;      // plans attached
+  uint64_t dwords = 0;     // buffer dwords those plans covered
+  uint64_t miss = 0;       // no template starts at this packet
+  uint64_t gap_pkts = 0;   // packets stepped live between spans
+  uint64_t cross = 0;      // template longer than the buffer's remainder
+  uint64_t dead = 0;       // refused: too much of the plan drifted
+  uint64_t demoted = 0;    // ops a failing guard sent back to a live re-parse
+  uint64_t lk_stale = 0;   // slot changed mid-read (race): counted, not used
+};
+
+bool TmplPlanAttach(CtxWalker* w, uint32_t pbase, uint32_t dw, uint32_t count,
+                    const uint8_t* raw);
+TmplSwapStats* TmplSwapStatsPtr();
+// True when the store holds plans (gpu_nr_tmpl_plan) rather than memo ops.
+bool TmplPlanMode();
+
 // Compare one executed depth-1 indirect buffer against the store.
 // Observation-only: private walker, private contexts, nothing shared with
 // the live modes. `raw` = TranslatePhysical(ptr); `mem_read` resolves by-ref

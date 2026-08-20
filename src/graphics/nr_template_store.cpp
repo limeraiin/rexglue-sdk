@@ -421,7 +421,14 @@ struct TmplView {
 constexpr size_t kMaxSnapBytes = 64u << 20;
 std::vector<uint8_t> g_snap;
 
-uint8_t g_view_scratch[kBlobHdr + kBuildOpCap * sizeof(CtxMemoOp) +
+// [NR-PLAN] The consuming swap's own CP-thread scratch: header + plan ops +
+// guards, never the span byte copy. Separate from g_view_scratch so a gate
+// run and a swap run can never share a buffer.
+alignas(16) uint8_t g_swap_scratch[kBlobHdr + kPlanOpCap * sizeof(CtxPlanOp) +
+                                   kPlanGuardCap * sizeof(CtxPlanGuard)];
+TmplSwapStats g_swap;
+
+alignas(16) uint8_t g_view_scratch[kBlobHdr + kBuildOpCap * sizeof(CtxMemoOp) +
                        kPlanOpCap * sizeof(CtxPlanOp) +
                        kPlanGuardCap * sizeof(CtxPlanGuard) + kMaxSpanBytes];
 
@@ -1108,6 +1115,79 @@ void TmplCompareBuffer(const uint8_t* raw_live, uint32_t ptr, uint32_t count,
       }
     }
   }
+}
+
+// ---- [NR-PLAN] the consuming swap -------------------------------------------
+
+TmplSwapStats* TmplSwapStatsPtr() { return &g_swap; }
+bool TmplPlanMode() { return g_active && g_plan_mode; }
+
+bool TmplPlanAttach(CtxWalker* w, uint32_t pbase, uint32_t dw, uint32_t count,
+                    const uint8_t* raw) {
+  if (!g_active || !g_plan_mode) return false;
+  const uint32_t key = (pbase + dw * 4) & kPhysMask;
+  const uint32_t h = SlotIndex(key);
+  for (uint32_t p = 0; p < kProbe; ++p) {
+    Slot& c = g_tbl[(h + p) & (kTblSize - 1)];
+    if (c.key.load(std::memory_order_acquire) != key) continue;
+    const uint32_t e1 = g_epoch.load(std::memory_order_acquire);
+    const uint32_t off = c.off;
+    const uint32_t nd = c.ndwords;
+    const uint32_t no = c.nops;
+    const uint32_t npl = c.nplan;
+    const uint32_t ngd = c.nguard;
+    if (c.epoch != e1 || !nd || !npl || nd > kMaxSpanDwords ||
+        npl > kPlanOpCap || ngd > kPlanGuardCap) {
+      break;
+    }
+    const uint32_t pl_off = kBlobHdr + no * uint32_t(sizeof(CtxMemoOp));
+    const uint32_t pl_bytes = npl * uint32_t(sizeof(CtxPlanOp)) +
+                              ngd * uint32_t(sizeof(CtxPlanGuard));
+    if (uint64_t(off) + pl_off + pl_bytes > kArenaBytes) break;
+    // Copy before use: the arena is producer-owned and its wrap would
+    // overwrite a blob under our feet. Ops only -- the byte copy is dead
+    // weight to this path, and it is most of the blob.
+    std::memcpy(g_swap_scratch, g_arena + off, kBlobHdr);
+    std::memcpy(g_swap_scratch + kBlobHdr, g_arena + off + pl_off, pl_bytes);
+    // Revalidate exactly as Lookup does: an unchanged (epoch, key, off)
+    // proves the copy coherent, because the arena is append-only inside an
+    // epoch and slots publish key-last.
+    if (g_epoch.load(std::memory_order_acquire) != e1 ||
+        c.key.load(std::memory_order_acquire) != key || c.off != off) {
+      ++g_swap.lk_stale;
+      break;
+    }
+    uint32_t hdr5[5];
+    std::memcpy(hdr5, g_swap_scratch, kBlobHdr);
+    if (hdr5[0] != key || hdr5[1] != nd || hdr5[2] != no || hdr5[3] != npl ||
+        hdr5[4] != ngd) {
+      ++g_swap.lk_stale;
+      break;
+    }
+    if (nd > count - dw) {
+      ++g_swap.cross;
+      break;
+    }
+    CtxPlanOp* plan = reinterpret_cast<CtxPlanOp*>(g_swap_scratch + kBlobHdr);
+    const CtxPlanGuard* guards = reinterpret_cast<const CtxPlanGuard*>(
+        g_swap_scratch + kBlobHdr + npl * sizeof(CtxPlanOp));
+    const uint32_t dem =
+        CtxPlanApplyGuards(raw + size_t(dw) * 4, nd, plan, npl, guards, ngd);
+    g_swap.demoted += dem;
+    // The ring recycles regions: a key whose plan drifted nearly everywhere
+    // describes some other span, and replaying a plan of pure re-parses would
+    // be correct but pointless. This is the density split, in plan form.
+    if (dem * 4 > npl) {
+      ++g_swap.dead;
+      break;
+    }
+    CtxPlanBegin(w, plan, npl, dw, nd);
+    ++g_swap.spans;
+    g_swap.dwords += nd;
+    return true;
+  }
+  ++g_swap.miss;
+  return false;
 }
 
 }  // namespace nr

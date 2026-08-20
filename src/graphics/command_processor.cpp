@@ -315,6 +315,20 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, true, "GPU",
 // proof of plainness. City measured 2.84M such writes/s slow-pathed by packet
 // shape ([nr-bfc] pdwsf plain=99.5%). Priced 2026-08-20: sound; this cvar is
 // the prerequisite the N-2-2 flat apply plan compiles against.
+// [NR-PLAN] N-2-2 item 2: the consuming swap. The record-time flat apply plan
+// (nr_template_store.cpp / nr_context.h [NR-PLAN]) REPLACES the PM4 parse for
+// every span it covers -- one op per packet, zero header decode, values read
+// live. Requires gpu_nr_skip (the walk must be the only decoder) plus
+// gpu_nr_tmpl + gpu_nr_tmpl_plan (which arm the record-time feed and put the
+// store in plan shape). Turning it on DISABLES the [nr-tmpl] compare gate:
+// the gate's own cost would poison any fps read, and the two answer different
+// questions.
+REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap, false, "GPU",
+                    "[nr-swap] N-2-2 item 2: replay the record-time flat "
+                    "apply plan per span instead of parsing the PM4. "
+                    "Requires gpu_nr_skip + gpu_nr_tmpl + gpu_nr_tmpl_plan. "
+                    "Off by default.");
+
 REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, true, "GPU",
                     "[nr-pb] N-2-2 item 0: under gpu_nr_skip, bulk-apply "
                     "full-fit multi-register writes to PLAIN state registers "
@@ -1500,6 +1514,8 @@ uint64_t g_skp_direct_fb = 0;
 bool g_nr_plain_bulk = false;
 uint64_t g_skp_plain_rng = 0;
 uint64_t g_skp_plain_dw = 0;
+// [NR-PLAN] N-2-2 item 2: the consuming swap latch.
+bool g_nr_tmpl_swap = false;
 // [NR-SPP] 5-4-4 step 0b: skip-path timing (CP-thread-only, gated on
 // gpu_nr_skip_profile; one bool test per stop when off).
 bool g_skp_prof = false;
@@ -3065,6 +3081,23 @@ void CommandProcessor::WorkerThreadMain() {
   } else if (REXCVAR_GET(gpu_nr_tmpl)) {
     REXGPU_INFO("[nr-tmpl] DISARMED: store arena allocation failed");
   }
+  // [NR-PLAN] N-2-2 item 2: the consuming swap. Every precondition is a
+  // REFUSAL that names itself, never a silent no-op: an armed-but-inert swap
+  // would read as "the plan is fps-neutral" when it never ran.
+  g_nr_tmpl_swap = REXCVAR_GET(gpu_nr_tmpl_swap) && kNrSkip && g_nr_tmpl &&
+                   nr::TmplPlanMode();
+  if (REXCVAR_GET(gpu_nr_tmpl_swap)) {
+    if (g_nr_tmpl_swap) {
+      REXGPU_INFO(
+          "[nr-swap] ON: the flat apply plan replaces the parse per span "
+          "(compare gate disabled)");
+    } else {
+      REXGPU_INFO(
+          "[nr-swap] REFUSED: skip={} tmpl={} planMode={} -- the swap is "
+          "inert, do not read a perf number from this run",
+          kNrSkip, g_nr_tmpl, nr::TmplPlanMode());
+    }
+  }
   // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
   const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue || kNrWalkFx;
   g_nr_draw = kNrDraw;
@@ -3833,6 +3866,19 @@ void CommandProcessor::WorkerThreadMain() {
               g_skp_deleg, g_skp_exec_fail, g_skp_arm_orphan, g_skp_rng,
               g_skp_rng_dw, g_skp_pdw, g_skp_plain_rng, g_skp_plain_dw,
               n ? ops : " deleg none");
+          // [NR-PLAN] N-2-2 item 2: what the swap actually replaced. `spans`
+          // and `dw` are the removed parse; `gap` is the packets still
+          // parsed live; `miss` is where no template starts. Coverage is
+          // dw/(dw+gap dwords) read against the [nr-tmpl] gate's own.
+          if (g_nr_tmpl_swap) {
+            nr::TmplSwapStats* sw = nr::TmplSwapStatsPtr();
+            REXGPU_INFO(
+                "[nr-swap] spans={} dw={} gapPkts={} miss={} cross={} "
+                "dead={} demoted={} lkStale={}",
+                sw->spans, sw->dwords, sw->gap_pkts, sw->miss, sw->cross,
+                sw->dead, sw->demoted, sw->lk_stale);
+            *sw = nr::TmplSwapStats{};
+          }
           g_skp_bufs = g_skp_fb = g_skp_draws = g_skp_deleg = 0;
           g_skp_direct = g_skp_direct_fb = 0;
           g_skp_exec_fail = g_skp_arm_orphan = 0;
@@ -4551,7 +4597,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // [NR-TMPL] N-2 rung 0: compare this buffer's walk against the record-time
   // span templates. Observation only, depth-1 only, before any live mode --
   // exactly the oracle's placement, for the oracle's reasons.
-  if (g_nr_tmpl && g_pm4_ib_depth == 1) {
+  if (g_nr_tmpl && !g_nr_tmpl_swap && g_pm4_ib_depth == 1) {
     nr::TmplCompareBuffer(memory_->TranslatePhysical(ptr), ptr, count,
                           bin_select_, bin_mask_, CtxMemRead, memory_);
     nr::TmplStats* ts = nr::TmplStatsPtr();
@@ -5142,6 +5188,32 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   trace_writer_.WriteIndirectBufferEnd();
 }
 
+// [NR-PLAN] N-2-2 item 2: the swap's stop source. The plan covers a SPAN, not
+// a buffer, so unlike every earlier consumer this cannot let the walker run
+// free to the end: it must re-offer the store at every packet boundary. Three
+// states, in order of frequency -- a plan is attached and drives; a plan is
+// available at the cursor and gets attached; neither, so one packet is parsed
+// live (the gap class, ~1 packet per span at menu) and the offer repeats.
+namespace {
+bool NrSwapNextStop(uint32_t pbase, const uint8_t* raw,
+                    nr::CtxDrawStop* stop) {
+  for (;;) {
+    if (g_ctx_walker.plan) {
+      if (nr::CtxWalkNextStop(&g_ctx_walker, stop)) return true;
+      nr::CtxPlanEnd(&g_ctx_walker);  // span exhausted: offer the next
+      continue;
+    }
+    if (g_ctx_walker.cursor >= g_ctx_walker.dwords) return false;
+    if (nr::TmplPlanAttach(&g_ctx_walker, pbase, g_ctx_walker.cursor,
+                           g_ctx_walker.dwords, raw)) {
+      continue;
+    }
+    ++nr::TmplSwapStatsPtr()->gap_pkts;
+    if (nr::CtxWalkStepOne(&g_ctx_walker, stop)) return true;
+  }
+}
+}  // namespace
+
 // [NR-SKP] Phase 5-4-2: one eligible depth-1 buffer, walk-only. The walker
 // (already begun by ExecuteIndirectBuffer) decodes the register/constant
 // stream, shader loads, bins and no-ops natively -- every decoded write
@@ -5221,7 +5293,13 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   bool aborted = false;
   bool dsp_open = false;  // [NR-DSP] a draw's span bracket is open
   bool spr_open = false;  // [NR-SPR] a draw's record/compare bracket is open
-  while (nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
+  // [NR-PLAN] N-2-2 item 2: the memo attaches w->rec and records through
+  // CtxWalkStep, which the plan replay does not call -- a stream recorded
+  // under the swap would be silently short. One of the two, never both.
+  const bool swap = g_nr_tmpl_swap && !wm_recording && !wm_replaying;
+  const uint32_t swap_pbase = ptr & 0x1FFFFFFFu;
+  while (swap ? NrSwapNextStop(swap_pbase, raw, &stop)
+              : nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
     // The delegated dispatch re-checks the predicate against the CP's own
     // bin members (including the predicated-XE_SWAP rule), and a delegated
     // nested buffer executes against them: they must hold the walk's CURRENT
@@ -5436,6 +5514,10 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       g_ctx_walker.bin = nr::CtxBinState{bin_select_, bin_mask_};
     }
   }
+  // [NR-PLAN] Detach before anything else drives the walker: CtxFinishWalk
+  // under an attached plan would stop at the span end and leave the rest of
+  // the buffer unapplied.
+  nr::CtxPlanEnd(&g_ctx_walker);
   if (aborted) g_ctx_walker.cursor = g_ctx_walker.dwords;
   // [NR-WM] finalize: commit a clean recording, compare under verify (ne
   // re-records so the store self-heals while naming the divergence), drop

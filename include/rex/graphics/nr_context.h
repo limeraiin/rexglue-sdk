@@ -585,6 +585,13 @@ bool CtxWalkNextDraw(CtxWalker* w, CtxDrawStop* stop);
 // (payload applied, flags word emitted, cursor past the packet).
 bool CtxWalkNextStop(CtxWalker* w, CtxDrawStop* stop);
 
+// [NR-PLAN] Decode exactly ONE packet at the cursor, surfacing draw and
+// delegate stops exactly as CtxWalkNextStop does. The consuming swap needs
+// this: it must re-offer the plan store at EVERY packet boundary, so it
+// cannot let the walker run free to the end of the buffer the way every
+// earlier consumer could. False = the packet applied and nothing surfaced.
+bool CtxWalkStepOne(CtxWalker* w, CtxDrawStop* stop);
+
 // Advances the cursor past the delegated packet CtxWalkNextStop stopped at.
 // The caller may have let the executor change the bin members meanwhile
 // (a nested indirect buffer can contain SET_BIN packets); it is the caller's
