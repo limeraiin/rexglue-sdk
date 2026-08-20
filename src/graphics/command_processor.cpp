@@ -329,6 +329,22 @@ REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap, false, "GPU",
                     "Requires gpu_nr_skip + gpu_nr_tmpl + gpu_nr_tmpl_plan. "
                     "Off by default.");
 
+// [NR-RUSE-BLK] N-2-2 follow-up. The 2026-08-20 menu A/B measured that 53%
+// of the `walk+rng` pool is the reuse bookkeeping, not PM4 decode and not the
+// register store: every applied register dword reaches NrRuseStaleMark, and
+// NrRuseRange loops it per dword with only the `stale_cnt == 0` O(1) escape.
+// City applies ~122 range dwords per draw, so that loop runs ~34M times a
+// second to discover, almost always, that nothing changed and nothing was
+// stale. This makes that discovery O(1) per 64 dwords instead of O(64): a
+// window is skipped only when NO dword in it changed (diff bitmap) AND no
+// register in the blocks it spans is currently stale (a per-64-register
+// stale count), which is exactly the condition under which every one of
+// those 64 NrRuseStaleMark calls would have been a no-op.
+REXCVAR_DEFINE_BOOL(gpu_nr_reuse_blk, false, "GPU",
+                    "[nr-ruse] block-skip the per-dword stale feed for "
+                    "register runs that neither changed nor hold a stale "
+                    "register. Requires the reuse machinery. Off by default.");
+
 REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
                     "DEV [nr-swap] N-2-2: run the swap's store lookup and "
                     "guard pass per span but NOT the replay, so the cost "
@@ -1863,6 +1879,14 @@ std::vector<uint32_t> g_ruse_byref_cur; // by-ref value stream, this replay
 std::vector<uint8_t> g_ruse_stale;      // per-register stale flag (0x5003)
 std::vector<uint32_t> g_ruse_stale_list;  // regs ever marked this replay
 uint32_t g_ruse_stale_cnt = 0;
+// [NR-RUSE-BLK] stale registers per 64-register block: the O(1) summary that
+// lets a clean window be skipped whole. Maintained in lockstep with
+// g_ruse_stale -- if these two ever disagree the skip is unsound, so every
+// site that touches one touches the other.
+std::vector<uint8_t> g_ruse_stale_blk;
+bool g_nr_ruse_blk = false;
+uint64_t g_ruse_blk_skip = 0;  // dwords skipped whole
+uint64_t g_ruse_blk_mark = 0;  // dwords still marked one by one
 uint32_t g_ruse_stale_sample = 0xFFFFFFFFu;  // last reg marked stale
 RuseBuf* g_ruse_cur_buf = nullptr;      // this replay's buffer entry
 const uint8_t* g_ruse_raw = nullptr;    // this replay's buffer bytes
@@ -2152,14 +2176,33 @@ inline void NrRuseStaleMark(uint32_t reg, bool changed) {
   if (changed) {
     if (!g_ruse_stale[reg]) {
       g_ruse_stale[reg] = 1;
+      ++g_ruse_stale_blk[reg >> 6];
       g_ruse_stale_list.push_back(reg);
       ++g_ruse_stale_cnt;
       g_ruse_stale_sample = reg;
     }
   } else if (g_ruse_stale[reg]) {
     g_ruse_stale[reg] = 0;
+    --g_ruse_stale_blk[reg >> 6];
     --g_ruse_stale_cnt;
   }
+}
+
+// [NR-RUSE-BLK] The `cnt` diff bits starting at buffer dword `dw`, low bits
+// first. Caller guarantees dw + cnt <= g_ruse_dwords and cnt <= 64, so the
+// out-of-range "reads as changed" rule of NrRuseDiffBit cannot apply.
+inline uint64_t NrRuseDiffMaskN(uint32_t dw, uint32_t cnt) {
+  if (g_ruse_diff_empty) return 0;
+  const uint32_t w = dw >> 6, sh = dw & 63;
+  uint64_t m = g_ruse_diff[w] >> sh;
+  // The next word is needed only when the window actually reaches into it.
+  // g_ruse_diff holds exactly (g_ruse_dwords + 63) / 64 words, so testing the
+  // LAST dword's word index -- not `sh` alone -- is what keeps this in bounds
+  // for a window ending in the final partial word.
+  if (sh && ((dw + cnt - 1) >> 6) != w) {
+    m |= g_ruse_diff[w + 1] << (64 - sh);
+  }
+  return cnt == 64 ? m : (m & ((uint64_t(1) << cnt) - 1));
 }
 
 // Changed-dword test against this replay's diff bitmap; out of range reads
@@ -2264,8 +2307,35 @@ void NrRuseRange(uint32_t base, const uint32_t* be, uint32_t n,
     }
     if (!any) return;
   }
-  for (uint32_t i = 0; i < n; ++i) {
-    NrRuseStaleMark(base + i, NrRuseDiffBit(o0 + i));
+  if (!g_nr_ruse_blk) {
+    for (uint32_t i = 0; i < n; ++i) {
+      NrRuseStaleMark(base + i, NrRuseDiffBit(o0 + i));
+    }
+    return;
+  }
+  // [NR-RUSE-BLK] Skip a window whole only when every NrRuseStaleMark it
+  // would make is provably a no-op: no dword in it changed (so no register
+  // can become stale) and no register in the 64-blocks it spans is currently
+  // stale (so no register can be cleared). The excluded registers the mark
+  // returns early on are covered for free -- skipping them is what the mark
+  // does. The stale set after this loop is bit-identical either way.
+  uint32_t i = 0;
+  while (i < n) {
+    const uint32_t reg = base + i;
+    const uint32_t rem = n - i;
+    const uint32_t blk = rem < 64 ? rem : 64;
+    if (o0 + i + blk <= g_ruse_dwords &&
+        reg + blk <= RegisterFile::kRegisterCount &&
+        !g_ruse_stale_blk[reg >> 6] &&
+        !g_ruse_stale_blk[(reg + blk - 1) >> 6] &&
+        !NrRuseDiffMaskN(o0 + i, blk)) {
+      g_ruse_blk_skip += blk;
+      i += blk;
+      continue;
+    }
+    ++g_ruse_blk_mark;
+    NrRuseStaleMark(reg, NrRuseDiffBit(o0 + i));
+    ++i;
   }
 }
 
@@ -2310,7 +2380,10 @@ bool NrRuseEntryComponent(std::vector<uint32_t>& shad, const uint32_t* live,
 // walk is the only decoder there, so `raw` is exactly what will be decoded).
 void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
                     uint32_t swap_now, uint64_t epoch, bool epoch_live) {
-  const auto t0 = std::chrono::steady_clock::now();
+  // [NR-RUSE] Probe-gated self-timer; see NrRuseDrawStop.
+  const bool cost_timed = g_nr_ruse_v0;
+  const auto t0 = cost_timed ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
   ++g_ruse_w_bufs;
   g_ruse_byref_h = 0;
   g_ruse_have_prev = false;
@@ -2320,8 +2393,17 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   // 20KB memset per replay was measurable at city rates).
   if (g_ruse_stale.size() != RegisterFile::kRegisterCount) {
     g_ruse_stale.assign(RegisterFile::kRegisterCount, 0);
+    g_ruse_stale_blk.assign((RegisterFile::kRegisterCount + 63) / 64, 0);
   } else {
-    for (uint32_t r : g_ruse_stale_list) g_ruse_stale[r] = 0;
+    // [NR-RUSE-BLK] the block counts follow the same sparse reset; a listed
+    // register may already have been cleared, so decrement only on the
+    // transition, exactly as the mark does.
+    for (uint32_t r : g_ruse_stale_list) {
+      if (g_ruse_stale[r]) {
+        g_ruse_stale[r] = 0;
+        --g_ruse_stale_blk[r >> 6];
+      }
+    }
   }
   g_ruse_stale_list.clear();
   g_ruse_stale_cnt = 0;
@@ -2492,16 +2574,27 @@ void NrRuseBufEntry(uint32_t ptr, const uint8_t* raw, uint32_t count,
   } else {
     b.have_entry = false;
   }
-  g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          std::chrono::steady_clock::now() - t0)
-                          .count();
+  if (cost_timed) {
+    g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+  }
 }
 
 // One draw stop: classify this execution against the draw's previous one,
 // under both rules (v0 prefix, v2 stale set).
 void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
                     uint32_t stop_dword) {
-  const auto t0 = std::chrono::steady_clock::now();
+  // [NR-RUSE] The self-timer is a PROBE, and it used to run unconditionally:
+  // two steady_clock reads (QueryPerformanceCounter on Windows) on every draw
+  // of every buffer, in the default perf config, to fill a counter only the
+  // probe's own report ever prints. At city draw rates that is ~500k clock
+  // reads a second sitting inside the walk pool. Gated on the probe now, so
+  // g_ruse_w_cost_ns reads 0 when the probe is off -- which is honest: with
+  // the probe off, nothing is measuring.
+  const bool cost_timed = g_nr_ruse_v0;
+  const auto t0 = cost_timed ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
   ++g_ruse_w_draws;
   const uint32_t hdr = __builtin_bswap32(
       *reinterpret_cast<const uint32_t*>(raw + size_t(stop_dword) * 4));
@@ -2597,9 +2690,11 @@ void NrRuseDrawStop(uint32_t ptr, const uint8_t* raw, uint32_t count,
   g_ruse_stop_sf = g_ruse_same_frame;
   g_ruse_stop_stale_only = stale_only;
   g_ruse_stop_valid = true;
-  g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          std::chrono::steady_clock::now() - t0)
-                          .count();
+  if (cost_timed) {
+    g_ruse_w_cost_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+  }
 }
 
 }  // namespace-local helpers continue below
@@ -3036,6 +3131,7 @@ void CommandProcessor::WorkerThreadMain() {
   // cvar itself (fast-only runs pay just the v2 verdict).
   g_nr_ruse_v0 = REXCVAR_GET(gpu_nr_reuse_probe) && kNrSkip;
   g_nr_ruse = (g_nr_ruse_v0 || REXCVAR_GET(gpu_nr_reuse_fast)) && kNrSkip;
+  g_nr_ruse_blk = REXCVAR_GET(gpu_nr_reuse_blk) && g_nr_ruse;
   // [NR-WM] 5-4-8: the walk memo needs the skip (the walk is the only
   // decoder) and the ruse byte compare (its validity gate). Rising edge
   // clears the store: while the latch was off, byte changes went unobserved
@@ -3892,6 +3988,17 @@ void CommandProcessor::WorkerThreadMain() {
                 sw->spans, sw->dwords, sw->gap_pkts, sw->miss, sw->cross,
                 sw->dead, sw->demoted, sw->lk_stale);
             *sw = nr::TmplSwapStats{};
+          }
+          // [NR-RUSE-BLK] coverage of the block skip: `skip` is dwords the
+          // stale feed never touched, `mark` is dwords it still walked one
+          // by one. A low skip share means the city's ranges genuinely
+          // change, and the per-dword feed is irreducible as written.
+          if (g_nr_ruse_blk) {
+            const uint64_t tot = g_ruse_blk_skip + g_ruse_blk_mark;
+            REXGPU_INFO("[nr-ruse-blk] skip={} mark={} ({}% skipped)",
+                        g_ruse_blk_skip, g_ruse_blk_mark,
+                        tot ? g_ruse_blk_skip * 100 / tot : 0);
+            g_ruse_blk_skip = g_ruse_blk_mark = 0;
           }
           g_skp_bufs = g_skp_fb = g_skp_draws = g_skp_deleg = 0;
           g_skp_direct = g_skp_direct_fb = 0;
