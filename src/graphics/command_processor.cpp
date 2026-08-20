@@ -315,12 +315,15 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, true, "GPU",
 // proof of plainness. City measured 2.84M such writes/s slow-pathed by packet
 // shape ([nr-bfc] pdwsf plain=99.5%). Priced 2026-08-20: sound; this cvar is
 // the prerequisite the N-2-2 flat apply plan compiles against.
-REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, true, "GPU",
                     "[nr-pb] N-2-2 item 0: under gpu_nr_skip, bulk-apply "
                     "full-fit multi-register writes to PLAIN state registers "
                     "(0x2000+, outside the constant windows) instead of the "
                     "per-dword virtual WriteRegister. Stateful ports and "
-                    "mirror-window ranges keep the per-dword path.");
+                    "mirror-window ranges keep the per-dword path. Default "
+                    "ON since the naruto_485/486 city gates (diverge=0, 68% "
+                    "of per-dword dwords captured, walk pool 1.26 -> 1.17 "
+                    "us/draw).");
 
 // [NR-WM] Phase 5-4-8: the walk memo. A skip-driven buffer whose bytes are
 // identical to its previous compared execution (the ruse shadow compare, on
