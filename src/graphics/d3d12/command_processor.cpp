@@ -1501,7 +1501,7 @@ struct NrTilProbe {
   uint64_t rep_elements = 0, sys_sets = 0;
   // Mode 3 compare gate.
   uint64_t cmp = 0, cmp_eq = 0, cmp_real = 0, cmp_dyn = 0, cmp_lenne = 0,
-           cmp_psone = 0, cmp_ctxne = 0, cmp_sysne = 0;
+           cmp_psone = 0, cmp_ctxne = 0, cmp_sysne = 0, cmp_fbar = 0, cmp_fupl = 0;
   uint32_t cmp_first_real = 0xFFFFFFFFu;
   uint32_t cmp_sys_off = 0xFFFFFFFFu;
   uint64_t cmp_stale = 0;  // armed but the anchor or the frame moved
@@ -1581,11 +1581,12 @@ void NrTilReportIfDue() {
     // address, which is expected and is what the replay reuses.
     REXGPU_INFO(
         "[nr-til] GATE cmp={} eq={} ({:.4f}%) | ne: span={} lenne={} pso={} "
-        "sys={} (1st byte {}) | dyn={} ctxne={} stale={} 1stcmd={}",
+        "sys={} (1st byte {}) | dyn={} fbar={} fupl={} ctxne={} stale={} "
+        "1stcmd={}",
         p.cmp, p.cmp_eq, p.cmp ? 100.0 * double(p.cmp_eq) / double(p.cmp) : 0.0,
         p.cmp_real, p.cmp_lenne, p.cmp_psone, p.cmp_sysne,
         p.cmp_sys_off == 0xFFFFFFFFu ? -1 : int32_t(p.cmp_sys_off), p.cmp_dyn,
-        p.cmp_ctxne, p.cmp_stale,
+        p.cmp_fbar, p.cmp_fupl, p.cmp_ctxne, p.cmp_stale,
         p.cmp_first_real == 0xFFFFFFFFu ? -1 : int32_t(p.cmp_first_real));
   }
   g_tile_p = NrTilProbe{};
@@ -8308,9 +8309,17 @@ void D3D12CommandProcessor::NrTileCompareEnd() {
   // 2. the draw span.
   {
     DeferredCommandList::NrDspDiff d;
+    // The replay's head runs residency and flushes SubmitBarriers() just
+    // before the span, so a barrier (`fbar`) or a shared-memory upload
+    // (`fupl`) the fresh execution emitted INSIDE it is not a difference in
+    // the claim -- it is counted instead of charged. Any other copy still
+    // charges `real`.
     deferred_command_list_.NrDspCompareSpan(g_tile_arena.data() + r.off, r.len,
-                                            g_tile_span_start, &d);
+                                            g_tile_span_start, &d, true,
+                                            shared_memory_->GetBuffer());
     p.cmp_dyn += d.dyn_view + d.dyn_table;
+    p.cmp_fbar += d.fresh_barriers;
+    p.cmp_fupl += d.fresh_uploads;
     if (d.length_differs) {
       ++p.cmp_lenne;
       eq = false;

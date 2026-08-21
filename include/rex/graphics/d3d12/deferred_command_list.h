@@ -75,6 +75,8 @@ class DeferredCommandList {
     uint32_t real = 0;        // any other difference
     uint32_t view_sites = 0;  // root-view sets = the patch sites a replay owes
     uint32_t first_real = 0xFFFFFFFFu;  // Command enum of the first real diff
+    uint32_t fresh_barriers = 0;  // fresh-only barriers skipped (tile replay)
+    uint32_t fresh_uploads = 0;   // fresh-only shared-memory uploads skipped
     bool length_differs = false;
   };
   // Copy [start_elements, end) out; returns elements copied, 0 if it does
@@ -88,8 +90,17 @@ class DeferredCommandList {
   size_t NrTilePipelineSpan(size_t start_elements, size_t end_elements, uintmax_t* dst,
                             size_t capacity) const;
   size_t NrDspCopySpan(size_t start_elements, uintmax_t* dst, size_t capacity) const;
+  // `skip_fresh_barriers` is for the [NR-TIL] tile replay: it runs residency
+  // and flushes SubmitBarriers() just BEFORE the span it replays, so a
+  // barrier -- or a shared-memory upload copy -- that the fresh execution
+  // emitted INSIDE the span has no counterpart in the recording, which the
+  // record-time whitelist refuses either of. Those advance the fresh cursor
+  // only and are charged to `fresh_barriers` / `fresh_uploads`. An upload is
+  // only recognized as one when its destination is `fresh_upload_dst` (the
+  // shared-memory buffer); a copy anywhere else is still a real difference.
   void NrDspCompareSpan(const uintmax_t* prev, size_t prev_len, size_t start_elements,
-                        NrDspDiff* out) const;
+                        NrDspDiff* out, bool skip_fresh_barriers = false,
+                        ID3D12Resource* fresh_upload_dst = nullptr) const;
 
   // [NR-SPR] Phase 5-4-7-1: scan a draw's span against the REPLAYABLE
   // WHITELIST (root signature / pipeline / graphics root parameters /

@@ -552,7 +552,9 @@ size_t DeferredCommandList::NrDspCopySpan(size_t start_elements, uintmax_t* dst,
 }
 
 void DeferredCommandList::NrDspCompareSpan(const uintmax_t* prev, size_t prev_len,
-                                           size_t start_elements, NrDspDiff* out) const {
+                                           size_t start_elements, NrDspDiff* out,
+                                           bool skip_fresh_barriers,
+                                           ID3D12Resource* fresh_upload_dst) const {
   // [NR-DSP] Lockstep walk of the stored span against the freshly emitted
   // one. A command whose bytes differ is charged to `real` unless the ONLY
   // differing field is one a replay would patch anyway.
@@ -562,12 +564,49 @@ void DeferredCommandList::NrDspCompareSpan(const uintmax_t* prev, size_t prev_le
   size_t b_rem = command_stream_.size() >= start_elements
                      ? command_stream_.size() - start_elements
                      : 0;
-  if (a_rem != b_rem) out->length_differs = true;
-  while (a_rem >= kCommandHeaderSizeElements && b_rem >= kCommandHeaderSizeElements) {
-    const CommandHeader& ha = *reinterpret_cast<const CommandHeader*>(a);
+  // Without the barrier skip the two lengths must match up front; with it
+  // they are allowed to differ by exactly the skipped barriers, so the test
+  // moves to after the walk.
+  if (!skip_fresh_barriers && a_rem != b_rem) out->length_differs = true;
+  while (b_rem >= kCommandHeaderSizeElements) {
     const CommandHeader& hb = *reinterpret_cast<const CommandHeader*>(b);
-    const size_t na = ha.arguments_size_elements, nb = hb.arguments_size_elements;
-    if (na > a_rem - kCommandHeaderSizeElements || nb > b_rem - kCommandHeaderSizeElements) {
+    const size_t nb = hb.arguments_size_elements;
+    if (nb > b_rem - kCommandHeaderSizeElements) {
+      out->length_differs = true;
+      return;
+    }
+    // [NR-TIL] N-4-1: work the fresh execution emitted inside the span that
+    // the recording cannot carry (the record-time whitelist refuses both
+    // classes) and that the replay emits in its HEAD, just before the span:
+    // a resource barrier (order-independent against the state sets it sits
+    // among, ordered only against the draw) and a shared-memory residency
+    // upload (`RequestRange` + `UseForReading`, and only when the copy's
+    // destination proves it is one).
+    if (skip_fresh_barriers &&
+        !(a_rem >= kCommandHeaderSizeElements &&
+          reinterpret_cast<const CommandHeader*>(a)->command == hb.command)) {
+      bool fresh_only = false;
+      if (hb.command == Command::kD3DResourceBarrier) {
+        fresh_only = true;
+        ++out->fresh_barriers;
+      } else if (fresh_upload_dst && hb.command == Command::kD3DCopyBufferRegion &&
+                 nb * sizeof(uintmax_t) >= sizeof(D3DCopyBufferRegionArguments) &&
+                 reinterpret_cast<const D3DCopyBufferRegionArguments*>(
+                     b + kCommandHeaderSizeElements)
+                         ->dst_buffer == fresh_upload_dst) {
+        fresh_only = true;
+        ++out->fresh_uploads;
+      }
+      if (fresh_only) {
+        b += kCommandHeaderSizeElements + nb;
+        b_rem -= kCommandHeaderSizeElements + nb;
+        continue;
+      }
+    }
+    if (a_rem < kCommandHeaderSizeElements) break;
+    const CommandHeader& ha = *reinterpret_cast<const CommandHeader*>(a);
+    const size_t na = ha.arguments_size_elements;
+    if (na > a_rem - kCommandHeaderSizeElements) {
       out->length_differs = true;
       return;
     }
@@ -609,6 +648,9 @@ void DeferredCommandList::NrDspCompareSpan(const uintmax_t* prev, size_t prev_le
     b += kCommandHeaderSizeElements + nb;
     b_rem -= kCommandHeaderSizeElements + nb;
   }
+  // Anything left on either side after the walk is a real length difference
+  // (trailing fresh barriers were consumed by the skip above).
+  if (skip_fresh_barriers && (a_rem || b_rem)) out->length_differs = true;
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
