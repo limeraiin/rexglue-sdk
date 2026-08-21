@@ -397,7 +397,11 @@ REXCVAR_DEFINE_INT32(gpu_nr_tile_probe, 0, "GPU",
 // removed, and the bin-dependent set is recomputed live.
 // Pixel-identical BY CONSTRUCTION - unlike gpu_nr_tile_probe, which is the
 // same population with the draws simply dropped.
-REXCVAR_DEFINE_INT32(gpu_nr_tile_replay, 0, "GPU",
+// DEFAULT ON since 2026-08-21: city-gated at 100.0000% over ~1.2M compares at
+// two loads, then a full user drive (naruto_518) replayed 8.79M repeat-band
+// draws = 97.5% of the band with ambig / absent / nomatch / segcap all zero,
+// no wrong pixels and 0 fatals, for +2.4 fps (+6.7%) at matched 9.2k dpf.
+REXCVAR_DEFINE_INT32(gpu_nr_tile_replay, 1, "GPU",
                      "[nr-til] N-4-1: serve repeat EDRAM-tile-band draws from "
                      "the base band recorded native span (viewport, scissor "
                      "and NDC recomputed per band). 1 = on, 2 = CYCLE on/off "
