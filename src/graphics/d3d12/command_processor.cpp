@@ -1457,6 +1457,10 @@ bool g_nr_tile_on = false;   // per-frame latch
 uint32_t g_tile_frame = UINT32_MAX;
 uint32_t g_tile_win = 0;     // the current segment's PA_SC_WINDOW_OFFSET
 bool g_tile_seg_open = false;
+// Ordinal 0 of the current repeat segment maps to this ordinal of its base
+// segment (nonzero only when the rescue below found the base band running
+// the two passes as one segment).
+uint32_t g_tile_ord_bias = 0;
 uint32_t g_tile_seg = 0;     // index into g_tile_segs
 uint32_t g_tile_mode = 0;    // 0 = pass through, 1 = record, 2 = replay
 uint32_t g_tile_ord = 0;     // next ordinal in this segment
@@ -1489,6 +1493,17 @@ struct NrTilProbe {
   uint64_t cand = 0;         // repeat-band draws with a record at their ordinal
   uint64_t rep = 0;          // actually replayed
   uint64_t segs_rec = 0, segs_rep = 0, seg_nomatch = 0;
+  // [NR-TIL] The segment-level population, which the per-draw fb_ counters
+  // cannot see: a repeat draw whose SEGMENT never matched a base one never
+  // becomes a candidate at all. nm_draws is how many draws that costs;
+  // nm_empty / nm_none split the cause (a base segment with this name that
+  // recorded no draw vs no base segment with this name), and seg_cap is the
+  // push that the per-frame segment table refused.
+  uint64_t nm_draws = 0, nm_empty = 0, nm_none = 0, seg_cap = 0;
+  // The ordinal-bias rescue: the base band did not BREAK where this band
+  // does, so the repeat segment's first draw sits INSIDE a longer base
+  // segment. Found by address among the base records (unique = usable).
+  uint64_t nm_bias = 0, nm_ambig = 0, nm_absent = 0;
   // Refusals, one counter per cause: a probe whose refusals are not counters
   // can go silent for the wrong reason.
   uint64_t fb_ord = 0, fb_norec = 0, fb_shape = 0, fb_batch = 0, fb_begin = 0,
@@ -1552,7 +1567,9 @@ void NrTilReportIfDue() {
                       p.fb_begin + p.fb_heap + p.fb_ctx + p.fb_valve +
                       p.fb_rt + p.fb_sys + p.fb_vf + p.fb_ib + p.fb_texpso;
   REXGPU_INFO(
-      "[nr-til] draws={} base={} repeat={} | rec={} segs {}/{} nomatch={} | "
+      "[nr-til] draws={} base={} repeat={} | rec={} segs {}/{} nomatch={} "
+      "(empty={} none={} draws={} = {:.1f}% of repeat, segcap={} | bias={} "
+      "ambig={} absent={}) | "
       "cand={} rep={} ({:.1f}% of repeat) el={:.1f} syssets={} | fb={} "
       "(ord={} norec={} shape={} batch={} begin={} heap={} ctx={} valve={} "
       "rt={} sys={} vf={} ib={} texpso={}) | rrefuse gen={} scan={} class={} "
@@ -1561,7 +1578,9 @@ void NrTilReportIfDue() {
       "topo={} ru2d={} shm={} utd={}/{}/{}/{}/{}/{}/{} first={} | "
       "arena={}KB recs={}",
       p.draws, p.base, p.repeat, p.recorded, p.segs_rep, p.segs_rec,
-      p.seg_nomatch, p.cand, p.rep,
+      p.seg_nomatch, p.nm_empty, p.nm_none, p.nm_draws,
+      p.repeat ? 100.0 * double(p.nm_draws) / double(p.repeat) : 0.0, p.seg_cap,
+      p.nm_bias, p.nm_ambig, p.nm_absent, p.cand, p.rep,
       p.repeat ? 100.0 * double(p.rep) / double(p.repeat) : 0.0,
       p.rep ? double(p.rep_elements) / double(p.rep) : 0.0, p.sys_sets, fb,
       p.fb_ord, p.fb_norec, p.fb_shape, p.fb_batch, p.fb_begin, p.fb_heap,
@@ -8015,13 +8034,17 @@ void D3D12CommandProcessor::NrTileBeginDraw(uint32_t win_off, uint32_t prim,
         g_tile_segs.push_back(
             TileSeg{nr_tile_draw_addr_, uint32_t(g_tile_recs.size()), 0});
         g_tile_seg = uint32_t(g_tile_segs.size()) - 1;
+        g_tile_ord_bias = 0;
         g_tile_mode = 1;
         ++p.segs_rec;
+      } else {
+        ++p.seg_cap;
       }
     } else {
       // Name the repeat band by its first draw stream position and find the
       // base-band segment it repeats. At most kTileMaxSegs entries, once per
       // segment: the whole lookup cost of the mechanism.
+      g_tile_ord_bias = 0;
       for (uint32_t i = 0; i < g_tile_segs.size(); ++i) {
         if (g_tile_segs[i].addr0 == nr_tile_draw_addr_ && g_tile_segs[i].count) {
           g_tile_seg = i;
@@ -8030,13 +8053,60 @@ void D3D12CommandProcessor::NrTileBeginDraw(uint32_t win_off, uint32_t prim,
           break;
         }
       }
-      if (g_tile_mode != 2) ++p.seg_nomatch;
+      if (g_tile_mode != 2) {
+        // The base band breaks its segments where its OWN resolves and band
+        // changes fall, and a repeat band opens on the band change alone, so
+        // a pass that follows another at window offset 0 with no resolve
+        // between them is one base segment and two repeat ones. Name the
+        // repeat segment by finding its first draw among the base RECORDS
+        // and biasing the ordinal. Once per segment, and only when the
+        // address is unique -- two records with it cannot be told apart.
+        uint32_t hits = 0, hit_seg = 0, hit_ord = 0;
+        for (uint32_t i = 0; i < g_tile_segs.size() && hits < 2; ++i) {
+          const TileSeg& sg = g_tile_segs[i];
+          for (uint32_t o = 0; o < sg.count; ++o) {
+            if (g_tile_recs[sg.first + o].addr == nr_tile_draw_addr_) {
+              ++hits;
+              hit_seg = i;
+              hit_ord = o;
+              if (hits >= 2) break;
+            }
+          }
+        }
+        if (hits == 1) {
+          g_tile_seg = hit_seg;
+          g_tile_ord_bias = hit_ord;
+          g_tile_mode = 2;
+          ++p.segs_rep;
+          ++p.nm_bias;
+        } else if (hits > 1) {
+          ++p.nm_ambig;
+        } else {
+          ++p.nm_absent;
+        }
+      }
+      if (g_tile_mode != 2) {
+        ++p.seg_nomatch;
+        bool named = false;
+        for (uint32_t i = 0; i < g_tile_segs.size(); ++i) {
+          if (g_tile_segs[i].addr0 == nr_tile_draw_addr_) {
+            named = true;
+            break;
+          }
+        }
+        if (named) {
+          ++p.nm_empty;
+        } else {
+          ++p.nm_none;
+        }
+      }
     }
   }
   if (win_off == 0) {
     ++p.base;
   } else {
     ++p.repeat;
+    if (g_tile_mode != 2) ++p.nm_draws;
   }
   g_tile_cur_ord = g_tile_ord++;
   g_tile_prim = prim;
@@ -8079,10 +8149,10 @@ void D3D12CommandProcessor::NrTileBeginDraw(uint32_t win_off, uint32_t prim,
     // the tail differs. The arming refusals reuse the consuming path
     // counters so the two modes report the same population the same way.
     const TileSeg& seg = g_tile_segs[g_tile_seg];
-    if (g_tile_cur_ord >= seg.count) {
+    if (g_tile_cur_ord + g_tile_ord_bias >= seg.count) {
       ++p.fb_ord;
     } else {
-      const uint32_t idx = seg.first + g_tile_cur_ord;
+      const uint32_t idx = seg.first + g_tile_ord_bias + g_tile_cur_ord;
       const TileRec& rc = g_tile_recs[idx];
       if (!rc.valid) {
         ++p.fb_norec;
@@ -8361,11 +8431,11 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   NrTilProbe& p = g_tile_p;
   if (g_tile_mode != 2 || g_tile_verify) return false;
   const TileSeg& seg = g_tile_segs[g_tile_seg];
-  if (g_tile_cur_ord >= seg.count) {
+  if (g_tile_cur_ord + g_tile_ord_bias >= seg.count) {
     ++p.fb_ord;
     return false;
   }
-  const TileRec& r = g_tile_recs[seg.first + g_tile_cur_ord];
+  const TileRec& r = g_tile_recs[seg.first + g_tile_ord_bias + g_tile_cur_ord];
   if (!r.valid) {
     ++p.fb_norec;
     return false;
