@@ -408,6 +408,15 @@ REXCVAR_DEFINE_INT32(gpu_nr_tile_replay, 1, "GPU",
                      "every 10s at one spot so a city A/B is matched by "
                      "construction. Requires the skip, verify off and the "
                      "bindings swap. 0 = off.");
+// [NR-TILP] N-4-2: its OWN cvar, not gpu_draw_profile. gpu_draw_profile also
+// arms [nr-texp], whose four stamps live INSIDE RequestTextures - i.e. inside
+// the tex stage this split is trying to price. A stage profile must not pay
+// for another profile nested in one of its stages.
+REXCVAR_DEFINE_BOOL(gpu_nr_tile_prof, false, "GPU",
+                    "DEV [nr-tilp] N-4-2: stage split of the tile replay HEAD "
+                    "(pre/tex/rt/vp/sys/res) per replayed draw. Attribution "
+                    "only - the stamps are a few percent at city replay "
+                    "rates, so never read fps from a run with this on.");
 REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
                     "DEV [nr-swap] N-2-2: run the swap's store lookup and "
                     "guard pass per span but NOT the replay, so the cost "

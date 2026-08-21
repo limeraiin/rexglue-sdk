@@ -183,6 +183,7 @@ REXCVAR_DECLARE(bool, gpu_nr_span_dedup);
 REXCVAR_DECLARE(bool, gpu_nr_span_replay);
 // [NR-TIL] N-4-1: the tile-pass replay + the probe it must never co-run with.
 REXCVAR_DECLARE(int32_t, gpu_nr_tile_replay);
+REXCVAR_DECLARE(bool, gpu_nr_tile_prof);
 REXCVAR_DECLARE(int32_t, gpu_nr_tile_probe);
 // [NR-RUF-V2B] guard: the CPU vertex-shader extent path reads float
 // constants outside the bitmap-packed packs -- refuse upgrades under it.
@@ -311,6 +312,7 @@ uint64_t g_const_writes_skipped = 0;
 // Index: 0=prim 1=rt-update 2=pipeline 3=textures 4=bindings 5=total IssueDraw
 //        6=BeginSubmission 7=draw-tail(residency+barriers+draw) 8=fixed-fn+sysconst.
 bool g_draw_prof = false;
+bool g_tile_prof = false;  // [NR-TILP] N-4-2 head stage split
 // [GPU-DRAW] 0..8 = the 9 named phases; 9..11 = tail sub-brackets
 // (9 = vertex-residency loop, 10 = primitive topology, 11 = index-buffer
 // view + barriers + deferred emission + memexport finish), added 5-4-4b so
@@ -1526,6 +1528,20 @@ struct NrTilProbe {
   // refusals cannot be fixed; this one names them.
   uint64_t ctx_why[12] = {};
   uint64_t ctx_first = 0;  // refusals on a segment first ordinal (expected)
+  // [NR-TILP] N-4-2 brief: the stage split of the REPLAY HEAD, the thing
+  // N-4-1 measured at ~1.44 of the ~1.75 us a repeat draw costs. Only the
+  // 0.31 us derivation is gone; every stage below still runs per draw.
+  // gpu_draw_profile-gated (a handful of QPC stamps per REPLAYED draw), and
+  // the numbers are an ATTRIBUTION, not an fps read -- the stamps themselves
+  // are ~3-4% at city replay rates.
+  // pre = ordinal/shape/batch/begin/heap/ctx gates - tex = RequestTextures +
+  // the SRV key valve - rt = render-target cache Update - vp = viewport key,
+  // scissor and UpdateFixedFunctionState - sys = UpdateSystemConstantValues
+  // + the pool upload - res = vfetch residency, IB range, UseForReading and
+  // SubmitBarriers - emit = the memcpy, the view patch and member adoption.
+  uint64_t ns_pre = 0, ns_tex = 0, ns_rt = 0, ns_vp = 0, ns_sys = 0,
+           ns_res = 0, ns_emit = 0;
+  uint64_t prof_rep = 0;  // replays that carried a full set of stamps
 };
 NrTilProbe g_tile_p;
 // [NR-TIL] the tile entry gate compares everything that decides WHETHER a
@@ -1607,6 +1623,20 @@ void NrTilReportIfDue() {
         p.cmp_sys_off == 0xFFFFFFFFu ? -1 : int32_t(p.cmp_sys_off), p.cmp_dyn,
         p.cmp_fbar, p.cmp_fupl, p.cmp_ctxne, p.cmp_stale,
         p.cmp_first_real == 0xFFFFFFFFu ? -1 : int32_t(p.cmp_first_real));
+  }
+  if (g_tile_prof && p.prof_rep) {
+    // us per REPLAYED draw. head = everything before the memcpy: what N-4-2
+    // has to hoist to the band.
+    const double r = double(p.prof_rep) * 1000.0;
+    const uint64_t head =
+        p.ns_pre + p.ns_tex + p.ns_rt + p.ns_vp + p.ns_sys + p.ns_res;
+    REXGPU_INFO(
+        "[nr-tilp] us/rep n={}: pre={:.3f} tex={:.3f} rt={:.3f} vp={:.3f} "
+        "sys={:.3f} res={:.3f} | head={:.3f} emit={:.3f} total={:.3f}",
+        p.prof_rep, double(p.ns_pre) / r, double(p.ns_tex) / r,
+        double(p.ns_rt) / r, double(p.ns_vp) / r, double(p.ns_sys) / r,
+        double(p.ns_res) / r, double(head) / r, double(p.ns_emit) / r,
+        double(head + p.ns_emit) / r);
   }
   g_tile_p = NrTilProbe{};
 }
@@ -4194,6 +4224,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // [PERF/DRAW-PROFILE] Refresh the per-draw timing flag once per frame; report
   // a per-second breakdown of where IssueDraw's CPU time goes.
   g_draw_prof = REXCVAR_GET(gpu_draw_profile);
+  g_tile_prof = REXCVAR_GET(gpu_nr_tile_prof);
   // [GPU-DRAW-DUMP] Refresh the draw-stream dump flag once per frame too.
   g_draw_dump = REXCVAR_GET(gpu_draw_dump);
   // [GPU-PRECORD] Phase 1a correctness-probe flag (forced segment-boundary re-emit).
@@ -8430,6 +8461,13 @@ void D3D12CommandProcessor::NrTileCompareEnd() {
 bool D3D12CommandProcessor::NrTileReplayTry() {
   NrTilProbe& p = g_tile_p;
   if (g_tile_mode != 2 || g_tile_verify) return false;
+  // [NR-TILP] stage stamps, gpu_draw_profile-gated. Accumulated into locals
+  // and committed only on the SUCCESS path: a refusal mid-head would
+  // otherwise charge a partial draw to whichever stage it died in.
+  using tilp_clock = std::chrono::steady_clock;
+  const bool tp = g_tile_prof;
+  tilp_clock::time_point tp0, tp_pre, tp_tex, tp_rt, tp_vp, tp_sys, tp_res;
+  if (tp) tp0 = tilp_clock::now();
   const TileSeg& seg = g_tile_segs[g_tile_seg];
   if (g_tile_cur_ord + g_tile_ord_bias >= seg.count) {
     ++p.fb_ord;
@@ -8484,6 +8522,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
     }
     return false;
   }
+  if (tp) tp_pre = tilp_clock::now();
   const D3D12Shader* vs = r.vs;
   const D3D12Shader* ps = r.ps;
   // Textures first (a load can move host SRV indices), then the key valve:
@@ -8521,6 +8560,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
       return false;
     }
   }
+  if (tp) tp_tex = tilp_clock::now();
   const RegisterFile& regs = GetActiveDrawRegisterFile();
   const bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
   const bool is_rasterization_done =
@@ -8534,6 +8574,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
     ++p.fb_rt;
     return false;
   }
+  if (tp) tp_rt = tilp_clock::now();
   // The bin-dependent set, recomputed from the LIVE registers: this is the
   // whole difference between the base band and this one.
   const uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
@@ -8575,6 +8616,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   scissor.extent[1] *= draw_resolution_scale_y;
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal,
                            normalized_depth_control);
+  if (tp) tp_vp = tilp_clock::now();
   UpdateSystemConstantValues(false, primitive_polygonal, r.llci,
                              xenos::Endian(r.index_endian), viewport_info, r.tex_mask,
                              normalized_depth_control, normalized_color_mask);
@@ -8591,6 +8633,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
     cbuffer_binding_system_.up_to_date = true;
     sys_uploaded = true;
   }
+  if (tp) tp_sys = tilp_clock::now();
   // Vertex residency over the recorded shader fetch bitmap; the bits are
   // already in sync from the base band unless something invalidated the
   // range, which is exactly when the request has to happen.
@@ -8633,6 +8676,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   }
   shared_memory_->UseForReading();
   SubmitBarriers();
+  if (tp) tp_res = tilp_clock::now();
   // Past here nothing may refuse: the span is about to enter the stream.
   //
   // The system-constants buffer moved and the recording does not re-set that
@@ -8717,6 +8761,21 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   if (sys_uploaded ||
       (r.root_mask & (1u << kRootParameter_Bindless_SystemConstants))) {
     current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SystemConstants;
+  }
+  if (tp) {
+    const auto tp_end = tilp_clock::now();
+    auto ns = [](tilp_clock::time_point a, tilp_clock::time_point b) {
+      return uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+    };
+    p.ns_pre += ns(tp0, tp_pre);
+    p.ns_tex += ns(tp_pre, tp_tex);
+    p.ns_rt += ns(tp_tex, tp_rt);
+    p.ns_vp += ns(tp_rt, tp_vp);
+    p.ns_sys += ns(tp_vp, tp_sys);
+    p.ns_res += ns(tp_sys, tp_res);
+    p.ns_emit += ns(tp_res, tp_end);
+    ++p.prof_rep;
   }
   ++p.rep;
   p.rep_elements += r.len;
