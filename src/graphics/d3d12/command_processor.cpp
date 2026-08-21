@@ -185,6 +185,7 @@ REXCVAR_DECLARE(bool, gpu_nr_span_replay);
 REXCVAR_DECLARE(int32_t, gpu_nr_tile_replay);
 REXCVAR_DECLARE(bool, gpu_nr_tile_prof);
 REXCVAR_DECLARE(int32_t, gpu_nr_tile_probe);
+REXCVAR_DECLARE(int32_t, gpu_nr_tile_sys);
 // [NR-RUF-V2B] guard: the CPU vertex-shader extent path reads float
 // constants outside the bitmap-packed packs -- refuse upgrades under it.
 REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
@@ -946,6 +947,9 @@ bool g_nr_verify = true;
 // sticky fields included) with one memcpy before reading.
 bool g_nr_lean_sys = false;
 bool g_nr_sys_member_stale = false;
+// [NR-TILSYS] set by every derivation: did it change the mirror? The tile
+// recorder stores it per draw.
+bool g_nr_sys_changed = false;
 
 // [NR-SWP] The 1Hz verdict line.
 void NrSwapReportIfDue() {
@@ -1450,6 +1454,11 @@ struct TileRec {
   uintmax_t dataA[8] = {};
   uint8_t nkeys_v = 0;
   uint8_t nkeys_p = 0;
+  // [NR-TILSYS] did the BASE band's derivation actually move the system
+  // constants at this ordinal? In lockstep the repeat band's sequence of
+  // values is the same one, so this bit is the repeat band's dirty verdict
+  // too - and it replaces a 464-byte compare per draw with a load.
+  uint8_t sys_dirty = 0;
   D3D12TextureCache::TextureSRVKey keys_v[kTileMaxKeys];
   D3D12TextureCache::TextureSRVKey keys_p[kTileMaxKeys];
   // Filled only in the compare mode: the system constants as the base band
@@ -1488,6 +1497,16 @@ uint32_t g_tile_prim = 0, g_tile_icount = 0, g_tile_ibbase = 0;
 bool g_tile_rec_open = false;
 // [NR-TIL] mode 3: compare instead of consume.
 bool g_tile_verify = false;
+// [NR-TILSYS] N-4-2b piece 1: 0 = off, 1 = serve the system constants from the
+// base band snapshot, 2 = do that into a temp and compare it against the real
+// derivation (the gate).
+uint32_t g_tile_sys = 0;
+// [NR-TILSYS] lockstep witness: the record whose (snapshot + live NDC) the
+// mirror currently holds, and the NDC that was patched into it. When the next
+// replay is the very next ordinal and neither moved, the mirror is ALREADY
+// what that draw needs and the restore is a no-op.
+size_t g_tile_sys_prev = SIZE_MAX;  // index into g_tile_recs, +1 biased
+float g_tile_sys_ndc[8] = {};
 bool g_tile_cmp_open = false;
 uint32_t g_tile_cmp_idx = 0;
 size_t g_tile_spanA_start = 0;  // pipeline-bind piece
@@ -1564,6 +1583,19 @@ struct NrTilProbe {
   // the bracket exit lives in the base TU.
   uint64_t ns_ostop = 0, ns_obegin = 0;
   uint64_t prof_orep = 0;  // replays that carried outer stamps
+  // [NR-TILSYS] the snapshot-restore path: n = draws served, ne = draws whose
+  // fast result differed from the real derivation (mode 2 only), off = first
+  // differing byte, dne = draws where the fast dirty verdict differed from
+  // the real one, dirty = draws that cleared cbuffer up_to_date, rov = draws
+  // refused because the ROV path is live.
+  uint64_t sf_n = 0, sf_ne = 0, sf_dne = 0, sf_dirty = 0, sf_rov = 0;
+  // Direction of a dirty-verdict disagreement. over = the fast path uploaded
+  // when it did not have to (a wasted constant buffer). under = it did NOT
+  // upload when the real derivation would have - that one is a wrong frame,
+  // and it has to be zero.
+  uint64_t sf_dover = 0, sf_dunder = 0;
+  uint64_t sf_nolock = 0, sf_noop = 0;
+  uint32_t sf_off = 0xFFFFFFFFu;
 };
 NrTilProbe g_tile_p;
 // [NR-TILP] outer-stamp pendings (CP thread only): measured before ReplayTry
@@ -1581,6 +1613,87 @@ uint64_t g_tile_pend_ostop = 0, g_tile_pend_obegin = 0;
 // same registers. What must match is the up-to-date flags, the root mask,
 // the pipeline / root-signature / topology identity and the shared-memory
 // flavor -- those decide which commands the recording OMITTED.
+// [NR-TILSYS] N-4-2b piece 1. A repeat-band draw derives the same system
+// constants as its base band draw except for what the VIEWPORT feeds:
+// ndc_scale, ndc_offset, and - for point lists only -
+// point_screen_diameter_to_ndc_radius, which divides the resolution scale by
+// the viewport extent. Everything else was proven byte-identical by the
+// N-4-1 compare gate (100.0000% over ~1.2M city compares), because it comes
+// from registers the two bands share.
+//
+// So: restore the recorded snapshot, then write those three live. The
+// per-band sticky rule is preserved exactly - the real derivation writes the
+// point radius ONLY on a point-list draw, so a non-point draw keeps the
+// value already live rather than importing the base band's.
+//
+// Returns whether the resulting state differs from what *state held on
+// entry, which is the caller's cbuffer up-to-date verdict. The compare is
+// bytewise on purpose: these floats can legitimately hold NaNs and still
+// have to compare bit-exactly (the same rule the mirror gate uses).
+bool NrTileSysFast(nr::NrSysConstants* state, size_t rec_index,
+                   const nr::NrSysConstants& snap, bool rec_dirty,
+                   const draw_util::ViewportInfo& vp, bool point_list,
+                   uint32_t res_scale_x, uint32_t res_scale_y,
+                   bool track) {
+  static_assert(offsetof(nr::NrSysConstants, ndc_scale) == 128 &&
+                    offsetof(nr::NrSysConstants, ndc_offset) == 144 &&
+                    offsetof(nr::NrSysConstants,
+                             point_screen_diameter_to_ndc_radius) == 168,
+                "[nr-tilsys] the viewport-derived window moved");
+  // The live viewport half, 32 bytes: ndc_scale, ndc_offset and the point
+  // radius (written by the real derivation only for point lists, so a
+  // non-point draw keeps whatever is live - the sticky rule, exactly).
+  float ndc[8];
+  std::memcpy(ndc, vp.ndc_scale, 3 * sizeof(float));
+  std::memcpy(ndc + 3, vp.ndc_offset, 3 * sizeof(float));
+  if (point_list) {
+    ndc[6] = float(res_scale_x) / float(vp.xy_extent[0] ? vp.xy_extent[0] : 1u);
+    ndc[7] = float(res_scale_y) / float(vp.xy_extent[1] ? vp.xy_extent[1] : 1u);
+  } else {
+    ndc[6] = state->point_screen_diameter_to_ndc_radius[0];
+    ndc[7] = state->point_screen_diameter_to_ndc_radius[1];
+  }
+  // LOCKSTEP: the mirror holds the previous ordinal's snapshot with this
+  // band's NDC already in it. Then "did anything move" is a recorded bit
+  // plus a 32-byte compare - not a 464-byte one - and when nothing moved
+  // there is nothing to write at all.
+  const bool lockstep = track && rec_index != 0 &&
+                        g_tile_sys_prev == rec_index - 1;
+  if (track && !lockstep) ++g_tile_p.sf_nolock;
+  const bool ndc_same =
+      std::memcmp(g_tile_sys_ndc, ndc, sizeof(ndc)) == 0;
+  bool changed;
+  if (lockstep && !rec_dirty) {
+    // The base band did not move the struct at this ordinal either, so the
+    // only thing that can differ is the viewport half.
+    if (ndc_same) {
+      changed = false;
+      if (track) ++g_tile_p.sf_noop;
+    } else {
+      std::memcpy(state->ndc_scale, ndc, 3 * sizeof(float));
+      std::memcpy(state->ndc_offset, ndc + 3, 3 * sizeof(float));
+      std::memcpy(state->point_screen_diameter_to_ndc_radius, ndc + 6,
+                  2 * sizeof(float));
+      changed = true;
+    }
+  } else {
+    std::memcpy(state, &snap, sizeof(nr::NrSysConstants));
+    std::memcpy(state->ndc_scale, ndc, 3 * sizeof(float));
+    std::memcpy(state->ndc_offset, ndc + 3, 3 * sizeof(float));
+    std::memcpy(state->point_screen_diameter_to_ndc_radius, ndc + 6,
+                2 * sizeof(float));
+    // Out of lockstep the previous state is unknown, so the verdict is the
+    // conservative one: an upload that was not needed costs a buffer, a
+    // skipped one that was needed draws the wrong frame.
+    changed = rec_dirty || !lockstep || !ndc_same;
+  }
+  if (track) {
+    g_tile_sys_prev = rec_index;
+    std::memcpy(g_tile_sys_ndc, ndc, sizeof(ndc));
+  }
+  return changed;
+}
+
 bool NrTileCtxEq(const SprCtx& a, const SprCtx& b, uint32_t* why) {
   uint32_t w = 0;
   if (a.guest_pipeline != b.guest_pipeline ||
@@ -1635,6 +1748,20 @@ void NrTilReportIfDue() {
       p.ctx_why[8], p.ctx_why[9], p.ctx_why[10], p.ctx_why[11], p.ctx_first,
       (g_tile_arena.size() * sizeof(uintmax_t)) >> 10,
       g_tile_recs.size());
+  if (p.sf_n || p.sf_rov) {
+    // [NR-TILSYS] ne has to be 0: the fast system constants must equal the
+    // real derivation byte for byte, and their dirty verdicts must agree.
+    // dirty% is how often the restore actually moves the struct (i.e. how
+    // much of the upload traffic is real).
+    REXGPU_INFO(
+        "[nr-tilsys] n={} ne={} (1st byte {}) dirtyne={} (over={} "
+        "UNDER={}) | dirty={} ({:.1f}%) nolock={} noop={} ({:.1f}%) rov={}",
+        p.sf_n, p.sf_ne, p.sf_off == 0xFFFFFFFFu ? -1 : int32_t(p.sf_off),
+        p.sf_dne, p.sf_dover, p.sf_dunder, p.sf_dirty,
+        p.sf_n ? 100.0 * double(p.sf_dirty) / double(p.sf_n) : 0.0,
+        p.sf_nolock, p.sf_noop,
+        p.sf_n ? 100.0 * double(p.sf_noop) / double(p.sf_n) : 0.0, p.sf_rov);
+  }
   if (p.cmp || p.cmp_stale) {
     // The gate line. eq is the number that has to be 100%: a repeat-band
     // draw whose freshly derived span, pipeline piece and system constants
@@ -4501,6 +4628,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       g_tile_arena_used = 0;
       g_tile_seg_open = false;
       g_tile_rec_open = false;
+      g_tile_sys_prev = SIZE_MAX;
       g_tile_frame = UINT32_MAX;
       REXGPU_INFO(
           "[nr-til] PHASE {}{} - repeat EDRAM tile bands {}.",
@@ -4518,6 +4646,34 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     // arm only when a replay can actually serve, or the arm is pure cost.
     g_tile_oprof = g_tile_prof && g_nr_tile_on && !g_tile_verify;
     if (!g_tile_oprof) g_tile_ostop_armed = false;
+    // [NR-TILSYS] only meaningful on the consuming path, and only while the
+    // mirror is the uploaded truth (that is what the snapshot restores).
+    uint32_t nr_sys_cv = (g_nr_tile_on && !g_tile_verify && g_nr_lean_sys)
+                             ? uint32_t(REXCVAR_GET(gpu_nr_tile_sys))
+                             : 0u;
+    if (nr_sys_cv == 3) {
+      // Mode 3: cycle 10 s off / 10 s on IN PLACE, so the [nr-tilp] sys
+      // stage is read against itself at matched load. A cross-run stage
+      // comparison is worthless here - every stage drifts together with
+      // cache warmth (naruto_521 vs naruto_527 moved 12% on every stage).
+      static const auto nr_sys_t0 = std::chrono::steady_clock::now();
+      const auto nr_sys_el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now() - nr_sys_t0)
+                                 .count();
+      nr_sys_cv = ((nr_sys_el / 10) & 1) != 0 ? 1u : 0u;
+    }
+    if (nr_sys_cv != g_tile_sys) {
+      REXGPU_INFO("[nr-tilsys] PHASE {} - tile-replay system constants {}.",
+                  nr_sys_cv ? "ON" : "OFF",
+                  nr_sys_cv == 0 ? "re-derived in full (control)"
+                                 : (nr_sys_cv == 2
+                                        ? "derived fast AND compared against "
+                                          "the full derivation"
+                                        : "restored from the base band "
+                                          "snapshot with the 3 viewport "
+                                          "fields recomputed"));
+    }
+    g_tile_sys = nr_sys_cv;
   }
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
   // gate itself is latched base-side (WorkerThreadMain), not here.
@@ -8119,6 +8275,7 @@ void D3D12CommandProcessor::NrTileBeginDraw(uint32_t win_off, uint32_t prim,
     // constant-pool GPU addresses, and the three bands of one frame are the
     // only executions that ever share them.
     g_tile_frame = frame_current_;
+    g_tile_sys_prev = SIZE_MAX;  // [NR-TILSYS] indices are per-frame
     g_tile_recs.clear();
     g_tile_segs.clear();
     g_tile_arena_used = 0;
@@ -8427,7 +8584,10 @@ void D3D12CommandProcessor::NrTileRecordEnd() {
   }
   r.entry_ctx = g_tile_entry_ctx;
   NrSprCaptureCtx(&r.exit_ctx);
-  if (g_tile_verify) r.sys_snap = g_nr_sys_state;
+  // [NR-TILSYS] recorded unconditionally since N-4-2b: the consuming path
+  // restores it, so it is no longer gate-only.
+  r.sys_snap = g_nr_sys_state;
+  r.sys_dirty = g_nr_sys_changed ? 1 : 0;
   r.valid = 1;
   ++p.recorded;
 }
@@ -8686,9 +8846,73 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal,
                            normalized_depth_control);
   if (tp) tp_vp = tilp_clock::now();
-  UpdateSystemConstantValues(false, primitive_polygonal, r.llci,
-                             xenos::Endian(r.index_endian), viewport_info, r.tex_mask,
-                             normalized_depth_control, normalized_color_mask);
+  if (g_tile_sys) {
+    // [NR-TILSYS] N-4-2b piece 1: restore the base band snapshot and patch
+    // the three viewport-derived fields, instead of re-deriving 464 bytes
+    // from the register file for a draw whose registers did not move.
+    const bool sf_point =
+        regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kPointList;
+    if (render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) {
+      // The ROV constants are derived by the full body only; never taken in
+      // this game, counted so silence is not mistaken for coverage.
+      ++p.sf_rov;
+      UpdateSystemConstantValues(false, primitive_polygonal, r.llci,
+                                 xenos::Endian(r.index_endian), viewport_info,
+                                 r.tex_mask, normalized_depth_control,
+                                 normalized_color_mask);
+    } else if (g_tile_sys == 2) {
+      // The gate: derive fast into a temp, then run the real derivation and
+      // compare every byte of it, plus the dirty verdict the two produce.
+      nr::NrSysConstants sf_tmp;
+      std::memcpy(&sf_tmp, &g_nr_sys_state, sizeof(sf_tmp));
+      const bool sf_changed = NrTileSysFast(
+          &sf_tmp, seg.first + g_tile_ord_bias + g_tile_cur_ord, r.sys_snap,
+          r.sys_dirty != 0, viewport_info, sf_point, draw_resolution_scale_x,
+          draw_resolution_scale_y, true);
+      const bool sf_utd_before = cbuffer_binding_system_.up_to_date;
+      UpdateSystemConstantValues(false, primitive_polygonal, r.llci,
+                                 xenos::Endian(r.index_endian), viewport_info,
+                                 r.tex_mask, normalized_depth_control,
+                                 normalized_color_mask);
+      ++p.sf_n;
+      const uint8_t* sf_a = reinterpret_cast<const uint8_t*>(&sf_tmp);
+      const uint8_t* sf_b = reinterpret_cast<const uint8_t*>(&g_nr_sys_state);
+      for (uint32_t i = 0; i < sizeof(nr::NrSysConstants); ++i) {
+        if (sf_a[i] != sf_b[i]) {
+          ++p.sf_ne;
+          if (p.sf_off == 0xFFFFFFFFu) p.sf_off = i;
+          break;
+        }
+      }
+      if (sf_utd_before &&
+          sf_changed != !cbuffer_binding_system_.up_to_date) {
+        ++p.sf_dne;
+        if (sf_changed) {
+          ++p.sf_dover;
+        } else {
+          ++p.sf_dunder;
+        }
+      }
+      if (sf_changed) ++p.sf_dirty;
+    } else {
+      ++p.sf_n;
+      if (NrTileSysFast(&g_nr_sys_state,
+                        seg.first + g_tile_ord_bias + g_tile_cur_ord,
+                        r.sys_snap, r.sys_dirty != 0, viewport_info, sf_point,
+                        draw_resolution_scale_x, draw_resolution_scale_y,
+                        true)) {
+        cbuffer_binding_system_.up_to_date = false;
+        ++p.sf_dirty;
+      }
+      // The Xenia-side member is now behind the mirror, exactly as after a
+      // lean-path call; the next full body re-syncs it before reading it.
+      g_nr_sys_member_stale = true;
+    }
+  } else {
+    UpdateSystemConstantValues(false, primitive_polygonal, r.llci,
+                               xenos::Endian(r.index_endian), viewport_info, r.tex_mask,
+                               normalized_depth_control, normalized_color_mask);
+  }
   bool sys_uploaded = false;
   if (!cbuffer_binding_system_.up_to_date) {
     uint8_t* system_constants = constant_buffer_pool_->Request(
@@ -9802,7 +10026,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     nr::NrSysInputs nr_in;
     nr_sys_fill_inputs(nr_in);
     if (nr::NrSysUpdate(nr_in, &g_nr_sys_state)) {
-      if (std::memcmp(&nr_prev, &g_nr_sys_state, sizeof(nr_prev)) != 0) {
+      g_nr_sys_changed =
+          std::memcmp(&nr_prev, &g_nr_sys_state, sizeof(nr_prev)) != 0;
+      if (g_nr_sys_changed) {
         cbuffer_binding_system_.up_to_date = false;
       }
       g_nr_sys_member_stale = true;

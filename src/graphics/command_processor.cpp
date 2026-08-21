@@ -417,6 +417,21 @@ REXCVAR_DEFINE_BOOL(gpu_nr_tile_prof, false, "GPU",
                     "(pre/tex/rt/vp/sys/res) per replayed draw. Attribution "
                     "only - the stamps are a few percent at city replay "
                     "rates, so never read fps from a run with this on.");
+// [NR-TILSYS] N-4-2b piece 1: the system constants of a repeat-band draw are
+// byte-identical to its base band recording outside three viewport-derived
+// fields -- ndc_scale, ndc_offset and (point lists only)
+// point_screen_diameter_to_ndc_radius. The N-4-1 compare gate read that at
+// 100.0000% over ~1.2M city compares and ~1.2M menu ones, so the replay can
+// restore the recorded snapshot and patch those three live instead of
+// re-deriving the whole struct. Priced at 0.106 us/rep at the heavy city.
+REXCVAR_DEFINE_INT32(gpu_nr_tile_sys, 0, "GPU",
+                     "[nr-tilsys] N-4-2b: serve a tile-replay draw's system "
+                     "constants from the base band snapshot (3 viewport "
+                     "fields recomputed) instead of re-deriving them. "
+                     "1 = on, 2 = VERIFY (derive fast into a temp, run the "
+                     "real derivation, compare every byte), 3 = CYCLE "
+                     "on/off every 10 s in place. Requires "
+                     "gpu_nr_tile_replay. 0 = off.");
 REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
                     "DEV [nr-swap] N-2-2: run the swap's store lookup and "
                     "guard pass per span but NOT the replay, so the cost "
