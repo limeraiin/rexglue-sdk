@@ -294,6 +294,20 @@ REXCVAR_DEFINE_BOOL(gpu_nr_residency, false, "GPU/D3D12",
                     "'[nr-rsy]' once/sec. Diagnostic only, off by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [NR-TILP] N-4-2 outer stamps, defined in graphics/command_processor.cpp
+// (the drawstop-bracket side of the seam). See the definitions for the
+// protocol; this TU consumes the arm at the tile block, commits on replay
+// success, and reports/resets the opost accumulators.
+namespace rex::graphics {
+extern bool g_tile_oprof;
+extern bool g_tile_ostop_armed;
+extern bool g_tile_orep;
+extern std::chrono::steady_clock::time_point g_tile_ostop_t0;
+extern std::chrono::steady_clock::time_point g_tile_orep_t1;
+extern uint64_t g_tile_ns_opost;
+extern uint64_t g_tile_n_opost;
+}  // namespace rex::graphics
+
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -1542,8 +1556,21 @@ struct NrTilProbe {
   uint64_t ns_pre = 0, ns_tex = 0, ns_rt = 0, ns_vp = 0, ns_sys = 0,
            ns_res = 0, ns_emit = 0;
   uint64_t prof_rep = 0;  // replays that carried a full set of stamps
+  // [NR-TILP] N-4-2 OUTER stamps, per replayed draw: ostop = direct drawstop
+  // bracket entry -> tile block (arg recovery + NrSubmitDraw's register-file
+  // repoint + IssueDrawImpl's prologue), obegin = NrTileBeginDraw itself.
+  // opost (replay return -> bracket exit: the five restore SetRegisterFile
+  // calls + the direct-issue tail) accumulates in the shared globals because
+  // the bracket exit lives in the base TU.
+  uint64_t ns_ostop = 0, ns_obegin = 0;
+  uint64_t prof_orep = 0;  // replays that carried outer stamps
 };
 NrTilProbe g_tile_p;
+// [NR-TILP] outer-stamp pendings (CP thread only): measured before ReplayTry
+// runs, committed only by its success path -- same refusal rule as the inner
+// stamps.
+bool g_tile_pend_valid = false;
+uint64_t g_tile_pend_ostop = 0, g_tile_pend_obegin = 0;
 // [NR-TIL] the tile entry gate compares everything that decides WHETHER a
 // command is emitted, and nothing that only decides its VALUE. The cbuffer
 // ADDRESSES are the difference from the 5-4-7-3 gate: the first draw of a
@@ -1637,6 +1664,26 @@ void NrTilReportIfDue() {
         double(p.ns_rt) / r, double(p.ns_vp) / r, double(p.ns_sys) / r,
         double(p.ns_res) / r, double(head) / r, double(p.ns_emit) / r,
         double(head + p.ns_emit) / r);
+  }
+  if (g_tile_prof && (p.prof_orep || g_tile_n_opost)) {
+    // [NR-TILP] N-4-2 outer split, us per replayed draw: ostop = drawstop
+    // bracket entry -> tile block (arg recovery, register-file repoint,
+    // IssueDrawImpl prologue), obegin = NrTileBeginDraw, opost = replay
+    // return -> bracket exit (restore SetRegisterFiles + direct-issue tail).
+    // ostop+obegin+opost + the [nr-tilp] total should reproduce N-4-1's
+    // 1.44 us/repeat-draw arithmetic in ONE run.
+    const double ro =
+        p.prof_orep ? double(p.prof_orep) * 1000.0 : 1.0;
+    REXGPU_INFO(
+        "[nr-tilo] us/rep n={}: ostop={:.3f} obegin={:.3f} | opost n={} "
+        "={:.3f}",
+        p.prof_orep, double(p.ns_ostop) / ro, double(p.ns_obegin) / ro,
+        g_tile_n_opost,
+        g_tile_n_opost
+            ? double(g_tile_ns_opost) / (double(g_tile_n_opost) * 1000.0)
+            : 0.0);
+    g_tile_ns_opost = 0;
+    g_tile_n_opost = 0;
   }
   g_tile_p = NrTilProbe{};
 }
@@ -4467,6 +4514,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                        "(viewport, scissor and NDC recomputed live)"));
     }
     g_nr_tile_on = nr_til_now;
+    // [NR-TILP] the outer-stamp master latch (base TU reads it per draw):
+    // arm only when a replay can actually serve, or the arm is pure cost.
+    g_tile_oprof = g_tile_prof && g_nr_tile_on && !g_tile_verify;
+    if (!g_tile_oprof) g_tile_ostop_armed = false;
   }
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
   // gate itself is latched base-side (WorkerThreadMain), not here.
@@ -5149,8 +5200,26 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // band recording. A false return is a fall-through -- every head step it
   // took is idempotent on the full path below.
   if (g_nr_tile_on) {
+    // [NR-TILP] consume the outer arm: ostop = drawstop bracket entry to
+    // here, obegin = NrTileBeginDraw itself. Held pending; ReplayTry's
+    // success path commits them (a refusal must not charge a partial draw).
+    const bool nr_otp = g_tile_oprof && g_tile_ostop_armed;
+    g_tile_ostop_armed = false;
+    std::chrono::steady_clock::time_point nr_ot_a;
+    if (nr_otp) nr_ot_a = std::chrono::steady_clock::now();
     NrTileBeginDraw(regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], uint32_t(primitive_type), index_count,
                     index_buffer_info ? index_buffer_info->guest_base : 0u);
+    if (nr_otp) {
+      const auto nr_ot_b = std::chrono::steady_clock::now();
+      g_tile_pend_ostop = uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(nr_ot_a - g_tile_ostop_t0)
+              .count());
+      g_tile_pend_obegin = uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(nr_ot_b - nr_ot_a).count());
+      g_tile_pend_valid = true;
+    } else {
+      g_tile_pend_valid = false;
+    }
     if (NrTileReplayTry()) {
       return true;
     }
@@ -8779,6 +8848,16 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   }
   ++p.rep;
   p.rep_elements += r.len;
+  // [NR-TILP] commit the outer stamps and mark the return moment so the
+  // drawstop bracket exit (base TU) can close opost.
+  if (g_tile_pend_valid) {
+    p.ns_ostop += g_tile_pend_ostop;
+    p.ns_obegin += g_tile_pend_obegin;
+    ++p.prof_orep;
+    g_tile_pend_valid = false;
+    g_tile_orep = true;
+    g_tile_orep_t1 = std::chrono::steady_clock::now();
+  }
   return true;
 }
 

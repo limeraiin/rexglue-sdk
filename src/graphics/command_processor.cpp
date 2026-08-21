@@ -724,6 +724,21 @@ namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
 
+// [NR-TILP] N-4-2 outer stamps: the drawstop bracket (this TU) around the
+// d3d12 tile replay (that TU), so one run prices what a repeat draw spends
+// OUTSIDE NrTileReplayTry. ostop_t0 is stamped at the direct drawstop
+// bracket entry; armed keeps a stale stamp from reaching a draw that came
+// in by any other path (delegated fallback, viz-killed predecessor);
+// orep/orep_t1 are set at a successful replay's return so the bracket exit
+// can close the post segment. CP thread only; extern'd by the d3d12 TU.
+bool g_tile_oprof = false;
+bool g_tile_ostop_armed = false;
+bool g_tile_orep = false;
+std::chrono::steady_clock::time_point g_tile_ostop_t0;
+std::chrono::steady_clock::time_point g_tile_orep_t1;
+uint64_t g_tile_ns_opost = 0;
+uint64_t g_tile_n_opost = 0;
+
 namespace {
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
@@ -5707,7 +5722,25 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       if (g_nr_skip_direct) {
         const auto spp_direct_t0 = spp ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
+        // [NR-TILP] arm the outer stamp for this stop; IssueDrawImpl's tile
+        // block consumes it (and clears armed) before BeginDraw.
+        if (g_tile_oprof) {
+          g_tile_ostop_t0 = std::chrono::steady_clock::now();
+          g_tile_ostop_armed = true;
+          g_tile_orep = false;
+        }
         if (NrSkipDrawDirect(stop.opcode, stop.dword, raw, count)) {
+          // [NR-TILP] close opost (replay return -> bracket exit) for a draw
+          // the replay served; drop the arm a viz-killed draw never consumed.
+          g_tile_ostop_armed = false;
+          if (g_tile_orep) {
+            g_tile_ns_opost += uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g_tile_orep_t1)
+                    .count());
+            ++g_tile_n_opost;
+            g_tile_orep = false;
+          }
           if (spp) {
             g_spp_draw_ns +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -5732,6 +5765,8 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
           continue;
         }
         ++g_skp_direct_fb;
+        // [NR-TILP] the direct decode refused before the arm was consumed.
+        g_tile_ostop_armed = false;
       }
     } else {
       ++g_skp_deleg;
