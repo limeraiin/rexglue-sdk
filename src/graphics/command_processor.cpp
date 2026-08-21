@@ -376,10 +376,15 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_blk, false, "GPU",
 // PIXELS ARE WRONG BY DESIGN in bands 2-3; fps and the [nr-tile] counters
 // are the measurement. Mode 2 additionally leaves the register file in band
 // 1's end state, so treat any visual beyond band 1 as meaningless.
+// Mode 3 CYCLES 0 -> 1 -> 2 every 10 s in place, so ONE drive to the heavy
+// spot prices all three conditions at matched draws/frame - which is the
+// standing rule for every fps read here, and the thing three separate
+// drives to "the same spot" can never guarantee.
 REXCVAR_DEFINE_INT32(gpu_nr_tile_probe, 0, "GPU",
                      "DEV [nr-tile] N-4: skip repeat EDRAM-tile-band work to "
                      "price de-tiling. 1 = skip their draws, 2 = skip their "
-                     "whole buffers. Wrong pixels by design. 0 = off.");
+                     "draws AND their device-state applies, 3 = cycle 0/1/2 "
+                     "every 10s at one spot. Wrong pixels by design. 0 = off.");
 
 REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
                     "DEV [nr-swap] N-2-2: run the swap's store lookup and "
@@ -1548,6 +1553,8 @@ bool g_nr_skip = false;
 bool g_nr_skip_bufactive = false;
 // [NR-TILE] N-4 probe latch + counters (CP thread only). See the cvar.
 int g_nr_tile_probe = 0;
+bool g_nr_tile_cycle = false;     // mode 3: walk 0/1/2 in place
+bool g_nr_tile_bufskip = false;   // mode 2: this buffer is a repeat band
 uint64_t g_tile_draws_skipped = 0, g_tile_draws_kept = 0;
 uint64_t g_tile_bufs_skipped = 0, g_tile_bufs_kept = 0;
 // The draw handshake: at a draw stop the skip loop stores the stop and
@@ -2888,6 +2895,42 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
       base, values_be, n, phys, from_memory);
 }
 
+// [NR-TILE] N-4 probe mode 2: apply only the SYSTEM/SYNC half of a repeat
+// tile band's register stream (everything below 0x2000: the scratch,
+// COHER and callback blocks the GUEST polls for progress). 0x2000 and above
+// - device state, the shader constant files, the fetch constants - is read
+// by this renderer alone, so a band whose draws are all skipped never needs
+// it, and band 1 rewrites it next frame from the same buffers.
+// ⚠ Dropping the whole stream is what hung the guest inside one second in
+// naruto_503 (buffer dropped outright, delegates lost with it) and again in
+// naruto_504 (delegates kept, applies dropped): the producer spins on
+// values these low registers carry.
+// ⚠ AND the bin trio (0x2080-0x2082) must ride along even though it sits
+// above 0x2000: PA_SC_WINDOW_OFFSET is what NAMES the band, and the guest
+// writes it from inside the buffers as well as from the ring (the N-2-0
+// in-place finalize class). Dropping it self-latched the probe in
+// naruto_505 - once a band left the offset non-zero, every later buffer
+// looked like a repeat band and every draw in the frame was skipped
+// (`bufs skipped=734 kept=0`).
+void NrTileRegWrite(void* user, uint32_t reg, uint32_t value,
+                    bool from_memory) {
+  if (reg < 0x2000u || (reg >= 0x2080u && reg <= 0x2082u)) {
+    NrWalkRegWrite(user, reg, value, from_memory);
+  }
+}
+
+bool NrTileRegRange(void* user, uint32_t base, const uint32_t* values_be,
+                    uint32_t n, uint32_t phys, bool from_memory) {
+  if (base < 0x2000u) {
+    return NrWalkRegRange(user, base, values_be, n, phys, from_memory);
+  }
+  if (base <= 0x2082u && base + n > 0x2080u) {
+    return false;  // straddles the bin trio: per-dword, where the filter
+                   // above keeps exactly those three registers live
+  }
+  return true;  // consumed and dropped: never falls back to per-dword
+}
+
 void ResAddrSeen(uint32_t addr) {
   if (!addr) return;
   uint32_t i = (addr * 2654435761u) >> 15;
@@ -3171,7 +3214,15 @@ void CommandProcessor::WorkerThreadMain() {
   // skip loop). Announced, because a run with wrong pixels must never be
   // mistaken for a normal one in a log.
   g_nr_tile_probe = kNrSkip ? REXCVAR_GET(gpu_nr_tile_probe) : 0;
-  if (g_nr_tile_probe) {
+  g_nr_tile_cycle = g_nr_tile_probe == 3;
+  if (g_nr_tile_cycle) {
+    g_nr_tile_probe = 0;
+    REXGPU_INFO(
+        "[nr-tile] PROBE ARMED mode=3 CYCLE - 10s off, 10s repeat-band draws "
+        "skipped, 10s repeat-band buffers skipped, repeating. Drive to the "
+        "heavy city and HOLD STILL. Pixels outside band 1 are wrong by "
+        "design in phases 1 and 2.");
+  } else if (g_nr_tile_probe) {
     REXGPU_INFO(
         "[nr-tile] PROBE ARMED mode={} - {} of every EDRAM tile band but the "
         "first is SKIPPED. Pixels outside band 1 are wrong by design.",
@@ -3399,6 +3450,26 @@ void CommandProcessor::WorkerThreadMain() {
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
+    }
+
+    // [NR-TILE] N-4 mode 3: walk the probe through 0/1/2 in place, 10s each,
+    // so one drive prices all three conditions at matched draws/frame. Only
+    // armed runs read the clock.
+    if (g_nr_tile_cycle) {
+      static auto tile_t0 = prof_clock::now();
+      const int phase =
+          int((std::chrono::duration_cast<std::chrono::seconds>(
+                   prof_clock::now() - tile_t0)
+                   .count() /
+               10) %
+              3);
+      if (phase != g_nr_tile_probe) {
+        g_nr_tile_probe = phase;
+        REXGPU_INFO("[nr-tile] mode -> {} ({})", phase,
+                    phase == 0   ? "OFF, pixels correct"
+                    : phase == 1 ? "repeat-band DRAWS skipped"
+                                 : "repeat-band BUFFERS skipped");
+      }
     }
 
     // [GPU-WORKER-PROFILE] / [GPU-SPLIT] / [PM4-CENSUS] ~1s wall-time report.
@@ -4046,7 +4117,7 @@ void CommandProcessor::WorkerThreadMain() {
           // is the repeat-band work dropped this window, `kept` is band 1
           // plus every offset-0 auxiliary pass. skipped/(skipped+kept)
           // should read ~2/3 at heavy city if the census transfers.
-          if (g_nr_tile_probe) {
+          if (g_nr_tile_probe || g_nr_tile_cycle) {
             REXGPU_INFO(
                 "[nr-tile] mode={} draws skipped={} kept={} | bufs "
                 "skipped={} kept={}",
@@ -4775,19 +4846,6 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
-  // [NR-TILE] N-4 probe mode 2: drop every depth-1 buffer submitted for a
-  // repeat tile band outright (walk included) to price true de-tiling. The
-  // band is named by PA_SC_WINDOW_OFFSET, which the ring writes once per
-  // band before submitting the same buffers again; band 1 is offset 0, so
-  // the auxiliary passes (shadow/cube, also offset 0) keep running.
-  if (g_nr_tile_probe == 2 && g_pm4_ib_depth == 0) {
-    if (register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET] != 0) {
-      ++g_tile_bufs_skipped;
-      return;
-    }
-    ++g_tile_bufs_kept;
-  }
-
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
 
   // [PM4-CENSUS] track indirect-buffer nesting + size. Depth is unconditional
@@ -4983,11 +5041,29 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         if (g_nri_from == 0 && g_nri_count < 0 && !trace_writer_.is_open() &&
             NrSkipBackendEligible()) {
           nr_skip_buf = true;
+          // [NR-TILE] N-4 probe mode 2: a buffer submitted for a repeat tile
+          // band keeps its PARSE and its DELEGATES but loses its draws and
+          // its register applies - which is what buffer-level tile replay
+          // would remove, plus a parse the template plan would remove too.
+          // ⚠ The first cut of this probe dropped the whole buffer and hung
+          // the guest inside one second (naruto_503): the delegates carry
+          // the EVENT_WRITE fences the producer spin-waits on, so a buffer
+          // may never be skipped wholesale.
+          g_nr_tile_bufskip =
+              g_nr_tile_probe == 2 &&
+              register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET] != 0;
           // [NR-SKP] 5-4-3: only a skip-driven buffer gets the bulk range
           // consumer (set after CtxWalkBegin zeroed the fields); every other
           // mode keeps the walker's per-dword path bit-identically.
           g_ctx_walker.range_fn = NrWalkRegRange;
           g_ctx_walker.range_user = this;
+          if (g_nr_tile_bufskip) {
+            ++g_tile_bufs_skipped;
+            g_ctx_walker.reg_fn = NrTileRegWrite;
+            g_ctx_walker.range_fn = NrTileRegRange;
+          } else if (g_nr_tile_probe == 2) {
+            ++g_tile_bufs_kept;
+          }
         } else {
           ++g_skp_fb;
         }
@@ -5543,6 +5619,13 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
           continue;
         }
         ++g_tile_draws_kept;
+      }
+      // Mode 2 drops BOTH draw kinds in a repeat band: with the applies gone
+      // the copy-mode 0x36 resolves would read band 1's stale RB_COPY_* and
+      // write somewhere meaningless.
+      if (g_nr_tile_bufskip) {
+        ++g_tile_draws_skipped;
+        continue;
       }
       // Draw stop: the walk already sits past this draw's packet, so the
       // handler must consume THIS stop instead of advancing the walk.
