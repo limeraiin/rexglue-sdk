@@ -424,11 +424,14 @@ REXCVAR_DEFINE_BOOL(gpu_nr_tile_prof, false, "GPU",
 // 100.0000% over ~1.2M city compares and ~1.2M menu ones, so the replay can
 // restore the recorded snapshot and patch those three live instead of
 // re-deriving the whole struct. Priced at 0.106 us/rep at the heavy city.
-REXCVAR_DEFINE_INT32(gpu_nr_tile_sys, 0, "GPU",
+// DEFAULT ON since 2026-08-21: city-gated at ne=0 / UNDER=0 over 8.92M
+// compares at ~420k draws/s (naruto_537), then a matched in-place A/B
+// (naruto_538) read the sys stage 0.099 -> 0.044 us/rep.
+REXCVAR_DEFINE_INT32(gpu_nr_tile_sys, 1, "GPU",
                      "[nr-tilsys] N-4-2b: serve a tile-replay draw's system "
                      "constants from the base band snapshot (3 viewport "
                      "fields recomputed) instead of re-deriving them. "
-                     "1 = on, 2 = VERIFY (derive fast into a temp, run the "
+                     "1 = on (default), 2 = VERIFY (derive fast into a temp, run the "
                      "real derivation, compare every byte), 3 = CYCLE "
                      "on/off every 10 s in place. Requires "
                      "gpu_nr_tile_replay. 0 = off.");
@@ -440,11 +443,15 @@ REXCVAR_DEFINE_INT32(gpu_nr_tile_sys, 0, "GPU",
 // the base band left at its LAST ordinal, so the derivation cannot just be
 // skipped. It is restored from what the base band recorded, once the live
 // fetch constants are shown to match.
-REXCVAR_DEFINE_INT32(gpu_nr_tile_tex, 0, "GPU",
+// DEFAULT ON since 2026-08-21: city-gated at ne=0 with miss=0 over 8.43M
+// restores (naruto_537), then a matched in-place A/B (naruto_538) read the
+// tex stage 0.299 -> 0.107 us/rep. City carries 2.34 fetch slots per draw
+// against menu's 1.00, so the win is BIGGER at the city than at the menu.
+REXCVAR_DEFINE_INT32(gpu_nr_tile_tex, 1, "GPU",
                      "[nr-tiltex] N-4-2b: restore a tile-replay draw's "
                      "texture bindings from the base band recording when the "
                      "fetch constants match, instead of re-deriving them. "
-                     "1 = on, 2 = VERIFY (restore, then force a real "
+                     "1 = on (default), 2 = VERIFY (restore, then force a real "
                      "re-derivation and compare), 3 = CYCLE on/off every "
                      "10 s in place (recording stays on in both halves). "
                      "Requires "
