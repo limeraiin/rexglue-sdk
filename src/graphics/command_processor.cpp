@@ -360,6 +360,27 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_blk, false, "GPU",
                     "register runs that neither changed nor hold a stale "
                     "register. Requires the reuse machinery. Off by default.");
 
+// [NR-TILE] N-4: price the EDRAM TILE LOOP. The heavy city renders the whole
+// scene THREE TIMES a frame, once per EDRAM tile band: the oracle census
+// (tools/n4-tile-census.py, 648 heavy frames) reads 93.8% of executions as
+// the same draw packet run x3, each run carrying a different
+// PA_SC_WINDOW_OFFSET (0, -256, -512) and window scissor band, with
+// per-tile draw counts identical to the packet (2466 / 7 / 542 in every
+// band). 62.5% of all draw executions exist only to emulate a 10 MB EDRAM.
+// This probe measures what removing them is worth, by skipping work for
+// every band but the first (window offset != 0):
+//   1 = skip the DRAW dispatch (resolves and the walk still run) -> the
+//       ceiling of a tile-pass draw-package replay.
+//   2 = skip the whole depth-1 BUFFER (walk included) -> the ceiling of
+//       true de-tiling (render once into a full-size target).
+// PIXELS ARE WRONG BY DESIGN in bands 2-3; fps and the [nr-tile] counters
+// are the measurement. Mode 2 additionally leaves the register file in band
+// 1's end state, so treat any visual beyond band 1 as meaningless.
+REXCVAR_DEFINE_INT32(gpu_nr_tile_probe, 0, "GPU",
+                     "DEV [nr-tile] N-4: skip repeat EDRAM-tile-band work to "
+                     "price de-tiling. 1 = skip their draws, 2 = skip their "
+                     "whole buffers. Wrong pixels by design. 0 = off.");
+
 REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
                     "DEV [nr-swap] N-2-2: run the swap's store lookup and "
                     "guard pass per span but NOT the replay, so the cost "
@@ -1525,6 +1546,10 @@ bool g_nr_walk_fx = false;
 // runs), instead of 5-4-0's effects-only firing.
 bool g_nr_skip = false;
 bool g_nr_skip_bufactive = false;
+// [NR-TILE] N-4 probe latch + counters (CP thread only). See the cvar.
+int g_nr_tile_probe = 0;
+uint64_t g_tile_draws_skipped = 0, g_tile_draws_kept = 0;
+uint64_t g_tile_bufs_skipped = 0, g_tile_bufs_kept = 0;
 // The draw handshake: at a draw stop the skip loop stores the stop and
 // delegates the draw packet; ExecutePacketType3Draw consumes it instead of
 // advancing the walk (which already sits past this draw).
@@ -3142,6 +3167,16 @@ void CommandProcessor::WorkerThreadMain() {
   // walk and the running context).
   const bool kNrSkip = REXCVAR_GET(gpu_nr_skip);
   g_nr_skip = kNrSkip;
+  // [NR-TILE] N-4: the tile probe rides the skip (the draw skip sits in the
+  // skip loop). Announced, because a run with wrong pixels must never be
+  // mistaken for a normal one in a log.
+  g_nr_tile_probe = kNrSkip ? REXCVAR_GET(gpu_nr_tile_probe) : 0;
+  if (g_nr_tile_probe) {
+    REXGPU_INFO(
+        "[nr-tile] PROBE ARMED mode={} - {} of every EDRAM tile band but the "
+        "first is SKIPPED. Pixels outside band 1 are wrong by design.",
+        g_nr_tile_probe, g_nr_tile_probe == 1 ? "the draws" : "the buffers");
+  }
   // [NR-SPP] skip-path timing probe rides the skip.
   const bool kSkpProf = REXCVAR_GET(gpu_nr_skip_profile) && kNrSkip;
   g_skp_prof = kSkpProf;
@@ -4007,6 +4042,19 @@ void CommandProcessor::WorkerThreadMain() {
               g_skp_deleg, g_skp_exec_fail, g_skp_arm_orphan, g_skp_rng,
               g_skp_rng_dw, g_skp_pdw, g_skp_plain_rng, g_skp_plain_dw,
               n ? ops : " deleg none");
+          // [NR-TILE] N-4 probe: what the EDRAM tile loop costs. `skipped`
+          // is the repeat-band work dropped this window, `kept` is band 1
+          // plus every offset-0 auxiliary pass. skipped/(skipped+kept)
+          // should read ~2/3 at heavy city if the census transfers.
+          if (g_nr_tile_probe) {
+            REXGPU_INFO(
+                "[nr-tile] mode={} draws skipped={} kept={} | bufs "
+                "skipped={} kept={}",
+                g_nr_tile_probe, g_tile_draws_skipped, g_tile_draws_kept,
+                g_tile_bufs_skipped, g_tile_bufs_kept);
+            g_tile_draws_skipped = g_tile_draws_kept = 0;
+            g_tile_bufs_skipped = g_tile_bufs_kept = 0;
+          }
           // [NR-PLAN] N-2-2 item 2: what the swap actually replaced. `spans`
           // and `dw` are the removed parse; `gap` is the packets still
           // parsed live; `miss` is where no template starts. Coverage is
@@ -4726,6 +4774,19 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+
+  // [NR-TILE] N-4 probe mode 2: drop every depth-1 buffer submitted for a
+  // repeat tile band outright (walk included) to price true de-tiling. The
+  // band is named by PA_SC_WINDOW_OFFSET, which the ring writes once per
+  // band before submitting the same buffers again; band 1 is offset 0, so
+  // the auxiliary passes (shadow/cube, also offset 0) keep running.
+  if (g_nr_tile_probe == 2 && g_pm4_ib_depth == 0) {
+    if (register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET] != 0) {
+      ++g_tile_bufs_skipped;
+      return;
+    }
+    ++g_tile_bufs_kept;
+  }
 
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
 
@@ -5470,6 +5531,19 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     bin_select_ = g_ctx_walker.bin.select;
     bin_mask_ = g_ctx_walker.bin.mask;
     if (!stop.delegate) {
+      // [NR-TILE] N-4 probe mode 1: skip the draw dispatch for every repeat
+      // tile band. Only opcode 0x22 is dropped, so the copy-mode draws that
+      // carry the resolves (all 0x36) still run and band 1 still presents.
+      // The walk already applied this packet's payload, so dropping the
+      // dispatch leaves the register file exactly as a normal execution
+      // would - this is the same shape as a viz-killed draw.
+      if (g_nr_tile_probe == 1 && stop.opcode == 0x22) {
+        if (register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET] != 0) {
+          ++g_tile_draws_skipped;
+          continue;
+        }
+        ++g_tile_draws_kept;
+      }
       // Draw stop: the walk already sits past this draw's packet, so the
       // handler must consume THIS stop instead of advancing the walk.
       g_nr_skip_stop = stop;
