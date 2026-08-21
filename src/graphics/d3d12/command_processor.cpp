@@ -180,6 +180,10 @@ REXCVAR_DECLARE(bool, gpu_nr_verify);
 REXCVAR_DECLARE(bool, gpu_nr_reuse_fast);
 REXCVAR_DECLARE(bool, gpu_nr_span_swap);
 REXCVAR_DECLARE(bool, gpu_nr_span_dedup);
+REXCVAR_DECLARE(bool, gpu_nr_span_replay);
+// [NR-TIL] N-4-1: the tile-pass replay + the probe it must never co-run with.
+REXCVAR_DECLARE(int32_t, gpu_nr_tile_replay);
+REXCVAR_DECLARE(int32_t, gpu_nr_tile_probe);
 // [NR-RUF-V2B] guard: the CPU vertex-shader extent path reads float
 // constants outside the bitmap-packed packs -- refuse upgrades under it.
 REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
@@ -1349,6 +1353,242 @@ void NrSprReportIfDue() {
       p.stored, p.first_seen, p.collision, p.too_long, p.empty, p.reset,
       p.ref_ff, p.ref_bar, p.ref_comp, p.ref_heaps, p.ref_other);
   g_spr_probe = NrSprProbe{};
+}
+
+// [NR-TIL] N-4-1 sizing. A heavy city base band is ~3.5k draws at ~43
+// elements each (~1.2 MB of span), so the arena is generous but bounded;
+// every cap refuses into the normal path and is counted, never silently.
+constexpr uint32_t kTileMaxKeys = 16;           // texture bindings per stage
+                                                // (8 refused ~10k draws/s in
+                                                // the attract demo)
+constexpr uint32_t kTileMaxSegs = 256;          // segments per frame (the
+                                                // heavy city runs ~63
+                                                // resolves a frame plus ~60
+                                                // tiny shadow/cube passes,
+                                                // all of them base-band)
+constexpr uint32_t kTileMaxRecs = 32768;        // draws recorded per frame
+constexpr uint32_t kTileMaxSpanElements = 512;  // elements in one draw's span
+constexpr size_t kTileArenaMaxElements = 4u << 20;  // 32 MB
+// ===========================================================================
+// [NR-TIL] N-4-1: EDRAM TILE-PASS DRAW REPLAY.
+//
+// The heavy city renders the whole scene THREE times a frame, once per EDRAM
+// tile band: the same draw packets, in the same order, with only
+// PA_SC_WINDOW_OFFSET and the window scissor moved (0 / -256 / -512). The
+// offline census (tools/n4-tile-census.py) reads 62.5% of all draw
+// executions as repeat bands, and gpu_nr_tile_probe measured what removing
+// their issue is worth: 36.9 -> 58 fps at the heavy city.
+//
+// This is the build the probe priced. Everything the CP derives for a repeat
+// band's draw is bit-identical to the base band's - same shaders, same
+// pipeline, same constants, same textures, same index buffer - because the
+// same packets wrote the same registers. The ONLY band-dependent outputs are
+// the viewport, the scissor and the system-constants NDC. So:
+//   base band (window offset 0): record each draw's native command span,
+//   anchored AFTER UpdateFixedFunctionState / UpdateSystemConstantValues so
+//   the span holds no viewport or scissor set;
+//   repeat band: recompute viewport / scissor / NDC live, then memcpy the
+//   recorded span in and patch its system-constants root view.
+// Pixel-identical by construction: same commands, same order, same state.
+//
+// Keyed by STREAM POSITION, not content. A segment (a run of draws between
+// resolves, band changes and frames) records into a flat vector; the repeat
+// band's segment finds its base by first-draw address and then walks the
+// same ordinals. That is what makes the verdict free - N-2-2 measured a
+// single hash-store lookup at 138 ns/span, which is more than the whole
+// saving here.
+//
+// The per-draw head that remains (RT update, texture requests + key valve,
+// viewport, sys upload, vertex/index residency) is the SAME head the 5-4-7-2
+// span swap ran, and its stage profile (naruto_436/439/453 [nr-spwp]) prices
+// it at ~0.9 us/draw against ~0.07 for the memcpy - so the head, not the
+// emission, is what the next increment has to hoist to the band. v1 keeps it
+// per draw because it is the sound version.
+struct TileRec {
+  uint32_t addr = 0;         // stream position (guard)
+  uint32_t prim = 0;         // primitive type (guard)
+  uint32_t index_count = 0;  // (guard)
+  uint32_t ib_base = 0;      // guest index base or 0 (guard)
+  uint32_t off = 0;          // element offset into g_tile_arena
+  uint32_t len = 0;          // span length in elements
+  uint32_t tex_mask = 0;
+  uint32_t llci = 0;
+  uint32_t ibr_base = 0;  // DMA index residency range
+  uint32_t ibr_size = 0;
+  uint32_t root_mask = 0;  // roots the span itself re-establishes
+  const D3D12Shader* vs = nullptr;
+  const D3D12Shader* ps = nullptr;
+  uint64_t smp_heap_ptr = 0;
+  uint64_t view_heap_ptr = 0;
+  uint16_t view_offsets[DeferredCommandList::kNrSprMaxViewSites] = {};
+  uint8_t view_roots[DeferredCommandList::kNrSprMaxViewSites] = {};
+  uint8_t view_count = 0;
+  uint8_t ib_dma = 0;
+  uint8_t index_endian = 0;
+  uint8_t valid = 0;  // 0 = this ordinal must fall through (the ordinal is
+                      // still held so the bands stay in lockstep)
+  // The pipeline-bind piece. A draw emits its pipeline set BEFORE the
+  // viewport and scissor, so the recording is two pieces with the
+  // bin-dependent set between them; this one is at most one command.
+  uint8_t lenA = 0;
+  uintmax_t dataA[8] = {};
+  uint8_t nkeys_v = 0;
+  uint8_t nkeys_p = 0;
+  D3D12TextureCache::TextureSRVKey keys_v[kTileMaxKeys];
+  D3D12TextureCache::TextureSRVKey keys_p[kTileMaxKeys];
+  // Filled only in the compare mode: the system constants as the base band
+  // left them, so the gate can prove that nothing outside the three
+  // viewport-derived fields moves between bands.
+  nr::NrSysConstants sys_snap;
+  SprCtx entry_ctx;
+  SprCtx exit_ctx;
+};
+struct TileSeg {
+  uint32_t addr0 = 0;  // first draw's stream position = the segment's name
+  uint32_t first = 0;  // index of its first record
+  uint32_t count = 0;
+};
+std::vector<TileRec> g_tile_recs;
+std::vector<TileSeg> g_tile_segs;
+std::vector<uintmax_t> g_tile_arena;
+size_t g_tile_arena_used = 0;
+// Per-frame / per-segment walking state.
+bool g_nr_tile_on = false;   // per-frame latch
+uint32_t g_tile_frame = UINT32_MAX;
+uint32_t g_tile_win = 0;     // the current segment's PA_SC_WINDOW_OFFSET
+bool g_tile_seg_open = false;
+uint32_t g_tile_seg = 0;     // index into g_tile_segs
+uint32_t g_tile_mode = 0;    // 0 = pass through, 1 = record, 2 = replay
+uint32_t g_tile_ord = 0;     // next ordinal in this segment
+uint32_t g_tile_cur_ord = 0; // this draw's ordinal
+// This draw's shape guard, latched at Begin (the replay runs before the
+// derivation, so these three are all the identity available for free).
+uint32_t g_tile_prim = 0, g_tile_icount = 0, g_tile_ibbase = 0;
+// Record bracket.
+bool g_tile_rec_open = false;
+// [NR-TIL] mode 3: compare instead of consume.
+bool g_tile_verify = false;
+bool g_tile_cmp_open = false;
+uint32_t g_tile_cmp_idx = 0;
+size_t g_tile_spanA_start = 0;  // pipeline-bind piece
+size_t g_tile_spanA_end = 0;
+size_t g_tile_span_start = 0;   // bindings + index buffer + draw
+uint64_t g_tile_span_gen = 0;
+SprCtx g_tile_entry_ctx;
+// The pipeline pair as it stood at the TOP of the draw -- the point where
+// the replay makes its decision. A texture load between there and the
+// pipeline bind would break the recording symmetry, so both sides check it.
+void* g_tile_top_guest_pso = nullptr;
+ID3D12PipelineState* g_tile_top_ext_pso = nullptr;
+
+struct NrTilProbe {
+  uint64_t draws = 0;        // draws seen under the latch
+  uint64_t base = 0;         // base-band draws (window offset 0)
+  uint64_t repeat = 0;       // repeat-band draws
+  uint64_t recorded = 0;     // spans stored
+  uint64_t cand = 0;         // repeat-band draws with a record at their ordinal
+  uint64_t rep = 0;          // actually replayed
+  uint64_t segs_rec = 0, segs_rep = 0, seg_nomatch = 0;
+  // Refusals, one counter per cause: a probe whose refusals are not counters
+  // can go silent for the wrong reason.
+  uint64_t fb_ord = 0, fb_norec = 0, fb_shape = 0, fb_batch = 0, fb_begin = 0,
+           fb_texpso = 0,
+           fb_heap = 0, fb_ctx = 0, fb_valve = 0, fb_rt = 0, fb_sys = 0,
+           fb_vf = 0, fb_ib = 0;
+  // Record-side refusals.
+  uint64_t rr_gen = 0, rr_scan = 0, rr_class = 0, rr_len = 0, rr_arena = 0, rr_pso = 0,
+           rr_keys = 0, rr_roots = 0, rr_cap = 0;
+  uint64_t rep_elements = 0, sys_sets = 0;
+  // Mode 3 compare gate.
+  uint64_t cmp = 0, cmp_eq = 0, cmp_real = 0, cmp_dyn = 0, cmp_lenne = 0,
+           cmp_psone = 0, cmp_ctxne = 0, cmp_sysne = 0;
+  uint32_t cmp_first_real = 0xFFFFFFFFu;
+  uint32_t cmp_sys_off = 0xFFFFFFFFu;
+  uint64_t cmp_stale = 0;  // armed but the anchor or the frame moved
+  // Why the entry gate refused: one bit per SprCtx field group (pipeline,
+  // root signature, topology, root-up-to-date mask, shared-memory flavor,
+  // then one per cbuffer up-to-date flag). A gate that only counts its
+  // refusals cannot be fixed; this one names them.
+  uint64_t ctx_why[12] = {};
+  uint64_t ctx_first = 0;  // refusals on a segment first ordinal (expected)
+};
+NrTilProbe g_tile_p;
+// [NR-TIL] the tile entry gate compares everything that decides WHETHER a
+// command is emitted, and nothing that only decides its VALUE. The cbuffer
+// ADDRESSES are the difference from the 5-4-7-3 gate: the first draw of a
+// repeat band runs the full path and gets FRESH pool allocations, so from
+// ordinal 2 on the addresses can never match the base band. They do not have
+// to: the base band buffer at the recorded address is same-frame, still
+// live, and holds byte-identical content, because the same packets wrote the
+// same registers. What must match is the up-to-date flags, the root mask,
+// the pipeline / root-signature / topology identity and the shared-memory
+// flavor -- those decide which commands the recording OMITTED.
+bool NrTileCtxEq(const SprCtx& a, const SprCtx& b, uint32_t* why) {
+  uint32_t w = 0;
+  if (a.guest_pipeline != b.guest_pipeline ||
+      a.external_pipeline != b.external_pipeline) {
+    w |= 1u << 0;
+  }
+  if (a.root_signature != b.root_signature) w |= 1u << 1;
+  if (a.topology != b.topology) w |= 1u << 2;
+  if (a.ru2d != b.ru2d) w |= 1u << 3;
+  if (a.shm_uav != b.shm_uav) w |= 1u << 4;
+  for (int i = 0; i < 7; ++i) {
+    if (a.cb_utd[i] != b.cb_utd[i]) w |= 1u << (5 + i);
+  }
+  *why = w;
+  return w == 0;
+}
+
+
+void NrTilReportIfDue() {
+  if (!g_nr_tile_on && !g_tile_p.draws) return;
+  static auto s_last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(1)) return;
+  s_last = now;
+  const NrTilProbe& p = g_tile_p;
+  const uint64_t fb = p.fb_ord + p.fb_norec + p.fb_shape + p.fb_batch +
+                      p.fb_begin + p.fb_heap + p.fb_ctx + p.fb_valve +
+                      p.fb_rt + p.fb_sys + p.fb_vf + p.fb_ib + p.fb_texpso;
+  REXGPU_INFO(
+      "[nr-til] draws={} base={} repeat={} | rec={} segs {}/{} nomatch={} | "
+      "cand={} rep={} ({:.1f}% of repeat) el={:.1f} syssets={} | fb={} "
+      "(ord={} norec={} shape={} batch={} begin={} heap={} ctx={} valve={} "
+      "rt={} sys={} vf={} ib={} texpso={}) | rrefuse gen={} scan={} class={} "
+      "len={} "
+      "arena={} keys={} roots={} pso={} cap={} | ctxwhy pso={} rs={} "
+      "topo={} ru2d={} shm={} utd={}/{}/{}/{}/{}/{}/{} first={} | "
+      "arena={}KB recs={}",
+      p.draws, p.base, p.repeat, p.recorded, p.segs_rep, p.segs_rec,
+      p.seg_nomatch, p.cand, p.rep,
+      p.repeat ? 100.0 * double(p.rep) / double(p.repeat) : 0.0,
+      p.rep ? double(p.rep_elements) / double(p.rep) : 0.0, p.sys_sets, fb,
+      p.fb_ord, p.fb_norec, p.fb_shape, p.fb_batch, p.fb_begin, p.fb_heap,
+      p.fb_ctx, p.fb_valve, p.fb_rt, p.fb_sys, p.fb_vf, p.fb_ib, p.fb_texpso,
+      p.rr_gen,
+      p.rr_scan, p.rr_class, p.rr_len, p.rr_arena, p.rr_keys, p.rr_roots,
+      p.rr_pso, p.rr_cap, p.ctx_why[0], p.ctx_why[1], p.ctx_why[2],
+      p.ctx_why[3], p.ctx_why[4], p.ctx_why[5], p.ctx_why[6], p.ctx_why[7],
+      p.ctx_why[8], p.ctx_why[9], p.ctx_why[10], p.ctx_why[11], p.ctx_first,
+      (g_tile_arena.size() * sizeof(uintmax_t)) >> 10,
+      g_tile_recs.size());
+  if (p.cmp || p.cmp_stale) {
+    // The gate line. eq is the number that has to be 100%: a repeat-band
+    // draw whose freshly derived span, pipeline piece and system constants
+    // all match the base band recording outside the three viewport-derived
+    // NDC fields. dyn counts root views that differ ONLY in their GPU
+    // address, which is expected and is what the replay reuses.
+    REXGPU_INFO(
+        "[nr-til] GATE cmp={} eq={} ({:.4f}%) | ne: span={} lenne={} pso={} "
+        "sys={} (1st byte {}) | dyn={} ctxne={} stale={} 1stcmd={}",
+        p.cmp, p.cmp_eq, p.cmp ? 100.0 * double(p.cmp_eq) / double(p.cmp) : 0.0,
+        p.cmp_real, p.cmp_lenne, p.cmp_psone, p.cmp_sysne,
+        p.cmp_sys_off == 0xFFFFFFFFu ? -1 : int32_t(p.cmp_sys_off), p.cmp_dyn,
+        p.cmp_ctxne, p.cmp_stale,
+        p.cmp_first_real == 0xFFFFFFFFu ? -1 : int32_t(p.cmp_first_real));
+  }
+  g_tile_p = NrTilProbe{};
 }
 
 void NrDspReportIfDue() {
@@ -4081,6 +4321,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   NrDspReportIfDue();
   NrSprReportIfDue();
   NrSpwReportIfDue();
+  NrTilReportIfDue();
   {
     // [NR-RUF] 5-4-5-2: the fast path implies the bundle machinery (its
     // captures are the restore source); the compare gate stays available
@@ -4130,6 +4371,51 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       std::fill(g_spr_headers.begin(), g_spr_headers.end(), SprHeader{});
     }
     g_nr_span_dedup = nr_spd_now;
+  }
+  // [NR-TIL] N-4-1: the tile-pass replay. Bindless only (the patch sites are
+  // bindless root CBVs), never under verify (the emulated compare gates read
+  // members the replay stops deriving), and never alongside the 5-4-7 span
+  // machinery -- both own g_spr_cap and both would record the same brackets.
+  // A flip drops every recording: the store is per-frame anyway.
+  {
+    const int32_t nr_til_cv = REXCVAR_GET(gpu_nr_tile_replay);
+    const bool nr_til_eligible = nr_til_cv != 0 && !g_nr_verify && g_nr_swap &&
+                                 bindless_resources_used_ &&
+                                 !REXCVAR_GET(gpu_nr_span_replay) &&
+                                 !REXCVAR_GET(gpu_nr_span_swap) &&
+                                 !REXCVAR_GET(gpu_nr_tile_probe);
+    bool nr_til_now = nr_til_eligible;
+    if (nr_til_eligible && nr_til_cv == 2) {
+      // Mode 2: cycle 10 s off / 10 s on IN PLACE. One drive to the heavy
+      // city then reads both conditions at matched draws/frame, which is the
+      // standing rule for every fps read here and the thing two drives to
+      // "the same spot" can never guarantee.
+      static const auto nr_til_t0 = std::chrono::steady_clock::now();
+      const auto nr_til_el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now() - nr_til_t0)
+                                 .count();
+      nr_til_now = ((nr_til_el / 10) & 1) != 0;
+    }
+    g_tile_verify = nr_til_eligible && nr_til_cv == 3;
+    if (nr_til_now != g_nr_tile_on) {
+      g_tile_recs.clear();
+      g_tile_segs.clear();
+      g_tile_arena_used = 0;
+      g_tile_seg_open = false;
+      g_tile_rec_open = false;
+      g_tile_frame = UINT32_MAX;
+      REXGPU_INFO(
+          "[nr-til] PHASE {}{} - repeat EDRAM tile bands {}.",
+          nr_til_now ? "ON" : "OFF", g_tile_verify ? " (COMPARE GATE)" : "",
+          !nr_til_now
+              ? "run the full derivation (control)"
+              : (g_tile_verify
+                     ? "run the full derivation AND compare it against the "
+                       "recording they would have replayed"
+                     : "are served from the base band recorded native spans "
+                       "(viewport, scissor and NDC recomputed live)"));
+    }
+    g_nr_tile_on = nr_til_now;
   }
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
   // gate itself is latched base-side (WorkerThreadMain), not here.
@@ -4796,11 +5082,29 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
+    // [NR-TIL] a resolve ends the tile segment: the census segments the
+    // bands at exactly these points, and the base band of the next segment
+    // is what the next repeat band replays.
+    if (g_nr_tile_on) NrTileSegBreak();
     // [GPU-DRAW] other sub-bracket 16 (copy): the whole resolve path.
     bool _dp_copy_ok = IssueCopy();
     if (g_draw_prof) g_draw_ns[16] += prof_ns_since(_dp_total.t0);
     return _dp_copy_ok;
   }
+
+  // [NR-TIL] N-4-1: tile-pass draw replay. BeginDraw advances the segment
+  // ordinal for EVERY draw (a fall-through still holds its slot, or the
+  // bands stop lining up); ReplayTry serves a repeat-band draw from the base
+  // band recording. A false return is a fall-through -- every head step it
+  // took is idempotent on the full path below.
+  if (g_nr_tile_on) {
+    NrTileBeginDraw(regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], uint32_t(primitive_type), index_count,
+                    index_buffer_info ? index_buffer_info->guest_base : 0u);
+    if (NrTileReplayTry()) {
+      return true;
+    }
+  }
+
 
   // [NR-SPW] Phase 5-4-7-2: a reusable draw with a clean recording replays
   // it (live head + memcpy + patch) instead of running the derivation below.
@@ -5169,6 +5473,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   auto _dp_tex0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
   texture_cache_->RequestTextures(used_texture_mask);
+  // [NR-TIL] N-4-1: open the pipeline piece (texture loads and their
+  // barriers are behind us; the pipeline set is the only thing ahead of the
+  // viewport).
+  if (g_tile_rec_open || g_tile_cmp_open) NrTileRecordAnchorA();
   if (g_draw_prof) g_draw_ns[3] += prof_ns_since(_dp_tex0);
   // [GPU-DRAW] other sub-bracket 15 (vp): here -> fixed-function state.
   auto _dp_ovp0 = g_draw_prof ? std::chrono::steady_clock::now()
@@ -5284,6 +5592,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   auto _dp_ff0 = g_draw_prof ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
   // Update viewport, scissor, blend factor and stencil reference.
+  // [NR-TIL] N-4-1: close the pipeline piece before the bin-dependent sets.
+  if (g_tile_rec_open || g_tile_cmp_open) NrTileRecordSplit();
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
   // Update system constants before uploading them.
@@ -5292,6 +5602,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
+
+  // [NR-TIL] N-4-1: the recording anchor. Everything band-dependent has been
+  // emitted by now (UpdateFixedFunctionState wrote the viewport and scissor,
+  // UpdateSystemConstantValues moved the NDC into the mirror), so the span
+  // from here on is band-INVARIANT and can be memcpyd into the repeat bands.
+  if (g_tile_rec_open || g_tile_cmp_open) NrTileRecordAnchor();
   if (g_draw_prof) g_draw_ns[8] += prof_ns_since(_dp_ff0);
 
   // [NR-BND] Phase 5-3b-0: the root-signature selection, ours against the one
@@ -5632,7 +5948,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // tessellated / non-kVertex host shaders, an instanced-batch start (the
   // draw is deferred out of the bracket); converted index buffers refuse in
   // the indexed branch below (their pool VA is frame-scoped).
-  if (g_spr_open) {
+  if (g_spr_open || g_tile_rec_open) {
     g_spr_cap.valid = true;
     g_spr_cap.refused = memexport_used || primitive_processing_result.IsTessellated() ||
                         primitive_processing_result.host_vertex_shader_type !=
@@ -5707,7 +6023,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
               shared_memory_->GetGPUAddress() + primitive_processing_result.guest_index_base;
           // [NR-SPR] the replay must re-request this range (residency is
           // the one live dependency of a DMA index buffer).
-          if (g_spr_open) {
+          if (g_spr_open || g_tile_rec_open) {
             g_spr_cap.ib_dma = 1;
             g_spr_cap.ib_base = primitive_processing_result.guest_index_base;
             g_spr_cap.ib_size = index_buffer_view.SizeInBytes;
@@ -5719,7 +6035,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
             primitive_processing_result.host_index_buffer_handle);
         // [NR-SPR] converted indices live in a frame-scoped pool: the
         // recorded IB view would go stale. Never replayable.
-        if (g_spr_open) {
+        if (g_spr_open || g_tile_rec_open) {
           g_spr_cap.refused = true;
         }
         break;
@@ -5793,6 +6109,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     g_draw_ns[11] += prof_ns_since(_dp_temit0);
     g_draw_ns[7] += prof_ns_since(_dp_tail0);
   }
+  // [NR-TIL] N-4-1: close the recording. Reached only by a draw that made it
+  // all the way to emission -- every earlier `return false` leaves the
+  // record valid=0, which is exactly right: the repeat bands must fall
+  // through at that ordinal too, and the ordinal itself is already held.
+  if (g_tile_rec_open) NrTileRecordEnd();
+  if (g_tile_cmp_open) NrTileCompareEnd();
   return true;
 }
 
@@ -7661,6 +7983,664 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
     w.ns_res += d(6, 7);
     w.ns_emit += d(7, 8);
   }
+  return true;
+}
+
+// [NR-TIL] N-4-1: a resolve, a band change or a frame ends the segment. The
+// next draw opens a new one and decides record / replay / pass-through.
+void D3D12CommandProcessor::NrTileSegBreak() { g_tile_seg_open = false; }
+
+void D3D12CommandProcessor::NrTileBeginDraw(uint32_t win_off, uint32_t prim,
+                                            uint32_t index_count, uint32_t ib_base) {
+  NrTilProbe& p = g_tile_p;
+  ++p.draws;
+  if (g_tile_frame != frame_current_) {
+    // Every recording is same-frame BY RULE: the spans embed per-frame
+    // constant-pool GPU addresses, and the three bands of one frame are the
+    // only executions that ever share them.
+    g_tile_frame = frame_current_;
+    g_tile_recs.clear();
+    g_tile_segs.clear();
+    g_tile_arena_used = 0;
+    g_tile_seg_open = false;
+  }
+  if (!g_tile_seg_open || win_off != g_tile_win) {
+    g_tile_win = win_off;
+    g_tile_seg_open = true;
+    g_tile_ord = 0;
+    g_tile_mode = 0;
+    if (win_off == 0) {
+      if (g_tile_segs.size() < kTileMaxSegs && g_tile_recs.size() < kTileMaxRecs) {
+        g_tile_segs.push_back(
+            TileSeg{nr_tile_draw_addr_, uint32_t(g_tile_recs.size()), 0});
+        g_tile_seg = uint32_t(g_tile_segs.size()) - 1;
+        g_tile_mode = 1;
+        ++p.segs_rec;
+      }
+    } else {
+      // Name the repeat band by its first draw stream position and find the
+      // base-band segment it repeats. At most kTileMaxSegs entries, once per
+      // segment: the whole lookup cost of the mechanism.
+      for (uint32_t i = 0; i < g_tile_segs.size(); ++i) {
+        if (g_tile_segs[i].addr0 == nr_tile_draw_addr_ && g_tile_segs[i].count) {
+          g_tile_seg = i;
+          g_tile_mode = 2;
+          ++p.segs_rep;
+          break;
+        }
+      }
+      if (g_tile_mode != 2) ++p.seg_nomatch;
+    }
+  }
+  if (win_off == 0) {
+    ++p.base;
+  } else {
+    ++p.repeat;
+  }
+  g_tile_cur_ord = g_tile_ord++;
+  g_tile_prim = prim;
+  g_tile_icount = index_count;
+  g_tile_ibbase = ib_base;
+  g_tile_rec_open = false;
+  // The tile recorder owns g_spr_cap when the span machinery is off (the
+  // two are mutually exclusive at the latch); the emission tail fills it.
+  g_spr_cap = SprCapture{};
+  // The comparison point for both sides: state at the TOP of the draw,
+  // before any of this draw own emissions. Capturing it after the pipeline
+  // bind (the first version) compared the recording POST-bind context
+  // against the replay PRE-bind one, and refused every draw that changed
+  // pipeline -- 58% of menu candidates, all of them attributed to the
+  // pipeline field by the ctxwhy split.
+  g_tile_top_guest_pso = current_guest_pipeline_;
+  g_tile_top_ext_pso = current_external_pipeline_;
+  if (g_tile_mode == 1) {
+    // Hold the ordinal for EVERY base-band draw, including one that aborts
+    // or refuses: the bands only stay in lockstep if the ordinals line up,
+    // and a valid=0 record is how a refusal is expressed.
+    if (g_tile_recs.size() >= kTileMaxRecs) {
+      ++p.rr_cap;
+      g_tile_mode = 0;
+      return;
+    }
+    NrSprCaptureCtx(&g_tile_entry_ctx);
+    TileRec& r = g_tile_recs.emplace_back();
+    r.addr = nr_tile_draw_addr_;
+    r.prim = prim;
+    r.index_count = index_count;
+    r.ib_base = ib_base;
+    g_tile_segs[g_tile_seg].count = g_tile_ord;
+    g_tile_rec_open = true;
+  }
+  g_tile_cmp_open = false;
+  if (g_tile_mode == 2 && g_tile_verify) {
+    // Mode 3: let the full derivation run and compare its span against the
+    // recording it would have replayed. Same anchors, same bracket -- only
+    // the tail differs. The arming refusals reuse the consuming path
+    // counters so the two modes report the same population the same way.
+    const TileSeg& seg = g_tile_segs[g_tile_seg];
+    if (g_tile_cur_ord >= seg.count) {
+      ++p.fb_ord;
+    } else {
+      const uint32_t idx = seg.first + g_tile_cur_ord;
+      const TileRec& rc = g_tile_recs[idx];
+      if (!rc.valid) {
+        ++p.fb_norec;
+      } else if (rc.addr != nr_tile_draw_addr_ || rc.prim != prim ||
+                 rc.index_count != index_count || rc.ib_base != ib_base) {
+        ++p.fb_shape;
+      } else {
+        ++p.cand;
+        g_tile_cmp_idx = idx;
+        g_tile_cmp_open = true;
+        NrSprCaptureCtx(&g_tile_entry_ctx);
+      }
+    }
+  }
+}
+
+// The pipeline-bind anchor, after the texture requests (which can emit
+// loads and barriers) and before the pipeline set. Everything from here to
+// the fixed-function state is at most one pipeline set.
+void D3D12CommandProcessor::NrTileRecordAnchorA() {
+  if (!g_tile_rec_open && !g_tile_cmp_open) return;
+  // The texture requests are allowed to bind pipelines (a load blit). If one
+  // did, the pipeline piece below was recorded against a state the replay
+  // will not reproduce -- refuse the record rather than replay a draw whose
+  // pipeline set was deduped against a blit.
+  if (current_guest_pipeline_ != g_tile_top_guest_pso ||
+      current_external_pipeline_ != g_tile_top_ext_pso) {
+    ++g_tile_p.rr_class;
+    g_tile_rec_open = false;
+    g_tile_cmp_open = false;
+    return;
+  }
+  g_tile_spanA_start = deferred_command_list_.stream_size_elements();
+  g_tile_spanA_end = g_tile_spanA_start;
+  g_tile_span_gen = deferred_command_list_.reset_generation();
+}
+
+// Closes the pipeline piece immediately before UpdateFixedFunctionState:
+// the viewport and scissor sets it is about to emit are the bin-dependent
+// set, and they must never enter a recording.
+void D3D12CommandProcessor::NrTileRecordSplit() {
+  if (!g_tile_rec_open && !g_tile_cmp_open) return;
+  g_tile_spanA_end = deferred_command_list_.stream_size_elements();
+}
+
+void D3D12CommandProcessor::NrTileRecordAnchor() {
+  if (!g_tile_rec_open && !g_tile_cmp_open) return;
+  g_tile_span_start = deferred_command_list_.stream_size_elements();
+}
+
+void D3D12CommandProcessor::NrTileRecordEnd() {
+  if (!g_tile_rec_open) return;
+  g_tile_rec_open = false;
+  NrTilProbe& p = g_tile_p;
+  TileRec& r = g_tile_recs[g_tile_segs[g_tile_seg].first + g_tile_cur_ord];
+  // A submission ended inside the draw: the anchor points into a refilled
+  // stream. (The submission id is NOT this check: the Reset happens at the
+  // next BeginSubmission, so an anchor can die under an unchanged id.)
+  if (deferred_command_list_.reset_generation() != g_tile_span_gen) {
+    ++p.rr_gen;
+    return;
+  }
+  // ... or a frame boundary moved the constant-buffer pool under the GPU
+  // addresses the span embeds.
+  if (frame_current_ != g_tile_frame) {
+    ++p.rr_gen;
+    return;
+  }
+  // The pipeline piece: empty, or exactly one pipeline set. Anything else
+  // between the texture requests and the fixed-function state would be
+  // silently dropped by the replay.
+  {
+    const size_t la = deferred_command_list_.NrTilePipelineSpan(
+        g_tile_spanA_start, g_tile_spanA_end, r.dataA, rex::countof(r.dataA));
+    if (la == SIZE_MAX) {
+      ++p.rr_pso;
+      return;
+    }
+    r.lenA = uint8_t(la);
+  }
+  if (!g_spr_cap.valid || g_spr_cap.refused || !g_spr_cap.vs) {
+    ++p.rr_class;
+    return;
+  }
+  DeferredCommandList::NrSprScan scan;
+  deferred_command_list_.NrSprScanSpan(g_tile_span_start, &scan);
+  if (scan.malformed) {
+    ++p.rr_scan;
+    return;
+  }
+  // Whitelist: exactly one draw, and nothing whose replay would be wrong or
+  // non-idempotent. ff = a viewport / scissor / blend-factor / stencil-ref
+  // set (bin-dependent, must stay live); barrier / compute / copy / clear /
+  // dispatch / query = texture-load and resolve traffic that has to
+  // regenerate; heaps = a descriptor-heap switch the replay does not make.
+  if (scan.draw != 1 || scan.ff || scan.barrier || scan.compute || scan.heaps ||
+      scan.other) {
+    ++p.rr_class;
+    return;
+  }
+  const size_t end = deferred_command_list_.stream_size_elements();
+  const size_t len = end - g_tile_span_start;
+  if (!len || len > kTileMaxSpanElements) {
+    ++p.rr_len;
+    return;
+  }
+  if (scan.view_sites != scan.view_offset_count) {
+    ++p.rr_roots;
+    return;
+  }
+  const size_t nkv = g_spr_cap.vs->GetTextureBindingsAfterTranslation().size();
+  const size_t nkp =
+      g_spr_cap.ps ? g_spr_cap.ps->GetTextureBindingsAfterTranslation().size() : 0;
+  if (nkv > kTileMaxKeys || nkp > kTileMaxKeys ||
+      current_texture_srv_keys_vertex_.size() < nkv ||
+      current_texture_srv_keys_pixel_.size() < nkp) {
+    ++p.rr_keys;
+    return;
+  }
+  if (g_tile_arena_used + len > kTileArenaMaxElements) {
+    ++p.rr_arena;
+    return;
+  }
+  if (g_tile_arena.size() < g_tile_arena_used + len) {
+    g_tile_arena.resize(std::min<size_t>(
+        kTileArenaMaxElements,
+        std::max<size_t>(g_tile_arena_used + len,
+                         g_tile_arena.size() * 2 + (size_t(1) << 16))));
+  }
+  const size_t copied = deferred_command_list_.NrDspCopySpan(
+      g_tile_span_start, g_tile_arena.data() + g_tile_arena_used, len);
+  if (copied != len) {
+    ++p.rr_len;
+    return;
+  }
+  uint32_t roots[DeferredCommandList::kNrSprMaxViewSites];
+  if (scan.view_offset_count &&
+      !DeferredCommandList::NrSprViewSiteRoots(g_tile_arena.data() + g_tile_arena_used,
+                                               scan.view_offsets,
+                                               scan.view_offset_count, roots)) {
+    ++p.rr_roots;
+    return;
+  }
+  r.off = uint32_t(g_tile_arena_used);
+  r.len = uint32_t(len);
+  g_tile_arena_used += len;
+  r.view_count = scan.view_offset_count;
+  for (uint32_t i = 0; i < scan.view_offset_count; ++i) {
+    r.view_offsets[i] = scan.view_offsets[i];
+    r.view_roots[i] = uint8_t(roots[i]);
+  }
+  r.root_mask = scan.root_mask;
+  r.vs = g_spr_cap.vs;
+  r.ps = g_spr_cap.ps;
+  r.tex_mask = g_spr_cap.tex_mask;
+  r.llci = g_spr_cap.llci;
+  r.index_endian = g_spr_cap.index_endian;
+  r.ib_dma = g_spr_cap.ib_dma;
+  r.ibr_base = g_spr_cap.ib_base;
+  r.ibr_size = g_spr_cap.ib_size;
+  r.smp_heap_ptr = sampler_bindless_heap_gpu_start_.ptr;
+  r.view_heap_ptr = view_bindless_heap_gpu_start_.ptr;
+  r.nkeys_v = uint8_t(nkv);
+  r.nkeys_p = uint8_t(nkp);
+  if (r.nkeys_v) {
+    std::memcpy(r.keys_v, current_texture_srv_keys_vertex_.data(),
+                r.nkeys_v * sizeof(D3D12TextureCache::TextureSRVKey));
+  }
+  if (r.nkeys_p) {
+    std::memcpy(r.keys_p, current_texture_srv_keys_pixel_.data(),
+                r.nkeys_p * sizeof(D3D12TextureCache::TextureSRVKey));
+  }
+  r.entry_ctx = g_tile_entry_ctx;
+  NrSprCaptureCtx(&r.exit_ctx);
+  if (g_tile_verify) r.sys_snap = g_nr_sys_state;
+  r.valid = 1;
+  ++p.recorded;
+}
+
+// [NR-TIL] N-4-1 mode 3: the compare gate. A repeat-band draw with a valid
+// base-band recording runs the FULL derivation, and its freshly emitted span
+// is compared against the recording it would have replayed. That turns the
+// whole correctness claim -- "a repeat band draw differs from its base band
+// draw only in viewport, scissor and the system-constants NDC" -- into a
+// number, at menu scale and at city scale, instead of an impression.
+//
+// Three things are compared:
+//   the pipeline piece   byte-exact,
+//   the draw span        lockstep and field-aware (a root view whose only
+//                        difference is its GPU address is `dyn`, which is
+//                        expected: the full path allocates fresh constant
+//                        buffers, and their CONTENT is identical because the
+//                        same packets wrote the same registers),
+//   the system constants byte-exact outside the three viewport-derived
+//                        fields (ndc_scale, ndc_offset,
+//                        point_screen_diameter_to_ndc_radius) -- this is the
+//                        one that tests the claim directly, since the sys
+//                        mirror is host memory and can be read back.
+// The entry context is compared too, so the gate also reports whether the
+// consuming path would have accepted this draw.
+void D3D12CommandProcessor::NrTileCompareEnd() {
+  if (!g_tile_cmp_open) return;
+  g_tile_cmp_open = false;
+  NrTilProbe& p = g_tile_p;
+  if (deferred_command_list_.reset_generation() != g_tile_span_gen ||
+      frame_current_ != g_tile_frame) {
+    ++p.cmp_stale;
+    return;
+  }
+  const TileRec& r = g_tile_recs[g_tile_cmp_idx];
+  ++p.cmp;
+  bool eq = true;
+  // 1. the pipeline piece.
+  {
+    uintmax_t buf[8];
+    const size_t la = deferred_command_list_.NrTilePipelineSpan(
+        g_tile_spanA_start, g_tile_spanA_end, buf, rex::countof(buf));
+    if (la == SIZE_MAX || la != r.lenA ||
+        (la && std::memcmp(buf, r.dataA, la * sizeof(uintmax_t)) != 0)) {
+      ++p.cmp_psone;
+      eq = false;
+    }
+  }
+  // 2. the draw span.
+  {
+    DeferredCommandList::NrDspDiff d;
+    deferred_command_list_.NrDspCompareSpan(g_tile_arena.data() + r.off, r.len,
+                                            g_tile_span_start, &d);
+    p.cmp_dyn += d.dyn_view + d.dyn_table;
+    if (d.length_differs) {
+      ++p.cmp_lenne;
+      eq = false;
+    }
+    if (d.real) {
+      p.cmp_real += d.real;
+      if (p.cmp_first_real == 0xFFFFFFFFu) p.cmp_first_real = d.first_real;
+      eq = false;
+    }
+  }
+  // 3. the system constants, outside the viewport-derived fields.
+  {
+    const uint8_t* a = reinterpret_cast<const uint8_t*>(&g_nr_sys_state);
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(&r.sys_snap);
+    for (uint32_t i = 0; i < sizeof(nr::NrSysConstants); ++i) {
+      // ndc_scale[3] at 128, ndc_offset[3] at 144,
+      // point_screen_diameter_to_ndc_radius[2] at 168.
+      if ((i >= 128 && i < 140) || (i >= 144 && i < 156) ||
+          (i >= 168 && i < 176)) {
+        continue;
+      }
+      if (a[i] != b[i]) {
+        ++p.cmp_sysne;
+        if (p.cmp_sys_off == 0xFFFFFFFFu) p.cmp_sys_off = i;
+        eq = false;
+        break;
+      }
+    }
+  }
+  // 4. would the consuming path have taken it?
+  {
+    uint32_t why = 0;
+    if (!NrTileCtxEq(g_tile_entry_ctx, r.entry_ctx, &why)) ++p.cmp_ctxne;
+  }
+  if (eq) ++p.cmp_eq;
+}
+
+bool D3D12CommandProcessor::NrTileReplayTry() {
+  NrTilProbe& p = g_tile_p;
+  if (g_tile_mode != 2 || g_tile_verify) return false;
+  const TileSeg& seg = g_tile_segs[g_tile_seg];
+  if (g_tile_cur_ord >= seg.count) {
+    ++p.fb_ord;
+    return false;
+  }
+  const TileRec& r = g_tile_recs[seg.first + g_tile_cur_ord];
+  if (!r.valid) {
+    ++p.fb_norec;
+    return false;
+  }
+  ++p.cand;
+  if (r.addr != nr_tile_draw_addr_ || r.prim != g_tile_prim ||
+      r.index_count != g_tile_icount || r.ib_base != g_tile_ibbase) {
+    ++p.fb_shape;
+    return false;
+  }
+  // An open instanced batch owns the stream tail; the merge-or-flush
+  // decision belongs to the full path.
+  if (g_instance && instanced_batch_.active) {
+    ++p.fb_batch;
+    return false;
+  }
+  if (!BeginSubmission(true)) {
+    ++p.fb_begin;
+    return false;
+  }
+  // A frame boundary inside this draw would have reset the constant-buffer
+  // pool the recording GPU addresses point into: the recording is dead, and
+  // the next BeginDraw clears the store.
+  if (frame_current_ != g_tile_frame) {
+    ++p.fb_begin;
+    return false;
+  }
+  if (r.smp_heap_ptr != sampler_bindless_heap_gpu_start_.ptr ||
+      r.view_heap_ptr != view_bindless_heap_gpu_start_.ptr) {
+    ++p.fb_heap;
+    return false;
+  }
+  // The emission-context gate, AFTER BeginSubmission: a submission open
+  // resets the dedupe members, and a DEDUPED span omitted commands are only
+  // sound when the current members equal the recording entry snapshot. In
+  // lockstep this matches by construction (the exit context of ordinal i-1
+  // is applied at the end of its replay), so a miss names a real divergence.
+  SprCtx nr_til_now;
+  NrSprCaptureCtx(&nr_til_now);
+  uint32_t nr_til_why = 0;
+  if (!NrTileCtxEq(nr_til_now, r.entry_ctx, &nr_til_why)) {
+    ++p.fb_ctx;
+    if (!g_tile_cur_ord) ++p.ctx_first;
+    for (int i = 0; i < 12; ++i) {
+      if (nr_til_why & (1u << i)) ++p.ctx_why[i];
+    }
+    return false;
+  }
+  const D3D12Shader* vs = r.vs;
+  const D3D12Shader* ps = r.ps;
+  // Textures first (a load can move host SRV indices), then the key valve:
+  // the recorded span descriptor-index constant buffer holds the base band
+  // indices, so a moved index means the recording is stale.
+  texture_cache_->RequestTextures(r.tex_mask);
+  // A load blit rebinding the pipeline breaks the symmetry the recorded
+  // pipeline piece was deduped under (the record side refuses the same
+  // case at its own anchor).
+  if (current_guest_pipeline_ != g_tile_top_guest_pso ||
+      current_external_pipeline_ != g_tile_top_ext_pso) {
+    ++p.fb_texpso;
+    return false;
+  }
+  {
+    const std::vector<D3D12Shader::TextureBinding>& tv =
+        vs->GetTextureBindingsAfterTranslation();
+    if (tv.size() != r.nkeys_v ||
+        (r.nkeys_v && !texture_cache_->AreActiveTextureSRVKeysUpToDate(
+                          r.keys_v, tv.data(), r.nkeys_v))) {
+      ++p.fb_valve;
+      return false;
+    }
+    if (ps) {
+      const std::vector<D3D12Shader::TextureBinding>& tp =
+          ps->GetTextureBindingsAfterTranslation();
+      if (tp.size() != r.nkeys_p ||
+          (r.nkeys_p && !texture_cache_->AreActiveTextureSRVKeysUpToDate(
+                            r.keys_p, tp.data(), r.nkeys_p))) {
+        ++p.fb_valve;
+        return false;
+      }
+    } else if (r.nkeys_p) {
+      ++p.fb_valve;
+      return false;
+    }
+  }
+  const RegisterFile& regs = GetActiveDrawRegisterFile();
+  const bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
+  const bool is_rasterization_done =
+      draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
+  reg::RB_DEPTHCONTROL normalized_depth_control =
+      draw_util::GetNormalizedDepthControl(regs);
+  const uint32_t normalized_color_mask =
+      ps ? draw_util::GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
+  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                    normalized_color_mask, *vs)) {
+    ++p.fb_rt;
+    return false;
+  }
+  // The bin-dependent set, recomputed from the LIVE registers: this is the
+  // whole difference between the base band and this one.
+  const uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+  const uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  const bool host_render_targets_used =
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+  const bool convert_z_to_float24 =
+      host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader();
+  const bool ps_writes_depth = ps && ps->writes_depth();
+  ViewportCacheKey viewport_key;
+  viewport_key.pa_cl_clip_cntl = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
+  viewport_key.pa_cl_vte_cntl = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
+  viewport_key.pa_su_sc_mode_cntl = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+  viewport_key.pa_su_vtx_cntl = regs[XE_GPU_REG_PA_SU_VTX_CNTL];
+  viewport_key.pa_sc_window_offset = regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+  viewport_key.normalized_depth_control = normalized_depth_control.value;
+  std::memcpy(viewport_key.vport_regs, &regs[XE_GPU_REG_PA_CL_VPORT_XSCALE],
+              sizeof(viewport_key.vport_regs));
+  viewport_key.flags = (uint32_t(convert_z_to_float24) << 0) |
+                       (uint32_t(host_render_targets_used) << 1) |
+                       (uint32_t(ps_writes_depth) << 2);
+  draw_util::ViewportInfo viewport_info;
+  if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
+    viewport_info = previous_viewport_info_;
+  } else {
+    draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x, draw_resolution_scale_y, true,
+                                   D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
+                                   normalized_depth_control, convert_z_to_float24,
+                                   host_render_targets_used, ps_writes_depth, viewport_info);
+    previous_viewport_key_ = viewport_key;
+    previous_viewport_info_ = viewport_info;
+    viewport_cache_valid_ = true;
+  }
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  scissor.offset[0] *= draw_resolution_scale_x;
+  scissor.offset[1] *= draw_resolution_scale_y;
+  scissor.extent[0] *= draw_resolution_scale_x;
+  scissor.extent[1] *= draw_resolution_scale_y;
+  UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal,
+                           normalized_depth_control);
+  UpdateSystemConstantValues(false, primitive_polygonal, r.llci,
+                             xenos::Endian(r.index_endian), viewport_info, r.tex_mask,
+                             normalized_depth_control, normalized_color_mask);
+  bool sys_uploaded = false;
+  if (!cbuffer_binding_system_.up_to_date) {
+    uint8_t* system_constants = constant_buffer_pool_->Request(
+        frame_current_, sizeof(g_nr_sys_state), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+        nullptr, nullptr, &cbuffer_binding_system_.address);
+    if (system_constants == nullptr) {
+      ++p.fb_sys;
+      return false;
+    }
+    std::memcpy(system_constants, &g_nr_sys_state, sizeof(g_nr_sys_state));
+    cbuffer_binding_system_.up_to_date = true;
+    sys_uploaded = true;
+  }
+  // Vertex residency over the recorded shader fetch bitmap; the bits are
+  // already in sync from the base band unless something invalidated the
+  // range, which is exactly when the request has to happen.
+  const Shader::ConstantRegisterMap& constant_map_vertex = vs->constant_register_map();
+  for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+    uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+      vfetch_bits_remaining &= ~(uint32_t(1) << j);
+      const uint32_t vfetch_index = i * 32 + j;
+      const uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
+      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
+        continue;
+      }
+      const xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+      if (vfetch_constant.type != xenos::FetchConstantType::kVertex &&
+          !(vfetch_constant.type == xenos::FetchConstantType::kInvalidVertex &&
+            REXCVAR_GET(gpu_allow_invalid_fetch_constants))) {
+        ++p.fb_vf;
+        return false;
+      }
+      VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+        continue;
+      }
+      if (!shared_memory_->RequestRange(vfetch_constant.address << 2,
+                                        vfetch_constant.size << 2)) {
+        ++p.fb_vf;
+        return false;
+      }
+      state.address = vfetch_constant.address;
+      state.size = vfetch_constant.size;
+      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+    }
+  }
+  if (r.ib_dma && !shared_memory_->RequestRange(r.ibr_base, r.ibr_size)) {
+    ++p.fb_ib;
+    return false;
+  }
+  shared_memory_->UseForReading();
+  SubmitBarriers();
+  // Past here nothing may refuse: the span is about to enter the stream.
+  //
+  // The system-constants buffer moved and the recording does not re-set that
+  // root (the base band found it already current): set it here, before the
+  // span, or the draw would read the base band NDC.
+  if (sys_uploaded &&
+      !(r.root_mask & (1u << kRootParameter_Bindless_SystemConstants))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_SystemConstants, cbuffer_binding_system_.address);
+    ++p.sys_sets;
+  }
+  // The pipeline piece first (the fresh path emits it before the viewport;
+  // both orders are equivalent to the command list, and this one keeps the
+  // recording contiguous with the draw it belongs to).
+  if (r.lenA) {
+    std::memcpy(deferred_command_list_.NrSprAppendRaw(r.lenA), r.dataA,
+                r.lenA * sizeof(uintmax_t));
+  }
+  uintmax_t* patched = deferred_command_list_.NrSprAppendRaw(r.len);
+  std::memcpy(patched, g_tile_arena.data() + r.off, r.len * sizeof(uintmax_t));
+  // Only the system-constants sites are patched. Every other root view in
+  // the span points at a base-band pool allocation that is same-frame, still
+  // live, and holds byte-identical content: the registers behind it were
+  // written by the same packets.
+  for (uint8_t i = 0; i < r.view_count; ++i) {
+    if (r.view_roots[i] == kRootParameter_Bindless_SystemConstants) {
+      DeferredCommandList::NrSprPatchViewAddress(patched, r.view_offsets[i],
+                                                 cbuffer_binding_system_.address);
+    }
+  }
+  // The stream now holds the recording tail state: adopt the recording EXIT
+  // members so ordinal i+1 entry context keeps matching. The
+  // system-constants ADDRESS is ours (it is excluded from the snapshot on
+  // purpose); everything else is the base band, which is what the span just
+  // bound.
+  const SprCtx& x = r.exit_ctx;
+  current_guest_pipeline_ = const_cast<void*>(x.guest_pipeline);
+  current_external_pipeline_ =
+      static_cast<ID3D12PipelineState*>(const_cast<void*>(x.external_pipeline));
+  current_graphics_root_signature_ =
+      static_cast<ID3D12RootSignature*>(const_cast<void*>(x.root_signature));
+  current_graphics_root_up_to_date_ = x.ru2d;
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY(x.topology);
+  if (x.shm_uav == 2) {
+    current_shared_memory_binding_is_uav_.reset();
+  } else {
+    current_shared_memory_binding_is_uav_ = x.shm_uav != 0;
+  }
+  // Root parameter of each cbuffer_binding_ slot, in SprCtx::cb_addr order.
+  static const uint32_t kTileCbRoots[7] = {
+      kRootParameter_Bindless_FetchConstants,
+      kRootParameter_Bindless_FloatConstantsVertex,
+      kRootParameter_Bindless_FloatConstantsPixel,
+      kRootParameter_Bindless_SystemConstants,
+      kRootParameter_Bindless_BoolLoopConstants,
+      kRootParameter_Bindless_DescriptorIndicesVertex,
+      kRootParameter_Bindless_DescriptorIndicesPixel};
+  ConstantBufferBinding* nr_til_cbs[7] = {
+      &cbuffer_binding_fetch_,
+      &cbuffer_binding_float_vertex_,
+      &cbuffer_binding_float_pixel_,
+      &cbuffer_binding_system_,
+      &cbuffer_binding_bool_loop_,
+      &cbuffer_binding_descriptor_indices_vertex_,
+      &cbuffer_binding_descriptor_indices_pixel_};
+  for (int i = 0; i < 7; ++i) {
+    // Adopt the recorded address only for a root the SPAN actually bound --
+    // that is the address now live on the command list. A root the span
+    // omitted is still bound to whatever this band bound earlier, whose
+    // content is identical; overwriting the member with the base band
+    // address there would make the member describe a buffer the list is not
+    // pointing at. The system-constants address is always ours.
+    if (i != 3 && (r.root_mask & (1u << kTileCbRoots[i]))) {
+      nr_til_cbs[i]->address = D3D12_GPU_VIRTUAL_ADDRESS(x.cb_addr[i]);
+    }
+    nr_til_cbs[i]->up_to_date = x.cb_utd[i] != 0;
+  }
+  // The system-constants root is bound-and-current exactly when the span set
+  // it or this replay set it; otherwise the recorded mask already tells the
+  // truth (the base band did not bind it either, and the previous ordinal
+  // left it bound).
+  if (sys_uploaded ||
+      (r.root_mask & (1u << kRootParameter_Bindless_SystemConstants))) {
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SystemConstants;
+  }
+  ++p.rep;
+  p.rep_elements += r.len;
   return true;
 }
 

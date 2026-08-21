@@ -260,6 +260,15 @@ class CommandProcessor {
   virtual void NrSprDrawEnd() {}
 
  protected:
+  // [NR-TIL] N-4-1: the guest packet address of the draw the walk is
+  // dispatching, latched at the draw stop so the tile replay can key a
+  // recording by stream POSITION (bands re-execute the same packets in the
+  // same order). A nested-buffer draw inherits its delegate's address, which
+  // is still a deterministic function of the position - the shape guard
+  // (primitive, index count, index base) is what separates two draws that
+  // land on the same value.
+  uint32_t nr_tile_draw_addr_ = 0;
+
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
     xenos::Endian endianness = xenos::Endian::kNone;

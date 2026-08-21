@@ -564,6 +564,24 @@ class D3D12CommandProcessor : public CommandProcessor {
   // false = fall through to the full derivation path (every head step
   // already taken is idempotent there).
   bool NrSpanReplayTry();
+  // [NR-TIL] N-4-1: EDRAM tile-pass draw replay. The repeat bands re-execute
+  // the base band packets in the same order with only the tile window moved,
+  // so a repeat-band draw native span equals the base band one except for
+  // viewport, scissor and the system-constants NDC. BeginDraw walks the
+  // segment / ordinal bookkeeping and decides record vs replay; ReplayTry
+  // serves the draw from the recording (true = IssueDrawImpl returns true);
+  // RecordAnchor latches the span start AFTER the fixed-function and system
+  // constant updates; RecordEnd scans and stores it; SegBreak ends a segment
+  // at a resolve.
+  void NrTileBeginDraw(uint32_t win_off, uint32_t prim, uint32_t index_count,
+                       uint32_t ib_base);
+  bool NrTileReplayTry();
+  void NrTileRecordAnchorA();
+  void NrTileRecordSplit();
+  void NrTileRecordAnchor();
+  void NrTileRecordEnd();
+  void NrTileCompareEnd();
+  void NrTileSegBreak();
   // [NR-SPD] Phase 5-4-7-3: snapshot the emission-context members (pipeline,
   // root signature, topology, root-up-to-date mask, cbuffer addresses+flags,
   // shared-memory flavor) into a cpp-local SprCtx (kept out of this header).

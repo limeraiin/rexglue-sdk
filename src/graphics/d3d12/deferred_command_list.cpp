@@ -518,6 +518,30 @@ void DeferredCommandList::NrSprPatchViewAddress(uintmax_t* span, uint32_t offset
   args.buffer_location = D3D12_GPU_VIRTUAL_ADDRESS(gpu_address);
 }
 
+size_t DeferredCommandList::NrTilePipelineSpan(size_t start_elements, size_t end_elements,
+                                               uintmax_t* dst, size_t capacity) const {
+  if (end_elements < start_elements || end_elements > command_stream_.size()) {
+    return SIZE_MAX;
+  }
+  const size_t len = end_elements - start_elements;
+  if (!len) return 0;
+  if (len > capacity || len < kCommandHeaderSizeElements) return SIZE_MAX;
+  const uintmax_t* stream = command_stream_.data() + start_elements;
+  const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+  if (header.command != Command::kD3DSetPipelineState &&
+      header.command != Command::kSetPipelineStateHandle) {
+    return SIZE_MAX;
+  }
+  // Exactly one command: anything trailing means something else emitted
+  // between the texture requests and the fixed-function state, which the
+  // replay would silently drop.
+  if (kCommandHeaderSizeElements + header.arguments_size_elements != len) {
+    return SIZE_MAX;
+  }
+  std::memcpy(dst, stream, len * sizeof(uintmax_t));
+  return len;
+}
+
 size_t DeferredCommandList::NrDspCopySpan(size_t start_elements, uintmax_t* dst,
                                           size_t capacity) const {
   if (command_stream_.size() < start_elements) return 0;

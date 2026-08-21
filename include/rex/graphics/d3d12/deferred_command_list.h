@@ -79,6 +79,14 @@ class DeferredCommandList {
   };
   // Copy [start_elements, end) out; returns elements copied, 0 if it does
   // not fit in `capacity`.
+  // [NR-TIL] N-4-1: the pipeline-bind piece of a tile recording. A draw
+  // emits its pipeline set BEFORE the viewport and scissor, and the tile
+  // replay has to keep those two live, so the recording is two pieces with
+  // the bin-dependent set between them. This copies out the first piece and
+  // proves it is nothing but a pipeline set: returns the element count, or
+  // SIZE_MAX if the range holds anything else (which refuses the record).
+  size_t NrTilePipelineSpan(size_t start_elements, size_t end_elements, uintmax_t* dst,
+                            size_t capacity) const;
   size_t NrDspCopySpan(size_t start_elements, uintmax_t* dst, size_t capacity) const;
   void NrDspCompareSpan(const uintmax_t* prev, size_t prev_len, size_t start_elements,
                         NrDspDiff* out) const;

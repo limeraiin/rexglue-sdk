@@ -386,6 +386,24 @@ REXCVAR_DEFINE_INT32(gpu_nr_tile_probe, 0, "GPU",
                      "draws AND their device-state applies, 3 = cycle 0/1/2 "
                      "every 10s at one spot. Wrong pixels by design. 0 = off.");
 
+
+// [NR-TIL] N-4-1: the BUILD the tile probe priced. Every band but the first
+// re-executes the same draw packets in the same order with only the tile
+// window changed, so a band-2/3 draw's native command span equals the band-1
+// span it repeats except for viewport, scissor and the system-constants NDC.
+// Record the base band's span per stream position, then serve the repeat
+// bands from it: the derivation half of the draw (shader analysis, primitive
+// processing, pipeline configure, the whole binding recompose and upload) is
+// removed, and the bin-dependent set is recomputed live.
+// Pixel-identical BY CONSTRUCTION - unlike gpu_nr_tile_probe, which is the
+// same population with the draws simply dropped.
+REXCVAR_DEFINE_INT32(gpu_nr_tile_replay, 0, "GPU",
+                     "[nr-til] N-4-1: serve repeat EDRAM-tile-band draws from "
+                     "the base band recorded native span (viewport, scissor "
+                     "and NDC recomputed per band). 1 = on, 2 = CYCLE on/off "
+                     "every 10s at one spot so a city A/B is matched by "
+                     "construction. Requires the skip, verify off and the "
+                     "bindings swap. 0 = off.");
 REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
                     "DEV [nr-swap] N-2-2: run the swap's store lookup and "
                     "guard pass per span but NOT the replay, so the cost "
@@ -5606,6 +5624,11 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // bin state, not the buffer-entry one.
     bin_select_ = g_ctx_walker.bin.select;
     bin_mask_ = g_ctx_walker.bin.mask;
+    // [NR-TIL] N-4-1: name every stop by its STREAM POSITION. The tile
+    // replay keys a recording by position, not by content, because the
+    // repeat bands re-execute the same packets in the same order; two
+    // register loads that are already in hand make the key.
+    nr_tile_draw_addr_ = (ptr & 0x1FFFFFFFu) + stop.dword * 4;
     if (!stop.delegate) {
       // [NR-TILE] N-4 probe mode 1: skip the draw dispatch for every repeat
       // tile band. Only opcode 0x22 is dropped, so the copy-mode draws that
