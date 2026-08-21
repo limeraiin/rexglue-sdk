@@ -481,6 +481,47 @@ class TextureCache {
   // off-thread segment replay (Phase 1b-1b).
   void SetRegisterFile(const RegisterFile* register_file) { register_file_ = register_file; }
 
+  // [NR-TILTEX] N-4-2b piece 2. The three EDRAM tile bands execute the same
+  // PM4, so they rewrite the same texture fetch constants and re-derive the
+  // same bindings - but the binding live at ordinal i of a REPEAT band is the
+  // one the BASE band left at its last ordinal, not at ordinal i, so the
+  // derivation cannot simply be skipped. It can be RESTORED: the base band
+  // records what it derived, and a repeat band that presents the same fetch
+  // constants gets the recording back instead of running
+  // BindingInfoFromFetchConstant / FindOrCreateTexture /
+  // UpdateTextureBindingsImpl again.
+  //
+  // The fetch constants are the whole identity: everything else the
+  // derivation reads (the texture cache, the resolution scale) is shared
+  // between the bands, and anything that could invalidate it in between sets
+  // texture_became_outdated_, which refuses the restore outright.
+  struct NrTexSnap {
+    uint32_t fetch[6];
+    TextureBinding binding;
+    uint32_t descriptor_index;
+    uint32_t descriptor_index_signed;
+    uint8_t slot;
+  };
+  // Returns the number of slots written, or UINT32_MAX if the mask holds more
+  // than max (the caller then records nothing and keeps the full path).
+  uint32_t NrTexCapture(uint32_t mask, NrTexSnap* out, uint32_t max);
+  // All-or-nothing: verifies every slot first, applies only then, so a
+  // mismatch can never leave the bindings half restored.
+  bool NrTexRestore(const NrTexSnap* snaps, uint32_t count);
+  // Gate support: force these slots to be re-derived by the next request, so
+  // a restored binding can be compared against the one the real derivation
+  // produces from the same fetch constants.
+  void NrTexDesync(uint32_t mask) { texture_bindings_in_sync_ &= ~mask; }
+  // The part of a texture request that is NOT derivation and still has to run
+  // for a restored draw: usage marking and the resource transitions.
+  virtual void NrTexBarriersOnly(uint32_t /*mask*/) {}
+
+ protected:
+  // Backend hooks for the two halves of a snapshot that live below this class
+  // (the descriptor indices).
+  virtual void NrTexCaptureImpl(uint32_t /*slot*/, NrTexSnap& /*s*/) {}
+  virtual void NrTexRestoreImpl(uint32_t /*slot*/, const NrTexSnap& /*s*/) {}
+
  protected:
   SharedMemory& shared_memory() const { return shared_memory_; }
 

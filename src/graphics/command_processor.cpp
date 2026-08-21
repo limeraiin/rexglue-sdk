@@ -432,6 +432,23 @@ REXCVAR_DEFINE_INT32(gpu_nr_tile_sys, 0, "GPU",
                      "real derivation, compare every byte), 3 = CYCLE "
                      "on/off every 10 s in place. Requires "
                      "gpu_nr_tile_replay. 0 = off.");
+// [NR-TILTEX] N-4-2b piece 2: the biggest head stage of a replayed draw is
+// its texture request (0.31 us/rep at the heavy city, 77% of it the request
+// itself and the rest the SRV-key valve). The three tile bands execute the
+// same PM4, so they rewrite the same fetch constants and re-derive the same
+// bindings - but the binding LIVE at ordinal i of a repeat band is the one
+// the base band left at its LAST ordinal, so the derivation cannot just be
+// skipped. It is restored from what the base band recorded, once the live
+// fetch constants are shown to match.
+REXCVAR_DEFINE_INT32(gpu_nr_tile_tex, 0, "GPU",
+                     "[nr-tiltex] N-4-2b: restore a tile-replay draw's "
+                     "texture bindings from the base band recording when the "
+                     "fetch constants match, instead of re-deriving them. "
+                     "1 = on, 2 = VERIFY (restore, then force a real "
+                     "re-derivation and compare), 3 = CYCLE on/off every "
+                     "10 s in place (recording stays on in both halves). "
+                     "Requires "
+                     "gpu_nr_tile_replay. 0 = off.");
 REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
                     "DEV [nr-swap] N-2-2: run the swap's store lookup and "
                     "guard pass per span but NOT the replay, so the cost "

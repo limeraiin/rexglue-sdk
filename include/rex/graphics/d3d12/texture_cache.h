@@ -99,6 +99,8 @@ class D3D12TextureCache final : public TextureCache {
   // (notifying the command processor about that), so this must be called before
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
+  // [NR-TILTEX] N-4-2b piece 2.
+  void NrTexBarriersOnly(uint32_t used_texture_mask) override;
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and
@@ -203,6 +205,8 @@ class D3D12TextureCache final : public TextureCache {
                                              bool load_mips) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
+  void NrTexCaptureImpl(uint32_t slot, NrTexSnap& s) override;
+  void NrTexRestoreImpl(uint32_t slot, const NrTexSnap& s) override;
 
  private:
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;

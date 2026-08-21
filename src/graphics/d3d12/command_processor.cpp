@@ -186,6 +186,7 @@ REXCVAR_DECLARE(int32_t, gpu_nr_tile_replay);
 REXCVAR_DECLARE(bool, gpu_nr_tile_prof);
 REXCVAR_DECLARE(int32_t, gpu_nr_tile_probe);
 REXCVAR_DECLARE(int32_t, gpu_nr_tile_sys);
+REXCVAR_DECLARE(int32_t, gpu_nr_tile_tex);
 // [NR-RUF-V2B] guard: the CPU vertex-shader extent path reads float
 // constants outside the bitmap-packed packs -- refuse upgrades under it.
 REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
@@ -1459,6 +1460,11 @@ struct TileRec {
   // values is the same one, so this bit is the repeat band's dirty verdict
   // too - and it replaces a 464-byte compare per draw with a load.
   uint8_t sys_dirty = 0;
+  // [NR-TILTEX] the derived texture bindings for this draw's fetch slots,
+  // in g_tile_texsnaps. count 0 = nothing recorded, replay keeps the full
+  // request.
+  uint8_t tex_count = 0;
+  uint32_t tex_off = 0;
   D3D12TextureCache::TextureSRVKey keys_v[kTileMaxKeys];
   D3D12TextureCache::TextureSRVKey keys_p[kTileMaxKeys];
   // Filled only in the compare mode: the system constants as the base band
@@ -1505,6 +1511,12 @@ uint32_t g_tile_sys = 0;
 // mirror currently holds, and the NDC that was patched into it. When the next
 // replay is the very next ordinal and neither moved, the mirror is ALREADY
 // what that draw needs and the restore is a no-op.
+// [NR-TILTEX] the per-frame binding snapshots the records index into.
+std::vector<TextureCache::NrTexSnap> g_tile_texsnaps;
+// A draw with more fetch slots than this records nothing and keeps the full
+// request (counted, never silent).
+constexpr uint32_t kTileTexMaxSlots = 12;
+uint32_t g_tile_tex = 0;
 size_t g_tile_sys_prev = SIZE_MAX;  // index into g_tile_recs, +1 biased
 float g_tile_sys_ndc[8] = {};
 bool g_tile_cmp_open = false;
@@ -1574,6 +1586,9 @@ struct NrTilProbe {
   // SubmitBarriers - emit = the memcpy, the view patch and member adoption.
   uint64_t ns_pre = 0, ns_tex = 0, ns_rt = 0, ns_vp = 0, ns_sys = 0,
            ns_res = 0, ns_emit = 0;
+  // tex splits into the request (binding derivation, loads, barriers) and
+  // the SRV-key valve that follows it - two different things to remove.
+  uint64_t ns_treq = 0;
   uint64_t prof_rep = 0;  // replays that carried a full set of stamps
   // [NR-TILP] N-4-2 OUTER stamps, per replayed draw: ostop = direct drawstop
   // bracket entry -> tile block (arg recovery + NrSubmitDraw's register-file
@@ -1595,6 +1610,15 @@ struct NrTilProbe {
   // and it has to be zero.
   uint64_t sf_dover = 0, sf_dunder = 0;
   uint64_t sf_nolock = 0, sf_noop = 0;
+  // [NR-TILTEX] tf_hit = bindings restored, tf_miss = the fetch constants
+  // moved (or a watch fired) so the full request ran, tf_norec = the base
+  // band recorded no snapshot, tf_cap = a draw with too many fetch slots,
+  // tf_slots = slots recorded.
+  uint64_t tf_hit = 0, tf_miss = 0, tf_norec = 0, tf_cap = 0, tf_slots = 0;
+  uint64_t tf_ne = 0;  // gate: a restored binding differed from the derived one
+  // Gate only: restored draws that still ran the (tautological) SRV-key
+  // valve and passed it. It never refuses - a refusal shows up as fb_valve.
+  uint64_t tf_valve = 0;
   uint32_t sf_off = 0xFFFFFFFFu;
 };
 NrTilProbe g_tile_p;
@@ -1748,6 +1772,16 @@ void NrTilReportIfDue() {
       p.ctx_why[8], p.ctx_why[9], p.ctx_why[10], p.ctx_why[11], p.ctx_first,
       (g_tile_arena.size() * sizeof(uintmax_t)) >> 10,
       g_tile_recs.size());
+  if (p.tf_hit || p.tf_miss || p.tf_norec) {
+    // [NR-TILTEX] hit% is the coverage; ne has to be 0 (gate mode only).
+    const uint64_t tf_all = p.tf_hit + p.tf_miss + p.tf_norec;
+    REXGPU_INFO(
+        "[nr-tiltex] hit={} ({:.1f}%) miss={} norec={} | ne={} valveok={} "
+        "slots/rec={:.2f} cap={}",
+        p.tf_hit, tf_all ? 100.0 * double(p.tf_hit) / double(tf_all) : 0.0,
+        p.tf_miss, p.tf_norec, p.tf_ne, p.tf_valve,
+        p.recorded ? double(p.tf_slots) / double(p.recorded) : 0.0, p.tf_cap);
+  }
   if (p.sf_n || p.sf_rov) {
     // [NR-TILSYS] ne has to be 0: the fast system constants must equal the
     // real derivation byte for byte, and their dirty verdicts must agree.
@@ -1785,9 +1819,11 @@ void NrTilReportIfDue() {
     const uint64_t head =
         p.ns_pre + p.ns_tex + p.ns_rt + p.ns_vp + p.ns_sys + p.ns_res;
     REXGPU_INFO(
-        "[nr-tilp] us/rep n={}: pre={:.3f} tex={:.3f} rt={:.3f} vp={:.3f} "
+        "[nr-tilp] us/rep n={}: pre={:.3f} tex={:.3f} (req={:.3f} "
+        "valve={:.3f}) rt={:.3f} vp={:.3f} "
         "sys={:.3f} res={:.3f} | head={:.3f} emit={:.3f} total={:.3f}",
         p.prof_rep, double(p.ns_pre) / r, double(p.ns_tex) / r,
+        double(p.ns_treq) / r, double(p.ns_tex - p.ns_treq) / r,
         double(p.ns_rt) / r, double(p.ns_vp) / r, double(p.ns_sys) / r,
         double(p.ns_res) / r, double(head) / r, double(p.ns_emit) / r,
         double(head + p.ns_emit) / r);
@@ -4629,6 +4665,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       g_tile_seg_open = false;
       g_tile_rec_open = false;
       g_tile_sys_prev = SIZE_MAX;
+      g_tile_texsnaps.clear();
       g_tile_frame = UINT32_MAX;
       REXGPU_INFO(
           "[nr-til] PHASE {}{} - repeat EDRAM tile bands {}.",
@@ -4674,6 +4711,29 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                           "fields recomputed"));
     }
     g_tile_sys = nr_sys_cv;
+    uint32_t nr_tex_cv = (g_nr_tile_on && !g_tile_verify)
+                             ? uint32_t(REXCVAR_GET(gpu_nr_tile_tex))
+                             : 0u;
+    if (nr_tex_cv == 3) {
+      // Mode 3: cycle 10 s off / 10 s on IN PLACE, for the same reason
+      // gpu_nr_tile_sys has one - a cross-run stage comparison here is
+      // noise, every stage drifts together.
+      static const auto nr_tex_t0 = std::chrono::steady_clock::now();
+      const auto nr_tex_el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now() - nr_tex_t0)
+                                 .count();
+      // Recording must stay ON through both halves, or the ON half spends
+      // its first frames with nothing to restore. 2 = record only.
+      nr_tex_cv = ((nr_tex_el / 10) & 1) != 0 ? 1u : 4u;
+    }
+    if (nr_tex_cv != g_tile_tex) {
+      REXGPU_INFO("[nr-tiltex] PHASE {} - tile-replay texture bindings {}.",
+                  nr_tex_cv == 4 ? "OFF" : (nr_tex_cv ? "ON" : "IDLE"),
+                  nr_tex_cv == 4 ? "re-derived in full (control; still "
+                                   "recorded)"
+                                 : "restored from the base band recording");
+    }
+    g_tile_tex = nr_tex_cv;
   }
   // [NR-FX] Phase 5-4-0: the walk-driven side-effect counters' 1Hz line. The
   // gate itself is latched base-side (WorkerThreadMain), not here.
@@ -8277,6 +8337,7 @@ void D3D12CommandProcessor::NrTileBeginDraw(uint32_t win_off, uint32_t prim,
     g_tile_frame = frame_current_;
     g_tile_sys_prev = SIZE_MAX;  // [NR-TILSYS] indices are per-frame
     g_tile_recs.clear();
+    g_tile_texsnaps.clear();
     g_tile_segs.clear();
     g_tile_arena_used = 0;
     g_tile_seg_open = false;
@@ -8588,6 +8649,22 @@ void D3D12CommandProcessor::NrTileRecordEnd() {
   // restores it, so it is no longer gate-only.
   r.sys_snap = g_nr_sys_state;
   r.sys_dirty = g_nr_sys_changed ? 1 : 0;
+  // [NR-TILTEX] capture what this draw's texture request derived, so the
+  // repeat bands can restore it instead of deriving it again.
+  r.tex_count = 0;
+  if (g_tile_tex && g_spr_cap.tex_mask) {
+    TextureCache::NrTexSnap snaps[kTileTexMaxSlots];
+    const uint32_t n =
+        texture_cache_->NrTexCapture(g_spr_cap.tex_mask, snaps, kTileTexMaxSlots);
+    if (n == UINT32_MAX) {
+      ++p.tf_cap;
+    } else if (n) {
+      r.tex_off = uint32_t(g_tile_texsnaps.size());
+      r.tex_count = uint8_t(n);
+      g_tile_texsnaps.insert(g_tile_texsnaps.end(), snaps, snaps + n);
+      p.tf_slots += n;
+    }
+  }
   r.valid = 1;
   ++p.recorded;
 }
@@ -8695,7 +8772,8 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   // otherwise charge a partial draw to whichever stage it died in.
   using tilp_clock = std::chrono::steady_clock;
   const bool tp = g_tile_prof;
-  tilp_clock::time_point tp0, tp_pre, tp_tex, tp_rt, tp_vp, tp_sys, tp_res;
+  tilp_clock::time_point tp0, tp_pre, tp_treq, tp_tex, tp_rt, tp_vp, tp_sys,
+      tp_res;
   if (tp) tp0 = tilp_clock::now();
   const TileSeg& seg = g_tile_segs[g_tile_seg];
   if (g_tile_cur_ord + g_tile_ord_bias >= seg.count) {
@@ -8757,7 +8835,51 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   // Textures first (a load can move host SRV indices), then the key valve:
   // the recorded span descriptor-index constant buffer holds the base band
   // indices, so a moved index means the recording is stale.
-  texture_cache_->RequestTextures(r.tex_mask);
+  bool tex_restored = false;
+  if (g_tile_tex == 4) {
+    // Control half of the cycle: recorded, deliberately not consumed.
+    ++p.tf_miss;
+  } else if (g_tile_tex && r.tex_count) {
+    tex_restored = texture_cache_->NrTexRestore(&g_tile_texsnaps[r.tex_off], r.tex_count);
+    if (tex_restored) {
+      ++p.tf_hit;
+      // Usage marking and the resource transitions still run: between the
+      // bands a resolve or a load blit can move a texture's state.
+      texture_cache_->NrTexBarriersOnly(r.tex_mask);
+      if (g_tile_tex == 2) {
+        // The gate: capture what the restore produced, force a re-derivation
+        // from the same fetch constants, and compare. This is the claim -
+        // "the two bands derive the same binding from the same fetch
+        // constants" - turned into a number.
+        TextureCache::NrTexSnap tf_a[kTileTexMaxSlots], tf_b[kTileTexMaxSlots];
+        const uint32_t na =
+            texture_cache_->NrTexCapture(r.tex_mask, tf_a, kTileTexMaxSlots);
+        texture_cache_->NrTexDesync(r.tex_mask);
+        texture_cache_->RequestTextures(r.tex_mask);
+        const uint32_t nb =
+            texture_cache_->NrTexCapture(r.tex_mask, tf_b, kTileTexMaxSlots);
+        bool tf_eq = na == nb && na != UINT32_MAX;
+        for (uint32_t i = 0; tf_eq && i < na; ++i) {
+          tf_eq = tf_a[i].slot == tf_b[i].slot &&
+                  !(tf_a[i].binding.key != tf_b[i].binding.key) &&
+                  tf_a[i].binding.host_swizzle == tf_b[i].binding.host_swizzle &&
+                  tf_a[i].binding.swizzled_signs == tf_b[i].binding.swizzled_signs &&
+                  tf_a[i].binding.texture == tf_b[i].binding.texture &&
+                  tf_a[i].binding.texture_signed == tf_b[i].binding.texture_signed &&
+                  tf_a[i].descriptor_index == tf_b[i].descriptor_index &&
+                  tf_a[i].descriptor_index_signed == tf_b[i].descriptor_index_signed;
+        }
+        if (!tf_eq) ++p.tf_ne;
+      }
+    } else {
+      ++p.tf_miss;
+    }
+  } else if (g_tile_tex) {
+    ++p.tf_norec;
+  }
+  if (!tex_restored) {
+    texture_cache_->RequestTextures(r.tex_mask);
+  }
   // A load blit rebinding the pipeline breaks the symmetry the recorded
   // pipeline piece was deduped under (the record side refuses the same
   // case at its own anchor).
@@ -8766,7 +8888,13 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
     ++p.fb_texpso;
     return false;
   }
-  {
+  if (tp) tp_treq = tilp_clock::now();
+  // [NR-TILTEX] The valve asks whether the SRV keys recorded with the base
+  // band draw still describe the live bindings. Under a successful restore
+  // those bindings ARE the recorded ones, so the answer is yes by
+  // construction and the check is tautological - it runs only when the
+  // derivation ran, and in gate mode, where a failure would be news.
+  if (!tex_restored || g_tile_tex == 2) {
     const std::vector<D3D12Shader::TextureBinding>& tv =
         vs->GetTextureBindingsAfterTranslation();
     if (tv.size() != r.nkeys_v ||
@@ -8788,6 +8916,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
       ++p.fb_valve;
       return false;
     }
+    if (tex_restored) ++p.tf_valve;
   }
   if (tp) tp_tex = tilp_clock::now();
   const RegisterFile& regs = GetActiveDrawRegisterFile();
@@ -9062,6 +9191,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
           std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
     };
     p.ns_pre += ns(tp0, tp_pre);
+    p.ns_treq += ns(tp_pre, tp_treq);
     p.ns_tex += ns(tp_pre, tp_tex);
     p.ns_rt += ns(tp_tex, tp_rt);
     p.ns_vp += ns(tp_rt, tp_vp);

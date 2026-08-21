@@ -458,6 +458,59 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   return true;
 }
 
+// [NR-TILTEX] N-4-2b piece 2: see the header for why a repeat band can
+// restore a derivation instead of repeating it.
+uint32_t TextureCache::NrTexCapture(uint32_t mask, NrTexSnap* out, uint32_t max) {
+  const auto& regs = register_file();
+  uint32_t n = 0, index;
+  uint32_t remaining = mask;
+  while (rex::bit_scan_forward(remaining, &index)) {
+    remaining &= ~(UINT32_C(1) << index);
+    if (n >= max) {
+      return UINT32_MAX;
+    }
+    NrTexSnap& s = out[n];
+    s.slot = uint8_t(index);
+    const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
+    static_assert(sizeof(s.fetch) == sizeof(fetch), "fetch constant is 6 dwords");
+    std::memcpy(s.fetch, &fetch, sizeof(s.fetch));
+    s.binding = texture_bindings_[index];
+    s.descriptor_index = UINT32_MAX;
+    s.descriptor_index_signed = UINT32_MAX;
+    NrTexCaptureImpl(index, s);
+    ++n;
+  }
+  return n;
+}
+
+bool TextureCache::NrTexRestore(const NrTexSnap* snaps, uint32_t count) {
+  // A memory watch fired between the bands: the bindings this would restore
+  // may name data that has to be reloaded. The full path clears the flag.
+  if (texture_became_outdated_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  const auto& regs = register_file();
+  for (uint32_t i = 0; i < count; ++i) {
+    const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(snaps[i].slot);
+    if (std::memcmp(&fetch, snaps[i].fetch, sizeof(snaps[i].fetch)) != 0) {
+      return false;
+    }
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t index = snaps[i].slot;
+    const uint32_t index_bit = UINT32_C(1) << index;
+    if (texture_bindings_in_sync_ & index_bit) {
+      // Already derived from this very fetch constant, so it already IS the
+      // recorded binding.
+      continue;
+    }
+    texture_bindings_[index] = snaps[i].binding;
+    texture_bindings_in_sync_ |= index_bit;
+    NrTexRestoreImpl(index, snaps[i]);
+  }
+  return true;
+}
+
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 

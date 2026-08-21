@@ -704,7 +704,15 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   TextureCache::RequestTextures(used_texture_mask);
+  NrTexBarriersOnly(used_texture_mask);
+}
 
+// [NR-TILTEX] N-4-2b piece 2: everything a texture request does that is NOT
+// the binding derivation. A tile-replay draw that restored its bindings from
+// the base band still has to mark the textures used and re-assert their
+// resource state, because between the two bands something else (a resolve,
+// a load blit) may have moved them.
+void D3D12TextureCache::NrTexBarriersOnly(uint32_t used_texture_mask) {
   // Pre-create 3D-as-2D wrappers before draw setup. Wrapper loading may bind
   // compute pipelines and must happen in the texture request phase.
   if (REXCVAR_GET(gpu_3d_to_2d_texture)) {
@@ -1966,6 +1974,16 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 
   return true;
+}
+
+void D3D12TextureCache::NrTexCaptureImpl(uint32_t slot, NrTexSnap& s) {
+  s.descriptor_index = d3d12_texture_bindings_[slot].descriptor_index;
+  s.descriptor_index_signed = d3d12_texture_bindings_[slot].descriptor_index_signed;
+}
+
+void D3D12TextureCache::NrTexRestoreImpl(uint32_t slot, const NrTexSnap& s) {
+  d3d12_texture_bindings_[slot].descriptor_index = s.descriptor_index;
+  d3d12_texture_bindings_[slot].descriptor_index_signed = s.descriptor_index_signed;
 }
 
 void D3D12TextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
