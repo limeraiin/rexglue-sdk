@@ -22,6 +22,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -93,6 +94,179 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_8bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_8bpp_scaled_cs.h"
 }  // namespace shaders
+
+namespace {
+
+// [N-6] THE BAND ARTIFACT. The resolve shader blobs under
+// src/graphics/shaders/bytecode are VENDORED PRECOMPILED DXBC - there is no
+// HLSL for them anywhere in this tree - and they were compiled against the
+// console's 2048-tile (10 MB) EDRAM. Every one of them ends its EDRAM address
+// maths with a hardcoded wrap:
+//
+//   imad r0.x, r0.x, l(1280), r1.x       // tile * samples_per_tile + intra
+//   udiv null, r0.x, r0.x, l(0x00280000) // r0.x %= 2048 * 1280
+//
+// We are not a 2048-tile EDRAM any more: kEdramExpandLog2 gives every surface
+// 4x the vertical room so one pass can own all 720 rows. A de-tiled 1280x720
+// 4xMSAA colour resolve spans 90 tile rows x 32 tiles = 2880 tiles, and at 4
+// tiles per guest row the wrap at tile 2048 lands on GUEST ROW 512 exactly -
+// so output rows 512..720 read back EDRAM rows 0..208. That is the measured
+// artifact, to the row.
+//
+// Stock (three 256-row bands) never crosses it: 32 tile rows x 32 = 1024
+// tiles, half the wrap. That is why this only shows with de-tile on.
+//
+// The blobs cannot be recompiled from anything we have, so rewrite the wrap
+// constant in the token stream and re-sign the container. Driven off the
+// xenos:: constants so it can never go stale again.
+constexpr uint32_t kEdramTileSamples =
+    xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples;
+constexpr uint32_t kConsoleEdramWrapDwords = xenos::kEdramGuestTileCount * kEdramTileSamples;
+constexpr uint32_t kHostEdramWrapDwords = xenos::kEdramTileCount * kEdramTileSamples;
+
+// Rewrites the console wrap constant in one vendored resolve blob. Returns
+// false (and leaves `patched` empty) when the constant is not a literal in the
+// shader code chunk, which is the case for the resolution-scaled variants:
+// they build the modulus at runtime as `tile_samples << 11` instead.
+bool PatchResolveShaderEdramWrap(const void* source, size_t source_size, const char* debug_name,
+                                 std::vector<uint8_t>& patched) {
+  patched.clear();
+  if (!source || source_size < sizeof(dxbc::ContainerHeader)) {
+    return false;
+  }
+  patched.assign(static_cast<const uint8_t*>(source),
+                 static_cast<const uint8_t*>(source) + source_size);
+
+  auto& container_header = *reinterpret_cast<dxbc::ContainerHeader*>(patched.data());
+  if (container_header.fourcc != dxbc::ContainerHeader::kFourCC ||
+      container_header.blob_count == 0) {
+    patched.clear();
+    return false;
+  }
+  const uint32_t* const blob_offsets = reinterpret_cast<const uint32_t*>(
+      patched.data() + sizeof(dxbc::ContainerHeader));
+  if (sizeof(dxbc::ContainerHeader) + sizeof(uint32_t) * container_header.blob_count >
+      source_size) {
+    patched.clear();
+    return false;
+  }
+
+  // Only the executable code chunk - a stray match in RDEF strings or in the
+  // statistics blob must not be rewritten.
+  uint32_t replacements = 0;
+  for (uint32_t blob_index = 0; blob_index < container_header.blob_count; ++blob_index) {
+    const uint32_t blob_offset = blob_offsets[blob_index];
+    if (blob_offset + sizeof(dxbc::BlobHeader) > source_size) {
+      continue;
+    }
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(patched.data() + blob_offset);
+    if (blob_header.fourcc != dxbc::BlobHeader::FourCC::kShaderEx) {
+      continue;
+    }
+    const size_t body_offset = blob_offset + sizeof(dxbc::BlobHeader);
+    if (body_offset + blob_header.size_bytes > source_size) {
+      continue;
+    }
+    uint32_t* const body = reinterpret_cast<uint32_t*>(patched.data() + body_offset);
+    const size_t body_dwords = blob_header.size_bytes / sizeof(uint32_t);
+    for (size_t i = 0; i < body_dwords; ++i) {
+      if (body[i] == kConsoleEdramWrapDwords) {
+        body[i] = kHostEdramWrapDwords;
+        ++replacements;
+      }
+    }
+  }
+
+  if (!replacements) {
+    patched.clear();
+    return false;
+  }
+  // One wrap per shader. More than one means the blob changed shape under us
+  // and the assumption above needs re-checking against the disassembly.
+  if (replacements != 1) {
+    REXGPU_WARN(
+        "D3D12RenderTargetCache: resolve shader {} had {} EDRAM wrap constants, "
+        "expected 1 - re-check the bytecode",
+        debug_name, replacements);
+  }
+
+  CalculateDXBCChecksum(reinterpret_cast<unsigned char*>(patched.data()),
+                        static_cast<unsigned int>(patched.size()),
+                        reinterpret_cast<unsigned int*>(&container_header.hash));
+  return true;
+}
+
+// [N-6] SECOND HALF OF THE SAME STALENESS, and the horizontal one. L1.1
+// widened ResolveEdramInfo (pitch 10 -> 9, base 11 -> 13) to carry the
+// expanded EDRAM, but the vendored blobs above still UNPACK THE OLD LAYOUT.
+// Straight out of resolve_full_32bpp_cs:
+//
+//   and  r0.xyzw, CB0[0][0].xzzz, l(1023, ...)             pitch = 10 bits @0
+//   ubfe r4.xyzw, l(2,11,4,1), l(10,13,24,28), CB0[0][0].x msaa@10 base@13
+//                                                          format@24 64bpp@28
+//
+// so every field above pitch is read one to two bits off. For the de-tiled
+// colour tap (pitch 32, k4X, base 0, format 0) the packed word is 0x420 and
+// the blob decodes msaa as k2X: it then stops doubling the sample X
+// coordinate and copies the LEFT HALF of the surface stretched over the full
+// width. That is the "only the top left half renders" report.
+//
+// Do not move the widths again - the blobs are the consumers and cannot be
+// recompiled from anything in this tree. Keep the internal struct wide and
+// re-pack into the layout they actually read, at the one place the value is
+// handed to them.
+//
+// base_tiles is the one field that will not fit: the blobs give it 11 bits and
+// our host bases reach 8188. Colour taps are base 0, so the de-tile path is
+// exact. A depth tap at host base 4096 truncates to 0 - which is exactly what
+// it already did before this function existed, so this is no regression, but
+// it is counted instead of silent. The real fix is to bind the EDRAM view at a
+// per-resolve tile offset and always pass base 0; that needs a per-resolve
+// descriptor on both the bindless and non-bindless paths.
+constexpr uint32_t kVendoredResolvePitchTilesBits = 10;
+constexpr uint32_t kVendoredResolveBaseTilesBits = 11;
+
+uint32_t PackResolveEdramInfoForVendoredShader(draw_util::ResolveEdramInfo info,
+                                               bool& base_truncated_out) {
+  constexpr uint32_t kMsaaShift = kVendoredResolvePitchTilesBits;
+  constexpr uint32_t kIsDepthShift = kMsaaShift + xenos::kMsaaSamplesBits;
+  constexpr uint32_t kBaseShift = kIsDepthShift + 1;
+  constexpr uint32_t kFormatShift = kBaseShift + kVendoredResolveBaseTilesBits;
+  constexpr uint32_t kFormatIs64bppShift = kFormatShift + xenos::kRenderTargetFormatBits;
+  constexpr uint32_t kFillHalfPixelOffsetShift = kFormatIs64bppShift + 1;
+  static_assert(kFillHalfPixelOffsetShift < 32,
+                "The layout the vendored resolve blobs unpack must fit in the packed dword");
+
+  const uint32_t base_mask = (uint32_t(1) << kVendoredResolveBaseTilesBits) - 1;
+  base_truncated_out = (info.base_tiles & ~base_mask) != 0;
+
+  return (info.pitch_tiles & ((uint32_t(1) << kVendoredResolvePitchTilesBits) - 1)) |
+         (uint32_t(info.msaa_samples) << kMsaaShift) | (info.is_depth << kIsDepthShift) |
+         ((info.base_tiles & base_mask) << kBaseShift) |
+         ((info.format & ((uint32_t(1) << xenos::kRenderTargetFormatBits) - 1)) << kFormatShift) |
+         (info.format_is_64bpp << kFormatIs64bppShift) |
+         (info.fill_half_pixel_offset << kFillHalfPixelOffsetShift);
+}
+
+// Picks the patched blob when the wrap constant was found, the original
+// otherwise, and keeps the storage alive for the CreateComputePipeline call.
+struct ResolveShaderBytecode {
+  ResolveShaderBytecode(const void* source, size_t source_size, const char* debug_name)
+      : data(source), size(source_size) {
+    if (kHostEdramWrapDwords != kConsoleEdramWrapDwords &&
+        PatchResolveShaderEdramWrap(source, source_size, debug_name, storage)) {
+      data = storage.data();
+      size = storage.size();
+      patched = true;
+    }
+  }
+  std::vector<uint8_t> storage;
+  const void* data;
+  size_t size;
+  bool patched = false;
+};
+
+}  // namespace
 
 const D3D12RenderTargetCache::ResolveCopyShaderCode
     D3D12RenderTargetCache::kResolveCopyShaders[size_t(
@@ -354,6 +528,8 @@ bool D3D12RenderTargetCache::Initialize() {
   direct_resolve_root_signature_depth_->AddRef();
 
   // Create the resolve copying pipelines.
+  uint32_t resolve_shaders_edram_wrap_patched = 0;
+  uint32_t resolve_shaders_edram_wrap_unpatched = 0;
   for (size_t i = 0; i < size_t(draw_util::ResolveCopyShaderIndex::kCount); ++i) {
     const draw_util::ResolveCopyShaderInfo& resolve_copy_shader_info =
         draw_util::resolve_copy_shader_info[i];
@@ -361,12 +537,16 @@ bool D3D12RenderTargetCache::Initialize() {
     // Somewhat verification whether resolve_copy_shaders_ is up to date.
     assert_true(resolve_copy_shader_code.unscaled && resolve_copy_shader_code.unscaled_size &&
                 resolve_copy_shader_code.scaled && resolve_copy_shader_code.scaled_size);
-    ID3D12PipelineState* resolve_copy_pipeline = ui::d3d12::util::CreateComputePipeline(
-        device,
+    ResolveShaderBytecode resolve_copy_bytecode(
         draw_resolution_scaled ? resolve_copy_shader_code.scaled
                                : resolve_copy_shader_code.unscaled,
         draw_resolution_scaled ? resolve_copy_shader_code.scaled_size
                                : resolve_copy_shader_code.unscaled_size,
+        resolve_copy_shader_info.debug_name);
+    resolve_shaders_edram_wrap_patched += resolve_copy_bytecode.patched ? 1 : 0;
+    resolve_shaders_edram_wrap_unpatched += resolve_copy_bytecode.patched ? 0 : 1;
+    ID3D12PipelineState* resolve_copy_pipeline = ui::d3d12::util::CreateComputePipeline(
+        device, resolve_copy_bytecode.data, resolve_copy_bytecode.size,
         resolve_copy_root_signature_);
     if (resolve_copy_pipeline == nullptr) {
       REXGPU_ERROR("D3D12RenderTargetCache: Failed to create {} resolve copy pipeline",
@@ -931,12 +1111,16 @@ bool D3D12RenderTargetCache::Initialize() {
     }
 
     // Create the resolve EDRAM buffer clearing pipelines.
-    resolve_rov_clear_32bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
-        device,
+    ResolveShaderBytecode resolve_clear_32bpp_bytecode(
         draw_resolution_scaled ? shaders::resolve_clear_32bpp_scaled_cs
                                : shaders::resolve_clear_32bpp_cs,
         draw_resolution_scaled ? sizeof(shaders::resolve_clear_32bpp_scaled_cs)
                                : sizeof(shaders::resolve_clear_32bpp_cs),
+        "resolve_clear_32bpp");
+    resolve_shaders_edram_wrap_patched += resolve_clear_32bpp_bytecode.patched ? 1 : 0;
+    resolve_shaders_edram_wrap_unpatched += resolve_clear_32bpp_bytecode.patched ? 0 : 1;
+    resolve_rov_clear_32bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+        device, resolve_clear_32bpp_bytecode.data, resolve_clear_32bpp_bytecode.size,
         resolve_rov_clear_root_signature_);
     if (resolve_rov_clear_32bpp_pipeline_ == nullptr) {
       REXGPU_ERROR(
@@ -946,12 +1130,16 @@ bool D3D12RenderTargetCache::Initialize() {
       return false;
     }
     resolve_rov_clear_32bpp_pipeline_->SetName(L"Resolve Clear 32bpp");
-    resolve_rov_clear_64bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
-        device,
+    ResolveShaderBytecode resolve_clear_64bpp_bytecode(
         draw_resolution_scaled ? shaders::resolve_clear_64bpp_scaled_cs
                                : shaders::resolve_clear_64bpp_cs,
         draw_resolution_scaled ? sizeof(shaders::resolve_clear_64bpp_scaled_cs)
                                : sizeof(shaders::resolve_clear_64bpp_cs),
+        "resolve_clear_64bpp");
+    resolve_shaders_edram_wrap_patched += resolve_clear_64bpp_bytecode.patched ? 1 : 0;
+    resolve_shaders_edram_wrap_unpatched += resolve_clear_64bpp_bytecode.patched ? 0 : 1;
+    resolve_rov_clear_64bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+        device, resolve_clear_64bpp_bytecode.data, resolve_clear_64bpp_bytecode.size,
         resolve_rov_clear_root_signature_);
     if (resolve_rov_clear_64bpp_pipeline_ == nullptr) {
       REXGPU_ERROR(
@@ -966,6 +1154,18 @@ bool D3D12RenderTargetCache::Initialize() {
     Shutdown();
     return false;
   }
+
+  // [N-6] Say out loud whether the console EDRAM wrap was rewritten. An
+  // unpatched resolve shader still folds any address past tile
+  // kEdramGuestTileCount back to zero, which is guest row 512 at the de-tiled
+  // pitch - the band artifact. The resolution-scaled variants build the
+  // modulus at runtime (`tile_samples << 11`) instead of taking it as a
+  // literal, so they are expected here and are still to be fixed.
+  REXGPU_INFO(
+      "D3D12RenderTargetCache: resolve EDRAM wrap {} -> {} dwords: {} shader(s) "
+      "patched, {} left on the console wrap",
+      kConsoleEdramWrapDwords, kHostEdramWrapDwords, resolve_shaders_edram_wrap_patched,
+      resolve_shaders_edram_wrap_unpatched);
 
   InitializeCommon();
 
@@ -1336,13 +1536,38 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
+          // [N-6] The blobs unpack the pre-L1.1 field layout, so hand them a
+          // word in that layout. Local copy: copy_shader_constants stays in
+          // the internal layout for anything else that reads it.
+          draw_util::ResolveCopyShaderConstants vendored_constants = copy_shader_constants;
+          bool vendored_base_truncated = false;
+          vendored_constants.dest_relative.edram_info.packed =
+              PackResolveEdramInfoForVendoredShader(copy_shader_constants.dest_relative.edram_info,
+                                                    vendored_base_truncated);
+          if (vendored_base_truncated) {
+            // Counted, and named the first time. Every resolve that lands here
+            // reads the wrong EDRAM surface - the same way it did before the
+            // repack existed, so this is a pre-existing break made visible, not
+            // a new one.
+            static uint32_t base_truncated_count = 0;
+            const uint32_t base_tiles =
+                uint32_t(copy_shader_constants.dest_relative.edram_info.base_tiles);
+            if (!base_truncated_count++) {
+              REXGPU_WARN(
+                  "D3D12RenderTargetCache: resolve source base {} tiles does not fit the {} "
+                  "bits the vendored resolve shaders give it - reading tile {} instead. Bind "
+                  "the EDRAM view at a tile offset to fix this.",
+                  base_tiles, kVendoredResolveBaseTilesBits,
+                  base_tiles & ((uint32_t(1) << kVendoredResolveBaseTilesBits) - 1));
+            }
+          }
           if (draw_resolution_scaled) {
             command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
-                &copy_shader_constants.dest_relative, 0);
+                0, sizeof(vendored_constants.dest_relative) / sizeof(uint32_t),
+                &vendored_constants.dest_relative, 0);
           } else {
             command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
+                0, sizeof(vendored_constants) / sizeof(uint32_t), &vendored_constants, 0);
           }
           command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();

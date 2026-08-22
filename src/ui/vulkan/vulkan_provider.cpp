@@ -88,9 +88,7 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
     bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
-    if (with_gpu_emulation && physical_devices.size() > 1 &&
-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
-         prefer_fill_mode_non_solid)) {
+    if (with_gpu_emulation && physical_devices.size() > 1) {
       struct PhysicalDeviceScore {
         VkPhysicalDevice physical_device;
         uint32_t score;
@@ -100,7 +98,28 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
       for (const VkPhysicalDevice physical_device : physical_devices) {
         VkPhysicalDeviceFeatures supported_features = {};
         ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
-        uint32_t score = 0;
+        // Device class dominates every feature bit. On a hybrid laptop the iGPU
+        // supports all four preferred features too, so a feature-only score ties
+        // and the stable sort hands back physical device 0 - the iGPU. That cost
+        // 8.4x on the D3D12 side before EnumAdapterByGpuPreference fixed it there.
+        VkPhysicalDeviceProperties physical_device_properties;
+        ifn.vkGetPhysicalDeviceProperties(physical_device, &physical_device_properties);
+        uint32_t device_class_rank = 0;
+        switch (physical_device_properties.deviceType) {
+          case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            device_class_rank = 4;
+            break;
+          case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+            device_class_rank = 2;
+            break;
+          case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+            device_class_rank = 1;
+            break;
+          default:
+            device_class_rank = 0;
+            break;
+        }
+        uint32_t score = device_class_rank * 16;
         if (prefer_geometry_shader && supported_features.geometryShader) {
           ++score;
         }
