@@ -17,6 +17,8 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <chrono>
+#include <map>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -47,6 +49,16 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
+
+// [NR-DETILE] N-6. The de-tile artifact is source_row = dest_row mod 512, and
+// 512 guest rows is 2048 tiles, exactly the console EDRAM. The ownership maths
+// says the colour RT owns all 2880 tiles, so the question is what the DUMP
+// actually covers and who owns each piece. This prints the resolve's dump
+// request beside the rectangles it produced, once a second.
+REXCVAR_DEFINE_BOOL(gpu_nr_dump_probe, false, "GPU",
+                    "[nr-detile] Log each resolve's EDRAM dump request and the "
+                    "rectangles it resolved to, with the owning render target "
+                    "of each, once per second.");
 
 namespace rex::graphics::d3d12 {
 
@@ -1210,6 +1222,31 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             ++direct_resolve_success_count_;
           } else {
             ++direct_resolve_fallback_count_;
+          }
+        }
+        // [NR-DETILE] N-6 probe, resolve level. The dump probe alone can only
+        // speak when a dump HAPPENS; a resolve that never dumps leaves it
+        // silent, and silence has already been mistaken for absence twice in
+        // this hunt. Report every resolve's EDRAM span and the path it took,
+        // so the colour tap cannot go missing without saying so.
+        if (REXCVAR_GET(gpu_nr_dump_probe)) {
+          uint32_t rp_base, rp_row_len, rp_rows, rp_pitch;
+          resolve_info.GetCopyEdramTileSpan(rp_base, rp_row_len, rp_rows, rp_pitch);
+          const uint64_t rp_sig = (uint64_t(rp_base) << 40) ^ (uint64_t(rp_pitch) << 24) ^
+                                  (uint64_t(rp_rows) << 8) ^ uint64_t(rp_row_len);
+          static std::map<uint64_t, std::chrono::steady_clock::time_point> rp_seen;
+          const auto rp_now = std::chrono::steady_clock::now();
+          auto rp_it = rp_seen.find(rp_sig);
+          if (rp_it == rp_seen.end() || rp_now - rp_it->second >= std::chrono::seconds(1)) {
+            if (rp_seen.size() > 64) {
+              rp_seen.clear();
+            }
+            rp_seen[rp_sig] = rp_now;
+            REXGPU_INFO(
+                "[nr-detile] resolve: edram base={}t row_len={}t rows={} pitch={}t "
+                "| shader={} direct={} dest={:08X}",
+                rp_base, rp_row_len, rp_rows, rp_pitch, uint32_t(copy_shader),
+                direct_resolved ? 1 : 0, resolve_info.copy_dest_base);
           }
         }
         if (!direct_resolved) {
@@ -5744,6 +5781,39 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  dump_rectangles_);
+  // [NR-DETILE] N-6 probe: which tiles this dump actually covers, and who owns
+  // them. A dump that stops short of the requested span leaves those EDRAM
+  // tiles holding whatever was there before, which is exactly the shape of the
+  // mod-512 duplicate.
+  if (REXCVAR_GET(gpu_nr_dump_probe)) {
+    // Rate-limiting blindly samples ONE resolve a second out of ~64 a frame,
+    // and the first run of this probe never once caught the colour tap - the
+    // only request the question is about. Dedupe by request signature instead,
+    // so every DISTINCT dump shape is reported once a second and none can hide.
+    const uint64_t dp_sig = (uint64_t(dump_base) << 40) ^ (uint64_t(dump_pitch) << 24) ^
+                            (uint64_t(dump_rows) << 8) ^ uint64_t(dump_row_length_used);
+    static std::map<uint64_t, std::chrono::steady_clock::time_point> dp_seen;
+    const auto dp_now = std::chrono::steady_clock::now();
+    auto dp_it = dp_seen.find(dp_sig);
+    if (dp_it == dp_seen.end() || dp_now - dp_it->second >= std::chrono::seconds(1)) {
+      if (dp_seen.size() > 64) {
+        dp_seen.clear();
+      }
+      dp_seen[dp_sig] = dp_now;
+      std::string dp;
+      for (const ResolveCopyDumpRectangle& r : dump_rectangles_) {
+        RenderTargetKey k = r.render_target ? r.render_target->key() : RenderTargetKey();
+        dp += fmt::format(" [rows {}..{} start={} end={} <- RT base={}t pitch={}t msaa={} depth={}]",
+                          r.row_first, r.row_first + r.rows, r.row_first_start, r.row_last_end,
+                          uint32_t(k.base_tiles), uint32_t(k.pitch_tiles_at_32bpp),
+                          uint32_t(k.msaa_samples), uint32_t(k.is_depth));
+      }
+      REXGPU_INFO(
+          "[nr-detile] dump: base={}t row_len={}t rows={} pitch={}t -> {} rect(s):{}",
+          dump_base, dump_row_length_used, dump_rows, dump_pitch,
+          dump_rectangles_.size(), dp);
+    }
+  }
   if (dump_rectangles_.empty()) {
     return true;
   }
