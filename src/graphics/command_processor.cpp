@@ -1086,6 +1086,48 @@ thread_local uint64_t g_draw_cnt = 0;
 bool g_split_prof = false;
 thread_local uint64_t g_type0_split_ns = 0;
 
+// [N8] Where the walk's applied register dwords actually GO. N-7 priced the
+// walk plus bulk applies at 30% of the command-processor second, and N-8 was
+// written as "hook the 91 D3D9 render-state setters". That premise is only
+// worth building if the state registers are actually where the dwords are:
+// [nr-skp] reports ~13M applied dwords a second at the city, and if 95% of
+// them are shader constants then the whole setter family is a rounding error
+// and N-8 has to be about constants instead. A pool is not a cost until it is
+// decomposed, so decompose it before designing anything.
+//
+// Classes are the Xenos register map: below 0x2000 is the guest's own
+// GPU-progress block (scratch / COHER / callback), 0x2000-0x3FFF is plain
+// state, 0x4000 is the ALU float constant file, 0x4800 the fetch constants,
+// 0x4900 the bool/loop constants.
+// The per-register histogram is kept for the sub-0x4000 half only: that is the
+// part a device-level state mirror could ever replace, and it is a small
+// fraction of the dwords, so the per-dword increment is affordable there.
+uint64_t g_n8_dw_low = 0, g_n8_dw_state = 0, g_n8_dw_alu = 0;
+uint64_t g_n8_dw_fetch = 0, g_n8_dw_boolloop = 0;
+uint64_t g_n8_rng = 0, g_n8_pdw = 0;
+constexpr uint32_t kN8HistRegs = 0x4000;
+uint32_t* g_n8_hist = nullptr;  // lazily allocated, 64 KB
+
+inline void N8Classify(uint32_t base, uint32_t n, bool per_dword) {
+  if (per_dword) ++g_n8_pdw; else ++g_n8_rng;
+  if (base >= 0x4900) { g_n8_dw_boolloop += n; return; }
+  if (base >= 0x4800) { g_n8_dw_fetch += n; return; }
+  if (base >= 0x4000) { g_n8_dw_alu += n; return; }
+  if (base >= 0x2000) g_n8_dw_state += n; else g_n8_dw_low += n;
+  if (!g_n8_hist) {
+    g_n8_hist = new uint32_t[kN8HistRegs]();
+  }
+  const uint32_t end = (base + n < kN8HistRegs) ? base + n : kN8HistRegs;
+  for (uint32_t r = base; r < end; ++r) ++g_n8_hist[r];
+}
+
+// [N7] Where the 19% outside the skip buffers goes. exec minus the skip
+// buffers was the second-biggest bucket of the N-7 drive and it was
+// un-itemised. These two brackets split it: every ExecuteIndirectBuffer (so
+// non-skip buffers = ib minus the skip path's own buf) and the swap.
+uint64_t g_n7_ib_ns = 0, g_n7_ib_calls = 0;
+uint64_t g_n7_swap_ns = 0, g_n7_swap_calls = 0;
+
 // [N7] Executed draws, unconditional. One increment at the single IssueDraw
 // call site; draws de-tile removed never reach it, so this counts what the
 // consumer actually did -- the number every rung below has to move.
@@ -3028,6 +3070,7 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   // fired on top (WriteRegister's own tail already ran).
   if (g_nr_skip_bufactive && user) {
     ++g_skp_pdw;
+    N8Classify(reg, 1, true);
     // [NR-RUSE] the one-reg by-ref fallback must feed the digest too, or a
     // patched single-dword LOAD_ALU would classify as reusable; every
     // per-dword apply also drives the v2 stale set.
@@ -3604,6 +3647,8 @@ void CommandProcessor::WorkerThreadMain() {
   uint64_t n7_last_spin_ns = 0, n7_last_exec_ns = 0;
   uint64_t n7_last_exec_calls = 0, n7_last_starves = 0;
   uint64_t n7_last_issuedraw_ns = 0, n7_last_type0_ns = 0, n7_last_draw_cnt = 0;
+  uint64_t n7_last_ib_ns = 0, n7_last_swap_ns = 0;
+  uint64_t n7_last_ib_calls = 0, n7_last_swap_calls = 0;
   auto n7_last_report = prof_clock::now();
   const auto n7_t0 = n7_last_report;
 
@@ -3766,6 +3811,65 @@ void CommandProcessor::WorkerThreadMain() {
               b_ms, d_ms, g_ms, b_ms - d_ms - g_ms, wall_ms, exec_ms);
         }
         g_spp_buf_ns = g_spp_draw_ns = g_spp_deleg_ns = 0;
+        // [N7] the ring remainder, itemised. ib = every indirect buffer;
+        // swap = the presenter and frame-end work; inline = what is left in
+        // ExecutePrimaryBuffer, which is the primary ring's own packets.
+        {
+          const double ib_ms = (g_n7_ib_ns - n7_last_ib_ns) / 1e6;
+          const double sw_ms = (g_n7_swap_ns - n7_last_swap_ns) / 1e6;
+          const double inl_ms = exec_ms - ib_ms - sw_ms;
+          REXGPU_INFO(
+              "[n7] ring exec={:.1f}ms | indirect_buffers={:.1f}ms({:.0f}%) n={} "
+              "| swap={:.1f}ms({:.0f}%) n={} | inline primary ring={:.1f}ms({:.0f}%)",
+              exec_ms, ib_ms, exec_ms > 0 ? 100.0 * ib_ms / exec_ms : 0.0,
+              g_n7_ib_calls - n7_last_ib_calls, sw_ms,
+              exec_ms > 0 ? 100.0 * sw_ms / exec_ms : 0.0,
+              g_n7_swap_calls - n7_last_swap_calls, inl_ms,
+              exec_ms > 0 ? 100.0 * inl_ms / exec_ms : 0.0);
+          n7_last_ib_ns = g_n7_ib_ns; n7_last_swap_ns = g_n7_swap_ns;
+          n7_last_ib_calls = g_n7_ib_calls; n7_last_swap_calls = g_n7_swap_calls;
+        }
+        // [N8] the applied-dword census. This is the number that says whether
+        // N-8 is about render state at all.
+        {
+          const uint64_t tot = g_n8_dw_low + g_n8_dw_state + g_n8_dw_alu +
+                               g_n8_dw_fetch + g_n8_dw_boolloop;
+          if (tot) {
+            const double pc = 100.0 / double(tot);
+            REXGPU_INFO(
+                "[n8] applied dwords/s={} | alu_const={:.1f}% fetch_const={:.1f}% "
+                "bool/loop={:.1f}% STATE(0x2000-0x3FFF)={:.1f}% low(<0x2000)={:.1f}% "
+                "| ranges={} per_dword={} | state dwords/frame={}",
+                tot, g_n8_dw_alu * pc, g_n8_dw_fetch * pc, g_n8_dw_boolloop * pc,
+                g_n8_dw_state * pc, g_n8_dw_low * pc, g_n8_rng, g_n8_pdw,
+                frames ? (g_n8_dw_state + g_n8_dw_low) / frames : 0);
+            // The top state registers: the N-8 target list, named. If these are
+            // the D3D9 shadow words (RB_DEPTHCONTROL 0x2200, RB_BLENDCONTROL0
+            // 0x2201, RB_COLOR_MASK 0x2104) the setter family is the right
+            // wedge; if they are VGT/PA/SQ plumbing it is not.
+            if (g_n8_hist) {
+              char hb[512];
+              int hn = 0;
+              for (int k = 0; k < 10; ++k) {
+                uint32_t best = 0, best_r = 0;
+                for (uint32_t r = 0; r < kN8HistRegs; ++r) {
+                  if (g_n8_hist[r] > best) { best = g_n8_hist[r]; best_r = r; }
+                }
+                if (!best) break;
+                const RegisterInfo* ri = RegisterFile::GetRegisterInfo(best_r);
+                hn += snprintf(hb + hn, sizeof(hb) - hn, " %s(%04X)=%u",
+                               ri && ri->name ? ri->name : "?", best_r, best);
+                g_n8_hist[best_r] = 0;
+                if (hn >= int(sizeof(hb)) - 48) break;
+              }
+              REXGPU_INFO("[n8] top state registers by applied dwords:{}", hb);
+              for (uint32_t r = 0; r < kN8HistRegs; ++r) g_n8_hist[r] = 0;
+            }
+          }
+          g_n8_dw_low = g_n8_dw_state = g_n8_dw_alu = 0;
+          g_n8_dw_fetch = g_n8_dw_boolloop = 0;
+          g_n8_rng = g_n8_pdw = 0;
+        }
         n7_last_frames = frames_now;
         n7_last_draws = g_n7_draws;
         n7_last_spin_ns = prof_spin_ns;
@@ -5180,6 +5284,17 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+  // [N7] one bracket per indirect buffer (~5.8k/s at city). Subtracting the
+  // skip path's own buf total leaves the buffers that DECLINED the skip.
+  const auto n7_ib_t0 = std::chrono::steady_clock::now();
+  struct N7IbEnd {
+    std::chrono::steady_clock::time_point t0;
+    ~N7IbEnd() {
+      g_n7_ib_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+      ++g_n7_ib_calls;
+    }
+  } n7_ib_end{n7_ib_t0};
 
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
 
@@ -6341,6 +6456,7 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
   }
   // [NR-BFC] bulk ranges feed the census (end-state size + class split).
   if (g_nr_bfc) NrBfcApply(base, n, false);
+  N8Classify(base, n, false);
   ++g_skp_rng;
   g_skp_rng_dw += n;
   return true;
@@ -6862,7 +6978,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  {
+    // [N7] the swap itself: presenter, post-effect, frame-end RT work.
+    const auto n7_sw_t0 = std::chrono::steady_clock::now();
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    g_n7_swap_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - n7_sw_t0).count();
+    ++g_n7_swap_calls;
+  }
 
   ++counter_;
   // Pure presented-frame tally (real swaps only, no vblank pollution).
