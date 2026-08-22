@@ -286,7 +286,12 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
                             regs[XE_GPU_REG_RB_SURFACE_INFO],
                             regs[XE_GPU_REG_RB_COLOR_INFO],
                             regs[XE_GPU_REG_RB_DEPTH_INFO]};
-    const uint32_t detile_full_height = nr::DetileWidenFullHeight(dt, false);
+    // Deliberately NOT the widen-segment-limited variant: the extent feeds
+    // render-target OWNERSHIP, and the extended tap-2 resolve reads all 720
+    // rows in every widen phase. Drive 4 measured what happens otherwise: with
+    // the overlay segment unwidened the estimator stopped extending, ownership
+    // shrank mid-frame and the middle band of the post-pass input went stale.
+    const uint32_t detile_full_height = nr::DetileBand0FullHeight(dt);
     if (detile_full_height) {
       scissor_bottom = int32_t(detile_full_height);
     }

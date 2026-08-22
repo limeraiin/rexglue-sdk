@@ -74,6 +74,16 @@ struct State {
   uint32_t stride_per_band = 0; // measured destination stride between bands
   int32_t tap_filter = -1;      // -1 = extend every band-1 tap
   int32_t widen_seg_limit = -1; // -1 = widen every band-1 segment
+  int32_t tail_mode = -1;       // -1 = execute tail rewrites, 0 = skip them
+
+  // Tail-rewrite record for the report.
+  struct TailRec {
+    uint32_t dest, y0, y1, tap, bands_in;
+  };
+  TailRec tail_rec{};
+  bool tail_rec_valid = false;
+  uint64_t tail_seen = 0;
+  uint64_t tail_skipped = 0;
 
   // Per-tap record of what band 1 actually resolved, for the log.
   struct TapRec {
@@ -262,6 +272,83 @@ void DetileCountExtendedResolve() { ++g_st.stats.resolves_extended; }
 void DetileSetTapFilter(int32_t tap) { g_st.tap_filter = tap; }
 
 void DetileSetWidenSegLimit(int32_t seg) { g_st.widen_seg_limit = seg; }
+
+void DetileSetTailMode(int32_t mode) { g_st.tail_mode = mode; }
+
+bool DetileTailSkipActive() { return g_st.tail_mode == 0; }
+
+namespace {
+// dest == band0_dest[k] + m*stride for m in 1..2 -> returns true and fills
+// tap/bands_in. Offset 0 (a tap's own base, reused as bloom scratch at the
+// start of the frame) is deliberately NOT a tail rewrite.
+inline bool TailMatch(uint32_t dest, uint32_t* tap, uint32_t* bands_in) {
+  if (!g_st.stride_per_band) {
+    return false;
+  }
+  const uint32_t taps = std::min(g_st.band0_taps, kMaxTaps);
+  for (uint32_t k = 0; k < taps; ++k) {
+    const uint32_t delta = dest - g_st.band0_dest[k];
+    if (delta && delta % g_st.stride_per_band == 0) {
+      const uint32_t m = delta / g_st.stride_per_band;
+      if (m >= 1 && m <= 2) {
+        *tap = k;
+        *bands_in = m;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+}  // namespace
+
+bool DetileIsTailRewrite(const DetileRegs& r, uint32_t copy_dest_base) {
+  if (!g_st.enabled || !g_st.armed) {
+    return false;
+  }
+  // Outside the tiled pass: window offset 0 but a different surface set.
+  if (WindowOffsetY(r.window_offset) != 0 || SigOf(r) == g_st.sig) {
+    return false;
+  }
+  uint32_t tap, bands_in;
+  if (!TailMatch(copy_dest_base, &tap, &bands_in)) {
+    return false;
+  }
+  ++g_st.tail_seen;
+  if (g_st.tail_mode == 0) {
+    ++g_st.tail_skipped;
+    return true;
+  }
+  return false;
+}
+
+void DetileNoteTailResolve(const DetileRegs& r, uint32_t dest_base, uint32_t y0,
+                           uint32_t y1) {
+  if (!g_st.enabled || !g_st.armed) {
+    return;
+  }
+  if (WindowOffsetY(r.window_offset) != 0 || SigOf(r) == g_st.sig) {
+    return;
+  }
+  uint32_t tap, bands_in;
+  if (!TailMatch(dest_base, &tap, &bands_in)) {
+    return;
+  }
+  g_st.tail_rec = State::TailRec{dest_base, y0, y1, tap, bands_in};
+  g_st.tail_rec_valid = true;
+}
+
+bool DetileFormatTail(char* out, size_t out_size) {
+  if (!g_st.tail_seen && !g_st.tail_rec_valid) {
+    return false;
+  }
+  const State::TailRec& t = g_st.tail_rec;
+  std::snprintf(out, out_size,
+                "dst=%08X tap%u+%ubands y=%u..%u seen=%llu skipped=%llu",
+                t.dest, t.tap, t.bands_in, t.y0, t.y1,
+                static_cast<unsigned long long>(g_st.tail_seen),
+                static_cast<unsigned long long>(g_st.tail_skipped));
+  return true;
+}
 
 uint32_t DetileWidenFullHeight(const DetileRegs& r, bool count_refusal) {
   const uint32_t fh = DetileBand0FullHeight(r);

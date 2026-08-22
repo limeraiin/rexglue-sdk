@@ -113,6 +113,30 @@ uint32_t DetileWidenFullHeight(const DetileRegs& regs, bool count_refusal);
 // below N (2 = world + refraction widened, overlay left at band height).
 void DetileSetWidenSegLimit(int32_t seg);
 
+// A TAIL REWRITE is a resolve outside the tiled pass (different RB_*_INFO
+// signature, window offset 0) whose destination is exactly a repeat band's
+// region of a band-1 tap destination (dest == band0_dest[k] + m*stride,
+// m in 1..bands-1). The city frame has exactly one: after the tiled pass, a
+// fullscreen draw on the msaa=0 post RT re-resolves into the bottom band's
+// region of the post-pass input (capture frame 2500 resolve #62,
+// dst 1DF53000 = tap2 + 2 bands). Under de-tiling the EDRAM it reads is no
+// longer band-local, which makes it the prime suspect for the duplicated
+// overlay in the bottom band. Bloom-scratch resolves that reuse a tap's BASE
+// address (offset 0) are deliberately not flagged.
+bool DetileIsTailRewrite(const DetileRegs& regs, uint32_t copy_dest_base);
+
+// -1 = execute tail rewrites (normal, still counted). 0 = SKIP them.
+void DetileSetTailMode(int32_t mode);
+bool DetileTailSkipActive();
+
+// Called from GetResolveInfo for resolves that are NOT band-1 taps, so the
+// report can show the tail rewrite's actual rect and destination.
+void DetileNoteTailResolve(const DetileRegs& regs, uint32_t dest_base,
+                           uint32_t y0, uint32_t y1);
+// Formats the tail record: "dst=.. tapK+Nbands y=a..b seen=N skipped=M".
+// Returns false if no tail resolve was seen since the last call.
+bool DetileFormatTail(char* out, size_t out_size);
+
 // Called from GetResolveInfo once the final rect is known, so the log can show
 // what each band-1 tap actually resolved instead of what it was assumed to.
 void DetileNoteTap(const DetileRegs& regs, uint32_t copy_control, uint32_t dest_base,

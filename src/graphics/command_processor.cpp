@@ -484,6 +484,17 @@ REXCVAR_DEFINE_INT32(gpu_nr_detile_tap, -1, "GPU",
 // below the band line come only from tap 2's write of the post-pass input, so
 // the duplicated overlay is drawn into EDRAM rows 256+ by one of band 1's
 // WIDENED draw segments. Refusing the widening per segment names it.
+// [NR-DETILE] N-5 drive-4 experiment. Capture frame 2500 resolve #62 copies
+// the fullscreen msaa=0 post RT into the bottom band's region of the
+// post-pass input; under de-tiling the EDRAM it reads is no longer band-local.
+REXCVAR_DEFINE_INT32(gpu_nr_detile_tail, -1, "GPU",
+                     "[nr-detile] Bisect: -1 executes tail rewrites (normal, "
+                     "counted and logged), 0 SKIPS the resolves that write a "
+                     "repeat band's region of a band-1 tap destination from "
+                     "outside the tiled pass, -2 cycles 8 s per phase between "
+                     "the two so one drive says whether the tail rewrite "
+                     "draws the duplicated overlay.");
+
 REXCVAR_DEFINE_INT32(gpu_nr_detile_widen_seg, -1, "GPU",
                      "[nr-detile] Bisect: -1 widens every band-1 draw segment "
                      "to the full frame (normal), N widens only segments below "
@@ -5784,6 +5795,15 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
           }
           continue;
         }
+        // [NR-DETILE] N-5 drive-4 experiment: the tail rewrite (the resolve
+        // that copies the fullscreen post RT back into a repeat band's region
+        // of the post-pass input) is the prime suspect for the duplicated
+        // overlay. Counted always; dropped only under gpu_nr_detile_tail 0.
+        if (dt_is_resolve &&
+            nr::DetileIsTailRewrite(dt_regs,
+                                    dt_rf[XE_GPU_REG_RB_COPY_DEST_BASE])) {
+          continue;
+        }
       }
       // [NR-TILE] N-4 probe mode 1: skip the draw dispatch for every repeat
       // tile band. Only opcode 0x22 is dropped, so the copy-mode draws that
@@ -6717,6 +6737,27 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       }
       nr::DetileSetWidenSegLimit(dt_wseg);
     }
+    // [NR-DETILE] tail-rewrite bisect latch. -2 cycles 8 s execute / skip.
+    {
+      int32_t dt_tail = REXCVAR_GET(gpu_nr_detile_tail);
+      if (dt_tail == -2) {
+        static const auto tail_t0 = std::chrono::steady_clock::now();
+        const auto tail_el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now() - tail_t0)
+                                 .count();
+        dt_tail = ((tail_el / 8) & 1) ? 0 : -1;
+      }
+      static int32_t dt_tail_prev = -3;
+      if (dt_tail != dt_tail_prev) {
+        dt_tail_prev = dt_tail;
+        REXGPU_INFO(
+            "[nr-detile] TAIL PHASE {} - tail rewrites into the tap "
+            "destinations are {}.",
+            dt_tail == 0 ? "SKIP" : "EXEC",
+            dt_tail == 0 ? "dropped" : "executed (normal)");
+      }
+      nr::DetileSetTailMode(dt_tail);
+    }
     const nr::DetileFrameVerdict dtv = nr::DetileFrameEnd();
     if (dtv.guard_tripped) {
       REXGPU_ERROR(
@@ -6753,6 +6794,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
         char tap_buf[512];
         if (nr::DetileFormatTaps(tap_buf, sizeof(tap_buf))) {
           REXGPU_INFO("[nr-detile] band-1 taps: {}", tap_buf);
+        }
+        char tail_buf[160];
+        if (nr::DetileFormatTail(tail_buf, sizeof(tail_buf))) {
+          REXGPU_INFO("[nr-detile] tail: {}", tail_buf);
         }
         char rt_buf[768];
         if (nr::DetileFormatRenderTargets(rt_buf, sizeof(rt_buf))) {
