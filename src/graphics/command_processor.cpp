@@ -73,6 +73,33 @@ REXCVAR_DEFINE_BOOL(gpu_split_profile, false, "GPU",
                     "parallelizing draws can help heavy-forest fps. Launch-time only "
                     "(read once at worker start, like gpu_worker_profile). Off by default.");
 
+// [N7] The re-baseline instrument -- NATIVE-PATH.md rung N-7. Every per-draw
+// and per-thread number this project owns predates de-tile, which cut executed
+// draws per frame from ~9.4k to ~3.7k. The standing finding that the guest
+// producer is not the wall was measured against a consumer 2.5x heavier than
+// today's, so it has to be re-taken before N-8..N-12 are ordered against it.
+//
+// It reports three things once a second, all cheap enough to leave on:
+//  - fps and draws per PRESENTED frame, on ONE line, so a reading buckets
+//    itself (single-run heavy-band fps is noise up to 3.4 at mismatched load).
+//  - the command-processor thread's own wall clock, split into real
+//    ExecutePrimaryBuffer work and starvation spin. This is what
+//    gpu_worker_profile measured, minus the per-packet timing that inflated it
+//    ~20%: the bracket is two clock reads per worker wake (~50/s at city load).
+//    exec% is CAP-INDEPENDENT, which is the point -- the heavy city now sits at
+//    the 60 cap, where a 20% consumer win reads as "60".
+//  - the ring backlog at each wake. That is the producer/consumer verdict
+//    measured at the seam: a deep ring means the guest is running ahead of us
+//    and we are the wall; a shallow one means the guest is pacing us.
+// Mode 2 additionally cycles the clean draw-vs-register-write split 5 s on /
+// 5 s off IN PLACE, so one drive prices both halves at matched draws per frame
+// and says whether N-8 (state) or N-9 (draws) is the larger pool.
+REXCVAR_DEFINE_INT32(gpu_n7, 1, "GPU",
+                     "[n7] Re-baseline report once a second: fps, draws per "
+                     "frame, command-processor exec vs spin, ring backlog. "
+                     "0 = off, 1 = report (default, ~free), 2 = report + cycle "
+                     "the IssueDraw/type-0 split 5 s on / 5 s off in place.");
+
 // [PM4-CENSUS] Naruto §11.7 draw-emission census. Settles where the ~10k
 // heavy-forest draws/frame come from: counts DRAW_INDX vs DRAW_INDX_2 packets,
 // split by whether each is inside a PM4_INDIRECT_BUFFER (a pre-recorded /
@@ -1058,6 +1085,11 @@ thread_local uint64_t g_draw_cnt = 0;
 // Does NOT enable the per-packet g_exec_prof timing, so it stays ~clean.
 bool g_split_prof = false;
 thread_local uint64_t g_type0_split_ns = 0;
+
+// [N7] Executed draws, unconditional. One increment at the single IssueDraw
+// call site; draws de-tile removed never reach it, so this counts what the
+// consumer actually did -- the number every rung below has to move.
+uint64_t g_n7_draws = 0;
 
 // [PM4-CENSUS] Only the cmd-proc worker thread executes packets, so plain
 // globals (no atomics) -- same pattern as g_issuedraw_ns / g_split_prof. Depth
@@ -3550,7 +3582,12 @@ void CommandProcessor::WorkerThreadMain() {
   const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger) || kNrCache;  // [NR-IBL] record/replay gate
   g_ib_ledger = kIbLedger;
   g_pm4_ib_dump = REXCVAR_GET(gpu_pm4_ib_dump);  // [PM4-IB-DUMP] one-shot IB structure dump
-  const bool kTimeExec = kProfile || kSplit;  // bracket ExecutePrimaryBuffer when either is on
+  // [N7] The spin/exec bracket is UNCONDITIONAL now. At city load the worker
+  // wakes ~50 times a second, so it is ~100 clock reads per second: it cannot
+  // move a frame rate, and it is the only thing that answers "how much of the
+  // consumer's wall clock is real work" without the per-packet timing that
+  // inflated gpu_worker_profile by ~20%.
+  const bool kTimeExec = true;
   using prof_clock = std::chrono::steady_clock;
   uint64_t prof_spin_ns = 0, prof_exec_ns = 0;
   uint64_t prof_spin_loops = 0, prof_event_waits = 0, prof_exec_calls = 0,
@@ -3561,6 +3598,14 @@ void CommandProcessor::WorkerThreadMain() {
   uint64_t last_issuedraw_ns = 0, last_draw_cnt = 0;
   uint64_t last_type0_split_ns = 0;
   auto prof_last_report = prof_clock::now();
+  const int32_t kN7 = REXCVAR_GET(gpu_n7);
+  uint64_t n7_backlog_sum = 0, n7_backlog_max = 0, n7_wakes = 0;
+  uint64_t n7_last_frames = 0, n7_last_draws = 0;
+  uint64_t n7_last_spin_ns = 0, n7_last_exec_ns = 0;
+  uint64_t n7_last_exec_calls = 0, n7_last_starves = 0;
+  uint64_t n7_last_issuedraw_ns = 0, n7_last_type0_ns = 0, n7_last_draw_cnt = 0;
+  auto n7_last_report = prof_clock::now();
+  const auto n7_t0 = n7_last_report;
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
@@ -3575,8 +3620,8 @@ void CommandProcessor::WorkerThreadMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
-      auto spin_t0 = kProfile ? prof_clock::now() : prof_clock::time_point{};
-      if (kProfile) prof_starves++;
+      auto spin_t0 = prof_clock::now();  // [N7] unconditional, ~50 reads/s
+      prof_starves++;
       PrepareForWait();
       uint32_t loop_count = 0;
       do {
@@ -3603,10 +3648,8 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (kProfile) {
-        prof_spin_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            prof_clock::now() - spin_t0).count();
-      }
+      prof_spin_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          prof_clock::now() - spin_t0).count();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -3615,6 +3658,16 @@ void CommandProcessor::WorkerThreadMain() {
 
     // Execute. Note that we handle wraparound transparently.
     {
+      // [N7] Ring backlog at the moment we wake, in dwords. Deep = the guest is
+      // ahead of us and we are the wall; shallow = the guest is pacing us.
+      if (kN7) {
+        const uint32_t rb_dwords = uint32_t(primary_buffer_size_ / sizeof(uint32_t));
+        const uint32_t backlog =
+            rb_dwords ? ((write_ptr_index - read_ptr_index_) & (rb_dwords - 1)) : 0u;
+        n7_backlog_sum += backlog;
+        if (backlog > n7_backlog_max) n7_backlog_max = backlog;
+        ++n7_wakes;
+      }
       auto exec_t0 = kTimeExec ? prof_clock::now() : prof_clock::time_point{};
       read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
       if (kTimeExec) {
@@ -3648,6 +3701,109 @@ void CommandProcessor::WorkerThreadMain() {
                     phase == 0   ? "OFF, pixels correct"
                     : phase == 1 ? "repeat-band DRAWS skipped"
                                  : "repeat-band BUFFERS skipped");
+      }
+    }
+
+    // [N7] The re-baseline line. Prints on a DEFAULT run, so every drive from
+    // here on carries its own ceiling and nothing about N-8..N-12 has to be
+    // judged against a number taken before de-tile.
+    if (kN7) {
+      const auto n7_now = prof_clock::now();
+      const uint64_t n7_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      n7_now - n7_last_report).count();
+      if (n7_wall_ns >= 1000000000ull) {
+        n7_last_report = n7_now;
+        const double wall_ms = n7_wall_ns / 1e6;
+        const uint64_t frames_now = swap_counter_.load(std::memory_order_relaxed);
+        const uint64_t frames = frames_now - n7_last_frames;
+        const uint64_t draws = g_n7_draws - n7_last_draws;
+        const double spin_ms = (prof_spin_ns - n7_last_spin_ns) / 1e6;
+        const double exec_ms = (prof_exec_ns - n7_last_exec_ns) / 1e6;
+        const double fps = 1000.0 * double(frames) / wall_ms;
+        const double exec_pct = 100.0 * exec_ms / wall_ms;
+        // What this consumer implies it could deliver: it spent exec_pct of the
+        // wall clock producing `fps` frames, so fps/exec_pct*100 is where IT
+        // becomes the wall. Only meaningful below ~99% -- at 100% the consumer
+        // IS the wall and the ceiling is the fps printed beside it.
+        const double ceiling = exec_pct > 1.0 ? fps * 100.0 / exec_pct : 0.0;
+        REXGPU_INFO(
+            "[n7] fps={:.1f} dpf={} | cp exec={:.1f}% spin={:.1f}% -> "
+            "ceiling~{:.0f}fps | wakes={} backlog avg={}dw max={}dw | "
+            "draws/s={} exec_calls={} starves={}",
+            fps, frames ? (draws / frames) : draws, exec_pct,
+            100.0 * spin_ms / wall_ms, ceiling, n7_wakes,
+            n7_wakes ? (n7_backlog_sum / n7_wakes) : uint64_t(0), n7_backlog_max,
+            draws, prof_exec_calls - n7_last_exec_calls,
+            prof_starves - n7_last_starves);
+        // The split, when this window was a SPLIT-ON phase. draw and exec are
+        // clean brackets; type0 carries ~3-8% of its own self-inflation, so
+        // other% is a floor. This is the number that orders N-8 against N-9.
+        if (g_split_prof && exec_ms > 0.0) {
+          const double draw_ms = (g_issuedraw_ns - n7_last_issuedraw_ns) / 1e6;
+          const double t0_ms = (g_type0_split_ns - n7_last_type0_ns) / 1e6;
+          const double other_ms = exec_ms - draw_ms - t0_ms;
+          REXGPU_INFO(
+              "[n7] split exec={:.1f}ms draw={:.1f}ms({:.0f}%) "
+              "type0/regwrite={:.1f}ms({:.0f}%) other={:.1f}ms({:.0f}%) draws={}",
+              exec_ms, draw_ms, 100.0 * draw_ms / exec_ms, t0_ms,
+              100.0 * t0_ms / exec_ms, other_ms, 100.0 * other_ms / exec_ms,
+              g_draw_cnt - n7_last_draw_cnt);
+        }
+        // The skip path's own halves, when this window was a SKIP-ON phase.
+        // buf = the whole skip-driven buffer; drawstop and delegstop are the
+        // two dispatch brackets; the remainder is the walk decode plus the
+        // bulk range applies. Under gpu_nr_skip the register firehose does NOT
+        // go through ExecutePacketType0 any more -- it is the walk -- which is
+        // why the split line's type0 bucket reads 0 and this line is the one
+        // that prices state decoding.
+        if (g_skp_prof && g_spp_buf_ns) {
+          const double b_ms = g_spp_buf_ns / 1e6;
+          const double d_ms = g_spp_draw_ns / 1e6;
+          const double g_ms = g_spp_deleg_ns / 1e6;
+          REXGPU_INFO(
+              "[n7] skip buf={:.1f}ms drawstop={:.1f}ms delegstop={:.1f}ms "
+              "walk+bulk={:.1f}ms (wall={:.0f}ms, exec={:.1f}ms)",
+              b_ms, d_ms, g_ms, b_ms - d_ms - g_ms, wall_ms, exec_ms);
+        }
+        g_spp_buf_ns = g_spp_draw_ns = g_spp_deleg_ns = 0;
+        n7_last_frames = frames_now;
+        n7_last_draws = g_n7_draws;
+        n7_last_spin_ns = prof_spin_ns;
+        n7_last_exec_ns = prof_exec_ns;
+        n7_last_exec_calls = prof_exec_calls;
+        n7_last_starves = prof_starves;
+        n7_last_issuedraw_ns = g_issuedraw_ns;
+        n7_last_type0_ns = g_type0_split_ns;
+        n7_last_draw_cnt = g_draw_cnt;
+        n7_backlog_sum = n7_backlog_max = n7_wakes = 0;
+        // Mode 2: cycle the split IN PLACE, 5 s per phase, toggled here so a
+        // report window never straddles a phase boundary.
+        // Three phases, 5 s each, ONE profiler at a time: a stage profiler
+        // running inside another one overstates it ([[nested-profile-inflates-
+        // stage]]), and fps must be read from the phase with neither.
+        //   0 CLEAN  - fps, occupancy, backlog, nothing armed
+        //   1 SPLIT  - IssueDraw vs the rest of exec (~2% self-cost)
+        //   2 SKIP   - the skip path's halves: walk+bulk vs the two dispatches
+        //              (~2 timestamps per stop, ~3% at city load)
+        if (kN7 >= 2 && !kSplit && !kSkpProf) {
+          const int64_t el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 n7_now - n7_t0).count();
+          const int phase = int((el / 5) % 3);
+          static const char* const kPhaseName[3] = {"CLEAN", "SPLIT", "SKIP"};
+          static int n7_phase_prev = -1;
+          if (phase != n7_phase_prev) {
+            n7_phase_prev = phase;
+            g_split_prof = (phase == 1);
+            g_skp_prof = (phase == 2);
+            REXGPU_INFO(
+                "[n7] PHASE {} - {} (read fps from CLEAN; the other two carry "
+                "their own ~2-3% self-cost).",
+                kPhaseName[phase],
+                phase == 0   ? "nothing armed"
+                : phase == 1 ? "IssueDraw bracket armed"
+                             : "skip-path brackets armed");
+          }
+        }
       }
     }
 
@@ -7479,6 +7635,7 @@ void CommandProcessor::ExecutePacketType3DrawTail(
       } else if (g_nr_draw && g_pm4_ib_depth != 1) {
         ++g_nrd_skipped_depth;
       }
+      ++g_n7_draws;  // [N7] executed draws, unconditional
       const bool kTimeDraw = g_exec_prof || g_split_prof;
       const auto draw_t0 = kTimeDraw ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
