@@ -6804,7 +6804,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
         // live frame has no tail rewrite" from "the predicate is wrong", so
         // the census names every resolve the observe site refused and lists
         // the destinations that reached the last gate.
-        char rescen_buf[1024];
+        char rescen_buf[4096];
         if (nr::DetileFormatResolveCensus(rescen_buf, sizeof(rescen_buf))) {
           REXGPU_INFO("[nr-detile] resolves: {}", rescen_buf);
         }

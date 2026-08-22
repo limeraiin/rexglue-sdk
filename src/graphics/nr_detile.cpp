@@ -49,7 +49,7 @@ inline PassSig SigOf(const DetileRegs& r) {
 }
 
 constexpr uint32_t kMaxTaps = 8;
-constexpr uint32_t kMaxOut = 12;
+constexpr uint32_t kMaxOut = 40;
 
 struct State {
   bool enabled = false;
@@ -96,8 +96,9 @@ struct State {
   uint64_t res_nomatch = 0;  // outside the pass, destination did not match
   uint32_t last_band0_taps = 0;  // band0_taps as of the last frame end
   struct OutRec {
-    uint32_t dest, ctrl, y0, y1;
+    uint32_t dest, ctrl, surf, y0, y1;
     uint64_t n;
+    char cls;  // b=band i=in-pass n=nomatch T=tail rewrite
   };
   OutRec out_rec[kMaxOut] = {};
   uint32_t out_rec_n = 0;
@@ -345,41 +346,44 @@ void DetileNoteTailResolve(const DetileRegs& r, uint32_t copy_control,
     return;
   }
   ++g_st.res_total;
+  uint32_t tap = 0, bands_in = 0;
+  char cls;
   if (WindowOffsetY(r.window_offset) != 0) {
     ++g_st.res_band;
-    return;
-  }
-  if (SigOf(r) == g_st.sig) {
+    cls = 'b';
+  } else if (SigOf(r) == g_st.sig) {
     ++g_st.res_insig;
-    return;
+    cls = 'i';
+  } else if (!TailMatch(dest_base, &tap, &bands_in)) {
+    ++g_st.res_nomatch;
+    cls = 'n';
+  } else {
+    cls = 'T';
+    g_st.tail_rec = State::TailRec{dest_base, y0, y1, tap, bands_in};
+    g_st.tail_rec_valid = true;
   }
-  // Outside the tiled pass. Whether or not the destination matches, record it:
-  // the list of destinations that get this far is the evidence that says
-  // whether the capture's tail rewrite happens in the live frame.
+  // Record EVERY resolve, in every class. The first version of this table held
+  // only the outside class in 12 slots, saturated on the bloom chain, and so
+  // could not say where the one destination the question is about had gone.
   uint32_t slot = kMaxOut;
   for (uint32_t i = 0; i < g_st.out_rec_n; ++i) {
-    if (g_st.out_rec[i].dest == dest_base) {
+    if (g_st.out_rec[i].dest == dest_base && g_st.out_rec[i].cls == cls) {
       slot = i;
       break;
     }
   }
   if (slot == kMaxOut && g_st.out_rec_n < kMaxOut) {
     slot = g_st.out_rec_n++;
-    g_st.out_rec[slot] = State::OutRec{dest_base, copy_control, y0, y1, 0};
+    g_st.out_rec[slot] =
+        State::OutRec{dest_base, copy_control, r.surface_info, y0, y1, 0, cls};
   }
   if (slot < kMaxOut) {
     g_st.out_rec[slot].ctrl = copy_control;
+    g_st.out_rec[slot].surf = r.surface_info;
     g_st.out_rec[slot].y0 = y0;
     g_st.out_rec[slot].y1 = y1;
     ++g_st.out_rec[slot].n;
   }
-  uint32_t tap, bands_in;
-  if (!TailMatch(dest_base, &tap, &bands_in)) {
-    ++g_st.res_nomatch;
-    return;
-  }
-  g_st.tail_rec = State::TailRec{dest_base, y0, y1, tap, bands_in};
-  g_st.tail_rec_valid = true;
 }
 
 bool DetileFormatTail(char* out, size_t out_size) {
@@ -500,19 +504,21 @@ bool DetileFormatResolveCensus(char* out, size_t out_size) {
   }
   size_t used = size_t(std::snprintf(
       out, out_size,
-      "total=%llu band=%llu insig=%llu nomatch=%llu | band0_taps=%u "
-      "stride=%#x | outside:",
+      "total=%llu band=%llu insig=%llu nomatch=%llu tail=%llu | "
+      "band0_taps=%u stride=%#x | b=band i=in-pass n=nomatch T=tail:",
       static_cast<unsigned long long>(g_st.res_total),
       static_cast<unsigned long long>(g_st.res_band),
       static_cast<unsigned long long>(g_st.res_insig),
-      static_cast<unsigned long long>(g_st.res_nomatch), g_st.last_band0_taps,
-      g_st.stride_per_band));
+      static_cast<unsigned long long>(g_st.res_nomatch),
+      static_cast<unsigned long long>(g_st.res_total - g_st.res_band -
+                                      g_st.res_insig - g_st.res_nomatch),
+      g_st.last_band0_taps, g_st.stride_per_band));
   for (uint32_t i = 0; i < g_st.out_rec_n && used + 64 < out_size; ++i) {
     const State::OutRec& o = g_st.out_rec[i];
-    const int n = std::snprintf(out + used, out_size - used,
-                                " %08X(ctrl=%08X y=%u..%u n=%llu)", o.dest,
-                                o.ctrl, o.y0, o.y1,
-                                static_cast<unsigned long long>(o.n));
+    const int n = std::snprintf(
+        out + used, out_size - used, " %c:%08X(surf=%08X ctrl=%08X y=%u..%u n=%llu)",
+        o.cls, o.dest, o.surf, o.ctrl, o.y0, o.y1,
+        static_cast<unsigned long long>(o.n));
     if (n <= 0) break;
     used += size_t(n);
   }
