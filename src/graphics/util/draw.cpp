@@ -885,7 +885,8 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     // Tail rewrites (resolves outside the tiled pass into a repeat band's
     // region of a tap destination) get their own record - the report needs
     // their real rect to say what part of the post RT they copy back.
-    nr::DetileNoteTailResolve(dt, regs[XE_GPU_REG_RB_COPY_DEST_BASE],
+    nr::DetileNoteTailResolve(dt, regs[XE_GPU_REG_RB_COPY_CONTROL],
+                              regs[XE_GPU_REG_RB_COPY_DEST_BASE],
                               uint32_t(y0), uint32_t(y1));
   }
 

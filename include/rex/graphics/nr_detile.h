@@ -131,11 +131,21 @@ bool DetileTailSkipActive();
 
 // Called from GetResolveInfo for resolves that are NOT band-1 taps, so the
 // report can show the tail rewrite's actual rect and destination.
-void DetileNoteTailResolve(const DetileRegs& regs, uint32_t dest_base,
-                           uint32_t y0, uint32_t y1);
+void DetileNoteTailResolve(const DetileRegs& regs, uint32_t copy_control,
+                           uint32_t dest_base, uint32_t y0, uint32_t y1);
 // Formats the tail record: "dst=.. tapK+Nbands y=a..b seen=N skipped=M".
 // Returns false if no tail resolve was seen since the last call.
 bool DetileFormatTail(char* out, size_t out_size);
+
+// A silent instrument is ambiguous between "the shape does not occur" and
+// "my predicate is wrong", so every resolve the observe site sees is
+// classified and counted: band = a repeat band (window offset Y != 0),
+// insig = inside the tiled pass (same RB_*_INFO signature), nomatch = outside
+// the pass but its destination is not tapK + m*stride, and the tail counters
+// above take the rest. `out` also lists the distinct destinations of the
+// nomatch class, which is what says whether the city frame's tail rewrite
+// exists at all in the live run.
+bool DetileFormatResolveCensus(char* out, size_t out_size);
 
 // Called from GetResolveInfo once the final rect is known, so the log can show
 // what each band-1 tap actually resolved instead of what it was assumed to.

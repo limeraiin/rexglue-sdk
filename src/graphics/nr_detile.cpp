@@ -49,6 +49,7 @@ inline PassSig SigOf(const DetileRegs& r) {
 }
 
 constexpr uint32_t kMaxTaps = 8;
+constexpr uint32_t kMaxOut = 12;
 
 struct State {
   bool enabled = false;
@@ -84,6 +85,22 @@ struct State {
   bool tail_rec_valid = false;
   uint64_t tail_seen = 0;
   uint64_t tail_skipped = 0;
+
+  // Resolve census. The tail bisect's first city run logged nothing at all,
+  // and `seen=0` alone cannot tell "the frame has no tail rewrite" from "the
+  // predicate is wrong" - so every resolve reaching the observe site is
+  // classified, and the destinations that reach the last gate are listed.
+  uint64_t res_total = 0;
+  uint64_t res_band = 0;     // refused: window offset Y != 0
+  uint64_t res_insig = 0;    // refused: same signature as the tiled pass
+  uint64_t res_nomatch = 0;  // outside the pass, destination did not match
+  uint32_t last_band0_taps = 0;  // band0_taps as of the last frame end
+  struct OutRec {
+    uint32_t dest, ctrl, y0, y1;
+    uint64_t n;
+  };
+  OutRec out_rec[kMaxOut] = {};
+  uint32_t out_rec_n = 0;
 
   // Per-tap record of what band 1 actually resolved, for the log.
   struct TapRec {
@@ -257,6 +274,7 @@ DetileFrameVerdict DetileFrameEnd() {
   g_st.obs_consistent = true;
   g_st.obs_full_height = 0;
   g_st.obs_band_rows = 0;
+  g_st.last_band0_taps = g_st.band0_taps;
   g_st.band0_taps = 0;
   g_st.band_taps = 0;
   g_st.band_tl_y = -1;
@@ -321,16 +339,43 @@ bool DetileIsTailRewrite(const DetileRegs& r, uint32_t copy_dest_base) {
   return false;
 }
 
-void DetileNoteTailResolve(const DetileRegs& r, uint32_t dest_base, uint32_t y0,
-                           uint32_t y1) {
+void DetileNoteTailResolve(const DetileRegs& r, uint32_t copy_control,
+                           uint32_t dest_base, uint32_t y0, uint32_t y1) {
   if (!g_st.enabled || !g_st.armed) {
     return;
   }
-  if (WindowOffsetY(r.window_offset) != 0 || SigOf(r) == g_st.sig) {
+  ++g_st.res_total;
+  if (WindowOffsetY(r.window_offset) != 0) {
+    ++g_st.res_band;
     return;
+  }
+  if (SigOf(r) == g_st.sig) {
+    ++g_st.res_insig;
+    return;
+  }
+  // Outside the tiled pass. Whether or not the destination matches, record it:
+  // the list of destinations that get this far is the evidence that says
+  // whether the capture's tail rewrite happens in the live frame.
+  uint32_t slot = kMaxOut;
+  for (uint32_t i = 0; i < g_st.out_rec_n; ++i) {
+    if (g_st.out_rec[i].dest == dest_base) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == kMaxOut && g_st.out_rec_n < kMaxOut) {
+    slot = g_st.out_rec_n++;
+    g_st.out_rec[slot] = State::OutRec{dest_base, copy_control, y0, y1, 0};
+  }
+  if (slot < kMaxOut) {
+    g_st.out_rec[slot].ctrl = copy_control;
+    g_st.out_rec[slot].y0 = y0;
+    g_st.out_rec[slot].y1 = y1;
+    ++g_st.out_rec[slot].n;
   }
   uint32_t tap, bands_in;
   if (!TailMatch(dest_base, &tap, &bands_in)) {
+    ++g_st.res_nomatch;
     return;
   }
   g_st.tail_rec = State::TailRec{dest_base, y0, y1, tap, bands_in};
@@ -447,6 +492,31 @@ uint32_t DetileFormatRenderTargets(char* out, size_t out_size) {
   const uint32_t n = g_rt_n;
   g_rt_n = 0;
   return n;
+}
+
+bool DetileFormatResolveCensus(char* out, size_t out_size) {
+  if (!g_st.res_total) {
+    return false;
+  }
+  size_t used = size_t(std::snprintf(
+      out, out_size,
+      "total=%llu band=%llu insig=%llu nomatch=%llu | band0_taps=%u "
+      "stride=%#x | outside:",
+      static_cast<unsigned long long>(g_st.res_total),
+      static_cast<unsigned long long>(g_st.res_band),
+      static_cast<unsigned long long>(g_st.res_insig),
+      static_cast<unsigned long long>(g_st.res_nomatch), g_st.last_band0_taps,
+      g_st.stride_per_band));
+  for (uint32_t i = 0; i < g_st.out_rec_n && used + 64 < out_size; ++i) {
+    const State::OutRec& o = g_st.out_rec[i];
+    const int n = std::snprintf(out + used, out_size - used,
+                                " %08X(ctrl=%08X y=%u..%u n=%llu)", o.dest,
+                                o.ctrl, o.y0, o.y1,
+                                static_cast<unsigned long long>(o.n));
+    if (n <= 0) break;
+    used += size_t(n);
+  }
+  return true;
 }
 
 uint32_t DetileFormatTaps(char* out, size_t out_size) {

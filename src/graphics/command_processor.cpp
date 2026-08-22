@@ -6799,6 +6799,15 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
         if (nr::DetileFormatTail(tail_buf, sizeof(tail_buf))) {
           REXGPU_INFO("[nr-detile] tail: {}", tail_buf);
         }
+        // The tail bisect's first two city runs logged NO tail line at all,
+        // including at real heavy-city load. `seen=0` cannot distinguish "the
+        // live frame has no tail rewrite" from "the predicate is wrong", so
+        // the census names every resolve the observe site refused and lists
+        // the destinations that reached the last gate.
+        char rescen_buf[1024];
+        if (nr::DetileFormatResolveCensus(rescen_buf, sizeof(rescen_buf))) {
+          REXGPU_INFO("[nr-detile] resolves: {}", rescen_buf);
+        }
         char rt_buf[768];
         if (nr::DetileFormatRenderTargets(rt_buf, sizeof(rt_buf))) {
           REXGPU_INFO("[nr-detile] edram: {}", rt_buf);
