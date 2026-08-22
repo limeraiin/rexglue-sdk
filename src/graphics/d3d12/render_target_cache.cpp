@@ -74,6 +74,34 @@ REXCVAR_DEFINE_BOOL(gpu_nr_dump_probe, false, "GPU",
                     "rectangles it resolved to, with the owning render target "
                     "of each, once per second.");
 
+// [NR-DETILE] N-6-5. The frozen-rows instrument's companion.
+//
+// The city EDRAM readback says rows 256..720 of BOTH the tiled colour and the
+// tiled depth surface are byte-identical across 104 samples taken a second
+// apart while driving, while rows 0..255 differ in every sample. Written once,
+// never again - which is the user's "it looked fine only the first frame" in
+// numbers. Nothing draws there and nothing CLEARS there.
+//
+// The offline city census (tools/n6-band1-clip-census.py, frame 2500) rules
+// out the guest: screen scissor is 0..8192 on every draw, band 1's viewport is
+// y 0..720, clip_disable is 0, vtx_window_offset_enable is 1, and the three
+// bands carry exactly 3015 draws each, so the guest emits the same list to
+// every band. It also names the depth convention: RB_DEPTHCONTROL zfunc is 6
+// (GEQUAL) on every single draw - reverse Z, where a LARGER stored value is
+// nearer. The frozen depth below row 256 reads 0xD3..0xE6 against 0x4E..0x63
+// above it, so those rows hold NEAR values. If they are never cleared back to
+// far, every widened draw below row 256 fails GEQUAL from frame 2 onwards and
+// writes neither depth nor colour - which is exactly a freeze.
+//
+// So: report what each resolve clear actually covers. Rect, both render target
+// keys, both tile ranges, both original bases, and the transfer counts, gated
+// to the clears and deduped by signature. The clear rect is derived from the
+// registers and the resolve rect, so this is STRUCTURAL and readable at the
+// title screen, where the tiled pass runs with all three taps.
+REXCVAR_DEFINE_BOOL(gpu_nr_detile_clear_probe, false, "GPU",
+                    "[nr-detile] Log every resolve clear's rectangle, render "
+                    "targets and EDRAM tile ranges, once per second per shape.");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -261,36 +289,62 @@ uint32_t PackResolveEdramInfoForVendoredShader(draw_util::ResolveEdramInfo info,
          (info.fill_half_pixel_offset << kFillHalfPixelOffsetShift);
 }
 
-// [NR-DETILE] N-6-2. Copies the resolved EDRAM span to a readback heap and,
-// one second later (so the copy has certainly retired without a fence and
-// without stalling the frame), reports per tile row whether the tile is FLAT -
-// every dword equal to the first, i.e. cleared or never written - or VARIED,
-// i.e. actually rasterised. A tile row is 8 guest rows at 4xMSAA, so tile row
-// 32 is guest row 256, the row the artifact starts at.
+// [NR-DETILE] N-6-2, reworked in N-6-5. Copies the resolved EDRAM span to a
+// readback heap and, one second later (so the copy has certainly retired
+// without a fence and without stalling the frame), reports per tile row:
+//   * flat  - every dword equal to the tile's first, i.e. cleared or never
+//             written - against VARIED, i.e. rasterised, and
+//   * = / * - whether the tile is BYTE-IDENTICAL to the previous sample.
 //
-// The buffer is deliberately never released: the probe is default-off, and a
-// lifetime hook here would be more code than the probe.
+// The second column is the one that named the defect. At the heavy city, rows
+// 256..720 of both the tiled colour and the tiled depth surface read the same
+// bytes in all 104 samples of a 104-second drive while rows 0..255 differ in
+// every one: written once, never again. "Wrong pixels" and "pixels nobody
+// writes any more" are different faults with different suspects, and only the
+// change column tells them apart.
+//
+// N-6-5 also fixed two instrument defects the N-6-4 handoff named:
+//   * ONE SLOT PER TAP. Slot 0 used to be shared by both band-1 colour taps,
+//     so the once-a-second sampler reported whichever arrived first and the
+//     two taps shared one rate limiter - a mixed population, which lies
+//     ([[census-dedupe-hides-the-lever]]). Slots are now keyed by destination.
+//   * The guest row labels assumed 4xMSAA (8 guest rows per tile row). The
+//     msaa-0 control slot has 16, so its labels read half the true row. The
+//     caller now passes the surface's own value.
+//
+// The readback buffers are deliberately never released: the probe is
+// default-off, and a lifetime hook here would be more code than the probe.
 constexpr uint32_t kTileDwords = xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples;
 
 template <typename TransitionFn>
 void NrDetileEdramProbe(D3D12CommandProcessor& command_processor, ID3D12Resource* edram_buffer,
-                        int slot, uint32_t edram_base, uint32_t rows, uint32_t pitch,
-                        uint32_t dest_base, TransitionFn&& transition) {
+                        uint64_t key, const char* name, uint32_t edram_base, uint32_t rows,
+                        uint32_t pitch, uint32_t guest_rows_per_tile_row, uint32_t dest_base,
+                        uint32_t copy_control, bool direct_resolved, TransitionFn&& transition) {
   struct Slot {
     ID3D12Resource* readback = nullptr;
+    const char* name = "";
     uint32_t pending_rows = 0;
     uint32_t pending_pitch = 0;
     uint32_t pending_dest = 0;
     uint32_t pending_base = 0;
+    uint32_t pending_guest_rows = 8;
+    uint32_t pending_ctrl = 0;
+    bool pending_direct = false;
+    std::vector<uint64_t> prev_digest;
     std::chrono::steady_clock::time_point last{};
   };
-  static Slot s_slots[3];
-  Slot& sl = s_slots[slot];
-  ID3D12Resource*& s_readback = sl.readback;
-  uint32_t& s_pending_rows = sl.pending_rows;
-  uint32_t& s_pending_pitch = sl.pending_pitch;
-  uint32_t& s_pending_dest = sl.pending_dest;
-  uint32_t& s_pending_base = sl.pending_base;
+  // A cap, so a shape nobody predicted cannot grow the table without bound.
+  static std::map<uint64_t, Slot> s_slots;
+  auto slot_it = s_slots.find(key);
+  if (slot_it == s_slots.end()) {
+    if (s_slots.size() >= 12) {
+      return;
+    }
+    slot_it = s_slots.emplace(key, Slot()).first;
+  }
+  Slot& sl = slot_it->second;
+  sl.name = name;
 
   const auto now = std::chrono::steady_clock::now();
   if (sl.last.time_since_epoch().count() && now - sl.last < std::chrono::seconds(1)) {
@@ -299,57 +353,68 @@ void NrDetileEdramProbe(D3D12CommandProcessor& command_processor, ID3D12Resource
 
   // Report the PREVIOUS capture before overwriting it. A second has passed, so
   // the copy that produced it has long since been submitted and retired.
-  if (s_readback && s_pending_rows) {
+  if (sl.readback && sl.pending_rows) {
     void* mapping = nullptr;
-    if (SUCCEEDED(s_readback->Map(0, nullptr, &mapping))) {
+    if (SUCCEEDED(sl.readback->Map(0, nullptr, &mapping))) {
       const uint32_t* const dwords = static_cast<const uint32_t*>(mapping);
       std::string report;
-      for (uint32_t tile_row = 0; tile_row < s_pending_rows; tile_row += 4) {
+      uint32_t sampled = 0;
+      uint32_t frozen = 0;
+      std::vector<uint64_t> digest;
+      for (uint32_t tile_row = 0; tile_row < sl.pending_rows; tile_row += 4) {
         // Middle of the row, so a letterboxed or half-width surface still
         // lands on real content.
-        const uint32_t tile = tile_row * s_pending_pitch + s_pending_pitch / 2;
+        const uint32_t tile = tile_row * sl.pending_pitch + sl.pending_pitch / 2;
         const uint32_t* const tile_dwords = dwords + size_t(tile) * kTileDwords;
         uint32_t differing = 0;
-        for (uint32_t i = 1; i < kTileDwords; ++i) {
-          differing += tile_dwords[i] != tile_dwords[0] ? 1 : 0;
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < kTileDwords; ++i) {
+          differing += (i && tile_dwords[i] != tile_dwords[0]) ? 1 : 0;
+          h = (h ^ tile_dwords[i]) * 1099511628211ull;
         }
-        report += fmt::format(" r{}={}{}({:08X})", tile_row * 8,
+        const size_t index = digest.size();
+        const bool same = index < sl.prev_digest.size() && sl.prev_digest[index] == h;
+        digest.push_back(h);
+        ++sampled;
+        frozen += same ? 1 : 0;
+        report += fmt::format(" r{}{}{}{}({:08X})", tile_row * sl.pending_guest_rows,
+                              sl.prev_digest.empty() ? "?" : (same ? "=" : "*"),
                               differing ? "VARIED" : "flat", differing, tile_dwords[0]);
       }
       D3D12_RANGE write_range = {};
-      s_readback->Unmap(0, &write_range);
+      sl.readback->Unmap(0, &write_range);
       // A whole-span non-zero count is the honest answer to "did the copy
       // land at all": a broken readback is all zeros everywhere, a black but
       // real surface is zeros with a plausible structure.
       uint64_t nonzero = 0;
-      const size_t span_dwords =
-          size_t(s_pending_rows) * s_pending_pitch * kTileDwords;
+      const size_t span_dwords = size_t(sl.pending_rows) * sl.pending_pitch * kTileDwords;
       for (size_t i = 0; i < span_dwords; ++i) {
         nonzero += dwords[i] != 0 ? 1 : 0;
       }
       REXGPU_INFO(
-          "[nr-detile-edram] slot={} ({}) dest={:08X} base={}t span={}rows x {}t nonzero={}/{}"
-          " | guest row = flat|VARIED differing(tile[0]):{}",
-          slot, slot == 0 ? "tiled color" : (slot == 1 ? "post color CONTROL" : "tiled depth"),
-          s_pending_dest, s_pending_base, s_pending_rows, s_pending_pitch, nonzero, span_dwords,
-          report);
+          "[nr-detile-edram] {} dest={:08X} ctrl={:08X} direct={} base={}t span={}rows x {}t "
+          "nonzero={}/{} | unchanged since last sample: {}/{} | guest row = ?|=|* then "
+          "flat|VARIED differing(tile[0]):{}",
+          sl.name, sl.pending_dest, sl.pending_ctrl, sl.pending_direct ? 1 : 0, sl.pending_base,
+          sl.pending_rows, sl.pending_pitch, nonzero, span_dwords, frozen, sampled, report);
+      sl.prev_digest = std::move(digest);
     }
-    s_pending_rows = 0;
+    sl.pending_rows = 0;
   }
 
   sl.last = now;
 
   const uint64_t span_bytes = uint64_t(rows) * pitch * xenos::kEdramTileWidthSamples *
                               xenos::kEdramTileHeightSamples * sizeof(uint32_t);
-  if (!s_readback) {
+  if (!sl.readback) {
     D3D12_RESOURCE_DESC desc;
     ui::d3d12::util::FillBufferResourceDesc(desc, xenos::kEdramSizeBytes,
                                             D3D12_RESOURCE_FLAG_NONE);
     const ui::d3d12::D3D12Provider& provider = command_processor.GetD3D12Provider();
     if (FAILED(provider.GetDevice()->CreateCommittedResource(
             &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
-            &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s_readback)))) {
-      REXGPU_WARN("[nr-detile-edram] could not create the readback buffer");
+            &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sl.readback)))) {
+      REXGPU_WARN("[nr-detile-edram] could not create the readback buffer for {}", name);
       return;
     }
   }
@@ -361,12 +426,15 @@ void NrDetileEdramProbe(D3D12CommandProcessor& command_processor, ID3D12Resource
   transition(D3D12_RESOURCE_STATE_COPY_SOURCE);
   command_processor.SubmitBarriers();
   command_processor.GetDeferredCommandList().D3DCopyBufferRegion(
-      s_readback, 0, edram_buffer, uint64_t(edram_base) * kTileDwords * sizeof(uint32_t),
+      sl.readback, 0, edram_buffer, uint64_t(edram_base) * kTileDwords * sizeof(uint32_t),
       span_bytes);
-  s_pending_rows = rows;
-  s_pending_pitch = pitch;
-  s_pending_dest = dest_base;
-  s_pending_base = edram_base;
+  sl.pending_rows = rows;
+  sl.pending_pitch = pitch;
+  sl.pending_dest = dest_base;
+  sl.pending_base = edram_base;
+  sl.pending_guest_rows = guest_rows_per_tile_row;
+  sl.pending_ctrl = copy_control;
+  sl.pending_direct = direct_resolved;
 }
 
 // Picks the patched blob when the wrap constant was found, the original
@@ -1586,33 +1654,43 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
         }
 
-        // [NR-DETILE] N-6-2. The pixels themselves, for the band-1 colour tap.
+        // [NR-DETILE] N-6-2, re-keyed in N-6-5. The pixels themselves.
         if (REXCVAR_GET(gpu_nr_detile_edram_probe)) {
           uint32_t ep_base, ep_row_len, ep_rows, ep_pitch;
           resolve_info.GetCopyEdramTileSpan(ep_base, ep_row_len, ep_rows, ep_pitch);
-          // Gate to the packet this names: the de-tiled full-frame colour tap
-          // is base 0, 32 tiles of pitch, 90 tile rows (720 guest rows at
-          // 4xMSAA). Anything else is a different pass and must not report
-          // under this name.
-          // Slot 0 is the de-tiled full-frame colour tap (base 0, pitch 32,
-          // 90 tile rows). Slot 1 is the pitch-16 msaa-0 post resolve, which
-          // carries the image that actually reaches the screen - it is the
-          // instrument's own control. If slot 1 reads flat too, the probe is
-          // broken, not the render target.
-          int ep_slot = -1;
+          const bool ep_depth = resolve_info.IsCopyingDepth();
+          const draw_util::ResolveEdramInfo& ep_info =
+              ep_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+          // A tile is 16 samples tall; at 2x/4x MSAA two of them are one guest
+          // row, so a tile row is 8 guest rows there and 16 at 1x. The old
+          // probe assumed 8 unconditionally and mislabelled the msaa-0 control
+          // slot by a factor of two.
+          const uint32_t ep_guest_rows =
+              xenos::kEdramTileHeightSamples >>
+              uint32_t(xenos::MsaaSamples(ep_info.msaa_samples) >= xenos::MsaaSamples::k2X);
+          // Gate to the packets this names: the de-tiled full-frame taps are
+          // pitch 32, 90 tile rows (720 guest rows at 4xMSAA). The pitch-16
+          // msaa-0 post resolve carries the image that actually reaches the
+          // screen and is the instrument's own CONTROL - if it reads flat too,
+          // the probe is broken, not the render target.
+          //
+          // ONE SLOT PER TAP, keyed by destination: the two band-1 colour taps
+          // share every field this used to key on, and sharing a slot made
+          // them share a rate limiter too.
+          const char* ep_name = nullptr;
           if (ep_pitch == 32 && ep_rows >= 90) {
-            // Slot 0 the de-tiled full-frame colour tap, slot 2 the depth
-            // surface beside it. If the colour rows below 256 are flat, the
-            // next question is whether depth below 256 was ever cleared.
-            ep_slot = resolve_info.IsCopyingDepth() ? 2 : 0;
-          } else if (ep_base == 0 && ep_pitch == 16 && ep_rows >= 45 &&
-                     !resolve_info.IsCopyingDepth()) {
-            ep_slot = 1;
+            ep_name = ep_depth ? "tiled depth" : "tiled color";
+          } else if (ep_base == 0 && ep_pitch == 16 && ep_rows >= 45 && !ep_depth) {
+            ep_name = "post color CONTROL";
           }
-          if (ep_slot >= 0) {
+          if (ep_name) {
+            const uint64_t ep_key = (uint64_t(resolve_info.copy_dest_base) << 2) |
+                                    (ep_depth ? 1u : 0u) |
+                                    (ep_pitch == 16 ? 2u : 0u);
             NrDetileEdramProbe(
-                command_processor_, edram_buffer_, ep_slot, ep_base, ep_rows, ep_pitch,
-                resolve_info.copy_dest_base,
+                command_processor_, edram_buffer_, ep_key, ep_name, ep_base, ep_rows, ep_pitch,
+                ep_guest_rows, resolve_info.copy_dest_base, resolve_info.rb_copy_control.value,
+                direct_resolved,
                 [this](D3D12_RESOURCE_STATES state) { TransitionEdramBuffer(state); });
           }
         }
@@ -1756,13 +1834,62 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   if (clear_depth || clear_color) {
     switch (GetPath()) {
       case Path::kHostRenderTargets: {
-        Transfer::Rectangle clear_rectangle;
-        RenderTarget* clear_render_targets[2];
+        Transfer::Rectangle clear_rectangle = {};
+        RenderTarget* clear_render_targets[2] = {};
         // If PrepareHostRenderTargetsResolveClear returns false, may be just an
         // empty region (success) or an error - don't care.
-        if (PrepareHostRenderTargetsResolveClear(resolve_info, clear_rectangle,
-                                                 clear_render_targets[0], clear_transfers_[0],
-                                                 clear_render_targets[1], clear_transfers_[1])) {
+        const bool clear_prepared = PrepareHostRenderTargetsResolveClear(
+            resolve_info, clear_rectangle, clear_render_targets[0], clear_transfers_[0],
+            clear_render_targets[1], clear_transfers_[1]);
+        // [NR-DETILE] N-6-5. What the clear that rides this resolve actually
+        // covers. Deduped by shape so every DISTINCT clear reports once a
+        // second and none can hide behind a busier one.
+        if (REXCVAR_GET(gpu_nr_detile_clear_probe)) {
+          auto rt_desc = [](const RenderTarget* rt) {
+            if (!rt) {
+              return std::string("none");
+            }
+            RenderTargetKey k = rt->key();
+            return fmt::format("base={}t pitch={}t msaa={} depth={} fmt={}",
+                               uint32_t(k.base_tiles), uint32_t(k.pitch_tiles_at_32bpp),
+                               uint32_t(k.msaa_samples), uint32_t(k.is_depth),
+                               uint32_t(k.resource_format));
+          };
+          const uint64_t cp_sig =
+              (uint64_t(clear_rectangle.y_pixels) << 44) ^
+              (uint64_t(clear_rectangle.height_pixels) << 30) ^
+              (uint64_t(clear_rectangle.x_pixels) << 16) ^
+              uint64_t(clear_rectangle.width_pixels) ^
+              (uint64_t(resolve_info.rb_copy_control.value) << 52) ^
+              (uint64_t(clear_prepared) << 63);
+          static std::map<uint64_t, std::chrono::steady_clock::time_point> cp_seen;
+          const auto cp_now = std::chrono::steady_clock::now();
+          auto cp_it = cp_seen.find(cp_sig);
+          if (cp_it == cp_seen.end() || cp_now - cp_it->second >= std::chrono::seconds(1)) {
+            if (cp_seen.size() > 64) {
+              cp_seen.clear();
+            }
+            cp_seen[cp_sig] = cp_now;
+            REXGPU_INFO(
+                "[nr-detile] clear: prepared={} ctrl={:08X} depth={} color={} | rect x={} y={} "
+                "w={} h={} | resolve y={}..{} | depth RT {} (orig_base={}t edram_base={}t "
+                "pitch={}t) xfers={} | color RT {} (orig_base={}t edram_base={}t pitch={}t) "
+                "xfers={}",
+                clear_prepared ? 1 : 0, resolve_info.rb_copy_control.value, clear_depth ? 1 : 0,
+                clear_color ? 1 : 0, clear_rectangle.x_pixels, clear_rectangle.y_pixels,
+                clear_rectangle.width_pixels, clear_rectangle.height_pixels,
+                uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3,
+                (uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3) +
+                    (resolve_info.height_div_8 << 3),
+                rt_desc(clear_render_targets[0]), resolve_info.depth_original_base,
+                uint32_t(resolve_info.depth_edram_info.base_tiles),
+                uint32_t(resolve_info.depth_edram_info.pitch_tiles), clear_transfers_[0].size(),
+                rt_desc(clear_render_targets[1]), resolve_info.color_original_base,
+                uint32_t(resolve_info.color_edram_info.base_tiles),
+                uint32_t(resolve_info.color_edram_info.pitch_tiles), clear_transfers_[1].size());
+          }
+        }
+        if (clear_prepared) {
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
           clear_values[1] =

@@ -1095,7 +1095,17 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     depth_edram_info.format = uint32_t(rb_depth_info.depth_format);
     depth_edram_info.format_is_64bpp = 0;
     depth_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
-    info_out.depth_original_base = rb_depth_info.depth_base;
+    // [NR-DETILE] N-6-5. HOST space, like depth_edram_info.base_tiles above.
+    // The EDRAM expansion moved base_tiles through EdramGuestBaseToHost and
+    // left this one in guest space, and every reader wants them to AGREE:
+    // PrepareHostRenderTargetsResolveClear subtracts this from base_tiles to
+    // get the offset within the surface, masks the sum with kEdramTileCount-1,
+    // and uses it as RenderTargetKey::base_tiles - which is host space
+    // everywhere else. With guest 1024 against host 4096 the subtraction gave
+    // an offset of 3072 tiles = 96 tile rows, the clear rectangle's Y clamped
+    // to the render target height, its height came out 0, and the function
+    // returned false: EVERY resolve clear in the game silently did nothing.
+    info_out.depth_original_base = xenos::EdramGuestBaseToHost(rb_depth_info.depth_base);
   } else {
     info_out.depth_original_base = 0;
   }
@@ -1126,7 +1136,10 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
       // to create a new copy info structure with one more bit just for this).
       exp_bias = std::min(exp_bias + int32_t(5), int32_t(31));
     }
-    info_out.color_original_base = color_info.color_base;
+    // [NR-DETILE] N-6-5. HOST space - see depth_original_base above. Colour is
+    // base 0 in this title so it was accidentally right, but it must move with
+    // the depth one or the two bases are in different spaces again.
+    info_out.color_original_base = xenos::EdramGuestBaseToHost(color_info.color_base);
   } else {
     info_out.color_original_base = 0;
   }

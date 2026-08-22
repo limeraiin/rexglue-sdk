@@ -484,6 +484,12 @@ struct ResolveInfo {
   // are used for EDRAM emulation - the same as the base that the render target
   // will likely be used for drawing next, to prevent unneeded tile ownership
   // transfers between clears and first usage if clearing a subregion.
+  //
+  // [NR-DETILE] N-6-5: these are in OUR EXPANDED (host) tile space, exactly
+  // like depth_edram_info.base_tiles / color_edram_info.base_tiles, because
+  // PrepareHostRenderTargetsResolveClear subtracts them from those and uses
+  // the result as a RenderTargetKey base. Both sides must move together
+  // through xenos::EdramGuestBaseToHost or the clear silently no-ops.
   uint32_t depth_original_base;
   uint32_t color_original_base;
 
