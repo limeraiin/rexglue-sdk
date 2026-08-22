@@ -523,15 +523,20 @@ REXCVAR_DEFINE_INT32(gpu_nr_detile_widen_seg, -1, "GPU",
                      "duplicate. HUD below the band line missing by design "
                      "except at -1.");
 
-REXCVAR_DEFINE_INT32(gpu_nr_detile, 0, "GPU",
+REXCVAR_DEFINE_INT32(gpu_nr_detile, 1, "GPU",
                      "[nr-detile] N-5: render the frame ONCE instead of once "
                      "per EDRAM tile band - band 1 rasterises and resolves the "
                      "full frame height and the repeat bands are not executed. "
                      "Self-arming from the previous frame, with a "
                      "resolve-destination guard that disarms on violation. "
                      "0 = off, 1 = on, 2 = cycle 10 s on / 10 s off IN PLACE "
-                     "so one drive reads both halves at matched load. Off by "
-                     "default until the city gate.");
+                     "so one drive reads both halves at matched load. "
+                     "DEFAULT ON since the N-6-5 city gate: correct picture "
+                     "confirmed by drive, 56-61 fps at 2500-3000 band-1 draws "
+                     "per frame against ~43 shipping, and the EDRAM readback "
+                     "reports every sampled row r0..r704 changing every "
+                     "sample. Kept as a cvar for the A/B and the in-place "
+                     "cycle, not as a thing anyone has to set.");
 
 REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, true, "GPU",
                     "[nr-pb] N-2-2 item 0: under gpu_nr_skip, bulk-apply "
