@@ -165,12 +165,36 @@ constexpr uint32_t kEdramTileSamples =
 constexpr uint32_t kConsoleEdramWrapDwords = xenos::kEdramGuestTileCount * kEdramTileSamples;
 constexpr uint32_t kHostEdramWrapDwords = xenos::kEdramTileCount * kEdramTileSamples;
 
+// [N-6-6] The resolution-SCALED variants have no literal to find. Their tile
+// stride is not a compile-time constant (it is scale_x * scale_y * samples),
+// so they build the same modulus as a SHIFT:
+//
+//   imul null, r1.y, r7.z, r7.y     ; r1.y = tile samples, from the scales
+//   imad r0.x, r0.x, r1.y, r2.z     ; addr = tile * tile_samples + intra
+//   ishl r1.y, r1.y, l(11)          ; * 2048 = the console tile count
+//   udiv null, r0.x, r0.x, r1.y     ; addr %= that
+//
+// 11 is log2 of the console's 2048 tiles, and it is a shift AMOUNT, which is
+// why the value scan that fixed the unscaled blobs reported "0 patched, 9
+// left" at resolution_scale 2 and the bottom of the frame banded again.
+// tools/n6-scan-scaled-wrap.py verified the idiom is exact and unique: all 11
+// scaled blobs have exactly one ishl-immediately-before-udiv, all 11 unscaled
+// ones have none.
+constexpr uint32_t ConstexprLog2(uint32_t value) {
+  return value <= 1 ? 0 : 1 + ConstexprLog2(value >> 1);
+}
+constexpr uint32_t kConsoleEdramWrapShift = ConstexprLog2(xenos::kEdramGuestTileCount);
+constexpr uint32_t kHostEdramWrapShift = ConstexprLog2(xenos::kEdramTileCount);
+
 // Rewrites the console wrap constant in one vendored resolve blob. Returns
 // false (and leaves `patched` empty) when the constant is not a literal in the
 // shader code chunk, which is the case for the resolution-scaled variants:
 // they build the modulus at runtime as `tile_samples << 11` instead.
 bool PatchResolveShaderEdramWrap(const void* source, size_t source_size, const char* debug_name,
-                                 std::vector<uint8_t>& patched) {
+                                 std::vector<uint8_t>& patched, bool* by_shift_out = nullptr) {
+  if (by_shift_out) {
+    *by_shift_out = false;
+  }
   patched.clear();
   if (!source || source_size < sizeof(dxbc::ContainerHeader)) {
     return false;
@@ -195,6 +219,7 @@ bool PatchResolveShaderEdramWrap(const void* source, size_t source_size, const c
   // Only the executable code chunk - a stray match in RDEF strings or in the
   // statistics blob must not be rewritten.
   uint32_t replacements = 0;
+  uint32_t shift_replacements = 0;
   for (uint32_t blob_index = 0; blob_index < container_header.blob_count; ++blob_index) {
     const uint32_t blob_offset = blob_offsets[blob_index];
     if (blob_offset + sizeof(dxbc::BlobHeader) > source_size) {
@@ -216,19 +241,62 @@ bool PatchResolveShaderEdramWrap(const void* source, size_t source_size, const c
         ++replacements;
       }
     }
+
+    // [N-6-6] The scaled form. Walk the instruction stream by the length field
+    // alone - no operand decoding is needed to segment instructions - and
+    // rewrite the shift amount of an ISHL that is IMMEDIATELY followed by a
+    // UDIV. Anchoring on the pair rather than on the bare value 11 is what
+    // makes this safe: the blobs are full of other shifts by 11-ish amounts,
+    // and none of them feed a modulus.
+    if (body_dwords > 2) {
+      size_t prev_start = 0;
+      uint32_t prev_length = 0;
+      uint32_t prev_opcode = UINT32_MAX;
+      // The chunk opens with the version token and its own dword length.
+      size_t i = 2;
+      while (i < body_dwords) {
+        const uint32_t token = body[i];
+        const uint32_t opcode = token & 0x7FF;
+        uint32_t length = (token >> 24) & 0x7F;
+        if (opcode == uint32_t(dxbc::Opcode::kCustomData)) {
+          length = (i + 1 < body_dwords) ? body[i + 1] : 0;
+        }
+        if (!length || i + length > body_dwords) {
+          break;
+        }
+        if (opcode == uint32_t(dxbc::Opcode::kUDiv) &&
+            prev_opcode == uint32_t(dxbc::Opcode::kIShL) && prev_length >= 2) {
+          // Immediate operands come last, so the shift amount is the final
+          // dword of the ISHL.
+          uint32_t& shift = body[prev_start + prev_length - 1];
+          if (shift == kConsoleEdramWrapShift) {
+            shift = kHostEdramWrapShift;
+            ++shift_replacements;
+          }
+        }
+        prev_opcode = opcode;
+        prev_start = i;
+        prev_length = length;
+        i += length;
+      }
+    }
   }
 
-  if (!replacements) {
+  if (!replacements && !shift_replacements) {
     patched.clear();
     return false;
   }
-  // One wrap per shader. More than one means the blob changed shape under us
-  // and the assumption above needs re-checking against the disassembly.
-  if (replacements != 1) {
+  if (by_shift_out) {
+    *by_shift_out = shift_replacements != 0;
+  }
+  // One wrap per shader, in exactly one of the two forms. Anything else means
+  // the blob changed shape under us and the assumption above needs re-checking
+  // against the disassembly (tools/n6-scan-scaled-wrap.py prints it).
+  if (replacements + shift_replacements != 1) {
     REXGPU_WARN(
-        "D3D12RenderTargetCache: resolve shader {} had {} EDRAM wrap constants, "
-        "expected 1 - re-check the bytecode",
-        debug_name, replacements);
+        "D3D12RenderTargetCache: resolve shader {} had {} literal and {} shift "
+        "EDRAM wraps, expected 1 in total - re-check the bytecode",
+        debug_name, replacements, shift_replacements);
   }
 
   CalculateDXBCChecksum(reinterpret_cast<unsigned char*>(patched.data()),
@@ -443,7 +511,7 @@ struct ResolveShaderBytecode {
   ResolveShaderBytecode(const void* source, size_t source_size, const char* debug_name)
       : data(source), size(source_size) {
     if (kHostEdramWrapDwords != kConsoleEdramWrapDwords &&
-        PatchResolveShaderEdramWrap(source, source_size, debug_name, storage)) {
+        PatchResolveShaderEdramWrap(source, source_size, debug_name, storage, &by_shift)) {
       data = storage.data();
       size = storage.size();
       patched = true;
@@ -453,6 +521,9 @@ struct ResolveShaderBytecode {
   const void* data;
   size_t size;
   bool patched = false;
+  // True when the wrap was a shift amount rather than a literal, i.e. this is
+  // a resolution-scaled variant.
+  bool by_shift = false;
 };
 
 }  // namespace
@@ -719,6 +790,11 @@ bool D3D12RenderTargetCache::Initialize() {
   // Create the resolve copying pipelines.
   uint32_t resolve_shaders_edram_wrap_patched = 0;
   uint32_t resolve_shaders_edram_wrap_unpatched = 0;
+  // Broken out because the two forms fail independently: the literal one is
+  // what the unscaled blobs carry, the shift one what the resolution-scaled
+  // blobs build at runtime. Reporting only the total let "0 patched, 9 left"
+  // at resolution_scale 2 look like the same fix simply not applying.
+  uint32_t resolve_shaders_edram_wrap_by_shift = 0;
   for (size_t i = 0; i < size_t(draw_util::ResolveCopyShaderIndex::kCount); ++i) {
     const draw_util::ResolveCopyShaderInfo& resolve_copy_shader_info =
         draw_util::resolve_copy_shader_info[i];
@@ -734,6 +810,7 @@ bool D3D12RenderTargetCache::Initialize() {
         resolve_copy_shader_info.debug_name);
     resolve_shaders_edram_wrap_patched += resolve_copy_bytecode.patched ? 1 : 0;
     resolve_shaders_edram_wrap_unpatched += resolve_copy_bytecode.patched ? 0 : 1;
+    resolve_shaders_edram_wrap_by_shift += resolve_copy_bytecode.by_shift ? 1 : 0;
     ID3D12PipelineState* resolve_copy_pipeline = ui::d3d12::util::CreateComputePipeline(
         device, resolve_copy_bytecode.data, resolve_copy_bytecode.size,
         resolve_copy_root_signature_);
@@ -1308,6 +1385,7 @@ bool D3D12RenderTargetCache::Initialize() {
         "resolve_clear_32bpp");
     resolve_shaders_edram_wrap_patched += resolve_clear_32bpp_bytecode.patched ? 1 : 0;
     resolve_shaders_edram_wrap_unpatched += resolve_clear_32bpp_bytecode.patched ? 0 : 1;
+    resolve_shaders_edram_wrap_by_shift += resolve_clear_32bpp_bytecode.by_shift ? 1 : 0;
     resolve_rov_clear_32bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
         device, resolve_clear_32bpp_bytecode.data, resolve_clear_32bpp_bytecode.size,
         resolve_rov_clear_root_signature_);
@@ -1327,6 +1405,7 @@ bool D3D12RenderTargetCache::Initialize() {
         "resolve_clear_64bpp");
     resolve_shaders_edram_wrap_patched += resolve_clear_64bpp_bytecode.patched ? 1 : 0;
     resolve_shaders_edram_wrap_unpatched += resolve_clear_64bpp_bytecode.patched ? 0 : 1;
+    resolve_shaders_edram_wrap_by_shift += resolve_clear_64bpp_bytecode.by_shift ? 1 : 0;
     resolve_rov_clear_64bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
         device, resolve_clear_64bpp_bytecode.data, resolve_clear_64bpp_bytecode.size,
         resolve_rov_clear_root_signature_);
@@ -1347,14 +1426,21 @@ bool D3D12RenderTargetCache::Initialize() {
   // [N-6] Say out loud whether the console EDRAM wrap was rewritten. An
   // unpatched resolve shader still folds any address past tile
   // kEdramGuestTileCount back to zero, which is guest row 512 at the de-tiled
-  // pitch - the band artifact. The resolution-scaled variants build the
-  // modulus at runtime (`tile_samples << 11`) instead of taking it as a
-  // literal, so they are expected here and are still to be fixed.
+  // pitch - the band artifact.
+  //
+  // [N-6-6] Both forms are now rewritten, and the counts are broken out
+  // because they fail independently. The unscaled blobs carry the wrap as a
+  // literal; the resolution-scaled ones build it as `tile_samples << 11`,
+  // where 11 is log2 of the console tile count. At resolution_scale 2 only
+  // the scaled variants are ever created, so before this the line read
+  // "0 patched, 9 left" and 1440p banded while 720p did not. `left` must be 0
+  // at every resolution scale.
   REXGPU_INFO(
-      "D3D12RenderTargetCache: resolve EDRAM wrap {} -> {} dwords: {} shader(s) "
-      "patched, {} left on the console wrap",
-      kConsoleEdramWrapDwords, kHostEdramWrapDwords, resolve_shaders_edram_wrap_patched,
-      resolve_shaders_edram_wrap_unpatched);
+      "D3D12RenderTargetCache: resolve EDRAM wrap {} -> {} dwords (shift {} -> {}): "
+      "{} shader(s) patched, {} of them resolution-scaled, {} left on the console wrap",
+      kConsoleEdramWrapDwords, kHostEdramWrapDwords, kConsoleEdramWrapShift,
+      kHostEdramWrapShift, resolve_shaders_edram_wrap_patched,
+      resolve_shaders_edram_wrap_by_shift, resolve_shaders_edram_wrap_unpatched);
 
   InitializeCommon();
 
