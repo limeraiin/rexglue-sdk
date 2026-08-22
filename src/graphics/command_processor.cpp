@@ -498,6 +498,18 @@ REXCVAR_DEFINE_INT32(gpu_nr_detile_tail, -1, "GPU",
 // [NR-DETILE] N-6-2. The widen edits PA_SC_WINDOW_SCISSOR only, but the host
 // viewport rectangle scissors too. Prints band 1's own viewport intent beside
 // the scissor, gated to the tiled pass, once a second.
+// [NR-DETILE] N-6-3. The Xenos tiles by PREDICATION: the app records one
+// command buffer, each band sets PA_SC_WINDOW_OFFSET and a BIN_MASK, and every
+// object is preceded by a SET_BIN_SELECT carrying the bins its bounding box
+// touches. A predicated packet runs only where (bin_select & bin_mask) != 0.
+// If that is what the guest does here, band 1's draw stream is ALREADY
+// restricted to objects that touch band 1, and no amount of scissor widening
+// can make the rest appear - which is exactly what the city EDRAM readback
+// showed. This counts the predicate outcome, split by band.
+REXCVAR_DEFINE_BOOL(gpu_nr_detile_bin_probe, false, "GPU",
+                    "[nr-detile] Count predicated packets that pass and fail, "
+                    "split by band, once a second");
+
 REXCVAR_DEFINE_BOOL(gpu_nr_detile_vp_probe, false, "GPU",
                     "[nr-detile] Log the guest viewport and scissor of the "
                     "band-1 draws de-tile widens, once a second");
@@ -6412,6 +6424,41 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   // We also skip predicated swaps, as they are never valid (probably?).
   if (packet & 1) {
     bool any_pass = (bin_select_ & bin_mask_) != 0;
+    if (REXCVAR_GET(gpu_nr_detile_bin_probe)) {
+      // Band 1 is the pass with no window offset; the repeat bands carry a
+      // negative one. Split there, because the question is precisely whether
+      // band 1 is missing packets that the repeat bands run.
+      const uint32_t win = register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+      const int32_t win_y = (int32_t(win << 1) >> 16) / 2;
+      const int band = win_y ? 1 : 0;
+      static uint64_t s_pred[2] = {}, s_fail[2] = {}, s_draw[2] = {}, s_draw_fail[2] = {};
+      static uint64_t s_sel = 0, s_mask = 0;
+      static std::chrono::steady_clock::time_point s_last{};
+      ++s_pred[band];
+      s_fail[band] += any_pass ? 0 : 1;
+      const bool is_draw = opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2;
+      if (is_draw) {
+        ++s_draw[band];
+        s_draw_fail[band] += any_pass ? 0 : 1;
+        s_sel = bin_select_;
+        s_mask = bin_mask_;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now - s_last >= std::chrono::seconds(1)) {
+        s_last = now;
+        REXGPU_INFO(
+            "[nr-detile-bin] band0: pkt={} fail={} ({:.1f}%) draws={} dfail={} ({:.1f}%) | "
+            "repeat: pkt={} fail={} ({:.1f}%) draws={} dfail={} ({:.1f}%) | "
+            "last draw select={:016X} mask={:016X}",
+            s_pred[0], s_fail[0], s_pred[0] ? 100.0 * double(s_fail[0]) / double(s_pred[0]) : 0.0,
+            s_draw[0], s_draw_fail[0],
+            s_draw[0] ? 100.0 * double(s_draw_fail[0]) / double(s_draw[0]) : 0.0,
+            s_pred[1], s_fail[1], s_pred[1] ? 100.0 * double(s_fail[1]) / double(s_pred[1]) : 0.0,
+            s_draw[1], s_draw_fail[1],
+            s_draw[1] ? 100.0 * double(s_draw_fail[1]) / double(s_draw[1]) : 0.0,
+            s_sel, s_mask);
+      }
+    }
     if (!any_pass || opcode == PM4_XE_SWAP) {
       reader->AdvanceRead(count * sizeof(uint32_t));
       trace_writer_.WritePacketEnd();
