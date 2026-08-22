@@ -1244,9 +1244,11 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             rp_seen[rp_sig] = rp_now;
             REXGPU_INFO(
                 "[nr-detile] resolve: edram base={}t row_len={}t rows={} pitch={}t "
-                "| shader={} direct={} dest={:08X}",
+                "| shader={} direct={} dest={:08X} extent={:08X}+{:X} ({} rows of 1280x4)",
                 rp_base, rp_row_len, rp_rows, rp_pitch, uint32_t(copy_shader),
-                direct_resolved ? 1 : 0, resolve_info.copy_dest_base);
+                direct_resolved ? 1 : 0, resolve_info.copy_dest_base,
+                resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+                resolve_info.copy_dest_extent_length / (1280 * 4));
           }
         }
         if (!direct_resolved) {
@@ -3995,6 +3997,65 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     const Transfer::Rectangle* resolve_clear_rectangle) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
+  // [NR-DETILE] N-6. The resolve path measured correct end to end, so the
+  // mod-512 fold must already be in the render target when the resolve reads
+  // it. Ownership transfers are what write a render target other than
+  // rasterisation, so name every one: which tiles, into which target, out of
+  // which source. A transfer landing on dest rows 512..720 from source rows
+  // 0..208 is the bug. Deduped by signature so no shape hides behind a busier
+  // one, and reported even when the list is EMPTY for a target that has one -
+  // silence has been mistaken for absence twice in this hunt already.
+  if (REXCVAR_GET(gpu_nr_dump_probe) && render_target_transfers) {
+    for (uint32_t ti = 0; ti < render_target_count; ++ti) {
+      const RenderTarget* dest_rt = render_targets[ti];
+      if (!dest_rt || render_target_transfers[ti].empty()) {
+        continue;
+      }
+      RenderTargetKey dk = dest_rt->key();
+      // Only the tiled pass shape is interesting here: 4xMSAA, 32-tile pitch.
+      const uint64_t tf_sig = (uint64_t(dk.base_tiles) << 40) ^
+                              (uint64_t(dk.pitch_tiles_at_32bpp) << 24) ^
+                              (uint64_t(dk.msaa_samples) << 16) ^
+                              (uint64_t(dk.is_depth) << 8) ^
+                              uint64_t(render_target_transfers[ti].size());
+      static std::map<uint64_t, std::chrono::steady_clock::time_point> tf_seen;
+      const auto tf_now = std::chrono::steady_clock::now();
+      auto tf_it = tf_seen.find(tf_sig);
+      if (tf_it != tf_seen.end() && tf_now - tf_it->second < std::chrono::seconds(1)) {
+        continue;
+      }
+      if (tf_seen.size() > 64) {
+        tf_seen.clear();
+      }
+      tf_seen[tf_sig] = tf_now;
+      const uint32_t dest_rows_per_tile_row =
+          xenos::kEdramTileHeightSamples >>
+          uint32_t(dk.msaa_samples >= xenos::MsaaSamples::k2X);
+      std::string tf;
+      for (const Transfer& t : render_target_transfers[ti]) {
+        RenderTargetKey sk = t.source ? t.source->key() : RenderTargetKey();
+        // Destination rows this tile range lands on, in the dest RT's own
+        // layout - the number that has to be compared against 512..720.
+        const uint32_t dr0 = dk.pitch_tiles_at_32bpp
+                                 ? (t.start_tiles - std::min(t.start_tiles, uint32_t(dk.base_tiles))) /
+                                       dk.pitch_tiles_at_32bpp * dest_rows_per_tile_row
+                                 : 0;
+        const uint32_t dr1 = dk.pitch_tiles_at_32bpp
+                                 ? (t.end_tiles - std::min(t.end_tiles, uint32_t(dk.base_tiles))) /
+                                       dk.pitch_tiles_at_32bpp * dest_rows_per_tile_row
+                                 : 0;
+        tf += fmt::format(" [{}..{}t -> destrows {}..{} <- src base={}t pitch={}t msaa={} depth={}]",
+                          t.start_tiles, t.end_tiles, dr0, dr1, uint32_t(sk.base_tiles),
+                          uint32_t(sk.pitch_tiles_at_32bpp), uint32_t(sk.msaa_samples),
+                          uint32_t(sk.is_depth));
+      }
+      REXGPU_INFO("[nr-detile] xfer: dest base={}t pitch={}t msaa={} depth={} | {} transfer(s):{}",
+                  uint32_t(dk.base_tiles), uint32_t(dk.pitch_tiles_at_32bpp),
+                  uint32_t(dk.msaa_samples), uint32_t(dk.is_depth),
+                  render_target_transfers[ti].size(), tf);
+    }
+  }
+
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
@@ -5803,10 +5864,16 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
       std::string dp;
       for (const ResolveCopyDumpRectangle& r : dump_rectangles_) {
         RenderTargetKey k = r.render_target ? r.render_target->key() : RenderTargetKey();
-        dp += fmt::format(" [rows {}..{} start={} end={} <- RT base={}t pitch={}t msaa={} depth={}]",
-                          r.row_first, r.row_first + r.rows, r.row_first_start, r.row_last_end,
-                          uint32_t(k.base_tiles), uint32_t(k.pitch_tiles_at_32bpp),
-                          uint32_t(k.msaa_samples), uint32_t(k.is_depth));
+        // The HOST texture height is the open question: the dump reads RT rows
+        // 0..720, and if the texture is shorter the read can fold back. Note
+        // that the edram: line's h= is height_used (ownership), NOT this.
+        const uint32_t rt_h = GetRenderTargetHeight(k.pitch_tiles_at_32bpp, k.msaa_samples);
+        dp += fmt::format(
+            " [rows {}..{} start={} end={} <- RT base={}t pitch={}t msaa={} depth={} "
+            "hostH={} scaleY={}]",
+            r.row_first, r.row_first + r.rows, r.row_first_start, r.row_last_end,
+            uint32_t(k.base_tiles), uint32_t(k.pitch_tiles_at_32bpp),
+            uint32_t(k.msaa_samples), uint32_t(k.is_depth), rt_h, draw_resolution_scale_y());
       }
       REXGPU_INFO(
           "[nr-detile] dump: base={}t row_len={}t rows={} pitch={}t -> {} rect(s):{}",
