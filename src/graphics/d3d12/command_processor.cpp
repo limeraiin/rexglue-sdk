@@ -29,6 +29,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
 #include <rex/graphics/nr_descriptors.h>
+#include <rex/graphics/nr_detile.h>
 #include <rex/graphics/nr_residency.h>
 #include <rex/graphics/nr_sys_constants.h>
 #include <rex/graphics/nr_native_pso.h>
@@ -165,10 +166,11 @@ REXCVAR_DEFINE_BOOL(gpu_instance_probe, false, "GPU/D3D12",
 // gpu_allow_invalid_upload_range, which defaults to reject). always_persist
 // keeps the value written to naruto.toml either way, so anyone who does see
 // flashing can flip this to false without knowing the key exists.
-REXCVAR_DEFINE_BOOL(gpu_instance, true, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(gpu_instance, false, "GPU/D3D12",
                     "Coalesce consecutive identical-except-transform draws into one "
                     "instanced draw (vertex-shader SV_InstanceID per-instance constants). "
-                    "On by default (experimental); reports '[gpu-inst]'.")
+                    "OFF by default: the NR-era city A/B measured the merge capped at 7.5% "
+                    "and fps neutral. Reports '[gpu-inst]'.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .always_persist();
 
@@ -202,12 +204,13 @@ REXCVAR_DEFINE_BOOL(gpu_nr_bindings, false, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-SYS] Phase 5-3b-1: the system-constants mirror's gate.
-REXCVAR_DEFINE_BOOL(gpu_nr_sysconst, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(gpu_nr_sysconst, true, "GPU/D3D12",
                     "[NR-SYS] Phase 5-3b-1 system-constants mirror: re-derive the system "
                     "constants (UpdateSystemConstantValues) from the draw register file "
                     "with the native renderer's own transcription and byte-compare the "
                     "whole struct against the emulated one after every update. Reports "
-                    "'[nr-sys]' once/sec. Diagnostic only, off by default.")
+                    "'[nr-sys]' once/sec. ON by default: this mirror is what the bindings "
+                    "swap uploads from.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-DSC] Phase 5-3b-2: the descriptor/sampler mirror's gate.
@@ -222,14 +225,14 @@ REXCVAR_DEFINE_BOOL(gpu_nr_desc, false, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-SWP] Phase 5-3b swap: our own UpdateBindings for eligible draws.
-REXCVAR_DEFINE_BOOL(gpu_nr_bindings_swap, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(gpu_nr_bindings_swap, true, "GPU/D3D12",
                     "[NR-SWP] Phase 5-3b swap: assemble each draw's bindings with the "
                     "native renderer's own UpdateBindings (system constants from the "
                     "5-3b-1 mirror, guest cbuffers via the 5-3b-0 packers, samplers via "
                     "the 5-3b-2 derivation, SRV index values via the 5-3b-3 maps, root "
                     "parameters transcribed) instead of the emulated one; per-draw "
                     "fallback, counted. Requires gpu_nr_sysconst and gpu_nr_residency. "
-                    "Reports '[nr-swp]' once/sec. Off by default.")
+                    "Reports '[nr-swp]' once/sec. ON by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-LEAN] Phase 5-4-4b inc 2b: skip the emulated sysconst derivation.
@@ -286,14 +289,14 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_v2b, false, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-RSY] Phase 5-3b-3: the residency + descriptor-allocation mirror's gate.
-REXCVAR_DEFINE_BOOL(gpu_nr_residency, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(gpu_nr_residency, true, "GPU/D3D12",
                     "[NR-RSY] Phase 5-3b-3 residency mirror: predict every vertex/index "
                     "buffer shared-memory residency request from the draw register file "
                     "with the native renderer's own transcription of the sync-state "
                     "machine, mirror the bindless view-descriptor pool and the "
                     "per-texture SRV descriptor maps, and compare the texture SRV index "
                     "values against every emulated descriptor-indices rebuild. Reports "
-                    "'[nr-rsy]' once/sec. Diagnostic only, off by default.")
+                    "'[nr-rsy]' once/sec. ON by default: the bindings swap requires it.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-TILP] N-4-2 outer stamps, defined in graphics/command_processor.cpp
@@ -1716,6 +1719,31 @@ bool NrTileSysFast(nr::NrSysConstants* state, size_t rec_index,
     std::memcpy(g_tile_sys_ndc, ndc, sizeof(ndc));
   }
   return changed;
+}
+
+// [NR-DETILE] N-5: the DRAW half of the band-1 widening. Band 1 rasterises the
+// whole frame so the two repeat bands become dead work.
+//
+// ⚠ This deliberately does NOT live in draw_util::GetScissor. GetResolveInfo
+// calls GetScissor too and uses it as a CLAMP; city drive 1 widened it there
+// and thereby removed the clamp that keeps a resolve inside its band, which
+// broke every frame below row 256. Draw and resolve want opposite things from
+// the same register, so they get two separate edits.
+//
+// Called with the scissor in GUEST pixels, before the resolution scaling.
+void NrDetileWidenDrawScissor(const RegisterFile& regs, draw_util::Scissor& scissor) {
+  const nr::DetileRegs dt{regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+                          regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                          regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+                          regs[XE_GPU_REG_RB_SURFACE_INFO],
+                          regs[XE_GPU_REG_RB_COLOR_INFO],
+                          regs[XE_GPU_REG_RB_DEPTH_INFO]};
+  const uint32_t full_height = nr::DetileBand0FullHeight(dt);
+  if (!full_height || scissor.offset[1] + scissor.extent[1] >= full_height) {
+    return;
+  }
+  scissor.extent[1] = full_height - scissor.offset[1];
+  nr::DetileCountScissorWidened();
 }
 
 bool NrTileCtxEq(const SprCtx& a, const SprCtx& b, uint32_t* why) {
@@ -5918,6 +5946,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                               : std::chrono::steady_clock::time_point{};
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  NrDetileWidenDrawScissor(regs, scissor);
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
@@ -8111,6 +8140,7 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
   }
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  NrDetileWidenDrawScissor(regs, scissor);
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
@@ -8968,6 +8998,7 @@ bool D3D12CommandProcessor::NrTileReplayTry() {
   }
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  NrDetileWidenDrawScissor(regs, scissor);
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
@@ -10449,7 +10480,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       dirty |= system_constants_.edram_rt_keep_mask[i][1] != rt_keep_masks[i][1];
       system_constants_.edram_rt_keep_mask[i][1] = rt_keep_masks[i][1];
       if (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX) {
-        uint32_t rt_base_dwords_scaled = color_info.color_base * edram_tile_dwords_scaled;
+        uint32_t rt_base_dwords_scaled = xenos::EdramGuestBaseToHost(color_info.color_base) * edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] != rt_base_dwords_scaled;
         system_constants_.edram_rt_base_dwords_scaled[i] = rt_base_dwords_scaled;
         uint32_t format_flags = RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
@@ -10469,7 +10500,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   if (edram_rov_used) {
-    uint32_t depth_base_dwords_scaled = rb_depth_info.depth_base * edram_tile_dwords_scaled;
+    uint32_t depth_base_dwords_scaled = xenos::EdramGuestBaseToHost(rb_depth_info.depth_base) * edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled != depth_base_dwords_scaled;
     system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
 

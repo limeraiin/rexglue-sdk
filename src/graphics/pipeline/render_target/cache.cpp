@@ -21,6 +21,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
+#include <rex/graphics/nr_detile.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -515,7 +516,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
       depth_and_color_rts_used_bits |= 1;
       auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-      edram_bases[0] = rb_depth_info.depth_base;
+      edram_bases[0] = xenos::EdramGuestBaseToHost(rb_depth_info.depth_base);
       // With pixel shader interlock, always the same addressing disregarding
       // the format.
       resource_formats[0] = interlock_barrier_only ? 0 : uint32_t(rb_depth_info.depth_format);
@@ -527,7 +528,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
       uint32_t rt_bit_index = 1 + i;
       depth_and_color_rts_used_bits |= uint32_t(1) << rt_bit_index;
-      edram_bases[rt_bit_index] = color_info.color_base;
+      edram_bases[rt_bit_index] = xenos::EdramGuestBaseToHost(color_info.color_base);
       xenos::ColorRenderTargetFormat color_format =
           regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_format;
       bool is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_format);
@@ -631,6 +632,25 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                        ? REXCVAR_GET(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend)
                        : true,
                    vertex_shader));
+
+  // [NR-DETILE] N-5 diagnostic: this is the number that decides how much EDRAM
+  // the render targets own, and therefore how much of what band 1 rasterises
+  // the resolve can reach. Reported on the [nr-detile] line.
+  nr::DetileNoteHeightUsed(height_used);
+  // [NR-DETILE] N-5 diagnostic: the whole EDRAM layout, deduped per second.
+  // Under the expansion the tiled colour surface grows from 1024 to 3072 tiles,
+  // so which surfaces it now overlaps - and at what MSAA, since a tile maps to
+  // a different number of pixel rows at 1x than at 4x - is worth reading
+  // directly rather than deriving.
+  {
+    uint32_t dt_rts = depth_and_color_rts_used_bits;
+    uint32_t dt_index;
+    while (rex::bit_scan_forward(dt_rts, &dt_index)) {
+      dt_rts &= ~(uint32_t(1) << dt_index);
+      nr::DetileNoteRenderTarget(edram_bases[dt_index], pitch_tiles_at_32bpp,
+                                 uint32_t(msaa_samples), dt_index == 0, height_used);
+    }
+  }
 
   // Sorted by EDRAM base and then by index in the pipeline - for simplicity,
   // treat render targets placed closer to the end of the EDRAM as truncating
@@ -866,8 +886,13 @@ uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
   static_assert(!(xenos::kTexture2DCubeMaxWidthHeight % xenos::kEdramTileHeightSamples),
                 "Maximum guest render target height is assumed to always be a multiple "
                 "of an EDRAM tile height");
-  uint32_t max_height_scaled = std::min(
-      xenos::kTexture2DCubeMaxWidthHeight * draw_resolution_scale_y(), GetMaxRenderTargetHeight());
+  // [N-5 DE-TILE] ...and to the tallest surface the guest can actually ask
+  // for. Without this the EDRAM expansion (xenos::kEdramExpandLog2) would make
+  // every render target 4x taller than any 720p surface needs.
+  uint32_t max_height_scaled =
+      std::min({xenos::kTexture2DCubeMaxWidthHeight * draw_resolution_scale_y(),
+                GetMaxRenderTargetHeight(),
+                xenos::kMaxUsefulRenderTargetHeight * draw_resolution_scale_y()});
   uint32_t msaa_samples_y_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
   uint32_t tile_height_samples_scaled = xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
   tile_rows =
@@ -1210,6 +1235,13 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
                 "expect to fully cover the EDRAM without exceeding the maximum guest "
                 "render target height.");
   if (kHeight * draw_resolution_scale_y() > GetMaxRenderTargetHeight()) {
+    return nullptr;
+  }
+  // [N-5 DE-TILE] The useful-height clamp in GetRenderTargetHeight can leave a
+  // render target shorter than a full-EDRAM snapshot needs. Refuse the restore
+  // rather than write into a target that cannot hold it. (Trace playback only;
+  // nothing in normal play reaches here.)
+  if (GetRenderTargetHeight(kPitchTilesAt32bpp, xenos::MsaaSamples::k1X) < kHeight) {
     return nullptr;
   }
   RenderTargetKey render_target_key;

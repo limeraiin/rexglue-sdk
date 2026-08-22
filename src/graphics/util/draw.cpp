@@ -15,6 +15,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/nr_detile.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -537,6 +538,18 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_su
   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   int32_t br_x = int32_t(pa_sc_window_scissor_br.br_x);
   int32_t br_y = int32_t(pa_sc_window_scissor_br.br_y);
+  // [NR-DETILE] ⚠ THE BAND-1 WIDENING DELIBERATELY DOES NOT LIVE HERE.
+  // City drive 1 (naruto_543) put it here so that every consumer would agree,
+  // and that was wrong: GetResolveInfo is also a consumer, and it uses this
+  // scissor for the OPPOSITE purpose - to CLAMP the resolve rect down. Two of
+  // the tiled pass's three resolve taps carry full-screen resolve vertices and
+  // rely on that clamp to keep them inside their band, so widening here let
+  // them resolve past what band 1 had rendered and produced a wrong frame
+  // below row 256.
+  // The draw half now lives in D3D12CommandProcessor (NrDetileWidenDrawScissor,
+  // applied right after each draw-path GetScissor call), and the resolve half
+  // is the explicit y1 extension in GetResolveInfo. Same register, two
+  // consumers, opposite needs, two separate edits.
   if (!pa_sc_window_scissor_tl.window_offset_disable) {
     auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
     tl_x += pa_sc_window_offset.window_x_offset;
@@ -840,6 +853,37 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   x1 = std::clamp(x1, int32_t(scissor.offset[0]), scissor_right);
   y1 = std::clamp(y1, int32_t(scissor.offset[1]), scissor_bottom);
 
+  // [NR-DETILE] N-5: band 1's resolve covers the WHOLE frame, which is what
+  // makes the two skipped bands' resolves unnecessary. The destination follows
+  // for free - y0 is still 0, so dest_base_y is 0 and copy_dest_base_adjusted
+  // stays exactly the guest's RB_COPY_DEST_BASE - and the copy then writes the
+  // union of the three strips, which the offline census proved is one
+  // contiguous texture (+0x140000 per band, exactly tiled_offset(0, 256, 1280,
+  // 32bpp), with RB_COPY_DEST_PITCH declaring 1280x720). The colour and depth
+  // clears that ride a resolve are driven by this same rect, so all 720 rows
+  // are cleared exactly once per frame, after being resolved.
+  {
+    const nr::DetileRegs dt{regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+                            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+                            regs[XE_GPU_REG_RB_SURFACE_INFO],
+                            regs[XE_GPU_REG_RB_COLOR_INFO],
+                            regs[XE_GPU_REG_RB_DEPTH_INFO]};
+    const uint32_t detile_full_height = nr::DetileResolveFullHeight(dt);
+    if (detile_full_height && y1 < int32_t(detile_full_height)) {
+      y1 = int32_t(detile_full_height);
+      nr::DetileCountExtendedResolve();
+    }
+    // Record what this band-1 tap ACTUALLY resolved. Drive 2 narrowed the
+    // remaining defect to one overlay class duplicated exactly one band down,
+    // and the three taps are the three moments the frame is snapshotted - so
+    // the log has to show each tap's real rect and destination rather than the
+    // rect it was assumed to have.
+    nr::DetileNoteTap(dt, regs[XE_GPU_REG_RB_COPY_CONTROL],
+                      regs[XE_GPU_REG_RB_COPY_DEST_BASE],
+                      regs[XE_GPU_REG_RB_COPY_DEST_PITCH], uint32_t(y0), uint32_t(y1));
+  }
+
   assert_true(x0 <= x1 && y0 <= y1);
 
   // Direct3D 9's D3DDevice_Resolve internally rounds the right/bottom of the
@@ -1041,7 +1085,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     depth_edram_info.is_depth = 1;
     // If wrapping happens, it's fine, it doesn't matter how many times and
     // where modulo xenos::kEdramTileCount is applied in this context.
-    depth_edram_info.base_tiles = rb_depth_info.depth_base + edram_base_offset_tiles;
+    depth_edram_info.base_tiles = xenos::EdramGuestBaseToHost(rb_depth_info.depth_base) + edram_base_offset_tiles;
     depth_edram_info.format = uint32_t(rb_depth_info.depth_format);
     depth_edram_info.format_is_64bpp = 0;
     depth_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
@@ -1062,7 +1106,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     color_edram_info.is_depth = 0;
     // If wrapping happens, it's fine, it doesn't matter how many times and
     // where modulo xenos::kEdramTileCount is applied in this context.
-    color_edram_info.base_tiles = color_info.color_base + (edram_base_offset_tiles << is_64bpp);
+    color_edram_info.base_tiles = xenos::EdramGuestBaseToHost(color_info.color_base) + (edram_base_offset_tiles << is_64bpp);
     color_edram_info.format = uint32_t(color_info.color_format);
     color_edram_info.format_is_64bpp = is_64bpp;
     color_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);

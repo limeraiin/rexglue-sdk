@@ -18,6 +18,7 @@
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/ucode.h>
+#include <rex/graphics/nr_detile.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/xenos.h>
@@ -272,6 +273,24 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
   // Scissor.
   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   int32_t scissor_bottom = int32_t(pa_sc_window_scissor_br.br_y);
+  // [NR-DETILE] N-5: this estimator reads PA_SC_WINDOW_SCISSOR_BR DIRECTLY
+  // rather than through draw_util::GetScissor, so the band-1 widening has to
+  // be repeated here - and it MUST be. The estimated height is what decides
+  // how much EDRAM the render target OWNS; leave it at the band height and
+  // band 1 would rasterise 720 rows into a target that only owns the first
+  // 256, and the resolve would find nothing behind rows 256..719.
+  {
+    const nr::DetileRegs dt{regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+                            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+                            regs[XE_GPU_REG_RB_SURFACE_INFO],
+                            regs[XE_GPU_REG_RB_COLOR_INFO],
+                            regs[XE_GPU_REG_RB_DEPTH_INFO]};
+    const uint32_t detile_full_height = nr::DetileBand0FullHeight(dt);
+    if (detile_full_height) {
+      scissor_bottom = int32_t(detile_full_height);
+    }
+  }
   bool scissor_window_offset = !regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>().window_offset_disable;
   if (scissor_window_offset) {
     scissor_bottom += window_y_offset;

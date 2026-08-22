@@ -31,6 +31,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/nr_buffer_cache.h>
 #include <rex/graphics/nr_context.h>
+#include <rex/graphics/nr_detile.h>
 #include <rex/graphics/nr_draw_cache.h>
 #include <rex/graphics/nr_state_walk.h>
 #include <rex/graphics/nr_draw_registry.h>
@@ -263,12 +264,12 @@ REXCVAR_DEFINE_BOOL(gpu_nr_pkt_census, false, "GPU",
 // proven gpu_nr_issue seam); the executor's per-packet framing for the other
 // ~96% of dispatches never runs. Eligibility: D3D12, no precord capture, no
 // open trace, no gpu_nr_issue_from/count bisection window.
-REXCVAR_DEFINE_BOOL(gpu_nr_skip, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_nr_skip, true, "GPU",
                     "[nr-skp] Phase 5-4-2: for eligible depth-1 indirect "
                     "buffers, skip the executor's packet loop and run the "
                     "lockstep walk as the only decoder (draws + non-stream "
                     "packets delegated to the executor's own handlers). "
-                    "Implies gpu_nr_issue and gpu_nr_walk_effects. Off by "
+                    "Implies gpu_nr_issue and gpu_nr_walk_effects. ON by "
                     "default.");
 
 // [NR-SPP] 5-4-4 step 0b: prices the skip path's halves. Whole-buffer bracket
@@ -461,6 +462,33 @@ REXCVAR_DEFINE_BOOL(gpu_nr_tmpl_swap_probe, false, "GPU",
                     "guard pass per span but NOT the replay, so the cost "
                     "half is measured alone against the same baseline. "
                     "Requires gpu_nr_tmpl_swap. Off by default.");
+
+// [NR-DETILE] N-5: the EDRAM tile loop, removed rather than made cheaper.
+// The offline census (tools/n5-detile-census.py) proved the repeat bands are
+// pure duplicates of band 1 and that the three resolve destinations are one
+// contiguous texture, so band 1 rasterising and resolving the full frame
+// height makes bands 2 and 3 dead work. Needs the expanded EDRAM
+// (xenos::kEdramExpandLog2) - a 720-row 4xMSAA colour+depth pair does not fit
+// a 10 MB one. See include/rex/graphics/nr_detile.h.
+// [NR-DETILE] N-5 drive-2 bisect. The three band-1 resolve taps are the three
+// moments the frame is snapshotted; extending exactly one of them at a time
+// says which extension duplicates the overlay, with no theory involved.
+REXCVAR_DEFINE_INT32(gpu_nr_detile_tap, -1, "GPU",
+                     "[nr-detile] Bisect: -1 extends every band-1 resolve tap "
+                     "to the full frame height (normal), 0..7 extends ONLY "
+                     "that tap and leaves the others at band height, -2 cycles "
+                     "8 s per phase through tap 0 / 1 / 2 / all so one drive "
+                     "names the tap. Wrong pixels by design except at -1.");
+
+REXCVAR_DEFINE_INT32(gpu_nr_detile, 0, "GPU",
+                     "[nr-detile] N-5: render the frame ONCE instead of once "
+                     "per EDRAM tile band - band 1 rasterises and resolves the "
+                     "full frame height and the repeat bands are not executed. "
+                     "Self-arming from the previous frame, with a "
+                     "resolve-destination guard that disarms on violation. "
+                     "0 = off, 1 = on, 2 = cycle 10 s on / 10 s off IN PLACE "
+                     "so one drive reads both halves at matched load. Off by "
+                     "default until the city gate.");
 
 REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, true, "GPU",
                     "[nr-pb] N-2-2 item 0: under gpu_nr_skip, bulk-apply "
@@ -1638,6 +1666,8 @@ bool g_nr_skip = false;
 bool g_nr_skip_bufactive = false;
 // [NR-TILE] N-4 probe latch + counters (CP thread only). See the cvar.
 int g_nr_tile_probe = 0;
+// [NR-DETILE] N-5 mode: 0 = off, 1 = on, 2 = cycle in place (see the cvar).
+int g_nr_detile_mode = 0;
 bool g_nr_tile_cycle = false;     // mode 3: walk 0/1/2 in place
 bool g_nr_tile_bufskip = false;   // mode 2: this buffer is a repeat band
 uint64_t g_tile_draws_skipped = 0, g_tile_draws_kept = 0;
@@ -3312,6 +3342,22 @@ void CommandProcessor::WorkerThreadMain() {
         "[nr-tile] PROBE ARMED mode={} - {} of every EDRAM tile band but the "
         "first is SKIPPED. Pixels outside band 1 are wrong by design.",
         g_nr_tile_probe, g_nr_tile_probe == 1 ? "the draws" : "the buffers");
+  }
+  // [NR-DETILE] N-5: rides the skip, because the observe-and-skip seam is the
+  // walk's own draw-stop loop. The per-frame value is recomputed at the swap
+  // (mode 2 cycles there); this only announces the mode and gates it.
+  g_nr_detile_mode = kNrSkip ? REXCVAR_GET(gpu_nr_detile) : 0;
+  if (g_nr_detile_mode && REXCVAR_GET(gpu_nr_detile_tap) >= 0) {
+    REXGPU_INFO(
+        "[nr-detile] TAP BISECT: only band-1 resolve tap {} is extended to "
+        "the full frame height. Wrong pixels by design.",
+        REXCVAR_GET(gpu_nr_detile_tap));
+  }
+  if (g_nr_detile_mode) {
+    REXGPU_INFO(
+        "[nr-detile] {}: the frame is rendered once instead of once per EDRAM "
+        "tile band (arming from the first frame that shows the bands).",
+        g_nr_detile_mode == 2 ? "CYCLE 10s ON / 10s OFF" : "ON");
   }
   // [NR-SPP] skip-path timing probe rides the skip.
   const bool kSkpProf = REXCVAR_GET(gpu_nr_skip_profile) && kNrSkip;
@@ -5697,6 +5743,35 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // register loads that are already in hand make the key.
     nr_tile_draw_addr_ = (ptr & 0x1FFFFFFFu) + stop.dword * 4;
     if (!stop.delegate) {
+      // [NR-DETILE] N-5. OBSERVE FIRST, THEN DECIDE: the band pattern is
+      // re-learned every frame from the packets themselves, including the ones
+      // whose dispatch we are about to drop. Observing after the skip would
+      // disarm the mode after one frame - the same self-latching trap that
+      // made tile probe mode 2 skip every band in naruto_505.
+      // Dropping only the DISPATCH is what makes this safe: the walk has
+      // already applied this packet's register payload, delegates (and with
+      // them the EVENT_WRITE fences the producer spin-waits on) are untouched,
+      // and nothing below 0x2000 is skipped.
+      {
+        const uint32_t* dt_rf = register_file_->values;
+        const nr::DetileRegs dt_regs{dt_rf[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+                                     dt_rf[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                                     dt_rf[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+                                     dt_rf[XE_GPU_REG_RB_SURFACE_INFO],
+                                     dt_rf[XE_GPU_REG_RB_COLOR_INFO],
+                                     dt_rf[XE_GPU_REG_RB_DEPTH_INFO]};
+        const bool dt_is_resolve =
+            (dt_rf[XE_GPU_REG_RB_MODECONTROL] & 0x7) == uint32_t(xenos::EdramMode::kCopy);
+        nr::DetileObserve(dt_regs, dt_is_resolve, dt_rf[XE_GPU_REG_RB_COPY_DEST_BASE]);
+        if (nr::DetileIsRepeatBand(dt_regs)) {
+          if (dt_is_resolve) {
+            nr::DetileCountSkippedResolve();
+          } else {
+            nr::DetileCountSkippedDraw();
+          }
+          continue;
+        }
+      }
       // [NR-TILE] N-4 probe mode 1: skip the draw dispatch for every repeat
       // tile band. Only opcode 0x22 is dropped, so the copy-mode draws that
       // carry the resolves (all 0x36) still run and band 1 still presents.
@@ -6544,6 +6619,104 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   ++counter_;
   // Pure presented-frame tally (real swaps only, no vblank pollution).
   swap_counter_.fetch_add(1, std::memory_order_relaxed);
+
+  // [NR-DETILE] N-5: the frame boundary. Promote this frame's observation of
+  // the tile bands into the next frame's arming, and report once a second.
+  {
+    // Mode 2 cycles the lever 10 s on / 10 s off IN PLACE, so one drive reads
+    // both halves at matched draws-per-frame. A cross-run fps comparison at
+    // this scale is noise up to 3.4 fps; an in-place cycle is not.
+    bool dt_on = g_nr_detile_mode == 1;
+    if (g_nr_detile_mode == 2) {
+      static const auto dt_t0 = std::chrono::steady_clock::now();
+      const auto dt_el = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now() - dt_t0)
+                             .count();
+      dt_on = ((dt_el / 10) & 1) != 0;
+    }
+    static bool dt_was_on = false;
+    if (dt_on != dt_was_on) {
+      dt_was_on = dt_on;
+      REXGPU_INFO("[nr-detile] PHASE {} - the EDRAM tile bands are {}.",
+                  dt_on ? "ON" : "OFF",
+                  dt_on ? "collapsed into one full-frame pass"
+                        : "all executed (control)");
+    }
+    nr::DetileSetEnabled(dt_on);
+    // [NR-DETILE] tap bisect. -2 cycles 8 s per phase through "only tap 0",
+    // "only tap 1", "only tap 2", "all taps", so ONE drive says which band-1
+    // resolve extension introduces the duplicated overlay. Phases 0-2 have
+    // wrong pixels by design.
+    {
+      int32_t dt_tap = REXCVAR_GET(gpu_nr_detile_tap);
+      if (dt_tap == -2) {
+        static const auto tap_t0 = std::chrono::steady_clock::now();
+        const auto tap_el = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - tap_t0)
+                                .count();
+        const int32_t phase = int32_t((tap_el / 8) % 4);
+        dt_tap = phase < 3 ? phase : -1;
+      }
+      static int32_t dt_tap_prev = -3;
+      if (dt_tap != dt_tap_prev) {
+        dt_tap_prev = dt_tap;
+        if (dt_tap < 0) {
+          REXGPU_INFO(
+              "[nr-detile] TAP PHASE ALL - every band-1 resolve tap extended "
+              "to the full frame (the normal mode).");
+        } else {
+          REXGPU_INFO(
+              "[nr-detile] TAP PHASE {} - ONLY band-1 tap {} is extended; the "
+              "other taps resolve their band only. Wrong pixels by design.",
+              dt_tap, dt_tap);
+        }
+      }
+      nr::DetileSetTapFilter(dt_tap);
+    }
+    const nr::DetileFrameVerdict dtv = nr::DetileFrameEnd();
+    if (dtv.guard_tripped) {
+      REXGPU_ERROR(
+          "[nr-detile] GUARD TRIPPED: the repeat bands' resolve destinations "
+          "are not evenly spaced strips of one texture. De-tiling disarmed.");
+    } else if (dtv.is_armed != dtv.was_armed) {
+      REXGPU_INFO("[nr-detile] {}: {} rows per band, {} rows per frame.",
+                  dtv.is_armed ? "ARMED" : "DISARMED", dtv.band_rows, dtv.full_height);
+    }
+    static auto dt_last = std::chrono::steady_clock::now();
+    const auto dt_now = std::chrono::steady_clock::now();
+    if (dt_now - dt_last >= std::chrono::seconds(1)) {
+      dt_last = dt_now;
+      const nr::DetileStats& s = nr::DetileGetStats();
+      static nr::DetileStats prev{};
+      if (g_nr_detile_mode) {
+        // ⚠ `extended` must equal `taps`. Every band-1 resolve tap of the
+        // tiled pass has to reach the full frame height; the ones that do not
+        // leave their destination's lower rows unwritten, which is exactly the
+        // wrong frame city drive 1 produced (extended=1 against taps=3).
+        // ON and OFF frames are both counted so a matched A/B has two halves.
+        REXGPU_INFO(
+            "[nr-detile] fps on={} off={} band={}x{}rows | skipped draws={} "
+            "resolves={} | scwiden={} extended={} of taps={} | "
+            "dest_stride={:#x} guard_fail={} own={}rows",
+            s.frames - prev.frames, s.frames_off - prev.frames_off,
+            (s.band_rows ? (s.full_height + s.band_rows - 1) / s.band_rows : 0),
+            s.band_rows, s.draws_skipped - prev.draws_skipped,
+            s.resolves_skipped - prev.resolves_skipped,
+            s.scissor_widened - prev.scissor_widened,
+            s.resolves_extended - prev.resolves_extended, s.taps - prev.taps,
+            s.dest_stride, s.guard_fail, s.height_used);
+        char tap_buf[512];
+        if (nr::DetileFormatTaps(tap_buf, sizeof(tap_buf))) {
+          REXGPU_INFO("[nr-detile] band-1 taps: {}", tap_buf);
+        }
+        char rt_buf[768];
+        if (nr::DetileFormatRenderTargets(rt_buf, sizeof(rt_buf))) {
+          REXGPU_INFO("[nr-detile] edram: {}", rt_buf);
+        }
+      }
+      prev = s;
+    }
+  }
   return true;
 }
 

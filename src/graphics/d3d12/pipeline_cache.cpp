@@ -91,11 +91,11 @@ REXCVAR_DEFINE_BOOL(gpu_nr_pso, false, "GPU",
 // The gate is byte equality with the emulated pipeline cache's binary for the
 // same key, checked once per key; the deliverable alongside it is the hit rate
 // and the first-sighting latency at city load.
-REXCVAR_DEFINE_BOOL(gpu_nr_shadercache, false, "GPU",
-                    "Diagnostic [nr-sc]: translate each draw's shaders through "
+REXCVAR_DEFINE_BOOL(gpu_nr_shadercache, true, "GPU",
+                    "[nr-sc] Phase 5-2: translate each draw's shaders through "
                     "the native renderer's own ucode->DXBC cache and byte-"
                     "compare the result against the emulated pipeline cache's. "
-                    "Off by default.");
+                    "ON by default: the native pipeline objects consume it.");
 REXCVAR_DEFINE_UINT32(gpu_nr_shadercache_entries, 8192, "GPU",
                       "[nr-sc] Maximum number of distinct {stage, ucode, modification} keys the "
                       "native shader cache holds. Beyond it, keys are refused and counted, never "
@@ -110,13 +110,13 @@ REXCVAR_DEFINE_UINT32(gpu_nr_shadercache_mb, 256, "GPU",
 // D3D12_GRAPHICS_PIPELINE_STATE_DESC against the emulated one built from the
 // same runtime description at the same moment. The second cvar is the actual
 // swap: bind ours for the draw instead of the emulated cache's.
-REXCVAR_DEFINE_BOOL(gpu_nr_native_pso, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_nr_native_pso, true, "GPU",
                     "Diagnostic [nr-npso]: build and create the native renderer's own D3D12 "
                     "pipeline object for each draw and compare its description against the "
-                    "emulated pipeline cache's. Off by default.");
-REXCVAR_DEFINE_BOOL(gpu_nr_native_pso_bind, false, "GPU",
+                    "emulated pipeline cache's. ON by default.");
+REXCVAR_DEFINE_BOOL(gpu_nr_native_pso_bind, true, "GPU",
                     "[nr-npso] Bind the native renderer's own pipeline object for the draw "
-                    "instead of the emulated pipeline cache's. Implies gpu_nr_native_pso. Off "
+                    "instead of the emulated pipeline cache's. Implies gpu_nr_native_pso. ON "
                     "by default.");
 REXCVAR_DEFINE_UINT32(gpu_nr_native_pso_entries, 4096, "GPU",
                       "[nr-npso] Maximum number of distinct pipeline descriptions the native "

@@ -410,15 +410,52 @@ constexpr uint32_t kRenderTargetFormatBits =
 
 constexpr uint32_t kEdramTileWidthSamples = 80;
 constexpr uint32_t kEdramTileHeightSamples = 16;
-constexpr uint32_t kEdramTileCount = 2048;
+
+// [N-5 DE-TILE] The Xenos has 2048 EDRAM tiles (10 MB), and this game's main
+// pass fills them EXACTLY: 1280x256 at 4xMSAA is 32x32 = 1024 colour tiles at
+// base 0 plus 1024 depth tiles at base 1024. That is WHY the frame is rendered
+// in three 256-row bands, and it is the only thing stopping one band from
+// rasterising all 720 rows - GetRenderTargetHeight(32 tiles, 4xMSAA) derives
+// its 512-guest-pixel ceiling straight from this count.
+//
+// We are not a 10 MB console. The emulated EDRAM is expanded by
+// kEdramExpandLog2 and EVERY guest EDRAM tile base is shifted by the same
+// amount, so the host layout is the guest layout scaled on one axis: ordering
+// and non-overlap are preserved exactly, no guest base can leave the range
+// (2047 << 2 = 8188 < 8192), and every surface gains 4x the vertical room the
+// guest gave it - colour 0..3071 for a full 720-row 4xMSAA frame, depth at
+// 4096..7167. Keep the count a power of two: the transfer, dump and resolve
+// shaders mask tile addresses with kEdramTileCount - 1.
+constexpr uint32_t kEdramExpandLog2 = 2;
+constexpr uint32_t kEdramGuestTileCount = 2048;
+constexpr uint32_t kEdramTileCount = kEdramGuestTileCount << kEdramExpandLog2;
 constexpr uint32_t kEdramSizeBytes =
     kEdramTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
 
+// Guest EDRAM tile base (RB_COLOR_INFO::color_base / RB_DEPTH_INFO::depth_base,
+// both 11-bit register fields) to our expanded address space. EVERY site that
+// reads one of those two fields as an address must go through this, or the
+// colour and depth surfaces land on top of each other.
+constexpr uint32_t EdramGuestBaseToHost(uint32_t guest_base_tiles) {
+  return guest_base_tiles << kEdramExpandLog2;
+}
+
+// [N-5 DE-TILE] Companion of the expansion. RenderTargetCache::
+// GetRenderTargetHeight derives a render target's host height from
+// kEdramTileCount / pitch, so expanding the EDRAM would otherwise make EVERY
+// render target 4x taller than any guest surface can be. The guest renders at
+// 720p, so 768 guest rows (48 EDRAM tile rows at 1x, 96 at 4xMSAA) covers
+// every surface with tile alignment to spare, and keeps a 1280x768 4xMSAA
+// target at 15.7 MB instead of 42.
+constexpr uint32_t kMaxUsefulRenderTargetHeight = 768;
+
 // RB_SURFACE_INFO::surface_pitch width.
 constexpr uint32_t kEdramPitchPixelsBits = 14;
-// The part of RB_COLOR_INFO::color_base and RB_DEPTH_INFO::depth_base width
-// usable on the Xenos, which has periodic 11-bit EDRAM tile addressing.
-constexpr uint32_t kEdramBaseTilesBits = 11;
+// Width of an EDRAM tile base in OUR address space. The guest's own field is a
+// literal 11 bits in RB_COLOR_INFO / RB_DEPTH_INFO (the Xenos has periodic
+// 11-bit EDRAM tile addressing) and is NOT affected by the expansion; this is
+// the width of every internal packed base, host-side and shader-side alike.
+constexpr uint32_t kEdramBaseTilesBits = 11 + kEdramExpandLog2;
 
 constexpr uint32_t GetSurfacePitchTiles(uint32_t pitch_pixels, MsaaSamples msaa_samples,
                                         bool is_64bpp) {
@@ -435,7 +472,17 @@ constexpr uint32_t GetSurfacePitchTiles(uint32_t pitch_pixels, MsaaSamples msaa_
 // 8192, but to avoid bounds checking).
 // log2_ceil of 16383, multiplied by 2 for 4x MSAA, rounded to 80 samples,
 // multiplied by 2 for 64bpp.
-constexpr uint32_t kEdramPitchTilesBits = 10;
+//
+// [N-5 DE-TILE] Narrowed 10 -> 9 to pay for the wider kEdramBaseTilesBits.
+// TransferAddressConstant packs {dest_pitch, source_pitch, source_to_dest}
+// as kEdramPitchTilesBits * 2 + kEdramBaseTilesBits + 1 and was EXACTLY
+// saturated at 32 bits before the EDRAM expansion; 9 + 9 + 14 fits again.
+// This is not a guess: RenderTargetKey stores the pitch at 32bpp in EIGHT
+// bits (max 255, its own comment bounds the real maximum at 205), and the
+// widest value that ever reaches this field is that doubled for 64bpp = 410.
+// 9 bits holds 511. Every consumer is a UBFE with this same constant, host
+// and shader alike, so they all move together.
+constexpr uint32_t kEdramPitchTilesBits = 9;
 
 constexpr uint32_t kFormatBits = 6;
 

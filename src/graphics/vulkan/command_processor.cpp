@@ -6286,7 +6286,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       dirty |= system_constants_.edram_rt_keep_mask[i][1] != rt_keep_masks[i][1];
       system_constants_.edram_rt_keep_mask[i][1] = rt_keep_masks[i][1];
       if (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX) {
-        uint32_t rt_base_dwords_scaled = color_info.color_base * edram_tile_dwords_scaled;
+        uint32_t rt_base_dwords_scaled = xenos::EdramGuestBaseToHost(color_info.color_base) * edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] != rt_base_dwords_scaled;
         system_constants_.edram_rt_base_dwords_scaled[i] = rt_base_dwords_scaled;
         uint32_t format_flags = RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
@@ -6306,7 +6306,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 
   if (edram_fragment_shader_interlock) {
-    uint32_t depth_base_dwords_scaled = rb_depth_info.depth_base * edram_tile_dwords_scaled;
+    uint32_t depth_base_dwords_scaled = xenos::EdramGuestBaseToHost(rb_depth_info.depth_base) * edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled != depth_base_dwords_scaled;
     system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
 
