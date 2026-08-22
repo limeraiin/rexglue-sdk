@@ -480,6 +480,19 @@ REXCVAR_DEFINE_INT32(gpu_nr_detile_tap, -1, "GPU",
                      "8 s per phase through tap 0 / 1 / 2 / all so one drive "
                      "names the tap. Wrong pixels by design except at -1.");
 
+// [NR-DETILE] N-5 drive-3 bisect. The reader census proved the visible rows
+// below the band line come only from tap 2's write of the post-pass input, so
+// the duplicated overlay is drawn into EDRAM rows 256+ by one of band 1's
+// WIDENED draw segments. Refusing the widening per segment names it.
+REXCVAR_DEFINE_INT32(gpu_nr_detile_widen_seg, -1, "GPU",
+                     "[nr-detile] Bisect: -1 widens every band-1 draw segment "
+                     "to the full frame (normal), N widens only segments below "
+                     "N (2 = world + refraction widened, overlay left at band "
+                     "height), -2 cycles 8 s per phase between ALL and 2 so "
+                     "one drive says whether the overlay segment draws the "
+                     "duplicate. HUD below the band line missing by design "
+                     "except at -1.");
+
 REXCVAR_DEFINE_INT32(gpu_nr_detile, 0, "GPU",
                      "[nr-detile] N-5: render the frame ONCE instead of once "
                      "per EDRAM tile band - band 1 rasterises and resolves the "
@@ -6673,6 +6686,37 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       }
       nr::DetileSetTapFilter(dt_tap);
     }
+    // [NR-DETILE] widen-segment bisect. -2 cycles 8 s between "widen every
+    // band-1 segment" and "widen only the world + refraction segments", so
+    // ONE drive says whether the duplicated overlay is drawn by the widened
+    // overlay segment. With the overlay left at band height, HUD elements
+    // below the band line are missing by design.
+    {
+      int32_t dt_wseg = REXCVAR_GET(gpu_nr_detile_widen_seg);
+      if (dt_wseg == -2) {
+        static const auto wseg_t0 = std::chrono::steady_clock::now();
+        const auto wseg_el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now() - wseg_t0)
+                                 .count();
+        dt_wseg = ((wseg_el / 8) & 1) ? 2 : -1;
+      }
+      static int32_t dt_wseg_prev = -3;
+      if (dt_wseg != dt_wseg_prev) {
+        dt_wseg_prev = dt_wseg;
+        if (dt_wseg < 0) {
+          REXGPU_INFO(
+              "[nr-detile] WIDEN PHASE ALL - every band-1 draw segment widened "
+              "to the full frame (the normal mode).");
+        } else {
+          REXGPU_INFO(
+              "[nr-detile] WIDEN PHASE {} - only band-1 segments below {} are "
+              "widened; the overlay segment stays at band height. HUD below "
+              "the band line missing by design.",
+              dt_wseg, dt_wseg);
+        }
+      }
+      nr::DetileSetWidenSegLimit(dt_wseg);
+    }
     const nr::DetileFrameVerdict dtv = nr::DetileFrameEnd();
     if (dtv.guard_tripped) {
       REXGPU_ERROR(
@@ -6696,13 +6740,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
         // ON and OFF frames are both counted so a matched A/B has two halves.
         REXGPU_INFO(
             "[nr-detile] fps on={} off={} band={}x{}rows | skipped draws={} "
-            "resolves={} | scwiden={} extended={} of taps={} | "
+            "resolves={} | scwiden={} wrefuse={} extended={} of taps={} | "
             "dest_stride={:#x} guard_fail={} own={}rows",
             s.frames - prev.frames, s.frames_off - prev.frames_off,
             (s.band_rows ? (s.full_height + s.band_rows - 1) / s.band_rows : 0),
             s.band_rows, s.draws_skipped - prev.draws_skipped,
             s.resolves_skipped - prev.resolves_skipped,
             s.scissor_widened - prev.scissor_widened,
+            s.widen_refused - prev.widen_refused,
             s.resolves_extended - prev.resolves_extended, s.taps - prev.taps,
             s.dest_stride, s.guard_fail, s.height_used);
         char tap_buf[512];

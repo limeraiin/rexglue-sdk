@@ -52,6 +52,7 @@ struct DetileStats {
   uint64_t draws_skipped;      // repeat-band draws not dispatched
   uint64_t resolves_skipped;   // repeat-band resolves not dispatched
   uint64_t scissor_widened;      // band-1 draws given the full-frame scissor
+  uint64_t widen_refused;      // band-1 draws NOT widened by the segment limit
   uint64_t resolves_extended;  // band-1 resolves given the full-frame height
   uint64_t guard_fail;         // destination-stride guard violations
   uint64_t taps;               // band-1 resolve taps of the tiled pass seen
@@ -95,6 +96,22 @@ uint32_t DetileResolveFullHeight(const DetileRegs& regs);
 
 // -1 = extend every tap (normal). 0..7 = extend only that tap.
 void DetileSetTapFilter(int32_t tap);
+
+// The draw-side variant. Same answer as DetileBand0FullHeight, except that it
+// honours the widen SEGMENT limit. Band 1's draws are segmented by the taps:
+// segment 0 runs before tap 0 (the world), segment 1 between taps 0 and 1
+// (the refraction group), segment 2 between taps 1 and 2 (the overlay group).
+// The offline reader census proved the visible rows below the band line come
+// ONLY from tap 2's write of the post-pass input, so the duplicated overlay
+// must be pixels that band 1's WIDENED draws put into EDRAM rows 256+ before
+// tap 2 - and the segment limit is the bisect that says which segment draws
+// them. count_refusal is false for the extent estimator so each refused draw
+// is counted exactly once, by the command processor.
+uint32_t DetileWidenFullHeight(const DetileRegs& regs, bool count_refusal);
+
+// -1 = widen every band-1 segment (normal). N >= 0 = widen only segments
+// below N (2 = world + refraction widened, overlay left at band height).
+void DetileSetWidenSegLimit(int32_t seg);
 
 // Called from GetResolveInfo once the final rect is known, so the log can show
 // what each band-1 tap actually resolved instead of what it was assumed to.

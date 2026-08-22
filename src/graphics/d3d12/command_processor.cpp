@@ -1738,7 +1738,7 @@ void NrDetileWidenDrawScissor(const RegisterFile& regs, draw_util::Scissor& scis
                           regs[XE_GPU_REG_RB_SURFACE_INFO],
                           regs[XE_GPU_REG_RB_COLOR_INFO],
                           regs[XE_GPU_REG_RB_DEPTH_INFO]};
-  const uint32_t full_height = nr::DetileBand0FullHeight(dt);
+  const uint32_t full_height = nr::DetileWidenFullHeight(dt, true);
   if (!full_height || scissor.offset[1] + scissor.extent[1] >= full_height) {
     return;
   }

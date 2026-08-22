@@ -73,6 +73,7 @@ struct State {
   int32_t band_tl_y = -1;       // which repeat band we are in
   uint32_t stride_per_band = 0; // measured destination stride between bands
   int32_t tap_filter = -1;      // -1 = extend every band-1 tap
+  int32_t widen_seg_limit = -1; // -1 = widen every band-1 segment
 
   // Per-tap record of what band 1 actually resolved, for the log.
   struct TapRec {
@@ -259,6 +260,26 @@ void DetileCountScissorWidened() { ++g_st.stats.scissor_widened; }
 void DetileCountExtendedResolve() { ++g_st.stats.resolves_extended; }
 
 void DetileSetTapFilter(int32_t tap) { g_st.tap_filter = tap; }
+
+void DetileSetWidenSegLimit(int32_t seg) { g_st.widen_seg_limit = seg; }
+
+uint32_t DetileWidenFullHeight(const DetileRegs& r, bool count_refusal) {
+  const uint32_t fh = DetileBand0FullHeight(r);
+  if (!fh) {
+    return 0;
+  }
+  // band0_taps counts the band-1 taps already resolved this frame, which is
+  // exactly the draw's segment index: 0 before tap 0 (world), 1 between taps
+  // 0 and 1 (refraction), 2 between taps 1 and 2 (overlay).
+  if (g_st.widen_seg_limit >= 0 &&
+      int32_t(g_st.band0_taps) >= g_st.widen_seg_limit) {
+    if (count_refusal) {
+      ++g_st.stats.widen_refused;
+    }
+    return 0;
+  }
+  return fh;
+}
 
 uint32_t DetileResolveFullHeight(const DetileRegs& r) {
   const uint32_t fh = DetileBand0FullHeight(r);
