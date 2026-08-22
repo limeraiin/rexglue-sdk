@@ -292,6 +292,8 @@ void DetileSetTapFilter(int32_t tap) { g_st.tap_filter = tap; }
 
 void DetileSetWidenSegLimit(int32_t seg) { g_st.widen_seg_limit = seg; }
 
+uint32_t DetileBand0Taps() { return g_st.band0_taps; }
+
 void DetileSetTailMode(int32_t mode) { g_st.tail_mode = mode; }
 
 bool DetileTailSkipActive() { return g_st.tail_mode == 0; }

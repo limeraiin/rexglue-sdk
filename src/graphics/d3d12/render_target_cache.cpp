@@ -56,6 +56,19 @@ REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native ste
 // says the colour RT owns all 2880 tiles, so the question is what the DUMP
 // actually covers and who owns each piece. This prints the resolve's dump
 // request beside the rectangles it produced, once a second.
+// [NR-DETILE] N-6-2. Every writer-side register has now measured correct -
+// host viewport rows 0..720 on 65k band-1 draws, scissor widened to match, RT
+// 1280x768, resolve span 90 tile rows - and yet only the top 256 rows carry
+// content. So stop reading registers and read the PIXELS: after the band-1
+// colour tap has dumped the render targets into edram_buffer_, copy that span
+// to a readback heap and report, per tile row, whether it is flat (cleared or
+// never written) or varied (rasterised). That splits the last fork - "band 1
+// never rasterised below row 256" against "it did, and something later loses
+// it" - without needing anyone to drive.
+REXCVAR_DEFINE_BOOL(gpu_nr_detile_edram_probe, false, "GPU",
+                    "[nr-detile] Read the band-1 colour tap's EDRAM span back "
+                    "and report per-tile-row flat/varied, once a second");
+
 REXCVAR_DEFINE_BOOL(gpu_nr_dump_probe, false, "GPU",
                     "[nr-detile] Log each resolve's EDRAM dump request and the "
                     "rectangles it resolved to, with the owning render target "
@@ -246,6 +259,114 @@ uint32_t PackResolveEdramInfoForVendoredShader(draw_util::ResolveEdramInfo info,
          ((info.format & ((uint32_t(1) << xenos::kRenderTargetFormatBits) - 1)) << kFormatShift) |
          (info.format_is_64bpp << kFormatIs64bppShift) |
          (info.fill_half_pixel_offset << kFillHalfPixelOffsetShift);
+}
+
+// [NR-DETILE] N-6-2. Copies the resolved EDRAM span to a readback heap and,
+// one second later (so the copy has certainly retired without a fence and
+// without stalling the frame), reports per tile row whether the tile is FLAT -
+// every dword equal to the first, i.e. cleared or never written - or VARIED,
+// i.e. actually rasterised. A tile row is 8 guest rows at 4xMSAA, so tile row
+// 32 is guest row 256, the row the artifact starts at.
+//
+// The buffer is deliberately never released: the probe is default-off, and a
+// lifetime hook here would be more code than the probe.
+constexpr uint32_t kTileDwords = xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples;
+
+template <typename TransitionFn>
+void NrDetileEdramProbe(D3D12CommandProcessor& command_processor, ID3D12Resource* edram_buffer,
+                        int slot, uint32_t edram_base, uint32_t rows, uint32_t pitch,
+                        uint32_t dest_base, TransitionFn&& transition) {
+  struct Slot {
+    ID3D12Resource* readback = nullptr;
+    uint32_t pending_rows = 0;
+    uint32_t pending_pitch = 0;
+    uint32_t pending_dest = 0;
+    uint32_t pending_base = 0;
+    std::chrono::steady_clock::time_point last{};
+  };
+  static Slot s_slots[3];
+  Slot& sl = s_slots[slot];
+  ID3D12Resource*& s_readback = sl.readback;
+  uint32_t& s_pending_rows = sl.pending_rows;
+  uint32_t& s_pending_pitch = sl.pending_pitch;
+  uint32_t& s_pending_dest = sl.pending_dest;
+  uint32_t& s_pending_base = sl.pending_base;
+
+  const auto now = std::chrono::steady_clock::now();
+  if (sl.last.time_since_epoch().count() && now - sl.last < std::chrono::seconds(1)) {
+    return;
+  }
+
+  // Report the PREVIOUS capture before overwriting it. A second has passed, so
+  // the copy that produced it has long since been submitted and retired.
+  if (s_readback && s_pending_rows) {
+    void* mapping = nullptr;
+    if (SUCCEEDED(s_readback->Map(0, nullptr, &mapping))) {
+      const uint32_t* const dwords = static_cast<const uint32_t*>(mapping);
+      std::string report;
+      for (uint32_t tile_row = 0; tile_row < s_pending_rows; tile_row += 4) {
+        // Middle of the row, so a letterboxed or half-width surface still
+        // lands on real content.
+        const uint32_t tile = tile_row * s_pending_pitch + s_pending_pitch / 2;
+        const uint32_t* const tile_dwords = dwords + size_t(tile) * kTileDwords;
+        uint32_t differing = 0;
+        for (uint32_t i = 1; i < kTileDwords; ++i) {
+          differing += tile_dwords[i] != tile_dwords[0] ? 1 : 0;
+        }
+        report += fmt::format(" r{}={}{}({:08X})", tile_row * 8,
+                              differing ? "VARIED" : "flat", differing, tile_dwords[0]);
+      }
+      D3D12_RANGE write_range = {};
+      s_readback->Unmap(0, &write_range);
+      // A whole-span non-zero count is the honest answer to "did the copy
+      // land at all": a broken readback is all zeros everywhere, a black but
+      // real surface is zeros with a plausible structure.
+      uint64_t nonzero = 0;
+      const size_t span_dwords =
+          size_t(s_pending_rows) * s_pending_pitch * kTileDwords;
+      for (size_t i = 0; i < span_dwords; ++i) {
+        nonzero += dwords[i] != 0 ? 1 : 0;
+      }
+      REXGPU_INFO(
+          "[nr-detile-edram] slot={} ({}) dest={:08X} base={}t span={}rows x {}t nonzero={}/{}"
+          " | guest row = flat|VARIED differing(tile[0]):{}",
+          slot, slot == 0 ? "tiled color" : (slot == 1 ? "post color CONTROL" : "tiled depth"),
+          s_pending_dest, s_pending_base, s_pending_rows, s_pending_pitch, nonzero, span_dwords,
+          report);
+    }
+    s_pending_rows = 0;
+  }
+
+  sl.last = now;
+
+  const uint64_t span_bytes = uint64_t(rows) * pitch * xenos::kEdramTileWidthSamples *
+                              xenos::kEdramTileHeightSamples * sizeof(uint32_t);
+  if (!s_readback) {
+    D3D12_RESOURCE_DESC desc;
+    ui::d3d12::util::FillBufferResourceDesc(desc, xenos::kEdramSizeBytes,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    const ui::d3d12::D3D12Provider& provider = command_processor.GetD3D12Provider();
+    if (FAILED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+            &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s_readback)))) {
+      REXGPU_WARN("[nr-detile-edram] could not create the readback buffer");
+      return;
+    }
+  }
+  if (span_bytes + uint64_t(edram_base) * kTileDwords * sizeof(uint32_t) >
+      xenos::kEdramSizeBytes) {
+    return;
+  }
+
+  transition(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor.SubmitBarriers();
+  command_processor.GetDeferredCommandList().D3DCopyBufferRegion(
+      s_readback, 0, edram_buffer, uint64_t(edram_base) * kTileDwords * sizeof(uint32_t),
+      span_bytes);
+  s_pending_rows = rows;
+  s_pending_pitch = pitch;
+  s_pending_dest = dest_base;
+  s_pending_base = edram_base;
 }
 
 // Picks the patched blob when the wrap constant was found, the original
@@ -1462,6 +1583,37 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
             return false;
+          }
+        }
+
+        // [NR-DETILE] N-6-2. The pixels themselves, for the band-1 colour tap.
+        if (REXCVAR_GET(gpu_nr_detile_edram_probe)) {
+          uint32_t ep_base, ep_row_len, ep_rows, ep_pitch;
+          resolve_info.GetCopyEdramTileSpan(ep_base, ep_row_len, ep_rows, ep_pitch);
+          // Gate to the packet this names: the de-tiled full-frame colour tap
+          // is base 0, 32 tiles of pitch, 90 tile rows (720 guest rows at
+          // 4xMSAA). Anything else is a different pass and must not report
+          // under this name.
+          // Slot 0 is the de-tiled full-frame colour tap (base 0, pitch 32,
+          // 90 tile rows). Slot 1 is the pitch-16 msaa-0 post resolve, which
+          // carries the image that actually reaches the screen - it is the
+          // instrument's own control. If slot 1 reads flat too, the probe is
+          // broken, not the render target.
+          int ep_slot = -1;
+          if (ep_pitch == 32 && ep_rows >= 90) {
+            // Slot 0 the de-tiled full-frame colour tap, slot 2 the depth
+            // surface beside it. If the colour rows below 256 are flat, the
+            // next question is whether depth below 256 was ever cleared.
+            ep_slot = resolve_info.IsCopyingDepth() ? 2 : 0;
+          } else if (ep_base == 0 && ep_pitch == 16 && ep_rows >= 45 &&
+                     !resolve_info.IsCopyingDepth()) {
+            ep_slot = 1;
+          }
+          if (ep_slot >= 0) {
+            NrDetileEdramProbe(
+                command_processor_, edram_buffer_, ep_slot, ep_base, ep_rows, ep_pitch,
+                resolve_info.copy_dest_base,
+                [this](D3D12_RESOURCE_STATES state) { TransitionEdramBuffer(state); });
           }
         }
       }

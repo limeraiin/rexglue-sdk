@@ -495,6 +495,13 @@ REXCVAR_DEFINE_INT32(gpu_nr_detile_tail, -1, "GPU",
                      "the two so one drive says whether the tail rewrite "
                      "draws the duplicated overlay.");
 
+// [NR-DETILE] N-6-2. The widen edits PA_SC_WINDOW_SCISSOR only, but the host
+// viewport rectangle scissors too. Prints band 1's own viewport intent beside
+// the scissor, gated to the tiled pass, once a second.
+REXCVAR_DEFINE_BOOL(gpu_nr_detile_vp_probe, false, "GPU",
+                    "[nr-detile] Log the guest viewport and scissor of the "
+                    "band-1 draws de-tile widens, once a second");
+
 REXCVAR_DEFINE_INT32(gpu_nr_detile_widen_seg, -1, "GPU",
                      "[nr-detile] Bisect: -1 widens every band-1 draw segment "
                      "to the full frame (normal), N widens only segments below "

@@ -178,6 +178,7 @@ REXCVAR_DEFINE_BOOL(gpu_instance, false, "GPU/D3D12",
 REXCVAR_DECLARE(bool, gpu_nr_native_pso);
 REXCVAR_DECLARE(bool, gpu_nr_native_pso_bind);
 // [NR-VERIFY] inc 2: defined base-side (command_processor.cpp).
+REXCVAR_DECLARE(bool, gpu_nr_detile_vp_probe);
 REXCVAR_DECLARE(bool, gpu_nr_verify);
 REXCVAR_DECLARE(bool, gpu_nr_reuse_fast);
 REXCVAR_DECLARE(bool, gpu_nr_span_swap);
@@ -1739,6 +1740,57 @@ void NrDetileWidenDrawScissor(const RegisterFile& regs, draw_util::Scissor& scis
                           regs[XE_GPU_REG_RB_COLOR_INFO],
                           regs[XE_GPU_REG_RB_DEPTH_INFO]};
   const uint32_t full_height = nr::DetileWidenFullHeight(dt, true);
+
+  // [NR-DETILE] N-6-2. The widen edits PA_SC_WINDOW_SCISSOR and nothing else,
+  // but the host VIEWPORT rectangle scissors as well - GetHostViewportInfo
+  // derives it from PA_CL_VPORT alone and the call site passes
+  // D3D12_VIEWPORT_BOUNDS_MAX as y_max, so nothing clamps it afterwards. If
+  // band 1's guest viewport is only 256 rows tall, no scissor can make it
+  // rasterise the other 464 and the widening is vacuous.
+  //
+  // Gated to the packet it names: full_height is non-zero only for a band-1
+  // draw of the tiled pass. Prints the guest's own viewport intent, the
+  // window offset that the 360 tiling scheme uses to slide bands, and the
+  // scissor on both sides of the edit.
+  if (full_height && REXCVAR_GET(gpu_nr_detile_vp_probe)) {
+    static auto s_vp_last = std::chrono::steady_clock::now();
+    static uint64_t s_vp_seen = 0;
+    static uint64_t s_vp_vp_short = 0;
+    static uint64_t s_vp_sci_short = 0;
+    ++s_vp_seen;
+    const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+    const auto su = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+    const float yscale =
+        vte.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
+    const float yoffset =
+        vte.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
+    const auto win = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    const float win_y =
+        su.vtx_window_offset_enable ? float(win.window_y_offset) : 0.0f;
+    // What GetHostViewportInfo will produce for Y, before resolution scaling.
+    const float vp_y0f = yoffset + win_y - std::abs(yscale);
+    const float vp_y1f = yoffset + win_y + std::abs(yscale);
+    const uint32_t vp_y0 = uint32_t(rex::clamp_float(vp_y0f, 0.0f, 16384.0f));
+    const uint32_t vp_y1 = uint32_t(rex::clamp_float(vp_y1f, 0.0f, 16384.0f));
+    if (vp_y1 < full_height) ++s_vp_vp_short;
+    if (scissor.offset[1] + scissor.extent[1] < full_height) ++s_vp_sci_short;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s_vp_last >= std::chrono::seconds(1)) {
+      s_vp_last = now;
+      REXGPU_INFO(
+          "[nr-detile-vp] seg={} full_height={} | vport y: scale={:.1f} offset={:.1f} "
+          "winy={:.1f} (ena s={} o={} w={}) -> host viewport rows {}..{} | scissor rows "
+          "{}..{} | seen={} vp_short={} sci_short={}",
+          nr::DetileBand0Taps(), full_height, yscale, yoffset, win_y,
+          uint32_t(vte.vport_y_scale_ena), uint32_t(vte.vport_y_offset_ena),
+          uint32_t(su.vtx_window_offset_enable), vp_y0, vp_y1, scissor.offset[1],
+          scissor.offset[1] + scissor.extent[1],
+          static_cast<unsigned long long>(s_vp_seen),
+          static_cast<unsigned long long>(s_vp_vp_short),
+          static_cast<unsigned long long>(s_vp_sci_short));
+    }
+  }
+
   if (!full_height || scissor.offset[1] + scissor.extent[1] >= full_height) {
     return;
   }

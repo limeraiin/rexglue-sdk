@@ -86,6 +86,10 @@ bool DetileIsRepeatBand(const DetileRegs& regs);
 // otherwise. Used both to widen the draw scissor and to extend the resolve.
 uint32_t DetileBand0FullHeight(const DetileRegs& regs);
 
+// Band-1 taps already resolved this frame = the current draw's segment index
+// (0 world, 1 refraction, 2 overlay). Diagnostics only.
+uint32_t DetileBand0Taps();
+
 // The resolve-side variant. Same answer, except that it honours the per-tap
 // bisect filter: with a tap selected, only that band-1 tap is extended to the
 // full frame height and the others stay at their band height. The tiled pass
