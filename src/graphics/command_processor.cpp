@@ -103,7 +103,10 @@ REXCVAR_DEFINE_INT32(gpu_n7, 1, "GPU",
                      "each in place, 4 = report + cycle the N-8c "
                      "synthetic range split CLEAN/ALUx4/FETCHx4/ALLx4 5 s "
                      "each in place (pixel-correct; the slope is the "
-                     "marginal cost of one range).");
+                     "marginal cost of one range), 5 = report + cycle the "
+                     "N-8f coalescer CLEAN/COALESCE 5 s each in place, 6 = "
+                     "report + cycle the N-9 plan replay CLEAN/PROG 5 s "
+                     "each in place (decode-exact; pair adjacent phases).");
 
 // [PM4-CENSUS] Naruto §11.7 draw-emission census. Settles where the ~10k
 // heavy-forest draws/frame come from: counts DRAW_INDX vs DRAW_INDX_2 packets,
@@ -599,6 +602,28 @@ REXCVAR_DEFINE_BOOL(gpu_nr_coalesce, false, "GPU",
                     "override. Pixel-identical by construction.");
 REXCVAR_DECLARE(bool, gpu_instance);
 REXCVAR_DECLARE(bool, gpu_dedupe_constants);
+
+// [N9] Whole-buffer flat-plan replay. Every skip-eligible depth-1 buffer
+// compiles ONCE (its first execution) into the N-2-2 CtxPlanOp stream --
+// one op per packet, everything the walk DERIVES precomputed, everything it
+// READS still read from the live bytes -- and every later execution replays
+// that plan through the proven interpreter instead of re-decoding the PM4.
+// Validity is the structural guard set, checked per execution: an in-place
+// value patch (the city recorder's constant traffic) passes untouched, a
+// re-record fails a guard and recompiles in the same execution. This is the
+// N-9 wedge at the naruto_603 decode bucket (~29% of the CP second exists
+// only to re-derive unchanged packet structure, ~2.68x per recording).
+// Distinct from the three parked shapes by mechanism, not by hope:
+// per-BUFFER lookup (not the template store's per-span 138 ns), structural
+// validity (not the memo's 17%-coverage byte gate), full flat replay (not
+// CtxMemoNext's 2/3 re-parse). The gpu_n7 6 cycler prices it in place.
+REXCVAR_DEFINE_BOOL(gpu_nr_prog, false, "GPU",
+                    "[n9] Under gpu_nr_skip, replay each depth-1 buffer's "
+                    "compiled flat plan instead of re-decoding its PM4 "
+                    "(structure memoized per buffer+length, values and "
+                    "delegates always live, structural guards checked every "
+                    "execution). Vetoed with a log line under "
+                    "ruse/bfc/memo/tmpl-swap/tile modes.");
 
 // [NR-WM] Phase 5-4-8: the walk memo. A skip-driven buffer whose bytes are
 // identical to its previous compared execution (the ruse shadow compare, on
@@ -1137,6 +1162,16 @@ thread_local uint64_t g_type0_split_ns = 0;
 //
 // Split factor per class, driven by the `gpu_n7 4` in-place cycler.
 int g_n8c_split_alu = 1, g_n8c_split_fetch = 1, g_n8c_split_other = 1;
+
+// [N9] Whole-buffer plan replay state. CP thread only.
+bool g_n9_eligible = false;  // latched once per worker init, veto logged
+bool g_n9_on = false;        // live switch: cvar, or the gpu_n7 6 phase
+// Window counters for the [n9] 1Hz line ([[count-refusals-every-granularity]]:
+// buffers AND the draws inside them, so a per-buffer refusal cannot hide).
+uint64_t g_n9_bufs = 0;        // buffer executions served from a plan
+uint64_t g_n9_walk_bufs = 0;   // buffer executions walked live with n9 on
+uint64_t g_n9_draws = 0;       // draw stops emitted by the plan interpreter
+uint64_t g_n9_walk_draws = 0;  // draw stops from the live walk with n9 on
 
 // [N8F] Coalescer state. Only the command-processor thread touches it (same
 // single-thread argument as every other g_* here). Spans are class-tagged so
@@ -3772,6 +3807,25 @@ void CommandProcessor::WorkerThreadMain() {
         "[n8f] ON: range side effects deferred to the draw stop, one apply "
         "per merged span (values always live)");
   }
+  // [N9] Whole-buffer plan replay. Vetoes are the modes that record, replay
+  // or byte-compare the walk's own emission stream (ruse/bfc/memo/tmpl-swap)
+  // or change what the stream means (tile probes). gpu_nr_verify is NOT a
+  // veto: the interpreter fires the same callbacks, so the verify passes are
+  // exactly the plan's divergence gate. Refusals are logged, never silent.
+  g_n9_eligible = kNrSkip && !g_nr_ruse && !g_nr_bfc && !g_nr_wm &&
+                  !g_nr_tmpl_swap && !g_nr_tile_probe && !g_nr_tile_cycle;
+  g_n9_on = g_n9_eligible && REXCVAR_GET(gpu_nr_prog);
+  if (REXCVAR_GET(gpu_nr_prog) && !g_n9_eligible) {
+    REXGPU_INFO(
+        "[n9] REFUSED: skip={} ruse={} bfc={} wm={} tmplswap={} tile={} -- "
+        "the plan replay is inert, do not read a perf number from this run",
+        kNrSkip, g_nr_ruse, g_nr_bfc, g_nr_wm, g_nr_tmpl_swap,
+        g_nr_tile_probe || g_nr_tile_cycle);
+  } else if (g_n9_on) {
+    REXGPU_INFO(
+        "[n9] ON: depth-1 buffers replay their compiled flat plan (values "
+        "and delegates live, structural guards checked per execution)");
+  }
   // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
   const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue || kNrWalkFx;
   g_nr_draw = kNrDraw;
@@ -4281,6 +4335,32 @@ void CommandProcessor::WorkerThreadMain() {
             } else if (n8f_phase_prev == phase) {
               REXGPU_INFO("[n8f] cycler armed but INELIGIBLE (see the boot "
                           "[n8f] line) - phases will not fire");
+            }
+          }
+        }
+        // Mode 6: N-9, whole-buffer plan replay, two 5 s phases IN PLACE.
+        // Both phases are decode-exact (the interpreter fires the same
+        // callbacks the parse would, values read live), so the paired fps
+        // delta IS the rung's worth. Store survives CLEAN phases, so PROG
+        // phases after the first serve warm.
+        //   0 CLEAN  the live per-packet parse
+        //   1 PROG   compiled flat plans, guards checked per execution
+        if (kN7 == 6) {
+          const int64_t el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 n7_now - n7_t0).count();
+          const int phase = int((el / 5) % 2);
+          static int n9_phase_prev = -1;
+          if (phase != n9_phase_prev) {
+            n9_phase_prev = phase;
+            if (g_n9_eligible) {
+              g_n9_on = phase == 1;
+              REXGPU_INFO(
+                  "[n7] N9 PHASE {} - both phases decode-exact; pair "
+                  "adjacent phases for the fps answer.",
+                  phase == 1 ? "PROG" : "CLEAN");
+            } else {
+              REXGPU_INFO("[n9] cycler armed but INELIGIBLE (see the boot "
+                          "[n9] line) - phases will not fire");
             }
           }
         }
@@ -4945,6 +5025,28 @@ void CommandProcessor::WorkerThreadMain() {
                 g_tile_bufs_skipped, g_tile_bufs_kept);
             g_tile_draws_skipped = g_tile_draws_kept = 0;
             g_tile_bufs_skipped = g_tile_bufs_kept = 0;
+          }
+          // [N9] whole-buffer plan replay. bufs rep vs walk and draws rep
+          // vs walk are the coverage at both granularities; gfail is
+          // structural drift (recompiled in place), refuse/marks name the
+          // buffers that never replay. cmp counts compiles this window.
+          if (g_n9_on || kN7 == 6) {
+            nr::CtxProgStats* ps = nr::CtxProgStatsPtr();
+            static nr::CtxProgStats n9_last{};
+            REXGPU_INFO(
+                "[n9] bufs rep={} walk={} | draws rep={} walk={} | cmp={} "
+                "gfail={} refexec={} marks={} retry={} | store bufs={} "
+                "{}KB evict={} | guards={}",
+                g_n9_bufs, g_n9_walk_bufs, g_n9_draws, g_n9_walk_draws,
+                ps->compiles - n9_last.compiles, ps->gfails - n9_last.gfails,
+                ps->refused_execs - n9_last.refused_execs,
+                ps->refuse_marks - n9_last.refuse_marks,
+                ps->retries - n9_last.retries, ps->bufs, ps->bytes >> 10,
+                ps->evicts - n9_last.evicts,
+                ps->guards_checked - n9_last.guards_checked);
+            n9_last = *ps;
+            g_n9_bufs = g_n9_walk_bufs = 0;
+            g_n9_draws = g_n9_walk_draws = 0;
           }
           // [NR-PLAN] N-2-2 item 2: what the swap actually replaced. `spans`
           // and `dw` are the removed parse; `gap` is the packets still
@@ -6420,6 +6522,22 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       if (wm_recording) ++g_wm_rec;
     }
   }
+  // [N9] Whole-buffer plan: one store lookup per buffer execution, then the
+  // interpreter drives every CtxWalkNextStop below with zero header decode
+  // for the common kinds. A guard failure recompiled inside Attach; a
+  // refusal fell through to the live walk, counted. The eligibility latch
+  // already excluded ruse/bfc/wm/tmpl-swap, so the mode checks here are
+  // belt-and-braces against a mid-run cvar flip.
+  bool n9_active = false;
+  if (g_n9_on && !wm_recording && !wm_replaying && !g_nr_ruse && !g_nr_bfc) {
+    n9_active =
+        nr::CtxProgAttach(&g_ctx_walker, ptr & 0x1FFFFFFFu, count, raw);
+    if (n9_active) {
+      ++g_n9_bufs;
+    } else {
+      ++g_n9_walk_bufs;
+    }
+  }
   nr::CtxDrawStop stop;
   bool aborted = false;
   bool dsp_open = false;  // [NR-DSP] a draw's span bracket is open
@@ -6427,7 +6545,9 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   // [NR-PLAN] N-2-2 item 2: the memo attaches w->rec and records through
   // CtxWalkStep, which the plan replay does not call -- a stream recorded
   // under the swap would be silently short. One of the two, never both.
-  const bool swap = g_nr_tmpl_swap && !wm_recording && !wm_replaying;
+  // [N9] an attached whole-buffer plan replaces the span swap outright.
+  const bool swap =
+      g_nr_tmpl_swap && !wm_recording && !wm_replaying && !n9_active;
   const uint32_t swap_pbase = ptr & 0x1FFFFFFFu;
   while (swap ? NrSwapNextStop(swap_pbase, raw, &stop)
               : nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
@@ -6512,6 +6632,15 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       g_nr_skip_stop = stop;
       g_nr_skip_draw_pending = true;
       ++g_skp_draws;
+      // [N9] attribute the draw to its stop source (plan still attached =
+      // the interpreter emitted it, drift catch-up parses included).
+      if (g_n9_on) {
+        if (g_ctx_walker.plan) {
+          ++g_n9_draws;
+        } else {
+          ++g_n9_walk_draws;
+        }
+      }
       // [NR-BFC] schedule position: delegates counted so far were pre-draw.
       if (g_nr_bfc) {
         g_bfc_buf.saw_draw = true;

@@ -481,6 +481,50 @@ uint32_t CtxPlanApplyGuards(const uint8_t* live, uint32_t live_dwords,
                             CtxPlanOp* ops, uint32_t nops,
                             const CtxPlanGuard* guards, uint32_t nguard);
 
+// [N9] Non-mutating guard check: 0 if every guard matches the live bytes,
+// else 1 + the index of the first mismatch. The whole-buffer program replay
+// falls back to a fresh compile on ANY mismatch instead of demoting per op,
+// so it never needs the caller-copy ApplyGuards requires -- the shared plan
+// is replayed in place, zero copies on the hot path.
+uint32_t CtxPlanCheckGuards(const uint8_t* live, uint32_t live_dwords,
+                            const CtxPlanGuard* guards, uint32_t nguard);
+
+// [N9] Whole-buffer plan store. One plan per (buffer address, dword count),
+// compiled from the buffer's own bytes at its FIRST skip-path execution and
+// replayed on every later one. This is the same CtxPlanOp interpreter the
+// 5-4-8/N-2-2 template swap proved decode-exact at city scale; what changed
+// is the store shape, aimed at that rung's three measured killers:
+//   - keyed per BUFFER (2-3k lookups/s), not per span (the template store
+//     paid a ~138 ns probe+copy per DRAW, more than the parse it replaced);
+//   - validity = the STRUCTURAL guard set, not byte identity (the memo's
+//     byte gate served only ~17% of city executions because the recorder
+//     patches VALUES in place; guards ignore values -- they are read live);
+//   - CP-thread-owned, so no arena, no epochs, no coherency copies.
+// A guard mismatch recompiles from the live bytes and replays the fresh plan
+// in the same execution; framing failures and compile thrash mark the buffer
+// refused (counted, self-healing retry every 64th execution).
+struct CtxProgStats {
+  uint64_t serves;         // buffer executions replayed from a plan
+  uint64_t compiles;       // plans compiled (first sight or guard-fail)
+  uint64_t gfails;         // executions whose guard check failed
+  uint64_t refused_execs;  // executions of a refused buffer (live walk)
+  uint64_t refuse_marks;   // buffers marked refused (framing / thrash)
+  uint64_t retries;        // refused buffers re-tried (self-heal probe)
+  uint64_t evicts;         // whole-store clears at the byte cap
+  uint64_t guards_checked; // total guard compares run
+  size_t bytes;            // ops + guards held (capacity)
+  uint32_t bufs;           // entries in the store
+};
+// Attach a stored (or freshly compiled) plan covering [0, count) to the
+// walker. Returns true when attached (caller counts a replay); false =
+// refused or compile-failed, walk live (caller counts a fallback). CP thread
+// only, like every other walker call.
+struct CtxWalker;
+bool CtxProgAttach(CtxWalker* w, uint32_t bufkey, uint32_t count,
+                   const uint8_t* raw);
+void CtxProgClear();
+CtxProgStats* CtxProgStatsPtr();
+
 struct CtxMemoStats {
   uint64_t commits;    // streams committed
   uint64_t replaced;   // verify-mode re-records over a mismatching stream

@@ -1443,6 +1443,147 @@ uint32_t CtxPlanApplyGuards(const uint8_t* live, uint32_t live_dwords,
   return demoted;
 }
 
+uint32_t CtxPlanCheckGuards(const uint8_t* live, uint32_t live_dwords,
+                            const CtxPlanGuard* guards, uint32_t nguard) {
+  for (uint32_t k = 0; k < nguard; ++k) {
+    if (guards[k].pos >= live_dwords ||
+        BE32(live, guards[k].pos) != guards[k].val) {
+      return k + 1;
+    }
+  }
+  return 0;
+}
+
+// ---- [N9] whole-buffer plan store -------------------------------------------
+// See the header for the design and the three template-store killers this
+// shape avoids. CP-thread-only, exactly like g_memo_store above.
+
+namespace {
+
+struct CtxProgEntry {
+  uint32_t count = 0;              // dword count this plan was compiled for
+  uint8_t refused = 0;             // framing failure or compile thrash
+  uint8_t thrash = 0;              // consecutive compiles with no clean serve
+  uint32_t serves_since_compile = 0;
+  uint32_t refused_execs = 0;      // executions while refused (retry pacing)
+  std::vector<CtxPlanOp> ops;
+  std::vector<CtxPlanGuard> guards;
+};
+
+std::unordered_map<uint32_t, CtxProgEntry> g_prog_store;
+CtxProgStats g_prog_stats;
+// City live set is ~6-10 MB (41 bufs/frame x ~100 KB); the cap only exists
+// so a pathological recorder cannot grow the store without bound. A clear-
+// all at the cap is the memo store's own proven policy, and it is counted.
+constexpr size_t kProgByteCap = 64ull << 20;
+std::vector<CtxPlanOp> g_prog_cops;       // compile scratch, reused
+std::vector<CtxPlanGuard> g_prog_cguards;
+
+size_t ProgEntryBytes(const CtxProgEntry& e) {
+  return e.ops.capacity() * sizeof(CtxPlanOp) +
+         e.guards.capacity() * sizeof(CtxPlanGuard);
+}
+
+// The compiler emits at most one op and one guard per packet plus the
+// type-1 pair (2 ops, 2 guards per 3 dwords) and the 0x2F triple guard over
+// a >=4 dword packet, so `count` ops and 2*count guards can never overflow.
+bool ProgCompileInto(CtxProgEntry* e, uint32_t count, const uint8_t* raw) {
+  if (g_prog_cops.size() < count) g_prog_cops.resize(count);
+  if (g_prog_cguards.size() < size_t(count) * 2) {
+    g_prog_cguards.resize(size_t(count) * 2);
+  }
+  uint32_t ng = 0;
+  const uint32_t np =
+      CtxPlanCompile(raw, count, g_prog_cops.data(), count,
+                     g_prog_cguards.data(), uint32_t(g_prog_cguards.size()),
+                     &ng, nullptr);
+  ++g_prog_stats.compiles;
+  if (!np) return false;
+  g_prog_stats.bytes -= ProgEntryBytes(*e);
+  e->ops.assign(g_prog_cops.data(), g_prog_cops.data() + np);
+  e->guards.assign(g_prog_cguards.data(), g_prog_cguards.data() + ng);
+  e->ops.shrink_to_fit();
+  e->guards.shrink_to_fit();
+  g_prog_stats.bytes += ProgEntryBytes(*e);
+  return true;
+}
+
+}  // namespace
+
+bool CtxProgAttach(CtxWalker* w, uint32_t bufkey, uint32_t count,
+                   const uint8_t* raw) {
+  if (g_prog_stats.bytes > kProgByteCap) {
+    CtxProgClear();
+    ++g_prog_stats.evicts;
+  }
+  CtxProgEntry& e = g_prog_store[bufkey];
+  if (e.count != count) {
+    // A different recording now lives at this address: forget everything
+    // (including a refusal -- the new bytes may compile) and start fresh.
+    g_prog_stats.bytes -= ProgEntryBytes(e);
+    e = CtxProgEntry{};
+    e.count = count;
+  }
+  if (e.refused) {
+    ++g_prog_stats.refused_execs;
+    // Self-heal probe: a re-record can turn an uncompilable buffer into a
+    // compilable one without changing its length. Retry every 64th.
+    if ((++e.refused_execs & 63u) != 0) return false;
+    ++g_prog_stats.retries;
+    e.refused = 0;
+    e.thrash = 0;
+  }
+  if (e.ops.empty()) {
+    if (!ProgCompileInto(&e, count, raw)) {
+      e.refused = 1;
+      e.refused_execs = 0;
+      ++g_prog_stats.refuse_marks;
+      return false;
+    }
+  } else {
+    g_prog_stats.guards_checked += e.guards.size();
+    if (CtxPlanCheckGuards(raw, count, e.guards.data(),
+                           uint32_t(e.guards.size()))) {
+      // Structure moved (a re-record, not an in-place value patch -- those
+      // never touch a guarded dword). Recompile from the live bytes and
+      // serve the fresh plan in this same execution.
+      ++g_prog_stats.gfails;
+      if (e.serves_since_compile == 0) {
+        // The previous compile never served one clean replay: churn. Four
+        // in a row and the buffer walks live until the retry probe.
+        if (++e.thrash >= 4) {
+          e.refused = 1;
+          e.refused_execs = 0;
+          ++g_prog_stats.refuse_marks;
+          return false;
+        }
+      } else {
+        e.thrash = 0;
+      }
+      e.serves_since_compile = 0;
+      if (!ProgCompileInto(&e, count, raw)) {
+        e.refused = 1;
+        e.refused_execs = 0;
+        ++g_prog_stats.refuse_marks;
+        return false;
+      }
+    }
+  }
+  ++e.serves_since_compile;
+  ++g_prog_stats.serves;
+  g_prog_stats.bufs = uint32_t(g_prog_store.size());
+  CtxPlanBegin(w, e.ops.data(), uint32_t(e.ops.size()), 0, count);
+  return true;
+}
+
+void CtxProgClear() {
+  g_prog_store.clear();
+  g_prog_stats.bytes = 0;
+  g_prog_stats.bufs = 0;
+}
+
+CtxProgStats* CtxProgStatsPtr() { return &g_prog_stats; }
+
 uint32_t WalkBufferContext(const uint8_t* raw, uint32_t dwords,
                            uint32_t buffer_phys, StateContext* ctx,
                            uint16_t* draw_flags, uint32_t max_draws,
