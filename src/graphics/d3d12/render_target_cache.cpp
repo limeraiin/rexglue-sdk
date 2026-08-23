@@ -5444,6 +5444,39 @@ void D3D12RenderTargetCache::SetCommandListRenderTargets(
   if (!are_current_command_list_render_targets_valid_) {
     std::memcpy(current_command_list_render_targets_, depth_and_color_render_targets,
                 sizeof(current_command_list_render_targets_));
+    // [gpu-census] draw sub-split: report the freshly bound RT config so
+    // draws are priced per pass class. Formatted only when first seen.
+    {
+      uint32_t census_rt_keys[5];
+      RenderTargetKey census_first_key;
+      char census_desc[64];
+      size_t census_len = 0;
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        const RenderTarget* census_rt = depth_and_color_render_targets[i];
+        RenderTargetKey census_key = census_rt ? census_rt->key() : RenderTargetKey();
+        census_rt_keys[i] = census_key.key;
+        if (census_key.IsEmpty() || census_len >= sizeof(census_desc)) {
+          continue;
+        }
+        if (census_first_key.IsEmpty()) {
+          census_first_key = census_key;
+        }
+        int census_n =
+            i == 0 ? snprintf(census_desc + census_len, sizeof(census_desc) - census_len,
+                              "d%ub%u ", uint32_t(census_key.resource_format),
+                              uint32_t(census_key.base_tiles))
+                   : snprintf(census_desc + census_len, sizeof(census_desc) - census_len,
+                              "c%u:%ub%u ", i - 1, uint32_t(census_key.resource_format),
+                              uint32_t(census_key.base_tiles));
+        census_len = std::min(census_len + size_t(std::max(census_n, 0)), sizeof(census_desc));
+      }
+      if (census_len < sizeof(census_desc)) {
+        snprintf(census_desc + census_len, sizeof(census_desc) - census_len, "p%um%u",
+                 uint32_t(census_first_key.pitch_tiles_at_32bpp),
+                 uint32_t(census_first_key.msaa_samples));
+      }
+      command_processor_.GpuCensusSetDrawConfig(census_rt_keys, census_desc);
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     if (depth_and_color_render_targets[0]) {
       dsv_handle = static_cast<const D3D12RenderTarget*>(depth_and_color_render_targets[0])

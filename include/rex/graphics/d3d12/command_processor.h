@@ -105,6 +105,13 @@ class D3D12CommandProcessor : public CommandProcessor {
     GpuCensusEmitTimestamp(gpu_census_class_);
     gpu_census_class_ = cls;
   }
+  // [gpu-census] draw sub-split: the RT cache reports the bound RT config
+  // (depth + 4 color RenderTargetKey values) whenever it binds; draws are
+  // then tagged with a per-config dynamic class so the 1 Hz report can
+  // price the GPU second per pass class (main vs shadow vs post etc).
+  // Overflowing configs fall back to the generic draw bucket. desc is only
+  // read the first time a config is seen (the RT cache formats it).
+  void GpuCensusSetDrawConfig(const uint32_t rt_keys[5], const char* desc);
   void GpuCensusPush(uint8_t cls) {
     if (!gpu_census_sub_active_) {
       return;
@@ -1106,6 +1113,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   static constexpr uint32_t kGpuCensusQueryPoolSize = 16384;
   static constexpr uint32_t kGpuCensusMaxPerSubmission = 512;
   static constexpr uint32_t kGpuCensusStackDepth = 8;
+  // Draw sub-split: dynamic classes kGpuCensusClassCount.. for RT configs.
+  static constexpr uint32_t kGpuCensusDrawConfigs = 24;
+  static constexpr uint32_t kGpuCensusTotalClasses =
+      kGpuCensusClassCount + kGpuCensusDrawConfigs;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_census_heap_;
   Microsoft::WRL::ComPtr<ID3D12Resource> gpu_census_readback_;
   const uint64_t* gpu_census_readback_mapping_ = nullptr;
@@ -1126,10 +1137,21 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint8_t tags[kGpuCensusMaxPerSubmission];
   };
   std::deque<GpuCensusPending> gpu_census_pending_;
-  uint64_t gpu_census_class_ticks_[kGpuCensusClassCount] = {};
-  uint64_t gpu_census_class_spans_[kGpuCensusClassCount] = {};
+  uint64_t gpu_census_class_ticks_[kGpuCensusTotalClasses] = {};
+  uint64_t gpu_census_class_spans_[kGpuCensusTotalClasses] = {};
   uint64_t gpu_census_trunc_ = 0;
   uint64_t gpu_census_dropped_ = 0;
+  // Draw sub-split state: the class future draws are tagged with, and the
+  // seen-config table (stable ids for the whole run, ticks reset 1 Hz).
+  uint8_t gpu_census_draw_class_ = kGpuCensusDraw;
+  struct GpuCensusDrawConfig {
+    uint32_t rt_keys[5];
+    char desc[64];
+  };
+  GpuCensusDrawConfig gpu_census_draw_configs_[kGpuCensusDrawConfigs];
+  uint32_t gpu_census_draw_config_count_ = 0;
+  uint32_t gpu_census_last_rt_keys_[5] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                                          UINT32_MAX};
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;

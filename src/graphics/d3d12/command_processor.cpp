@@ -5842,9 +5842,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (!_dp_bs_ok) {
     return false;
   }
-  // [gpu-census] draw class; no-op when already there (one timestamp per
-  // class change, not per draw).
-  GpuCensusSetClass(kGpuCensusDraw);
+  // [gpu-census] draw class (per-RT-config when known); no-op when already
+  // there (one timestamp per class change, not per draw).
+  GpuCensusSetClass(gpu_census_draw_class_);
 
   // [GPU-PRECORD] Phase 1a: at each segment boundary, force the following draws to
   // re-emit ALL command-list state (models a fresh per-segment command list). This
@@ -13100,6 +13100,9 @@ bool D3D12CommandProcessor::InitializeGpuCensusResources() {
   gpu_census_heap_.Reset();
   gpu_census_readback_.Reset();
   gpu_census_readback_mapping_ = nullptr;
+  gpu_census_draw_class_ = kGpuCensusDraw;
+  gpu_census_draw_config_count_ = 0;
+  std::memset(gpu_census_last_rt_keys_, 0xFF, sizeof(gpu_census_last_rt_keys_));
   if (!REXCVAR_GET(d3d12_gpu_census)) {
     return false;
   }
@@ -13246,12 +13249,54 @@ void D3D12CommandProcessor::GpuCensusConsumeCompleted() {
     const uint64_t* timestamps = gpu_census_readback_mapping_ + pending.start;
     for (uint32_t i = 1; i < pending.count; ++i) {
       uint64_t dt = timestamps[i] >= timestamps[i - 1] ? timestamps[i] - timestamps[i - 1] : 0;
-      uint8_t cls = pending.tags[i] < kGpuCensusClassCount ? pending.tags[i]
-                                                           : uint8_t(kGpuCensusOther);
+      uint8_t cls = pending.tags[i] < kGpuCensusTotalClasses ? pending.tags[i]
+                                                             : uint8_t(kGpuCensusOther);
       gpu_census_class_ticks_[cls] += dt;
       ++gpu_census_class_spans_[cls];
     }
     gpu_census_pending_.pop_front();
+  }
+}
+
+// [gpu-census] draw sub-split: map the bound RT config to a stable dynamic
+// class. Called by the RT cache on every SetCommandListRenderTargets; the
+// same-config early-out keeps it cheap. If the current class is already a
+// draw class, transition immediately so the next recorded commands (the
+// first draw of the new pass) land on the right config.
+void D3D12CommandProcessor::GpuCensusSetDrawConfig(const uint32_t rt_keys[5], const char* desc) {
+  if (!gpu_census_available_) {
+    return;
+  }
+  if (!std::memcmp(rt_keys, gpu_census_last_rt_keys_, sizeof(gpu_census_last_rt_keys_))) {
+    return;
+  }
+  std::memcpy(gpu_census_last_rt_keys_, rt_keys, sizeof(gpu_census_last_rt_keys_));
+  uint32_t config_index = UINT32_MAX;
+  for (uint32_t i = 0; i < gpu_census_draw_config_count_; ++i) {
+    if (!std::memcmp(gpu_census_draw_configs_[i].rt_keys, rt_keys, sizeof(uint32_t) * 5)) {
+      config_index = i;
+      break;
+    }
+  }
+  if (config_index == UINT32_MAX) {
+    if (gpu_census_draw_config_count_ < kGpuCensusDrawConfigs) {
+      config_index = gpu_census_draw_config_count_++;
+      GpuCensusDrawConfig& config = gpu_census_draw_configs_[config_index];
+      std::memcpy(config.rt_keys, rt_keys, sizeof(uint32_t) * 5);
+      snprintf(config.desc, sizeof(config.desc), "%s", desc ? desc : "?");
+    } else {
+      // Table full - fall back to the generic draw bucket.
+      gpu_census_draw_class_ = kGpuCensusDraw;
+      return;
+    }
+  }
+  uint8_t new_class = uint8_t(kGpuCensusClassCount + config_index);
+  uint8_t old_class = gpu_census_draw_class_;
+  gpu_census_draw_class_ = new_class;
+  if (gpu_census_sub_active_ &&
+      (gpu_census_class_ == old_class || gpu_census_class_ == kGpuCensusDraw ||
+       gpu_census_class_ >= kGpuCensusClassCount)) {
+    GpuCensusSetClass(new_class);
   }
 }
 
@@ -13261,15 +13306,21 @@ void D3D12CommandProcessor::GpuCensusReport1Hz() {
   }
   GpuCensusConsumeCompleted();
   uint64_t total_ticks = 0;
-  for (uint32_t i = 0; i < kGpuCensusClassCount; ++i) {
+  for (uint32_t i = 0; i < kGpuCensusTotalClasses; ++i) {
     total_ticks += gpu_census_class_ticks_[i];
+  }
+  // "draw" in the main line = generic bucket + every per-RT-config class.
+  uint64_t draw_ticks = gpu_census_class_ticks_[kGpuCensusDraw];
+  uint64_t draw_spans = gpu_census_class_spans_[kGpuCensusDraw];
+  for (uint32_t i = kGpuCensusClassCount; i < kGpuCensusTotalClasses; ++i) {
+    draw_ticks += gpu_census_class_ticks_[i];
+    draw_spans += gpu_census_class_spans_[i];
   }
   const double to_ms = gpu_census_ticks_to_ms_;
   REXGPU_INFO(
       "[gpu-census] gpu {:.1f}ms/s | draw {:.1f}/{} xfer {:.1f}/{} resolve {:.1f}/{} "
       "texup {:.1f}/{} memup {:.1f}/{} swap {:.1f}/{} other {:.1f}/{} | trunc {} drop {}",
-      double(total_ticks) * to_ms, double(gpu_census_class_ticks_[kGpuCensusDraw]) * to_ms,
-      gpu_census_class_spans_[kGpuCensusDraw],
+      double(total_ticks) * to_ms, double(draw_ticks) * to_ms, draw_spans,
       double(gpu_census_class_ticks_[kGpuCensusXfer]) * to_ms,
       gpu_census_class_spans_[kGpuCensusXfer],
       double(gpu_census_class_ticks_[kGpuCensusResolve]) * to_ms,
@@ -13282,6 +13333,39 @@ void D3D12CommandProcessor::GpuCensusReport1Hz() {
       gpu_census_class_spans_[kGpuCensusSwap],
       double(gpu_census_class_ticks_[kGpuCensusOther]) * to_ms,
       gpu_census_class_spans_[kGpuCensusOther], gpu_census_trunc_, gpu_census_dropped_);
+  // [gpu-census-draw] sub-split: top RT configs by GPU ms this second.
+  // Configs under 1 ms are noise; the generic bucket prints as "other".
+  {
+    uint32_t order[kGpuCensusDrawConfigs];
+    for (uint32_t i = 0; i < gpu_census_draw_config_count_; ++i) {
+      order[i] = kGpuCensusClassCount + i;
+    }
+    std::sort(order, order + gpu_census_draw_config_count_,
+              [this](uint32_t a, uint32_t b) {
+                return gpu_census_class_ticks_[a] > gpu_census_class_ticks_[b];
+              });
+    std::string draw_line;
+    uint32_t printed = 0;
+    for (uint32_t i = 0; i < gpu_census_draw_config_count_ && printed < 8; ++i) {
+      uint32_t cls = order[i];
+      double ms = double(gpu_census_class_ticks_[cls]) * to_ms;
+      if (ms < 1.0) {
+        break;
+      }
+      draw_line += fmt::format("[{}] {:.1f}/{} | ",
+                               gpu_census_draw_configs_[cls - kGpuCensusClassCount].desc, ms,
+                               gpu_census_class_spans_[cls]);
+      ++printed;
+    }
+    if (gpu_census_class_ticks_[kGpuCensusDraw]) {
+      draw_line += fmt::format("other {:.1f}/{}",
+                               double(gpu_census_class_ticks_[kGpuCensusDraw]) * to_ms,
+                               gpu_census_class_spans_[kGpuCensusDraw]);
+    }
+    if (!draw_line.empty()) {
+      REXGPU_INFO("[gpu-census-draw] {}", draw_line);
+    }
+  }
   std::memset(gpu_census_class_ticks_, 0, sizeof(gpu_census_class_ticks_));
   std::memset(gpu_census_class_spans_, 0, sizeof(gpu_census_class_spans_));
   gpu_census_trunc_ = 0;
