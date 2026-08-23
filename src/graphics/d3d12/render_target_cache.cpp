@@ -134,20 +134,13 @@ REXCVAR_DEFINE_BOOL(gpu_nr_detile_clear_probe, false, "GPU",
                     "[nr-detile] Log every resolve clear's rectangle, render "
                     "targets and EDRAM tile ranges, once per second per shape.");
 
-// [NR-XFER] N-10b. The one EDRAM-buffer use left on the shipping path outside
-// the resolve fallback: when a depth render target regains ownership of a
-// range and the best host depth source for it is the destination ITSELF, the
-// legacy path dispatches a compute store of the dest's depth plane into the
-// EDRAM buffer, and the transfer pixel shader reads it back as a raw buffer
-// (TransferShaderKey::host_depth_source_is_copy). Natively there is no EDRAM:
-// snapshot the dest depth plane into a scratch depth TEXTURE with one
-// CopyResource and let the transfer shader take the ordinary host-depth
-// TEXTURE variant with identity addressing (the source key IS the dest key).
-// Deletes the round trip and, once shipped, the three host_depth_store_*
-// blobs. Legacy path kept only for the A/B.
-REXCVAR_DEFINE_BOOL(gpu_nr_native_hds, true, "GPU/D3D12",
-                    "[nr-xfer] Snapshot self-referential host depth into a "
-                    "scratch texture instead of the EDRAM buffer round trip.");
+// [NR-XFER] N-10b. Self-referential host depth (a depth RT regaining
+// ownership of a range with itself as the best host depth source) is
+// UNCONDITIONALLY a scratch-texture snapshot read through the ordinary
+// host-depth TEXTURE shader variant with identity addressing. The legacy
+// compute store into the EDRAM buffer and the is_copy buffer-read shader
+// variant were deleted after the naruto_627 gate (hds native 7189 /
+// legacy 0 over a full city drive, no fatals, no visual issues).
 
 namespace rex::graphics::d3d12 {
 
@@ -155,9 +148,6 @@ namespace rex::graphics::d3d12 {
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/clear_uint2_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fullscreen_cw_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/host_depth_store_1xmsaa_cs.h"
-#include "../shaders/bytecode/d3d12_5_1/host_depth_store_2xmsaa_cs.h"
-#include "../shaders/bytecode/d3d12_5_1/host_depth_store_4xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/passthrough_position_xy_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_scaled_cs.h"
@@ -1015,106 +1005,9 @@ bool D3D12RenderTargetCache::Initialize() {
     null_rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
     device->CreateRenderTargetView(nullptr, &null_rtv_desc, null_rtv_descriptor_ms_.GetHandle());
 
-    // For host depth -> same depth transfers, host depth storing root signature
-    // and pipelines.
-    D3D12_ROOT_PARAMETER
-    host_depth_store_root_parameters[kHostDepthStoreRootParameterCount];
-    // Constants.
-    D3D12_ROOT_PARAMETER& host_depth_store_root_constants =
-        host_depth_store_root_parameters[kHostDepthStoreRootParameterConstants];
-    host_depth_store_root_constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    host_depth_store_root_constants.Constants.ShaderRegister = 0;
-    host_depth_store_root_constants.Constants.RegisterSpace = 0;
-    host_depth_store_root_constants.Constants.Num32BitValues =
-        sizeof(HostDepthStoreConstants) / sizeof(uint32_t);
-    host_depth_store_root_constants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    // Source.
-    D3D12_DESCRIPTOR_RANGE host_depth_store_root_source_range;
-    host_depth_store_root_source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    host_depth_store_root_source_range.NumDescriptors = 1;
-    host_depth_store_root_source_range.BaseShaderRegister = 0;
-    host_depth_store_root_source_range.RegisterSpace = 0;
-    host_depth_store_root_source_range.OffsetInDescriptorsFromTableStart = 0;
-    D3D12_ROOT_PARAMETER& host_depth_store_root_source =
-        host_depth_store_root_parameters[kHostDepthStoreRootParameterSource];
-    host_depth_store_root_source.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    host_depth_store_root_source.DescriptorTable.NumDescriptorRanges = 1;
-    host_depth_store_root_source.DescriptorTable.pDescriptorRanges =
-        &host_depth_store_root_source_range;
-    host_depth_store_root_source.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    // Destination.
-    D3D12_DESCRIPTOR_RANGE host_depth_store_root_dest_range;
-    host_depth_store_root_dest_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    host_depth_store_root_dest_range.NumDescriptors = 1;
-    host_depth_store_root_dest_range.BaseShaderRegister = 0;
-    host_depth_store_root_dest_range.RegisterSpace = 0;
-    host_depth_store_root_dest_range.OffsetInDescriptorsFromTableStart = 0;
-    D3D12_ROOT_PARAMETER& host_depth_store_root_dest =
-        host_depth_store_root_parameters[kHostDepthStoreRootParameterDest];
-    host_depth_store_root_dest.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    host_depth_store_root_dest.DescriptorTable.NumDescriptorRanges = 1;
-    host_depth_store_root_dest.DescriptorTable.pDescriptorRanges =
-        &host_depth_store_root_dest_range;
-    host_depth_store_root_dest.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    // Root signature.
-    D3D12_ROOT_SIGNATURE_DESC host_depth_store_root_desc;
-    host_depth_store_root_desc.NumParameters = UINT(rex::countof(host_depth_store_root_parameters));
-    host_depth_store_root_desc.pParameters = host_depth_store_root_parameters;
-    host_depth_store_root_desc.NumStaticSamplers = 0;
-    host_depth_store_root_desc.pStaticSamplers = nullptr;
-    host_depth_store_root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-    host_depth_store_root_signature_ =
-        ui::d3d12::util::CreateRootSignature(provider, host_depth_store_root_desc);
-    if (!host_depth_store_root_signature_) {
-      REXGPU_ERROR(
-          "D3D12RenderTargetCache: Failed to create the host depth storing "
-          "root signature");
-      Shutdown();
-      return false;
-    }
-    // Pipelines.
-    // 1 sample.
-    host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k1X)] =
-        ui::d3d12::util::CreateComputePipeline(device, shaders::host_depth_store_1xmsaa_cs,
-                                               sizeof(shaders::host_depth_store_1xmsaa_cs),
-                                               host_depth_store_root_signature_);
-    if (!host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k1X)]) {
-      REXGPU_ERROR(
-          "D3D12RenderTargetCache: Failed to create the 1-sample host depth "
-          "storing pipeline");
-      Shutdown();
-      return false;
-    }
-    host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k1X)]->SetName(
-        L"Host Depth Store 1xMSAA");
-    // 2 samples.
-    host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k2X)] =
-        ui::d3d12::util::CreateComputePipeline(device, shaders::host_depth_store_2xmsaa_cs,
-                                               sizeof(shaders::host_depth_store_2xmsaa_cs),
-                                               host_depth_store_root_signature_);
-    if (!host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k2X)]) {
-      REXGPU_ERROR(
-          "D3D12RenderTargetCache: Failed to create the 2-sample host depth "
-          "storing pipeline");
-      Shutdown();
-      return false;
-    }
-    host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k2X)]->SetName(
-        L"Host Depth Store 2xMSAA");
-    // 4 samples.
-    host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k4X)] =
-        ui::d3d12::util::CreateComputePipeline(device, shaders::host_depth_store_4xmsaa_cs,
-                                               sizeof(shaders::host_depth_store_4xmsaa_cs),
-                                               host_depth_store_root_signature_);
-    if (!host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k4X)]) {
-      REXGPU_ERROR(
-          "D3D12RenderTargetCache: Failed to create the 4-sample host depth "
-          "storing pipeline");
-      Shutdown();
-      return false;
-    }
-    host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k4X)]->SetName(
-        L"Host Depth Store 4xMSAA");
+    // [NR-XFER] N-10b: the host depth storing root signature and the three
+    // host_depth_store compute pipelines are DELETED - the native scratch
+    // texture snapshot replaced the EDRAM round trip.
 
     // Transfer and clear vertex buffer, for quads of up to tile granularity.
     transfer_vertex_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
@@ -1592,10 +1485,6 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
 
   transfer_vertex_buffer_pool_.reset();
 
-  for (size_t i = 0; i < rex::countof(host_depth_store_pipelines_); ++i) {
-    ui::d3d12::util::ReleaseAndNull(host_depth_store_pipelines_[i]);
-  }
-  ui::d3d12::util::ReleaseAndNull(host_depth_store_root_signature_);
 
   null_rtv_descriptor_ms_.Free();
   null_rtv_descriptor_ss_.Free();
@@ -4857,15 +4746,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
              draw_resolution_scale_y());
   }
 
-  // Do host depth storing for the depth destination (assuming there can be only
-  // one depth destination) where depth destination == host depth source.
-  // [NR-XFER] N-10b: on the native path the dest depth plane is snapshotted
-  // into a scratch TEXTURE with one CopyResource instead - no EDRAM buffer,
-  // no compute store, and the transfer shader takes the ordinary host-depth
-  // texture variant with identity addressing (the source key IS the dest
-  // key). The legacy store below survives only for the A/B and as the
-  // fallback if scratch creation ever fails.
-  bool host_depth_store_set_up = false;
+  // [NR-XFER] N-10b, legacy store DELETED (gated naruto_627: hds native
+  // 7189 / legacy 0 over a full city drive, no fatals, no visual issues).
+  // When the depth destination is its own host depth source, snapshot its
+  // depth plane into a scratch TEXTURE with one CopyResource; the transfer
+  // shader takes the ordinary host-depth texture variant with identity
+  // addressing (the source key IS the dest key). No EDRAM buffer, no
+  // compute store. If scratch creation ever fails (cached, effectively
+  // never), the key builder below degrades those transfers to guest-depth
+  // only and counts them in the census.
   bool native_hds_used = false;
   D3D12_CPU_DESCRIPTOR_HANDLE native_hds_srv_handle = {};
   for (uint32_t i = 0; i < render_target_count; ++i) {
@@ -4874,8 +4763,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       continue;
     }
     auto& dest_d3d12_rt = *static_cast<D3D12RenderTarget*>(dest_rt);
-    RenderTargetKey dest_rt_key = dest_d3d12_rt.key();
-    if (!dest_rt_key.is_depth) {
+    if (!dest_d3d12_rt.key().is_depth) {
       continue;
     }
     const std::vector<Transfer>& depth_transfers = render_target_transfers[i];
@@ -4883,107 +4771,30 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       if (transfer.host_depth_source != dest_rt) {
         continue;
       }
-      if (REXCVAR_GET(gpu_nr_native_hds) && !native_hds_used) {
-        NativeHostDepthScratch* scratch = GetOrCreateNativeHostDepthScratch(dest_d3d12_rt);
-        if (scratch) {
-          command_processor_.PushTransitionBarrier(
-              dest_d3d12_rt.resource(),
-              dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
-              D3D12_RESOURCE_STATE_COPY_SOURCE);
-          if (scratch->state != D3D12_RESOURCE_STATE_COPY_DEST) {
-            command_processor_.PushTransitionBarrier(scratch->resource.Get(), scratch->state,
-                                                     D3D12_RESOURCE_STATE_COPY_DEST);
-            scratch->state = D3D12_RESOURCE_STATE_COPY_DEST;
-          }
-          command_processor_.SubmitBarriers();
-          command_list.D3DCopyResource(scratch->resource.Get(), dest_d3d12_rt.resource());
-          command_processor_.PushTransitionBarrier(scratch->resource.Get(), scratch->state,
-                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-          scratch->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-          native_hds_srv_handle = scratch->descriptor_srv.GetHandle();
-          native_hds_used = true;
-          ++xfer_census_hds_native_;
-        }
-      }
-      if (native_hds_used) {
-        // One whole-resource snapshot covers every transfer rectangle.
-        continue;
-      }
-      if (!host_depth_store_set_up) {
-        ++xfer_census_hds_legacy_;
-        // Bindings.
-        // 0 - source.
-        // 1 - EDRAM if bindful.
-        ui::d3d12::util::DescriptorCpuGpuHandlePair host_depth_store_descriptors[2];
-        if (!command_processor_.RequestOneUseSingleViewDescriptors(
-                1 + uint32_t(!bindless_resources_used_), host_depth_store_descriptors)) {
-          continue;
-        }
-        command_list.D3DSetComputeRootSignature(host_depth_store_root_signature_);
-        // Destination (EDRAM uint4 buffer).
-        if (bindless_resources_used_) {
-          command_list.D3DSetComputeRootDescriptorTable(
-              kHostDepthStoreRootParameterDest,
-              command_processor_.GetEdramUintPow2BindlessUAVHandlePair(4).second);
-        } else {
-          const ui::d3d12::util::DescriptorCpuGpuHandlePair& host_depth_store_descriptor_dest =
-              host_depth_store_descriptors[1];
-          WriteEdramUintPow2UAVDescriptor(host_depth_store_descriptor_dest.first, 4);
-          command_list.D3DSetComputeRootDescriptorTable(kHostDepthStoreRootParameterDest,
-                                                        host_depth_store_descriptor_dest.second);
-        }
-        // Depth source texture.
-        const ui::d3d12::util::DescriptorCpuGpuHandlePair& host_depth_store_descriptor_source =
-            host_depth_store_descriptors[0];
-        device->CopyDescriptorsSimple(1, host_depth_store_descriptor_source.first,
-                                      dest_d3d12_rt.descriptor_srv().GetHandle(),
-                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        command_list.D3DSetComputeRootDescriptorTable(kHostDepthStoreRootParameterSource,
-                                                      host_depth_store_descriptor_source.second);
-        // Render target constant.
-        HostDepthStoreRenderTargetConstant host_depth_store_render_target_constant =
-            GetHostDepthStoreRenderTargetConstant(dest_rt_key.pitch_tiles_at_32bpp,
-                                                  msaa_2x_supported_);
-        command_list.D3DSetComputeRoot32BitConstants(
-            kHostDepthStoreRootParameterConstants,
-            sizeof(host_depth_store_render_target_constant) / sizeof(uint32_t),
-            &host_depth_store_render_target_constant,
-            offsetof(HostDepthStoreConstants, render_target) / sizeof(uint32_t));
-        // Barriers - don't need to try to combine them with the rest of
-        // render target transfer barriers now - if this happens, after host
-        // depth storing, NON_PIXEL_SHADER_RESOURCE -> DEPTH_WRITE will be done
-        // anyway even in the best case, so it's not possible to have all the
-        // barriers in one place here.
-        TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      NativeHostDepthScratch* scratch = GetOrCreateNativeHostDepthScratch(dest_d3d12_rt);
+      if (scratch) {
         command_processor_.PushTransitionBarrier(
             dest_d3d12_rt.resource(),
-            dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        // Pipeline.
-        command_processor_.SetExternalPipeline(
-            host_depth_store_pipelines_[size_t(dest_rt_key.msaa_samples)]);
-        host_depth_store_set_up = true;
-      }
-      Transfer::Rectangle transfer_rectangles[Transfer::kMaxRectanglesWithCutout];
-      uint32_t transfer_rectangle_count = transfer.GetRectangles(
-          dest_rt_key.base_tiles, dest_rt_key.pitch_tiles_at_32bpp, dest_rt_key.msaa_samples, false,
-          transfer_rectangles, resolve_clear_rectangle);
-      assert_not_zero(transfer_rectangle_count);
-      HostDepthStoreRectangleConstant host_depth_store_rectangle_constant;
-      for (uint32_t j = 0; j < transfer_rectangle_count; ++j) {
-        uint32_t group_count_x, group_count_y;
-        GetHostDepthStoreRectangleInfo(transfer_rectangles[j], dest_rt_key.msaa_samples,
-                                       host_depth_store_rectangle_constant, group_count_x,
-                                       group_count_y);
-        command_list.D3DSetComputeRoot32BitConstants(
-            kHostDepthStoreRootParameterConstants,
-            sizeof(host_depth_store_rectangle_constant) / sizeof(uint32_t),
-            &host_depth_store_rectangle_constant,
-            offsetof(HostDepthStoreConstants, rectangle) / sizeof(uint32_t));
+            dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (scratch->state != D3D12_RESOURCE_STATE_COPY_DEST) {
+          command_processor_.PushTransitionBarrier(scratch->resource.Get(), scratch->state,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST);
+          scratch->state = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
         command_processor_.SubmitBarriers();
-        command_list.D3DDispatch(group_count_x, group_count_y, 1);
-        MarkEdramBufferModified();
+        command_list.D3DCopyResource(scratch->resource.Get(), dest_d3d12_rt.resource());
+        command_processor_.PushTransitionBarrier(scratch->resource.Get(), scratch->state,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        scratch->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        native_hds_srv_handle = scratch->descriptor_srv.GetHandle();
+        native_hds_used = true;
+        ++xfer_census_hds_native_;
+      } else {
+        ++xfer_census_hds_fail_;
       }
+      // One whole-resource snapshot covers every transfer rectangle.
+      break;
     }
     break;
   }
@@ -5060,11 +4871,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           dest_d3d12_rt.resource(), dest_d3d12_rt.SetResourceState(dest_state), dest_state);
     }
   }
-  if (host_depth_store_set_up) {
-    // Will be reading copied host depth from the EDRAM buffer.
-    TransitionEdramBuffer(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  }
-
   // Copy source descriptors to the shader-visible heap.
   // Clear previously set shader-visible descriptor indices.
   for (uint32_t i = 0; i < render_target_count; ++i) {
@@ -5086,14 +4892,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     }
   }
   current_temporary_descriptors_cpu_.clear();
-  uint32_t host_depth_copy_srv_index;
-  if (host_depth_store_set_up && !bindless_resources_used_) {
-    host_depth_copy_srv_index = uint32_t(current_temporary_descriptors_cpu_.size());
-    current_temporary_descriptors_cpu_.push_back(provider.OffsetViewDescriptor(
-        edram_buffer_descriptor_heap_start_, uint32_t(EdramBufferDescriptorIndex::kR32UintSRV)));
-  } else {
-    host_depth_copy_srv_index = UINT32_MAX;
-  }
   // [NR-XFER] The native host-depth scratch SRV rides the same one-use heap
   // as the render target SRVs.
   uint32_t native_hds_srv_index = UINT32_MAX;
@@ -5161,8 +4959,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   uint32_t last_descriptor_index_color = UINT32_MAX;
   uint32_t last_descriptor_index_depth = UINT32_MAX;
   uint32_t last_descriptor_index_stencil = UINT32_MAX;
-  uint32_t last_descriptor_index_host_depth_non_copy = UINT32_MAX;
-  bool last_descriptor_host_depth_is_copy = false;
+  uint32_t last_descriptor_index_host_depth = UINT32_MAX;
   TransferAddressConstant last_address_constant;
   TransferAddressConstant last_host_depth_address_constant;
 
@@ -5248,17 +5045,20 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           RenderTargetKey source_rt_key = source_d3d12_rt.key();
           new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
-          bool host_depth_source_is_self = host_depth_source_d3d12_rt == &dest_d3d12_rt;
-          // [NR-XFER] With the native snapshot the self case reads a scratch
-          // texture with the dest's own key, so it takes the ordinary
-          // host-depth TEXTURE shader variant, not the EDRAM buffer one.
-          bool host_depth_source_is_copy = host_depth_source_is_self && !native_hds_used;
-          new_transfer_shader_key.host_depth_source_is_copy = host_depth_source_is_copy;
-          // The host depth copy buffer has only raw samples.
+          // [NR-XFER] The self case reads the native scratch snapshot with
+          // the dest's own key, so every host depth source takes the
+          // ordinary TEXTURE shader variant now; the EDRAM buffer variant
+          // (is_copy) is dead. If the scratch failed (cached, effectively
+          // never), degrade to a guest-depth-only transfer.
+          bool host_depth_degraded = false;
+          if (host_depth_source_d3d12_rt == &dest_d3d12_rt && !native_hds_used) {
+            host_depth_source_d3d12_rt = nullptr;
+            host_depth_degraded = true;
+          }
+          new_transfer_shader_key.host_depth_source_is_copy = false;
           new_transfer_shader_key.host_depth_source_msaa_samples =
-              (host_depth_source_d3d12_rt && !host_depth_source_is_copy)
-                  ? host_depth_source_d3d12_rt->key().msaa_samples
-                  : xenos::MsaaSamples::k1X;
+              host_depth_source_d3d12_rt ? host_depth_source_d3d12_rt->key().msaa_samples
+                                         : xenos::MsaaSamples::k1X;
           if (j) {
             new_transfer_shader_key.mode = source_rt_key.is_depth
                                                ? TransferMode::kDepthToStencilBit
@@ -5287,8 +5087,13 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           if (j) {
             ++xfer_census_stencil_bit_;
             current_transfer_invocations_.back().transfer.host_depth_source = nullptr;
-          } else if (size_t(new_transfer_shader_key.mode) < rex::countof(xfer_census_modes_)) {
-            ++xfer_census_modes_[size_t(new_transfer_shader_key.mode)];
+          } else {
+            if (host_depth_degraded) {
+              current_transfer_invocations_.back().transfer.host_depth_source = nullptr;
+            }
+            if (size_t(new_transfer_shader_key.mode) < rex::countof(xfer_census_modes_)) {
+              ++xfer_census_modes_[size_t(new_transfer_shader_key.mode)];
+            }
           }
         }
       }
@@ -5396,10 +5201,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             source_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (host_depth_source_d3d12_rt) {
-          if (transfer_shader_key.host_depth_source_is_copy) {
-            // Reading copied host depth from the EDRAM buffer.
-            TransitionEdramBuffer(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-          } else if (host_depth_source_d3d12_rt == &dest_d3d12_rt) {
+          if (host_depth_source_d3d12_rt == &dest_d3d12_rt) {
             // [NR-XFER] Native self snapshot: the scratch texture was left in
             // PIXEL_SHADER_RESOURCE by the setup copy; the destination itself
             // must stay bound as the depth target.
@@ -5513,27 +5315,18 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           }
         }
         if (transfer_root_parameters_used & kTransferUsedRootParameterHostDepthSRVBit) {
-          if (transfer_shader_key.host_depth_source_is_copy) {
-            if (!last_descriptor_host_depth_is_copy) {
-              last_descriptor_host_depth_is_copy = true;
-              transfer_root_parameters_set &= ~kTransferUsedRootParameterHostDepthSRVBit;
-            }
-          } else {
-            assert_not_null(host_depth_source_d3d12_rt);
-            // [NR-XFER] The native self snapshot binds the scratch texture's
-            // one-use SRV; the destination has no temporary SRV of its own.
-            uint32_t descriptor_index_host_depth =
-                host_depth_source_d3d12_rt == &dest_d3d12_rt
-                    ? native_hds_srv_index
-                    : host_depth_source_d3d12_rt->temporary_srv_descriptor_index();
-            assert_true(descriptor_index_host_depth != UINT32_MAX);
-            if (last_descriptor_host_depth_is_copy ||
-                last_descriptor_index_host_depth_non_copy != descriptor_index_host_depth) {
-              transfer_root_parameters_set &= ~kTransferUsedRootParameterHostDepthSRVBit;
-            }
-            last_descriptor_host_depth_is_copy = false;
-            last_descriptor_index_host_depth_non_copy = descriptor_index_host_depth;
+          assert_not_null(host_depth_source_d3d12_rt);
+          // [NR-XFER] The native self snapshot binds the scratch texture's
+          // one-use SRV; the destination has no temporary SRV of its own.
+          uint32_t descriptor_index_host_depth =
+              host_depth_source_d3d12_rt == &dest_d3d12_rt
+                  ? native_hds_srv_index
+                  : host_depth_source_d3d12_rt->temporary_srv_descriptor_index();
+          assert_true(descriptor_index_host_depth != UINT32_MAX);
+          if (last_descriptor_index_host_depth != descriptor_index_host_depth) {
+            transfer_root_parameters_set &= ~kTransferUsedRootParameterHostDepthSRVBit;
           }
+          last_descriptor_index_host_depth = descriptor_index_host_depth;
         }
         if (transfer_root_parameters_used & kTransferUsedRootParameterAddressConstantBit) {
           RenderTargetKey source_rt_key = source_d3d12_rt.key();
@@ -5574,29 +5367,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           transfer_root_parameters_set |= kTransferUsedRootParameterHostDepthAddressConstantBit;
         }
         if (transfer_root_parameters_unset & kTransferUsedRootParameterHostDepthSRVBit) {
-          D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_handle;
-          if (last_descriptor_host_depth_is_copy) {
-            if (bindless_resources_used_) {
-              descriptor_gpu_handle =
-                  command_processor_
-                      .GetSystemBindlessViewHandlePair(
-                          D3D12CommandProcessor::SystemBindlessView ::kEdramR32UintSRV)
-                      .second;
-            } else {
-              assert_true(host_depth_copy_srv_index != UINT32_MAX);
-              descriptor_gpu_handle =
-                  current_temporary_descriptors_gpu_[host_depth_copy_srv_index].second;
-            }
-          } else {
-            assert_true(last_descriptor_index_host_depth_non_copy != UINT32_MAX);
-            descriptor_gpu_handle =
-                current_temporary_descriptors_gpu_[last_descriptor_index_host_depth_non_copy]
-                    .second;
-          }
+          assert_true(last_descriptor_index_host_depth != UINT32_MAX);
           command_list.D3DSetGraphicsRootDescriptorTable(
               rex::bit_count(transfer_root_parameters_used &
                              (kTransferUsedRootParameterHostDepthSRVBit - 1)),
-              descriptor_gpu_handle);
+              current_temporary_descriptors_gpu_[last_descriptor_index_host_depth].second);
           transfer_root_parameters_set |= kTransferUsedRootParameterHostDepthSRVBit;
         }
         if (transfer_root_parameters_unset & kTransferUsedRootParameterAddressConstantBit) {
@@ -5793,10 +5568,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     xfer_census_last_report_ = xfer_census_now;
     REXGPU_INFO(
         "[nr-xfer] cum: passes {} | c2d {} c2c {} d2d {} d2c {} c2sb {} d2sb {} chd {} dhd {} | "
-        "sb-draws {} | hds legacy {} native {}",
+        "sb-draws {} | hds fail {} native {}",
         xfer_census_passes_, xfer_census_modes_[0], xfer_census_modes_[1], xfer_census_modes_[2],
         xfer_census_modes_[3], xfer_census_modes_[4], xfer_census_modes_[5], xfer_census_modes_[6],
-        xfer_census_modes_[7], xfer_census_stencil_bit_, xfer_census_hds_legacy_,
+        xfer_census_modes_[7], xfer_census_stencil_bit_, xfer_census_hds_fail_,
         xfer_census_hds_native_);
   }
 }

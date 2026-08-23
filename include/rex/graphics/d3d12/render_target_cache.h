@@ -471,13 +471,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     }
   };
 
-  enum {
-    kHostDepthStoreRootParameterConstants,
-    kHostDepthStoreRootParameterSource,
-    kHostDepthStoreRootParameterDest,
-    kHostDepthStoreRootParameterCount,
-  };
-
   union DumpPipelineKey {
     uint32_t key;
     struct {
@@ -749,14 +742,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> current_temporary_descriptors_cpu_;
   std::vector<ui::d3d12::util::DescriptorCpuGpuHandlePair> current_temporary_descriptors_gpu_;
 
-  ID3D12RootSignature* host_depth_store_root_signature_ = nullptr;
-  ID3D12PipelineState* host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k4X) + 1] = {};
-
   // [NR-XFER] N-10b native host-depth snapshot: when a depth transfer's host
   // depth source is the destination itself, the dest depth plane is copied
   // into this scratch texture and the transfer shader reads it as an ordinary
-  // host-depth TEXTURE source with identity addressing, instead of the
-  // legacy compute store into the EDRAM buffer. Keyed by the dest resource's
+  // host-depth TEXTURE source with identity addressing. (The legacy compute
+  // store into the EDRAM buffer was deleted after the naruto_627 gate.)
+  // Keyed by the dest resource's
   // {format, sample count, width, height}; the game's closed RT config set
   // keeps this at a couple of entries, created once and cached forever.
   struct NativeHostDepthScratch {
@@ -777,7 +768,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   uint64_t xfer_census_passes_ = 0;
   uint64_t xfer_census_modes_[8] = {};  // TransferMode order
   uint64_t xfer_census_stencil_bit_ = 0;
-  uint64_t xfer_census_hds_legacy_ = 0;
+  uint64_t xfer_census_hds_fail_ = 0;
   uint64_t xfer_census_hds_native_ = 0;
   std::chrono::steady_clock::time_point xfer_census_last_report_{};
 
