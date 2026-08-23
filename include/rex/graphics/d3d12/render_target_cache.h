@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -591,30 +592,45 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     }
   };
 
-  struct DirectResolvePushConstants {
-    draw_util::ResolveCopyShaderConstants resolve;
-    uint32_t source_base_tiles;
-    uint32_t source_pitch_tiles;
-    uint32_t dispatch_first_tile;
+  // [NR-DRES] N-10a direct resolve: a resolve copy that reads the host render
+  // target itself and writes the tiled guest destination in ONE compute
+  // dispatch. No EDRAM dump, no vendored copy shader. TryResolveCopyDirectly
+  // is the PREFLIGHT only - it answers eligibility and fills
+  // direct_resolve_plan_; the dispatch replaces the vendored copy dispatch at
+  // its site in Resolve so shared-memory commit ordering and written-range
+  // bookkeeping stay identical. Anything outside the closed set declines with
+  // a counted reason ([[count-refusals-every-granularity]]) and takes the dump
+  // path unchanged. Pipelines are HLSL compiled at runtime through
+  // D3DCompiler_47 (already loaded by the provider for disassembly); if the
+  // compiler is unavailable every resolve declines and nothing changes.
+  struct DirectResolvePlan {
+    ID3D12PipelineState* pipeline = nullptr;
+    D3D12RenderTarget* render_target = nullptr;
+    // b0 layout: dest_info raw | dest_coordinate_info raw | dest_base |
+    // width|height<<16 | rt origin x|y<<16 | sample list+count |
+    // folded bias factor bits | reserved.
+    uint32_t constants[8] = {};
+    uint32_t group_count_x = 0, group_count_y = 0;
+    bool is_depth = false;
+    // Resolution-scaled: the dest is the texture cache's scaled resolve
+    // range (windowed UAV, dest_base 0), not shared memory.
+    bool scaled = false;
+    // For the verify diagnostics: the guest dest base (constants[2] is zeroed
+    // when scaled) and the dest bytes-per-block log2 (2, or 0 for 8bpp).
+    uint32_t dest_base_guest = 0;
+    uint32_t bpp_log2 = 2;
   };
-
-  struct DirectResolvePipelineKey {
-    DumpPipelineKey dump_pipeline_key;
-    draw_util::ResolveCopyShaderIndex copy_shader;
-    bool draw_resolution_scaled;
-
-    uint64_t packed() const {
-      return uint64_t(dump_pipeline_key.key) | (uint64_t(size_t(copy_shader)) << 32) |
-             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40);
-    }
-    struct Hasher {
-      size_t operator()(const DirectResolvePipelineKey& key) const {
-        return std::hash<uint64_t>{}(key.packed());
-      }
-    };
-    bool operator==(const DirectResolvePipelineKey& other_key) const {
-      return packed() == other_key.packed();
-    }
+  enum class DirectResolveDecline : uint32_t {
+    kScaled,         // resolution-scaled (not in increment 1)
+    kShaderClass,    // not a fast-32bpp copy shader
+    kDestArray,      // 3D/array destination
+    kNoRect,         // no owning render target rectangle
+    kMultiRect,      // span owned by more than one render target
+    kRectPartial,    // single owner does not cover the whole span
+    kGeometry,       // base delta / pitch / msaa mismatch vs the owning RT
+    kFormat,         // format outside the implemented set
+    kPipeline,       // shader compile / root signature / pso failure
+    kCount,
   };
 
   // Returns:
@@ -658,10 +674,30 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void SetCommandListRenderTargets(RenderTarget* const* depth_and_color_render_targets);
 
   ID3D12PipelineState* GetOrCreateDumpPipeline(DumpPipelineKey key);
-  ID3D12PipelineState* GetOrCreateDirectResolvePipeline(DirectResolvePipelineKey key);
+  // [NR-DRES] full/pack_class/src_gamma16 extend the variant space for the
+  // full-class (averaging/format-converting) shaders; the map key packs them
+  // into the DumpPipelineKey's spare upper bits.
+  ID3D12PipelineState* GetOrCreateDirectResolvePipeline(DumpPipelineKey key, bool full,
+                                                        uint32_t pack_class, bool src_gamma16);
   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                               draw_util::ResolveCopyShaderIndex copy_shader,
                               bool draw_resolution_scaled);
+  // [NR-DRES] Issues the prepared direct resolve at the vendored copy dispatch
+  // site. Returns false only on transient descriptor exhaustion (the same
+  // failure mode the vendored path has there).
+  bool DispatchDirectResolve(D3D12SharedMemory& shared_memory, D3D12TextureCache& texture_cache);
+  // [NR-DRES] Verify support: snapshots the dest span into readback slot
+  // `stage` (0 = legacy result, 1 = direct result) for a CPU compare a second
+  // later. Rate-limited internally. Scaled dests snapshot from the scaled
+  // resolve buffer chunk (single-chunk extents only).
+  void DirectResolveVerifySnapshot(D3D12SharedMemory& shared_memory,
+                                   D3D12TextureCache& texture_cache, uint32_t stage,
+                                   uint32_t dest_start, uint32_t dest_length);
+  // [NR-DRES] Verify arbiter: snapshots the source RT texture itself
+  // (single-sampled color only) so a diverge report can say which side
+  // matches the render target.
+  void DirectResolveVerifySnapshotSource();
+  void ReportDirectResolveStats();
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -730,7 +766,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
-  std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
 
   ID3D12RootSignature* dump_root_signature_color_ = nullptr;
   ID3D12RootSignature* dump_root_signature_depth_ = nullptr;
@@ -738,14 +773,53 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // buffer. May be null if failed to create.
   std::unordered_map<DumpPipelineKey, ID3D12PipelineState*, DumpPipelineKey::Hasher>
       dump_pipelines_;
+  // [NR-DRES] Direct resolve: own root signatures (color: constants + dest UAV
+  // + source SRV; depth: + stencil SRV), runtime-compiled pipelines keyed by
+  // the same {msaa, format, is_depth} key as the dump pipelines (null cached on
+  // compile failure), the preflight-filled plan, and the decline census.
   ID3D12RootSignature* direct_resolve_root_signature_color_ = nullptr;
   ID3D12RootSignature* direct_resolve_root_signature_depth_ = nullptr;
-  std::unordered_map<DirectResolvePipelineKey, ID3D12PipelineState*,
-                     DirectResolvePipelineKey::Hasher>
+  std::unordered_map<DumpPipelineKey, ID3D12PipelineState*, DumpPipelineKey::Hasher>
       direct_resolve_pipelines_;
+  DirectResolvePlan direct_resolve_plan_;
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+  uint64_t direct_resolve_declines_[size_t(DirectResolveDecline::kCount)] = {};
+  // Class declines itemized by the vendored shader they fell back to.
+  uint64_t direct_resolve_class_declines_[size_t(draw_util::ResolveCopyShaderIndex::kCount)] = {};
+  uint64_t direct_resolve_dispatch_count_ = 0;
+  // [NR-DRES] Verify ring: slot 0 = legacy result, slot 1 = direct result of
+  // the same resolve; compared on the CPU one second later (the copy has long
+  // since retired, same pattern as NrDetileEdramProbe). Never sampled from
+  // upload/readback memory mid-flight ([[upload-heap-readback-trap]]).
+  // Slot 2 holds a copy of the source RT texture itself (single-sampled
+  // sources only), the arbiter when legacy and direct disagree: whichever
+  // side matches the RT is right.
+  ID3D12Resource* dres_verify_readback_[3] = {nullptr, nullptr, nullptr};
+  uint32_t dres_verify_pending_length_ = 0;
+  uint32_t dres_verify_pending_dest_ = 0;
+  uint32_t dres_verify_pending_format_ = 0;
+  uint32_t dres_verify_pending_src_rows_ = 0;  // 0 = no RT snapshot this pair
+  uint32_t dres_verify_pending_src_pitch_ = 0;  // bytes per row in slot 2
+  // When the pending pair was recorded. The compare must wait until the
+  // copies have retired (>= 1 s, the NrDetileEdramProbe pattern) - comparing
+  // on the next Resolve call reads the PREVIOUS pair's bytes under THIS
+  // pair's metadata and misattributes every diagnostic.
+  std::chrono::steady_clock::time_point dres_verify_pending_time_{};
+  // The plan constants + source identity of the pending pair, so a diverge
+  // report can name the exact pixel (forward-scan inverse of the tiled
+  // address) and the sample mapping in effect.
+  uint32_t dres_verify_pending_constants_[8] = {};
+  uint32_t dres_verify_pending_rt_key_ = 0;
+  uint32_t dres_verify_pending_dest_base_ = 0;
+  uint32_t dres_verify_pending_bpp_log2_ = 2;
+  bool dres_verify_pending_scaled_ = false;
+  std::chrono::steady_clock::time_point dres_verify_last_{};
+  uint64_t dres_verify_compared_ = 0;
+  uint64_t dres_verify_diverged_ = 0;
+  uint64_t dres_verify_diverged_dwords_ = 0;
+  std::chrono::steady_clock::time_point dres_report_last_{};
 
   // Parameter 0 - 2 root constants (red, green).
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;
