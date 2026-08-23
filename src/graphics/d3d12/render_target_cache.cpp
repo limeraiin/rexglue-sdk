@@ -134,6 +134,21 @@ REXCVAR_DEFINE_BOOL(gpu_nr_detile_clear_probe, false, "GPU",
                     "[nr-detile] Log every resolve clear's rectangle, render "
                     "targets and EDRAM tile ranges, once per second per shape.");
 
+// [NR-XFER] N-10b. The one EDRAM-buffer use left on the shipping path outside
+// the resolve fallback: when a depth render target regains ownership of a
+// range and the best host depth source for it is the destination ITSELF, the
+// legacy path dispatches a compute store of the dest's depth plane into the
+// EDRAM buffer, and the transfer pixel shader reads it back as a raw buffer
+// (TransferShaderKey::host_depth_source_is_copy). Natively there is no EDRAM:
+// snapshot the dest depth plane into a scratch depth TEXTURE with one
+// CopyResource and let the transfer shader take the ordinary host-depth
+// TEXTURE variant with identity addressing (the source key IS the dest key).
+// Deletes the round trip and, once shipped, the three host_depth_store_*
+// blobs. Legacy path kept only for the A/B.
+REXCVAR_DEFINE_BOOL(gpu_nr_native_hds, true, "GPU/D3D12",
+                    "[nr-xfer] Snapshot self-referential host depth into a "
+                    "scratch texture instead of the EDRAM buffer round trip.");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -657,25 +672,13 @@ bool D3D12RenderTargetCache::Initialize() {
   } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
     path_ = Path::kPixelShaderInterlock;
   } else {
-    // As of April 2021 (driver version 27.20.0100.9316), on Intel (tested on
-    // UHD Graphics 630), the "always" stencil comparison function isn't working
-    // properly, so clears in the Xbox 360's Direct3D 9 don't work. Forcing ROV
-    // there.
-#if 1
-    // The ROV path is currently much slower generally.
-    // TODO(Triang3l): Make ROV the default when it's optimized better (for
-    // instance, using static shader modifications to pass render target
-    // parameters).
-    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel
-                ? Path::kPixelShaderInterlock
-                : Path::kHostRenderTargets;
-#else
-    // The AMD shader compiler crashes very often with Xenia's custom
-    // output-merger code as of March 2021.
-    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kAMD
-                ? Path::kHostRenderTargets
-                : Path::kPixelShaderInterlock;
-#endif
+    // [NR] N-10b: RTV everywhere, Intel included. The old Intel ROV forcing
+    // dated to a 2021 driver stencil bug; measured 2026-08-23 (naruto_626,
+    // UHD 630 city drive) forced RTV boots with no hang, renders the city
+    // correctly, and skips the ROV pixel-shader compile storm that used to
+    // grind Intel boots. ROV stays reachable via render_target_path_d3d12
+    // for the A/B until the path is deleted.
+    path_ = Path::kHostRenderTargets;
   }
   if (path_ == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
     path_ = Path::kHostRenderTargets;
@@ -1564,6 +1567,10 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   dres_verify_pending_length_ = 0;
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_depth_);
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_color_);
+
+  // [NR-XFER] ComPtr + descriptor RAII; cleared before the SRV descriptor
+  // pool member is destroyed.
+  native_hds_scratch_.clear();
 
   for (const auto& transfer_pipeline_array_pair : transfer_stencil_bit_pipelines_) {
     for (ID3D12PipelineState* transfer_pipeline : transfer_pipeline_array_pair.second) {
@@ -4715,6 +4722,55 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   return pipelines;
 }
 
+D3D12RenderTargetCache::NativeHostDepthScratch*
+D3D12RenderTargetCache::GetOrCreateNativeHostDepthScratch(D3D12RenderTarget& dest_rt) {
+  D3D12_RESOURCE_DESC desc = dest_rt.resource()->GetDesc();
+  const uint64_t key = (uint64_t(desc.Format) << 48) ^ (uint64_t(desc.SampleDesc.Count) << 40) ^
+                       (uint64_t(desc.Width) << 16) ^ uint64_t(desc.Height);
+  auto it = native_hds_scratch_.find(key);
+  if (it != native_hds_scratch_.end()) {
+    // Null resource = a cached creation failure; the caller falls back.
+    return it->second.resource ? &it->second : nullptr;
+  }
+  NativeHostDepthScratch& scratch = native_hds_scratch_[key];
+  // Reusing the live resource's own desc keeps the CopyResource pair matched
+  // exactly. The scratch is never a DSV, but MSAA textures must carry one of
+  // the RTV/DSV flags, so ALLOW_DEPTH_STENCIL stays.
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                             D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&resource)))) {
+    REXGPU_ERROR("[nr-xfer] Failed to create the native host-depth scratch texture");
+    return nullptr;
+  }
+  resource->SetName(L"NR Native Host Depth Scratch");
+  ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv =
+      descriptor_pool_srv_->AllocateDescriptor();
+  if (!descriptor_srv.IsValid()) {
+    return nullptr;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+  srv_desc.Format = GetDepthSRVDepthDXGIFormat(dest_rt.key().GetDepthFormat());
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  if (desc.SampleDesc.Count > 1) {
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+  } else {
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+    srv_desc.Texture2D.MipLevels = 1;
+    srv_desc.Texture2D.PlaneSlice = 0;
+    srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+  }
+  device->CreateShaderResourceView(resource.Get(), &srv_desc, descriptor_srv.GetHandle());
+  scratch.resource = std::move(resource);
+  scratch.descriptor_srv = std::move(descriptor_srv);
+  scratch.state = D3D12_RESOURCE_STATE_COPY_DEST;
+  return &scratch;
+}
+
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
@@ -4803,7 +4859,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   // Do host depth storing for the depth destination (assuming there can be only
   // one depth destination) where depth destination == host depth source.
+  // [NR-XFER] N-10b: on the native path the dest depth plane is snapshotted
+  // into a scratch TEXTURE with one CopyResource instead - no EDRAM buffer,
+  // no compute store, and the transfer shader takes the ordinary host-depth
+  // texture variant with identity addressing (the source key IS the dest
+  // key). The legacy store below survives only for the A/B and as the
+  // fallback if scratch creation ever fails.
   bool host_depth_store_set_up = false;
+  bool native_hds_used = false;
+  D3D12_CPU_DESCRIPTOR_HANDLE native_hds_srv_handle = {};
   for (uint32_t i = 0; i < render_target_count; ++i) {
     RenderTarget* dest_rt = render_targets[i];
     if (!dest_rt) {
@@ -4819,7 +4883,34 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       if (transfer.host_depth_source != dest_rt) {
         continue;
       }
+      if (REXCVAR_GET(gpu_nr_native_hds) && !native_hds_used) {
+        NativeHostDepthScratch* scratch = GetOrCreateNativeHostDepthScratch(dest_d3d12_rt);
+        if (scratch) {
+          command_processor_.PushTransitionBarrier(
+              dest_d3d12_rt.resource(),
+              dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+              D3D12_RESOURCE_STATE_COPY_SOURCE);
+          if (scratch->state != D3D12_RESOURCE_STATE_COPY_DEST) {
+            command_processor_.PushTransitionBarrier(scratch->resource.Get(), scratch->state,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST);
+            scratch->state = D3D12_RESOURCE_STATE_COPY_DEST;
+          }
+          command_processor_.SubmitBarriers();
+          command_list.D3DCopyResource(scratch->resource.Get(), dest_d3d12_rt.resource());
+          command_processor_.PushTransitionBarrier(scratch->resource.Get(), scratch->state,
+                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+          scratch->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+          native_hds_srv_handle = scratch->descriptor_srv.GetHandle();
+          native_hds_used = true;
+          ++xfer_census_hds_native_;
+        }
+      }
+      if (native_hds_used) {
+        // One whole-resource snapshot covers every transfer rectangle.
+        continue;
+      }
       if (!host_depth_store_set_up) {
+        ++xfer_census_hds_legacy_;
         // Bindings.
         // 0 - source.
         // 1 - EDRAM if bindful.
@@ -5003,6 +5094,13 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   } else {
     host_depth_copy_srv_index = UINT32_MAX;
   }
+  // [NR-XFER] The native host-depth scratch SRV rides the same one-use heap
+  // as the render target SRVs.
+  uint32_t native_hds_srv_index = UINT32_MAX;
+  if (native_hds_used) {
+    native_hds_srv_index = uint32_t(current_temporary_descriptors_cpu_.size());
+    current_temporary_descriptors_cpu_.push_back(native_hds_srv_handle);
+  }
   for (uint32_t i = 0; i < render_target_count; ++i) {
     RenderTarget* dest_rt = render_targets[i];
     if (!dest_rt) {
@@ -5150,7 +5248,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           RenderTargetKey source_rt_key = source_d3d12_rt.key();
           new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
-          bool host_depth_source_is_copy = host_depth_source_d3d12_rt == &dest_d3d12_rt;
+          bool host_depth_source_is_self = host_depth_source_d3d12_rt == &dest_d3d12_rt;
+          // [NR-XFER] With the native snapshot the self case reads a scratch
+          // texture with the dest's own key, so it takes the ordinary
+          // host-depth TEXTURE shader variant, not the EDRAM buffer one.
+          bool host_depth_source_is_copy = host_depth_source_is_self && !native_hds_used;
           new_transfer_shader_key.host_depth_source_is_copy = host_depth_source_is_copy;
           // The host depth copy buffer has only raw samples.
           new_transfer_shader_key.host_depth_source_msaa_samples =
@@ -5180,8 +5282,13 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             }
           }
           current_transfer_invocations_.emplace_back(transfer, new_transfer_shader_key);
+          // [NR-XFER] Census: every transfer invocation by mode, stencil-bit
+          // passes separately.
           if (j) {
+            ++xfer_census_stencil_bit_;
             current_transfer_invocations_.back().transfer.host_depth_source = nullptr;
+          } else if (size_t(new_transfer_shader_key.mode) < rex::countof(xfer_census_modes_)) {
+            ++xfer_census_modes_[size_t(new_transfer_shader_key.mode)];
           }
         }
       }
@@ -5292,6 +5399,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           if (transfer_shader_key.host_depth_source_is_copy) {
             // Reading copied host depth from the EDRAM buffer.
             TransitionEdramBuffer(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+          } else if (host_depth_source_d3d12_rt == &dest_d3d12_rt) {
+            // [NR-XFER] Native self snapshot: the scratch texture was left in
+            // PIXEL_SHADER_RESOURCE by the setup copy; the destination itself
+            // must stay bound as the depth target.
           } else {
             // Reading host depth from the texture.
             command_processor_.PushTransitionBarrier(
@@ -5409,8 +5520,12 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             }
           } else {
             assert_not_null(host_depth_source_d3d12_rt);
+            // [NR-XFER] The native self snapshot binds the scratch texture's
+            // one-use SRV; the destination has no temporary SRV of its own.
             uint32_t descriptor_index_host_depth =
-                host_depth_source_d3d12_rt->temporary_srv_descriptor_index();
+                host_depth_source_d3d12_rt == &dest_d3d12_rt
+                    ? native_hds_srv_index
+                    : host_depth_source_d3d12_rt->temporary_srv_descriptor_index();
             assert_true(descriptor_index_host_depth != UINT32_MAX);
             if (last_descriptor_host_depth_is_copy ||
                 last_descriptor_index_host_depth_non_copy != descriptor_index_host_depth) {
@@ -5667,6 +5782,22 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
     }
+  }
+
+  // [NR-XFER] N-10b census, cumulative, 1 Hz. c2d..dhd follow the TransferMode
+  // order; "dhd"/"chd" self hits are what decide whether the EDRAM host-depth
+  // round trip is reachable at all in this game.
+  ++xfer_census_passes_;
+  const auto xfer_census_now = std::chrono::steady_clock::now();
+  if (xfer_census_now - xfer_census_last_report_ >= std::chrono::seconds(1)) {
+    xfer_census_last_report_ = xfer_census_now;
+    REXGPU_INFO(
+        "[nr-xfer] cum: passes {} | c2d {} c2c {} d2d {} d2c {} c2sb {} d2sb {} chd {} dhd {} | "
+        "sb-draws {} | hds legacy {} native {}",
+        xfer_census_passes_, xfer_census_modes_[0], xfer_census_modes_[1], xfer_census_modes_[2],
+        xfer_census_modes_[3], xfer_census_modes_[4], xfer_census_modes_[5], xfer_census_modes_[6],
+        xfer_census_modes_[7], xfer_census_stencil_bit_, xfer_census_hds_legacy_,
+        xfer_census_hds_native_);
   }
 }
 

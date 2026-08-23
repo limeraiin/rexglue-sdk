@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -750,6 +751,35 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   ID3D12RootSignature* host_depth_store_root_signature_ = nullptr;
   ID3D12PipelineState* host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k4X) + 1] = {};
+
+  // [NR-XFER] N-10b native host-depth snapshot: when a depth transfer's host
+  // depth source is the destination itself, the dest depth plane is copied
+  // into this scratch texture and the transfer shader reads it as an ordinary
+  // host-depth TEXTURE source with identity addressing, instead of the
+  // legacy compute store into the EDRAM buffer. Keyed by the dest resource's
+  // {format, sample count, width, height}; the game's closed RT config set
+  // keeps this at a couple of entries, created once and cached forever.
+  struct NativeHostDepthScratch {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+  };
+  std::map<uint64_t, NativeHostDepthScratch> native_hds_scratch_;
+  // Returns null on creation failure (cached; the caller then takes the
+  // legacy EDRAM store).
+  NativeHostDepthScratch* GetOrCreateNativeHostDepthScratch(D3D12RenderTarget& dest_rt);
+
+  // [NR-XFER] Transfer census, printed 1 Hz from
+  // PerformTransfersAndResolveClears. Answers, from any drive, which
+  // ownership-transfer shapes the game actually hits - in particular whether
+  // the self-referential host-depth path (the last shipping-path EDRAM
+  // dependency outside the resolve fallback) ever fires.
+  uint64_t xfer_census_passes_ = 0;
+  uint64_t xfer_census_modes_[8] = {};  // TransferMode order
+  uint64_t xfer_census_stencil_bit_ = 0;
+  uint64_t xfer_census_hds_legacy_ = 0;
+  uint64_t xfer_census_hds_native_ = 0;
+  std::chrono::steady_clock::time_point xfer_census_last_report_{};
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> transfer_vertex_buffer_pool_;
 
