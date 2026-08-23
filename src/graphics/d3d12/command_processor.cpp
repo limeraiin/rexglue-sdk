@@ -322,10 +322,66 @@ namespace {
 // atomics). The hot WriteRegister path reads this bool instead of the cvar
 // accessor (which carries a static-local guard check per call).
 bool g_dedupe_constants = false;
-// Instrumentation: count of dedupe-eligible constant writes and how many were
-// redundant. Reported ~1/s from IssueSwap when gpu_worker_profile is on.
-uint64_t g_const_writes_total = 0;
-uint64_t g_const_writes_skipped = 0;
+
+// [N8B] THE CONSTANT-REDUNDANCY CENSUS.
+// N-8's dword census said 82.7% of the command processor's 63.9 M applied
+// register dwords a second are ALU shader constants: 288 dwords, 72 float4s,
+// re-uploaded on EVERY draw, copied into the register file and then copied
+// again into a cbuffer. A pool is not a cost, so before designing a zero-copy
+// constant path, ask the cheap question first -- how many of those dwords are
+// re-writes of a value that is already there?
+//   dword-level sameness = the ceiling for ANY dedupe.
+//   range-level sameness = what the whole-range early return below actually
+//     removes, and it removes the cbuffer re-upload too, which is the SECOND
+//     copy and lives inside IssueDraw's 42%.
+// Class index: 0 = ALU float (0x4000), 1 = bool/loop (0x4900), 2 = fetch
+// (0x4800 -- censused, never deduped: the texture-cache and vertex-residency
+// invalidations are correctness, not bookkeeping).
+//
+// Mode, set once a frame in IssueSwap:
+//   0 = off          -- no compare at all, this is the clean fps baseline
+//   1 = census only  -- compare and count, act on nothing. Prices the compare.
+//   2 = census+act   -- the whole-range early return fires (the dedupe).
+// `gpu_n7 3` cycles the three 5 s each IN PLACE ([[price-stages-in-place]]),
+// so one drive gives the redundancy fractions, the compare's own cost, and the
+// net win, all at matched draws per frame.
+int g_n8b_mode = 0;
+uint64_t g_n8b_rng[3] = {}, g_n8b_rng_same[3] = {};
+uint64_t g_n8b_dw[3] = {}, g_n8b_dw_same[3] = {};
+uint64_t g_n8b_pdw[3] = {}, g_n8b_pdw_same[3] = {};
+uint64_t g_n8b_skip_rng = 0, g_n8b_skip_dw = 0;
+
+// [N8C] The SECOND copy, counted. The constants are copied into the register
+// file by the walk and then composed again into a per-draw upload-heap
+// cbuffer by NrUpdateBindings. That second copy is the part that lives inside
+// IssueDraw's 42%, and it only happens when a binding went stale. These four
+// counters plus the per-draw denominator say how many cbuffer re-uploads a
+// draw actually costs -- which is what an N-8b dedupe has to move, and the
+// only way an fps-neutral result can be explained rather than shrugged at.
+// Free (one increment on a path that is already writing kilobytes), so they
+// are unconditional and reported whenever [n7] is on, in EVERY phase.
+// Index: 0 = float vertex, 1 = float pixel, 2 = bool/loop, 3 = fetch.
+uint64_t g_n8c_up[4] = {};
+uint64_t g_n8c_binds = 0;
+
+// One bulk constant range: count how many of its dwords already match the
+// register file, and report whether ALL of them did. base[] is guest-endian,
+// the register file is host-endian, so swap-compare -- same load the copy
+// below would do.
+inline bool N8bCensusRange(int cls, const uint32_t* be, const uint32_t* cur, uint32_t n) {
+  uint32_t same = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    same += (memory::load_and_swap<uint32_t>(be + i) == cur[i]) ? 1u : 0u;
+  }
+  ++g_n8b_rng[cls];
+  g_n8b_dw[cls] += n;
+  g_n8b_dw_same[cls] += same;
+  if (same != n) {
+    return false;
+  }
+  ++g_n8b_rng_same[cls];
+  return true;
+}
 
 // [PERF/DRAW-PROFILE] Per-draw phase timing (cmd-proc thread only -> plain
 // globals). Refreshed once/frame in IssueSwap; reported there when on.
@@ -4225,15 +4281,20 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // bool/loop). Deliberately NOT applied to fetch constants (texture-cache /
   // vertex-residency invalidation is correctness-sensitive) or any non-constant
   // register (scratch writeback, COHER dirty bit, DC_LUT state machine).
-  if (g_dedupe_constants &&
+  // [N8B] the per-dword half of the census rides the same test: mode 1 counts
+  // without acting, mode 2 is the dedupe.
+  if (g_n8b_mode &&
       ((index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
         index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
        (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
         index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
-    ++g_const_writes_total;
+    const int cls = index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 ? 1 : 0;
+    ++g_n8b_pdw[cls];
     if (register_file_->values[index] == value) {
-      ++g_const_writes_skipped;
-      return;
+      ++g_n8b_pdw_same[cls];
+      if (g_n8b_mode >= 2) {
+        return;
+      }
     }
   }
 
@@ -4375,20 +4436,15 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     // [PERF/CONST-DEDUPE] If the whole incoming block matches the register file,
     // the copy is a no-op and the cbuffer is already correct -> skip both the
     // copy and the invalidation. base[] is guest-endian, so swap-compare.
-    if (g_dedupe_constants) {
-      g_const_writes_total += num_registers;
-      const uint32_t* cur = register_file_->values + start_index;
-      bool changed = false;
-      for (uint32_t i = 0; i < num_registers; ++i) {
-        if (memory::load_and_swap<uint32_t>(base + i) != cur[i]) {
-          changed = true;
-          break;
-        }
-      }
-      if (!changed) {
-        g_const_writes_skipped += num_registers;
-        return;
-      }
+    // [N8B] ALU float constants: 82.7% of every applied dword. Census every dword (mode 1+); act on a
+    // wholly unchanged range only (mode 2). The early return skips the copy
+    // AND the cbuffer invalidation, which is the second copy.
+    if (g_n8b_mode &&
+        N8bCensusRange(0, base, register_file_->values + start_index, num_registers) &&
+        g_n8b_mode >= 2) {
+      ++g_n8b_skip_rng;
+      g_n8b_skip_dw += num_registers;
+      return;
     }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     if (frame_open_ && !precord_skip_side_effects) {
@@ -4417,20 +4473,15 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
     // [PERF/CONST-DEDUPE] See float-range note above.
-    if (g_dedupe_constants) {
-      g_const_writes_total += num_registers;
-      const uint32_t* cur = register_file_->values + start_index;
-      bool changed = false;
-      for (uint32_t i = 0; i < num_registers; ++i) {
-        if (memory::load_and_swap<uint32_t>(base + i) != cur[i]) {
-          changed = true;
-          break;
-        }
-      }
-      if (!changed) {
-        g_const_writes_skipped += num_registers;
-        return;
-      }
+    // [N8B] bool/loop constants. Census every dword (mode 1+); act on a
+    // wholly unchanged range only (mode 2). The early return skips the copy
+    // AND the cbuffer invalidation, which is the second copy.
+    if (g_n8b_mode &&
+        N8bCensusRange(1, base, register_file_->values + start_index, num_registers) &&
+        g_n8b_mode >= 2) {
+      ++g_n8b_skip_rng;
+      g_n8b_skip_dw += num_registers;
+      return;
     }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     if (!precord_skip_side_effects) {
@@ -4441,6 +4492,13 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    // [N8B] fetch constants are censused but NEVER deduped: the texture-cache
+    // and vertex-buffer-residency invalidations below are correctness, not
+    // bookkeeping, and an unchanged fetch word does not mean an unchanged
+    // resource.
+    if (g_n8b_mode) {
+      N8bCensusRange(2, base, register_file_->values + start_index, num_registers);
+    }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     if (!precord_skip_side_effects) {
       cbuffer_binding_fetch_.up_to_date = false;
@@ -4493,21 +4551,82 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
 
-  // [PERF/CONST-DEDUPE] Refresh the cached enable flag once per frame (cmd-proc
-  // thread only), and when profiling is on emit the redundant-write rate.
+  // [N8B] Refresh the census/dedupe mode once per frame (cmd-proc thread only).
+  // `gpu_n7 3` owns it while it is cycling the three phases in place; otherwise
+  // the old gpu_dedupe_constants cvar is the switch and means "census + act".
   g_dedupe_constants = REXCVAR_GET(gpu_dedupe_constants);
-  if (REXCVAR_GET(gpu_worker_profile)) {
-    static uint64_t s_last_total = 0, s_last_skipped = 0;
-    static auto s_last_report = std::chrono::steady_clock::now();
+  g_n8b_mode = rex::graphics::g_n7_n8b_phase >= 0 ? rex::graphics::g_n7_n8b_phase
+                                                  : (g_dedupe_constants ? 2 : 0);
+  // The census report. Unconditional whenever the census is armed -- it must NOT
+  // hang off gpu_worker_profile, whose per-packet timing inflates the thing it
+  // is reporting on by ~20% ([[nested-profile-inflates-stage]]).
+  // [N8C] the second copy, reported in EVERY phase (including OFF) so the
+  // dedupe's effect on it is readable, and reported separately from the
+  // census so it does not disappear when the census is not armed.
+  if (REXCVAR_GET(gpu_n7)) {
+    static uint64_t l_up[4] = {}, l_binds = 0;
+    static auto l_report = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
-    if (now - s_last_report >= std::chrono::seconds(1)) {
-      uint64_t dt_total = g_const_writes_total - s_last_total;
-      uint64_t dt_skip = g_const_writes_skipped - s_last_skipped;
-      REXGPU_INFO("[gpu-dedupe] const_writes={} skipped={} ({:.0f}%)", dt_total, dt_skip,
-                  dt_total ? 100.0 * double(dt_skip) / double(dt_total) : 0.0);
-      s_last_report = now;
-      s_last_total = g_const_writes_total;
-      s_last_skipped = g_const_writes_skipped;
+    if (now - l_report >= std::chrono::seconds(1)) {
+      const uint64_t b = g_n8c_binds - l_binds;
+      const double per = b ? 1.0 / double(b) : 0.0;
+      REXGPU_INFO(
+          "[n8c] cbuffer uploads/s: float_v={} float_p={} bool_loop={} fetch={} "
+          "| binds={} | per bind: {:.2f} {:.2f} {:.2f} {:.2f}",
+          g_n8c_up[0] - l_up[0], g_n8c_up[1] - l_up[1], g_n8c_up[2] - l_up[2],
+          g_n8c_up[3] - l_up[3], b, double(g_n8c_up[0] - l_up[0]) * per,
+          double(g_n8c_up[1] - l_up[1]) * per, double(g_n8c_up[2] - l_up[2]) * per,
+          double(g_n8c_up[3] - l_up[3]) * per);
+      for (int c = 0; c < 4; ++c) l_up[c] = g_n8c_up[c];
+      l_binds = g_n8c_binds;
+      l_report = now;
+    }
+  }
+  {
+    static uint64_t l_rng[3] = {}, l_rng_same[3] = {}, l_dw[3] = {}, l_dw_same[3] = {};
+    static uint64_t l_pdw[3] = {}, l_pdw_same[3] = {}, l_skip_rng = 0, l_skip_dw = 0;
+    static auto l_report = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (g_n8b_mode && now - l_report >= std::chrono::seconds(1)) {
+      const auto pct = [](uint64_t a, uint64_t b) {
+        return b ? 100.0 * double(a) / double(b) : 0.0;
+      };
+      static const char* const kCls[3] = {"alu", "bool/loop", "fetch"};
+      static const char* const kMode[3] = {"OFF", "CENSUS", "CENSUS+DEDUPE"};
+      char line[512];
+      int n = snprintf(line, sizeof(line), "[n8b] mode=%d %s |", g_n8b_mode,
+                       kMode[g_n8b_mode < 3 ? g_n8b_mode : 2]);
+      for (int c = 0; c < 3; ++c) {
+        const uint64_t r = g_n8b_rng[c] - l_rng[c], rs = g_n8b_rng_same[c] - l_rng_same[c];
+        const uint64_t d = g_n8b_dw[c] - l_dw[c], ds = g_n8b_dw_same[c] - l_dw_same[c];
+        n += snprintf(line + n, sizeof(line) - n,
+                      " %s: rng=%llu same=%.1f%% dw=%llu same=%.1f%% |", kCls[c],
+                      (unsigned long long)r, pct(rs, r), (unsigned long long)d, pct(ds, d));
+        if (n >= int(sizeof(line)) - 80) break;
+      }
+      REXGPU_INFO("{}", line);
+      const uint64_t pd = (g_n8b_pdw[0] - l_pdw[0]) + (g_n8b_pdw[1] - l_pdw[1]);
+      const uint64_t pds = (g_n8b_pdw_same[0] - l_pdw_same[0]) + (g_n8b_pdw_same[1] - l_pdw_same[1]);
+      REXGPU_INFO("[n8b] per-dword applies={} same={:.1f}% | SKIPPED ranges={} dwords={}",
+                  pd, pct(pds, pd), g_n8b_skip_rng - l_skip_rng, g_n8b_skip_dw - l_skip_dw);
+      for (int c = 0; c < 3; ++c) {
+        l_rng[c] = g_n8b_rng[c]; l_rng_same[c] = g_n8b_rng_same[c];
+        l_dw[c] = g_n8b_dw[c]; l_dw_same[c] = g_n8b_dw_same[c];
+        l_pdw[c] = g_n8b_pdw[c]; l_pdw_same[c] = g_n8b_pdw_same[c];
+      }
+      l_skip_rng = g_n8b_skip_rng; l_skip_dw = g_n8b_skip_dw;
+      l_report = now;
+    } else if (!g_n8b_mode) {
+      // Keep the deltas honest across an OFF phase: nothing accumulated, but
+      // the wall clock moved, so re-base the window rather than reporting a
+      // multi-second sum on the next ON phase's first line.
+      l_report = now;
+      for (int c = 0; c < 3; ++c) {
+        l_rng[c] = g_n8b_rng[c]; l_rng_same[c] = g_n8b_rng_same[c];
+        l_dw[c] = g_n8b_dw[c]; l_dw_same[c] = g_n8b_dw_same[c];
+        l_pdw[c] = g_n8b_pdw[c]; l_pdw_same[c] = g_n8b_pdw_same[c];
+      }
+      l_skip_rng = g_n8b_skip_rng; l_skip_dw = g_n8b_skip_dw;
     }
   }
 
@@ -9365,16 +9484,13 @@ void D3D12CommandProcessor::PrecordApplyWrite(RegisterFile* file, uint32_t index
   // the CommandProcessor base).
 
   // [PERF/CONST-DEDUPE] mirror WriteRegister's constant dedupe, against `file`.
-  if (g_dedupe_constants &&
+  if (g_n8b_mode >= 2 &&
       ((index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
         index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
        (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
-        index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
-    ++g_const_writes_total;
-    if (file->values[index] == value) {
-      ++g_const_writes_skipped;
-      return;
-    }
+        index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) &&
+      file->values[index] == value) {
+    return;
   }
 
   // Value store (base CommandProcessor::WriteRegister, deferrable subset). Extended
@@ -9461,8 +9577,7 @@ void D3D12CommandProcessor::PrecordApplyWriteFromMem(RegisterFile* file, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    if (g_dedupe_constants) {
-      g_const_writes_total += num_registers;
+    if (g_n8b_mode >= 2) {
       const uint32_t* cur = file->values + start_index;
       bool changed = false;
       for (uint32_t i = 0; i < num_registers; ++i) {
@@ -9472,7 +9587,6 @@ void D3D12CommandProcessor::PrecordApplyWriteFromMem(RegisterFile* file, uint32_
         }
       }
       if (!changed) {
-        g_const_writes_skipped += num_registers;
         return;
       }
     }
@@ -9502,8 +9616,7 @@ void D3D12CommandProcessor::PrecordApplyWriteFromMem(RegisterFile* file, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    if (g_dedupe_constants) {
-      g_const_writes_total += num_registers;
+    if (g_n8b_mode >= 2) {
       const uint32_t* cur = file->values + start_index;
       bool changed = false;
       for (uint32_t i = 0; i < num_registers; ++i) {
@@ -9513,7 +9626,6 @@ void D3D12CommandProcessor::PrecordApplyWriteFromMem(RegisterFile* file, uint32_
         }
       }
       if (!changed) {
-        g_const_writes_skipped += num_registers;
         return;
       }
     }
@@ -12011,6 +12123,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
                                              const D3D12Shader* pixel_shader,
                                              ID3D12RootSignature* root_signature,
                                              bool shared_memory_is_uav, bool* refused_out) {
+  ++g_n8c_binds;  // [N8C] the per-draw denominator for the four upload counters.
   // [NR-SWP] Phase 5-3b swap: this project's own UpdateBindings, bindless
   // path only, operating on the SAME member state machine as the emulated
   // one (dirty flags, constant pool, sampler allocator, root-parameter
@@ -12121,6 +12234,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SystemConstants);
   }
   if (!cbuffer_binding_float_vertex_.up_to_date) {
+    ++g_n8c_up[0];  // [N8C]
     if (g_draw_prof) ++g_bind_cnt[4];
     const uint32_t float_vertex_size =
         uint32_t(sizeof(float)) * 4 * std::max(float_constant_count_vertex, uint32_t(1));
@@ -12151,6 +12265,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsVertex);
   }
   if (!cbuffer_binding_float_pixel_.up_to_date) {
+    ++g_n8c_up[1];  // [N8C]
     if (g_draw_prof) ++g_bind_cnt[5];
     const uint32_t float_pixel_size =
         uint32_t(sizeof(float)) * 4 * std::max(float_constant_count_pixel, uint32_t(1));
@@ -12182,6 +12297,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FloatConstantsPixel);
   }
   if (!cbuffer_binding_bool_loop_.up_to_date) {
+    ++g_n8c_up[2];  // [N8C]
     if (g_draw_prof) ++g_bind_cnt[6];
     if (g_draw_prof) ++g_bind_cnt[2];
     auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
@@ -12206,6 +12322,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_BoolLoopConstants);
   }
   if (!cbuffer_binding_fetch_.up_to_date) {
+    ++g_n8c_up[3];  // [N8C]
     if (g_draw_prof) ++g_bind_cnt[7];
     if (g_draw_prof) ++g_bind_cnt[2];
     auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()

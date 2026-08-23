@@ -98,7 +98,9 @@ REXCVAR_DEFINE_INT32(gpu_n7, 1, "GPU",
                      "[n7] Re-baseline report once a second: fps, draws per "
                      "frame, command-processor exec vs spin, ring backlog. "
                      "0 = off, 1 = report (default, ~free), 2 = report + cycle "
-                     "the IssueDraw/type-0 split 5 s on / 5 s off in place.");
+                     "CLEAN/SPLIT/SKIP 5 s each in place, 3 = report + cycle "
+                     "the N-8b constant census OFF/CENSUS/CENSUS+DEDUPE 5 s "
+                     "each in place.");
 
 // [PM4-CENSUS] Naruto §11.7 draw-emission census. Settles where the ~10k
 // heavy-forest draws/frame come from: counts DRAW_INDX vs DRAW_INDX_2 packets,
@@ -1067,6 +1069,9 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
   swap_post_effect_desired_ = swap_post_effect;
   CallInThread([this, swap_post_effect]() { swap_post_effect_actual_ = swap_post_effect; });
 }
+
+// [N8B] see the header: the constant-census phase the `gpu_n7 3` cycler drives.
+int g_n7_n8b_phase = -1;
 
 namespace {
 // [GPU-EXEC-PROFILE] Per-category timing, broken out of gpu_worker_profile's total
@@ -3814,13 +3819,17 @@ void CommandProcessor::WorkerThreadMain() {
         // [N7] the ring remainder, itemised. ib = every indirect buffer;
         // swap = the presenter and frame-end work; inline = what is left in
         // ExecutePrimaryBuffer, which is the primary ring's own packets.
+        // The swap packet is emitted INSIDE an indirect buffer, so its
+        // bracket NESTS in the ib bracket rather than sitting beside it.
+        // Subtracting both from exec printed a negative inline figure in the
+        // first build; outside-ib is exec - ib, and swap is a sub-item of ib.
         {
           const double ib_ms = (g_n7_ib_ns - n7_last_ib_ns) / 1e6;
           const double sw_ms = (g_n7_swap_ns - n7_last_swap_ns) / 1e6;
-          const double inl_ms = exec_ms - ib_ms - sw_ms;
+          const double inl_ms = exec_ms - ib_ms;
           REXGPU_INFO(
               "[n7] ring exec={:.1f}ms | indirect_buffers={:.1f}ms({:.0f}%) n={} "
-              "| swap={:.1f}ms({:.0f}%) n={} | inline primary ring={:.1f}ms({:.0f}%)",
+              "| of which swap={:.1f}ms({:.0f}%) n={} | outside ib={:.1f}ms({:.0f}%)",
               exec_ms, ib_ms, exec_ms > 0 ? 100.0 * ib_ms / exec_ms : 0.0,
               g_n7_ib_calls - n7_last_ib_calls, sw_ms,
               exec_ms > 0 ? 100.0 * sw_ms / exec_ms : 0.0,
@@ -3889,7 +3898,7 @@ void CommandProcessor::WorkerThreadMain() {
         //   1 SPLIT  - IssueDraw vs the rest of exec (~2% self-cost)
         //   2 SKIP   - the skip path's halves: walk+bulk vs the two dispatches
         //              (~2 timestamps per stop, ~3% at city load)
-        if (kN7 >= 2 && !kSplit && !kSkpProf) {
+        if (kN7 == 2 && !kSplit && !kSkpProf) {
           const int64_t el = std::chrono::duration_cast<std::chrono::seconds>(
                                  n7_now - n7_t0).count();
           const int phase = int((el / 5) % 3);
@@ -3906,6 +3915,35 @@ void CommandProcessor::WorkerThreadMain() {
                 phase == 0   ? "nothing armed"
                 : phase == 1 ? "IssueDraw bracket armed"
                              : "skip-path brackets armed");
+          }
+        }
+        // Mode 3: the N-8b constant census, three 5 s phases IN PLACE. This
+        // one is not a profiler, it is a LEVER plus its own measurement, so
+        // the three phases separate the three things a single number cannot:
+        //   0 OFF           - no compare, the honest fps baseline
+        //   1 CENSUS        - compare and count, act on nothing: this is what
+        //                     the compare itself costs, and it is the number
+        //                     that says whether a dedupe can ever pay
+        //   2 CENSUS+DEDUPE - the whole-range early return fires, skipping the
+        //                     register copy AND the cbuffer re-upload
+        // fps is read from OFF against DEDUPE; CENSUS is the tax line between.
+        if (kN7 == 3) {
+          const int64_t el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 n7_now - n7_t0).count();
+          const int phase = int((el / 5) % 3);
+          static const char* const kN8bName[3] = {"OFF", "CENSUS",
+                                                  "CENSUS+DEDUPE"};
+          static int n8b_phase_prev = -1;
+          if (phase != n8b_phase_prev) {
+            n8b_phase_prev = phase;
+            g_n7_n8b_phase = phase;
+            REXGPU_INFO(
+                "[n7] N8B PHASE {} - {} (fps: compare OFF against "
+                "CENSUS+DEDUPE; CENSUS is the compare's own tax).",
+                kN8bName[phase],
+                phase == 0   ? "no constant compare at all"
+                : phase == 1 ? "compare and count, act on nothing"
+                             : "unchanged constant ranges skipped entirely");
           }
         }
       }

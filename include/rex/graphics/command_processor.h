@@ -40,6 +40,13 @@ namespace rex::graphics {
 class GraphicsSystem;
 class Shader;
 
+// [N8B] The constant-census phase, owned by the `gpu_n7 3` in-place cycler in
+// command_processor.cpp and read once a frame by the D3D12 backend, which is
+// where the constant ranges are actually applied. -1 = not cycling, follow the
+// gpu_dedupe_constants cvar; 0 = off, 1 = census only, 2 = census + dedupe.
+// Command-processor thread only, so a plain int is correct.
+extern int g_n7_n8b_phase;
+
 enum class ReadbackResolveMode {
   kDisabled,
   kFast,
