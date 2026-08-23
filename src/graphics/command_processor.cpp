@@ -4288,7 +4288,12 @@ void CommandProcessor::WorkerThreadMain() {
     }
 
     // [GPU-WORKER-PROFILE] / [GPU-SPLIT] / [PM4-CENSUS] ~1s wall-time report.
-    if (kProfile || kSplit || kCensus || kIbLedger || kNrSdb || kSkpProf) {
+    // [N8D] kNrSkip keeps the per-second [nr-skp]/[nr-ctx] watchdog lines on
+    // default runs -- they used to ride the always-on kIbLedger, and losing
+    // exec_fail/orphan/diverge visibility is a debuggability regression.
+    // Inner prints stay gated on their own flags, so this adds no new noise.
+    if (kProfile || kSplit || kCensus || kIbLedger || kNrSdb || kSkpProf ||
+        kNrSkip) {
       auto now = prof_clock::now();
       uint64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              now - prof_last_report).count();
