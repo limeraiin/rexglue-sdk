@@ -200,6 +200,14 @@ class CommandProcessor {
   // applied) only when the caller should fall back to the per-dword path.
   // Public for the same reason as NrSkipApplyRegWrite; defined in
   // command_processor.cpp next to the probe state it feeds.
+  // [N8C] The body of one range apply. NrSkipApplyRegRange resolves the guest
+  // pointer, runs the contiguity census on the range AS THE WALK DECODED IT,
+  // and then calls this once -- or k times over equal sub-ranges when the
+  // synthetic-split probe is armed, which is the direct measurement of what
+  // one range costs.
+  bool NrSkipApplyRegRangeBody(uint32_t base, uint32_t* be, uint32_t n,
+                               bool from_memory);
+
   bool NrSkipApplyRegRange(uint32_t base, const uint32_t* values_be,
                            uint32_t n, uint32_t phys, bool from_memory);
 

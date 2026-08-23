@@ -100,7 +100,10 @@ REXCVAR_DEFINE_INT32(gpu_n7, 1, "GPU",
                      "0 = off, 1 = report (default, ~free), 2 = report + cycle "
                      "CLEAN/SPLIT/SKIP 5 s each in place, 3 = report + cycle "
                      "the N-8b constant census OFF/CENSUS/CENSUS+DEDUPE 5 s "
-                     "each in place.");
+                     "each in place, 4 = report + cycle the N-8c "
+                     "synthetic range split CLEAN/ALUx4/FETCHx4/ALLx4 5 s "
+                     "each in place (pixel-correct; the slope is the "
+                     "marginal cost of one range).");
 
 // [PM4-CENSUS] Naruto §11.7 draw-emission census. Settles where the ~10k
 // heavy-forest draws/frame come from: counts DRAW_INDX vs DRAW_INDX_2 packets,
@@ -1090,6 +1093,126 @@ thread_local uint64_t g_draw_cnt = 0;
 // Does NOT enable the per-packet g_exec_prof timing, so it stays ~clean.
 bool g_split_prof = false;
 thread_local uint64_t g_type0_split_ns = 0;
+
+// [N8C] The splitter and the census. See NrSkipApplyRegRangeBody for the
+// apply itself.
+//
+// N-8b measured the constant path and found the bytes are not the cost:
+// 59.5 M applied dwords a second is 238 MB/s of memcpy, ~3 ms of a CPU
+// second, and a dedupe that removed a quarter of them moved fps 0.7%. What
+// is expensive is that those dwords arrive in 4.14 M RANGES a second - 24.3
+// per draw, 14.4 dwords each, ~72 ns apiece of which ~4 ns is the data. So
+// the rung is fewer ranges, and two numbers decide it:
+//
+//   1. what one range COSTS. Measured by SPLITTING: apply each range as k
+//      equal sub-ranges instead of one. The register file, the cbuffer
+//      invalidations and the fetch invalidations all end identical (the
+//      split unions to the same set), so it is correctness-preserving; the
+//      only thing that changes is the range count. Three points on a line,
+//      and the SLOPE is the marginal cost of a range - exactly the quantity
+//      a merge recovers. Splitting the whole body, not just the store, is
+//      deliberate: a merge saves everything downstream of the decode.
+//   2. how many ranges a merge could actually remove. Measured by the
+//      contiguity census below, on the UNSPLIT stream.
+//
+// Split factor per class, driven by the `gpu_n7 4` in-place cycler.
+int g_n8c_split_alu = 1, g_n8c_split_fetch = 1, g_n8c_split_other = 1;
+
+// [N8D] The contiguity census. A range that begins exactly where the previous
+// one ended is a range a look-ahead merge could absorb; if it is also
+// contiguous in guest memory the merged apply is a single memcpy, and if it
+// is not, it is two memcpys but still one dispatch and one side-effect
+// evaluation. Both are counted because they are different rungs.
+// cls: 0 = alu, 1 = fetch, 2 = everything else.
+uint64_t g_n8d_rng[3] = {}, g_n8d_creg[3] = {}, g_n8d_cmem[3] = {};
+uint64_t g_n8d_repeat[3] = {};
+// Per CLASS, not one global cursor: the walk interleaves classes inside a
+// draw, so a single cursor breaks the chain on every alu-state-alu sequence
+// and reports "nothing is contiguous" when plenty is.
+uint32_t g_n8d_prev_end[3] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+uint32_t g_n8d_prev_base[3] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+const uint32_t* g_n8d_prev_mem_end[3] = {nullptr, nullptr, nullptr};
+// Ranges the BODY actually applied, i.e. AFTER any synthetic split. The
+// slope wants this against us/draw; g_n8d_rng is the pre-split walk count and
+// is deliberately unaffected by the probe.
+uint64_t g_n8d_applied = 0;
+
+// [N8E] The census that matters if adjacent-merge is dead. Adjacency asks
+// "can I merge this range with the one that arrived just before it", and the
+// answer at the intro is 0.0%. The better question does not depend on
+// emission order at all: **if every constant range in a draw were
+// accumulated and applied ONCE at the draw stop, how many applies would there
+// be?** That is what a native renderer does - it does not apply constants
+// incrementally, it composes the buffer once per draw - and the ceiling is
+// the union of the draw's intervals, not their adjacency.
+// Per class, a small set of disjoint [lo,hi) intervals, insert-merged as each
+// range arrives and counted at the draw stop. kMax caps the work; an overflow
+// is COUNTED, never silently dropped, because a silent cap reads as coverage.
+constexpr int kN8eMax = 24;
+struct N8eSet {
+  uint32_t lo[kN8eMax], hi[kN8eMax];
+  int n = 0;
+  bool overflow = false;
+};
+N8eSet g_n8e[3];
+// SAMPLED 1 draw in 16. The insert-merge is ~10 comparisons per range and
+// there are 17-24 ranges a draw, which unsampled is 1-2% of the command
+// processor - a constant offset cancels in the split SLOPE, but it would also
+// make this run's absolute us/draw incomparable with naruto_596. A 1/16
+// sample costs ~0.1% and the ratio it reports is unbiased.
+constexpr uint64_t kN8eSample = 16;
+bool g_n8e_active = true;
+uint64_t g_n8e_seen = 0;
+uint64_t g_n8e_draws = 0;
+uint64_t g_n8e_rng[3] = {}, g_n8e_grp[3] = {}, g_n8e_dw[3] = {}, g_n8e_udw[3] = {};
+uint64_t g_n8e_overflow = 0;
+
+inline void N8eAdd(int cls, uint32_t base, uint32_t n) {
+  if (!g_n8e_active) return;
+  N8eSet& s = g_n8e[cls];
+  ++g_n8e_rng[cls];
+  g_n8e_dw[cls] += n;
+  uint32_t lo = base, hi = base + n;
+  // absorb every interval this one touches or abuts
+  int w = 0;
+  for (int i = 0; i < s.n; ++i) {
+    if (s.hi[i] < lo || s.lo[i] > hi) {
+      s.lo[w] = s.lo[i]; s.hi[w] = s.hi[i]; ++w;
+    } else {
+      if (s.lo[i] < lo) lo = s.lo[i];
+      if (s.hi[i] > hi) hi = s.hi[i];
+    }
+  }
+  s.n = w;
+  if (s.n < kN8eMax) {
+    s.lo[s.n] = lo; s.hi[s.n] = hi; ++s.n;
+  } else {
+    s.overflow = true;
+  }
+}
+
+inline void N8eDrawBoundary() {
+  const bool was = g_n8e_active;
+  g_n8e_active = (++g_n8e_seen % kN8eSample) == 0;
+  if (!was) return;
+  ++g_n8e_draws;
+  for (int c = 0; c < 3; ++c) {
+    N8eSet& s = g_n8e[c];
+    g_n8e_grp[c] += uint32_t(s.n);
+    for (int i = 0; i < s.n; ++i) g_n8e_udw[c] += s.hi[i] - s.lo[i];
+    if (s.overflow) ++g_n8e_overflow;
+    s.n = 0;
+    s.overflow = false;
+  }
+}
+// A non-sampled draw never accumulated anything, so the sets are already
+// empty and the early return above is safe.
+
+inline int N8cClass(uint32_t base) {
+  if (base >= 0x4800 && base < 0x4900) return 1;   // fetch constants
+  if (base >= 0x4000 && base < 0x4800) return 0;   // ALU float constants
+  return 2;
+}
 
 // [N8] Where the walk's applied register dwords actually GO. N-7 priced the
 // walk plus bulk applies at 30% of the command-processor second, and N-8 was
@@ -3879,6 +4002,73 @@ void CommandProcessor::WorkerThreadMain() {
           g_n8_dw_fetch = g_n8_dw_boolloop = 0;
           g_n8_rng = g_n8_pdw = 0;
         }
+        // [N8D] the contiguity census, and with it the merge ceiling. A range
+        // that begins where the previous one ended is one a look-ahead merge
+        // could absorb, so `groups` is what the range count would fall to.
+        // The split probe does NOT pollute this: the census runs on the walk's
+        // range, before the split.
+        {
+          uint64_t tr = 0, tc = 0, tm = 0, tp = 0;
+          for (int c = 0; c < 3; ++c) {
+            tr += g_n8d_rng[c]; tc += g_n8d_creg[c];
+            tm += g_n8d_cmem[c]; tp += g_n8d_repeat[c];
+          }
+          if (tr) {
+            static const char* const kC[3] = {"alu", "fetch", "other"};
+            const double pc = 100.0 / double(tr);
+            const uint64_t groups = tr - tc;
+            char cb[320];
+            int cn = 0;
+            for (int c = 0; c < 3; ++c) {
+              cn += snprintf(cb + cn, sizeof(cb) - cn,
+                             " %s=%.0f%%/%.0f%%", kC[c],
+                             g_n8d_rng[c] ? 100.0 * double(g_n8d_creg[c]) / double(g_n8d_rng[c]) : 0.0,
+                             g_n8d_rng[c] ? 100.0 * double(g_n8d_cmem[c]) / double(g_n8d_rng[c]) : 0.0);
+            }
+            REXGPU_INFO(
+                "[n8d] split(alu{},ftc{},oth{}) walk ranges/draw={:.2f} "
+                "APPLIED ranges/draw={:.2f} | contiguous reg={:.1f}% "
+                "reg+mem={:.1f}% repeat-base={:.1f}% -> merge groups/draw="
+                "{:.2f} (ceiling -{:.0f}% of ranges) | by class reg%/mem%:{}",
+                g_n8c_split_alu, g_n8c_split_fetch, g_n8c_split_other,
+                draws ? double(tr) / double(draws) : 0.0,
+                draws ? double(g_n8d_applied) / double(draws) : 0.0,
+                tc * pc, tm * pc, tp * pc,
+                draws ? double(groups) / double(draws) : 0.0, tc * pc, cb);
+          }
+          for (int c = 0; c < 3; ++c) {
+            g_n8d_rng[c] = g_n8d_creg[c] = g_n8d_cmem[c] = g_n8d_repeat[c] = 0;
+          }
+          g_n8d_applied = 0;
+        }
+        // [N8E] the per-draw union: what the range count would fall to if a
+        // draw's constant ranges were accumulated and applied ONCE at the draw
+        // stop. This is order-independent, so it survives the adjacency
+        // census reading zero.
+        if (g_n8e_draws) {
+          static const char* const kC[3] = {"alu", "fetch", "other"};
+          const double d = double(g_n8e_draws);
+          char eb[384];
+          int en = 0;
+          double tr = 0, tg = 0;
+          for (int c = 0; c < 3; ++c) {
+            tr += double(g_n8e_rng[c]); tg += double(g_n8e_grp[c]);
+            en += snprintf(eb + en, sizeof(eb) - en,
+                           " %s %.2f->%.2f (dw %.0f->%.0f)", kC[c],
+                           double(g_n8e_rng[c]) / d, double(g_n8e_grp[c]) / d,
+                           double(g_n8e_dw[c]) / d, double(g_n8e_udw[c]) / d);
+            if (en >= int(sizeof(eb)) - 64) break;
+          }
+          REXGPU_INFO(
+              "[n8e] per-draw union: ranges {:.2f} -> applies {:.2f} "
+              "(-{:.0f}%) | overflowed draws={} |{}",
+              tr / d, tg / d, tr > 0 ? 100.0 * (1.0 - tg / tr) : 0.0,
+              g_n8e_overflow, eb);
+          g_n8e_draws = g_n8e_overflow = 0;
+          for (int c = 0; c < 3; ++c) {
+            g_n8e_rng[c] = g_n8e_grp[c] = g_n8e_dw[c] = g_n8e_udw[c] = 0;
+          }
+        }
         n7_last_frames = frames_now;
         n7_last_draws = g_n7_draws;
         n7_last_spin_ns = prof_spin_ns;
@@ -3915,6 +4105,37 @@ void CommandProcessor::WorkerThreadMain() {
                 phase == 0   ? "nothing armed"
                 : phase == 1 ? "IssueDraw bracket armed"
                              : "skip-path brackets armed");
+          }
+        }
+        // Mode 4: N-8c, the synthetic-split probe. Four 5 s phases IN PLACE.
+        // Every phase is pixel-correct - splitting a range into k sub-ranges
+        // leaves the register file and every invalidation identical, only the
+        // range COUNT changes. Read us/draw per phase, subtract CLEAN, and
+        // divide by the added ranges per draw ([n8d] prints ranges/draw in
+        // every phase): that quotient IS the marginal cost of a range, per
+        // class, and it is the exact quantity a look-ahead merge recovers.
+        //   0 CLEAN     nothing split
+        //   1 ALU x4    the 9.3 alu ranges/draw become ~37
+        //   2 FETCH x4  the 4.2 fetch ranges/draw become ~17
+        //   3 ALL x4    linearity check: should be ~ the sum of 1 and 2 plus
+        //               the other classes. If it is not, the cost is not
+        //               per-range and this whole rung is wrong.
+        if (kN7 == 4) {
+          const int64_t el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 n7_now - n7_t0).count();
+          const int phase = int((el / 5) % 4);
+          static const char* const kSplitName[4] = {"CLEAN", "ALU x4",
+                                                    "FETCH x4", "ALL x4"};
+          static int split_phase_prev = -1;
+          if (phase != split_phase_prev) {
+            split_phase_prev = phase;
+            g_n8c_split_alu = (phase == 1 || phase == 3) ? 4 : 1;
+            g_n8c_split_fetch = (phase == 2 || phase == 3) ? 4 : 1;
+            g_n8c_split_other = (phase == 3) ? 4 : 1;
+            REXGPU_INFO(
+                "[n7] N8C PHASE {} - every phase is pixel-correct; the SLOPE "
+                "of us/draw against ranges/draw is the answer.",
+                kSplitName[phase]);
           }
         }
         // Mode 3: the N-8b constant census, three 5 s phases IN PLACE. This
@@ -6460,6 +6681,41 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
     be = memory_->TranslatePhysical<uint32_t*>(phys);
     if (!be) return false;
   }
+  const int cls = N8cClass(base);
+  // [N8D] census on the range as the WALK decoded it, before any split.
+  {
+    ++g_n8d_rng[cls];
+    if (base == g_n8d_prev_base[cls]) {
+      ++g_n8d_repeat[cls];
+    } else if (base == g_n8d_prev_end[cls]) {
+      ++g_n8d_creg[cls];
+      if (be == g_n8d_prev_mem_end[cls]) ++g_n8d_cmem[cls];
+    }
+    g_n8d_prev_base[cls] = base;
+    g_n8d_prev_end[cls] = base + n;
+    g_n8d_prev_mem_end[cls] = be + n;
+    N8eAdd(cls, base, n);
+  }
+  // [N8C] the synthetic split.
+  const int k = cls == 0 ? g_n8c_split_alu
+              : cls == 1 ? g_n8c_split_fetch
+                         : g_n8c_split_other;
+  if (k > 1 && n >= uint32_t(k)) {
+    const uint32_t chunk = n / uint32_t(k);
+    uint32_t off = 0;
+    bool ok = true;
+    for (int i = 0; i < k; ++i) {
+      const uint32_t m = (i == k - 1) ? (n - off) : chunk;
+      ok = NrSkipApplyRegRangeBody(base + off, be + off, m, from_memory) && ok;
+      off += m;
+    }
+    return ok;
+  }
+  return NrSkipApplyRegRangeBody(base, be, n, from_memory);
+}
+
+bool CommandProcessor::NrSkipApplyRegRangeBody(uint32_t base, uint32_t* be,
+                                               uint32_t n, bool from_memory) {
   // [NR-RUSE] by-ref payloads bypass the buffer bytes; chain them so a draw's
   // prefix digest covers everything the packet dwords cannot. Every range
   // also drives the v2 stale set (inline via the diff bitmap, by-ref via the
@@ -6495,6 +6751,7 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
   // [NR-BFC] bulk ranges feed the census (end-state size + class split).
   if (g_nr_bfc) NrBfcApply(base, n, false);
   N8Classify(base, n, false);
+  ++g_n8d_applied;
   ++g_skp_rng;
   g_skp_rng_dw += n;
   return true;
@@ -7797,6 +8054,7 @@ void CommandProcessor::ExecutePacketType3DrawTail(
         ++g_nrd_skipped_depth;
       }
       ++g_n7_draws;  // [N7] executed draws, unconditional
+      N8eDrawBoundary();  // [N8E] close this draw's constant-interval union
       const bool kTimeDraw = g_exec_prof || g_split_prof;
       const auto draw_t0 = kTimeDraw ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
