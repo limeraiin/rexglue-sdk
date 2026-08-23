@@ -125,6 +125,15 @@ class PipelineCache {
   // [NR-NPSO] Phase 5-3a: emit the native-pipeline verdict once a second.
   void NrNativePsoReportIfDue();
 
+  // [PSO-LIB] N-10b: create a graphics PSO through the persistent driver
+  // pipeline-blob library (see the private section for the mechanism).
+  // Public so ad-hoc CP-thread creates outside this cache (the render target
+  // cache's transfer pipelines) go through the same library and the same
+  // [hitch] timing. Falls back to a plain create when the library is off or
+  // unavailable; returns nullptr on failure.
+  ID3D12PipelineState* CreateGraphicsPipelineWithLibrary(
+      const D3D12_GRAPHICS_PIPELINE_STATE_DESC& state_desc);
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -374,6 +383,27 @@ class PipelineCache {
   bool PrepareRuntimeDescriptionForQueuedCreation(Pipeline* pipeline,
                                                   PipelineRuntimeDescription& runtime_description);
 
+  // [PSO-LIB] N-10b: persist DRIVER pipeline blobs between boots via
+  // ID3D12PipelineLibrary. The pipeline-description storage above recreates
+  // every stored pipeline each boot, which is a full driver compile of every
+  // PSO (52-64 s for 4.5k pipelines on Intel UHD 630; ~2 s warm on NVIDIA
+  // only because its own driver cache hits). The library keys each PSO by a
+  // hash of its full creation inputs (the desc with pointers zeroed plus the
+  // shader bytecode bytes), so the next boot loads driver blobs instead of
+  // compiling. LoadGraphicsPipeline validates the desc against the stored
+  // pipeline, so a stale or colliding name can only cost a miss (fall back
+  // to a plain create), never a wrong pipeline. Both creation paths route
+  // through the helper: the emulated cache's CreateD3D12Pipeline and the NR
+  // path's NrNativePsoCreate (the helper itself is declared public above).
+  void InitializePipelineLibrary(const std::filesystem::path& local_root, uint32_t title_id,
+                                 bool edram_rov_used);
+  // Writes the library to disk if any pipelines were stored since the last
+  // serialize. Called after the boot-from-storage creation pass (banks the
+  // first boot's compiles even if the run later crashes), from the storage
+  // write thread once enough new stores accumulate, and at shutdown.
+  void SerializePipelineLibrary();
+  void ShutdownPipelineLibrary();
+
   D3D12CommandProcessor& command_processor_;
   const RegisterFile* register_file_;
   const D3D12RenderTargetCache& render_target_cache_;
@@ -478,6 +508,26 @@ class PipelineCache {
   // Pipeline storage output stream, for preload in the next emulator runs.
   FILE* pipeline_storage_file_ = nullptr;
   bool pipeline_storage_file_flush_needed_ = false;
+
+  // [PSO-LIB] Driver pipeline-blob library. pipeline_library_data_ is the
+  // backing memory of the loaded file and must outlive pipeline_library_
+  // (CreatePipelineLibrary keeps referencing it). The mutex guards
+  // StorePipeline and Serialize against each other; loads are free-threaded.
+  ID3D12PipelineLibrary* pipeline_library_ = nullptr;
+  std::vector<uint8_t> pipeline_library_data_;
+  std::filesystem::path pipeline_library_path_;
+  std::mutex pipeline_library_mutex_;
+  std::atomic<uint32_t> pipeline_library_stores_unserialized_{0};
+  // True while the boot-from-storage creation pass runs: the [hitch] per
+  // single >5ms WARN is suppressed there (the pass has its own summary line
+  // and a cold boot would spam hundreds of them). Written and read on the
+  // CP thread only.
+  bool pipeline_library_boot_pass_ = false;
+  // [hitch] The command-processor thread's id, so the shared create helper
+  // can attribute PSO creation time to the CP thread vs a creation thread.
+  // Registered from InitializeShaderStorage and EndSubmission (both run on
+  // the CP thread).
+  std::atomic<uint32_t> cp_thread_id_{0};
 
   // Thread for asynchronous writing to the storage streams.
   void StorageWriteThread();

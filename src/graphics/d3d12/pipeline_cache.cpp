@@ -32,6 +32,7 @@
 #include <rex/perf/counter.h>
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/d3d12/hitch_probe.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
@@ -65,6 +66,13 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
+
+// [PSO-LIB] N-10b: keep the driver's compiled pipeline blobs between runs so
+// a later boot loads them instead of recompiling every stored pipeline (the
+// 52-64 s Intel boot grind). Default on; kill switch only.
+REXCVAR_DEFINE_BOOL(d3d12_pipeline_library, true, "GPU/D3D12",
+                    "Persist driver pipeline blobs between runs (skips the boot "
+                    "pipeline recompile).");
 
 // [NR-PSO] Phase 5-1: the state mirror. Phase 4 proved every register a draw
 // reads is recoverable from the buffer stream and then proved it by
@@ -313,6 +321,15 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 
   bool edram_rov_used =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+
+  // [hitch] This runs on the command-processor thread; register its id so
+  // the PSO create helper can attribute creation time per thread.
+  cp_thread_id_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+
+  // [PSO-LIB] Driver blobs are per-adapter and per-driver, so they live in
+  // shaders/local/, not shareable/. Must be up before the boot creation pass
+  // below so the stored pipelines load instead of compiling.
+  InitializePipelineLibrary(shader_storage_root / "local", title_id, edram_rov_used);
 
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
@@ -596,6 +613,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   // Create the pipelines.
   if (!pipeline_stored_descriptions.empty()) {
     uint64_t pipeline_creation_start_ = rex::chrono::Clock::QueryHostTickCount();
+    // [PSO-LIB] The pass has its own summary; keep per-single WARNs quiet.
+    pipeline_library_boot_pass_ = true;
 
     // Launch additional creation threads to use all cores to create
     // pipelines faster. Will also be using the main thread, so minus 1.
@@ -603,7 +622,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     size_t creation_thread_needed_count =
         std::max(std::min(pipeline_stored_descriptions.size(), logical_processor_count) - size_t(1),
                  creation_thread_original_count);
-    while (creation_threads_.size() < creation_thread_original_count) {
+    // [PSO-LIB session] was `< creation_thread_original_count`, a no-op that
+    // left creation_thread_needed_count unused - upstream raises the thread
+    // pool to logical_processor_count - 1 for the boot-from-storage pass.
+    while (creation_threads_.size() < creation_thread_needed_count) {
       size_t creation_thread_index = creation_threads_.size();
       std::unique_ptr<rex::thread::Thread> creation_thread = rex::thread::Thread::Create(
           {}, [this, creation_thread_index]() { CreationThread(creation_thread_index); });
@@ -756,12 +778,16 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
     }
 
+    pipeline_library_boot_pass_ = false;
     REXGPU_INFO(
         "Created {} graphics pipelines (not including reading the "
         "descriptions) from the storage in {} milliseconds",
         pipelines_created,
         (rex::chrono::Clock::QueryHostTickCount() - pipeline_creation_start_) * 1000 /
             rex::chrono::Clock::QueryHostTickFrequency());
+    // [PSO-LIB] Bank the boot pass's driver compiles now, so the first
+    // (grinding) boot's work survives even a later crash.
+    SerializePipelineLibrary();
     // If any pipeline descriptions were corrupted (or the whole file has excess
     // bytes in the end), truncate to the last valid pipeline description.
     rex::filesystem::TruncateStdioFile(
@@ -802,6 +828,9 @@ void PipelineCache::ShutdownShaderStorage() {
   storage_write_shader_queue_.clear();
   storage_write_pipeline_queue_.clear();
 
+  // [PSO-LIB] Serialize any unbanked stores, then drop the library.
+  ShutdownPipelineLibrary();
+
   if (pipeline_storage_file_) {
     fclose(pipeline_storage_file_);
     pipeline_storage_file_ = nullptr;
@@ -819,13 +848,22 @@ void PipelineCache::ShutdownShaderStorage() {
 }
 
 void PipelineCache::EndSubmission() {
-  if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
+  // [hitch] Keep the CP thread id fresh for the PSO create helper.
+  cp_thread_id_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+  // [PSO-LIB] NR-path creates never enqueue a pipeline description, so the
+  // storage thread would otherwise never wake to bank their driver blobs -
+  // wake it whenever enough stores are pending (it serializes off-thread).
+  bool pipeline_library_serialize_due =
+      storage_write_thread_ &&
+      pipeline_library_stores_unserialized_.load(std::memory_order_relaxed) >= 16;
+  if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_ ||
+      pipeline_library_serialize_due) {
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
       if (shader_storage_file_flush_needed_) {
         storage_write_flush_shaders_ = true;
       }
-      if (pipeline_storage_file_flush_needed_) {
+      if (pipeline_storage_file_flush_needed_ || pipeline_library_serialize_due) {
         storage_write_flush_pipelines_ = true;
       }
     }
@@ -850,7 +888,14 @@ void PipelineCache::EndSubmission() {
     }
     if (await_creation_completion_event) {
       creation_request_cond_.notify_one();
+      // [hitch] The CP thread blocks here until the creation threads finish
+      // every queued pipeline - on Intel a mid-drive driver compile stalls
+      // the whole frame at this wait.
+      uint64_t wait_start = rex::chrono::Clock::QueryHostTickCount();
       rex::thread::Wait(creation_completion_event_.get(), false);
+      g_hitch_probe.pso_endsub_wait_ticks.fetch_add(
+          rex::chrono::Clock::QueryHostTickCount() - wait_start, std::memory_order_relaxed);
+      g_hitch_probe.pso_endsub_waits.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
@@ -1730,12 +1775,9 @@ void PipelineCache::NrShaderCacheReportIfDue() {
 ID3D12PipelineState* PipelineCache::NrNativePsoCreate(
     void* ctx, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
   PipelineCache* self = static_cast<PipelineCache*>(ctx);
-  ID3D12Device* device = self->command_processor_.GetD3D12Provider().GetDevice();
-  ID3D12PipelineState* state = nullptr;
-  if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&state)))) {
-    return nullptr;
-  }
-  return state;
+  // [PSO-LIB] Route through the driver-blob library: a warm hit skips the
+  // driver compile that otherwise runs synchronously on the CP thread here.
+  return self->CreateGraphicsPipelineWithLibrary(desc);
 }
 
 void PipelineCache::NrNativePsoRelease(void* ctx, ID3D12PipelineState* state) {
@@ -3718,9 +3760,9 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   }
 
   // Create the D3D12 pipeline state object.
-  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
-  ID3D12PipelineState* state;
-  if (FAILED(device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state)))) {
+  // [PSO-LIB] Through the driver-blob library: hits skip the driver compile.
+  ID3D12PipelineState* state = CreateGraphicsPipelineWithLibrary(state_desc);
+  if (!state) {
     if (runtime_description.pixel_shader != nullptr) {
       REXGPU_ERROR("Failed to create graphics pipeline with VS {:016X}, PS {:016X}",
                    runtime_description.vertex_shader->shader().ucode_data_hash(),
@@ -3744,6 +3786,236 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   return state;
 }
 
+ID3D12PipelineState* PipelineCache::CreateGraphicsPipelineWithLibrary(
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& state_desc) {
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  ID3D12PipelineState* state = nullptr;
+  uint64_t create_start = rex::chrono::Clock::QueryHostTickCount();
+  if (!pipeline_library_) {
+    if (FAILED(device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state)))) {
+      state = nullptr;
+    }
+  } else {
+    // The name is a hash of everything the driver compiles from: the desc
+    // with every pointer zeroed plus the shader bytecode bytes (both desc
+    // builders memset their desc, so padding hashes stably). Load validates
+    // the desc against the stored pipeline, so a collision or a stale entry
+    // can only cost a miss and a plain create, never a wrong pipeline.
+    struct NameKey {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+      uint64_t vs_hash;
+      uint64_t ps_hash;
+      uint64_t gs_hash;
+    } key;
+    std::memset(&key, 0, sizeof(key));
+    key.desc = state_desc;
+    key.desc.pRootSignature = nullptr;
+    key.desc.VS.pShaderBytecode = nullptr;
+    key.desc.PS.pShaderBytecode = nullptr;
+    key.desc.DS.pShaderBytecode = nullptr;
+    key.desc.HS.pShaderBytecode = nullptr;
+    key.desc.GS.pShaderBytecode = nullptr;
+    std::memset(&key.desc.StreamOutput, 0, sizeof(key.desc.StreamOutput));
+    key.desc.InputLayout.pInputElementDescs = nullptr;
+    std::memset(&key.desc.CachedPSO, 0, sizeof(key.desc.CachedPSO));
+    if (state_desc.VS.pShaderBytecode && state_desc.VS.BytecodeLength) {
+      key.vs_hash = XXH3_64bits(state_desc.VS.pShaderBytecode, state_desc.VS.BytecodeLength);
+    }
+    if (state_desc.PS.pShaderBytecode && state_desc.PS.BytecodeLength) {
+      key.ps_hash = XXH3_64bits(state_desc.PS.pShaderBytecode, state_desc.PS.BytecodeLength);
+    }
+    if (state_desc.GS.pShaderBytecode && state_desc.GS.BytecodeLength) {
+      key.gs_hash = XXH3_64bits(state_desc.GS.pShaderBytecode, state_desc.GS.BytecodeLength);
+    }
+    uint64_t name_hash = XXH3_64bits(&key, sizeof(key));
+    wchar_t name[17];
+    for (int i = 0; i < 16; ++i) {
+      name[i] = L"0123456789ABCDEF"[(name_hash >> ((15 - i) * 4)) & 0xF];
+    }
+    name[16] = 0;
+    if (SUCCEEDED(
+            pipeline_library_->LoadGraphicsPipeline(name, &state_desc, IID_PPV_ARGS(&state)))) {
+      g_hitch_probe.lib_hits.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      state = nullptr;
+      g_hitch_probe.lib_misses.fetch_add(1, std::memory_order_relaxed);
+      if (SUCCEEDED(device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state)))) {
+        // Loads are free-threaded; only StorePipeline and Serialize must be
+        // kept apart from each other.
+        std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+        if (SUCCEEDED(pipeline_library_->StorePipeline(name, state))) {
+          pipeline_library_stores_unserialized_.fetch_add(1, std::memory_order_relaxed);
+          g_hitch_probe.lib_stores.fetch_add(1, std::memory_order_relaxed);
+        }
+      } else {
+        state = nullptr;
+      }
+    }
+  }
+  // [hitch] Attribute the creation time to the thread class that paid it.
+  uint64_t create_ticks = rex::chrono::Clock::QueryHostTickCount() - create_start;
+  if (GetCurrentThreadId() == cp_thread_id_.load(std::memory_order_relaxed)) {
+    g_hitch_probe.pso_cp_ticks.fetch_add(create_ticks, std::memory_order_relaxed);
+    g_hitch_probe.pso_cp_creates.fetch_add(1, std::memory_order_relaxed);
+    if (create_ticks > g_hitch_probe.pso_cp_max_ticks.load(std::memory_order_relaxed)) {
+      g_hitch_probe.pso_cp_max_ticks.store(create_ticks, std::memory_order_relaxed);
+    }
+    uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+    if (!pipeline_library_boot_pass_ && create_ticks * 200 > tick_frequency) {
+      // A single CP-thread pipeline create over 5 ms is a visible stall.
+      REXGPU_WARN("[hitch] CP-thread pipeline create took {} ms",
+                  create_ticks * 1000 / tick_frequency);
+    }
+  } else {
+    g_hitch_probe.pso_thr_ticks.fetch_add(create_ticks, std::memory_order_relaxed);
+    g_hitch_probe.pso_thr_creates.fetch_add(1, std::memory_order_relaxed);
+  }
+  return state;
+}
+
+void PipelineCache::InitializePipelineLibrary(const std::filesystem::path& local_root,
+                                              uint32_t title_id, bool edram_rov_used) {
+  if (!REXCVAR_GET(d3d12_pipeline_library) || pipeline_library_) {
+    return;
+  }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  D3D12_FEATURE_DATA_SHADER_CACHE cache_support = {};
+  if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE, &cache_support,
+                                         sizeof(cache_support))) ||
+      !(cache_support.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY)) {
+    REXGPU_INFO("[pso-lib] driver pipeline library unsupported; every boot will recompile");
+    return;
+  }
+  ID3D12Device1* device1 = nullptr;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1)))) {
+    REXGPU_INFO("[pso-lib] ID3D12Device1 unavailable; every boot will recompile");
+    return;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(local_root, ec);
+  // Driver blobs are per-adapter, so the adapter's vendor and device id go in
+  // the file name - a hybrid laptop alternating iGPU and dGPU must not thrash
+  // one shared file (each boot would reject the other GPU's blobs and
+  // overwrite them with its own).
+  uint32_t adapter_vendor = 0;
+  uint32_t adapter_device = 0;
+  {
+    LUID adapter_luid = device->GetAdapterLuid();
+    IDXGIFactory4* factory4 = nullptr;
+    if (SUCCEEDED(command_processor_.GetD3D12Provider().GetDXGIFactory()->QueryInterface(
+            IID_PPV_ARGS(&factory4)))) {
+      IDXGIAdapter* adapter = nullptr;
+      if (SUCCEEDED(factory4->EnumAdapterByLuid(adapter_luid, IID_PPV_ARGS(&adapter)))) {
+        DXGI_ADAPTER_DESC adapter_desc;
+        if (SUCCEEDED(adapter->GetDesc(&adapter_desc))) {
+          adapter_vendor = adapter_desc.VendorId;
+          adapter_device = adapter_desc.DeviceId;
+        }
+        adapter->Release();
+      }
+      factory4->Release();
+    }
+  }
+  pipeline_library_path_ =
+      local_root / fmt::format("{:08X}.{}.{:04X}{:04X}.d3d12.psolib", title_id,
+                               edram_rov_used ? "rov" : "rtv", adapter_vendor, adapter_device);
+  pipeline_library_data_.clear();
+  FILE* file = rex::filesystem::OpenFile(pipeline_library_path_, "rb");
+  if (file) {
+    rex::filesystem::Seek(file, 0, SEEK_END);
+    int64_t file_size = rex::filesystem::Tell(file);
+    if (file_size > 0 && rex::filesystem::Seek(file, 0, SEEK_SET)) {
+      pipeline_library_data_.resize(size_t(file_size));
+      if (fread(pipeline_library_data_.data(), 1, size_t(file_size), file) != size_t(file_size)) {
+        pipeline_library_data_.clear();
+      }
+    }
+    fclose(file);
+  }
+  if (!pipeline_library_data_.empty()) {
+    HRESULT hr = device1->CreatePipelineLibrary(pipeline_library_data_.data(),
+                                                pipeline_library_data_.size(),
+                                                IID_PPV_ARGS(&pipeline_library_));
+    if (FAILED(hr)) {
+      // DRIVER_VERSION_MISMATCH / ADAPTER_NOT_FOUND after a driver update or
+      // GPU change, E_INVALIDARG if corrupt - the blobs are dead either way.
+      REXGPU_INFO("[pso-lib] stored driver blobs rejected ({:#010x}); starting fresh",
+                  uint32_t(hr));
+      pipeline_library_ = nullptr;
+      pipeline_library_data_.clear();
+    } else {
+      REXGPU_INFO("[pso-lib] loaded {} KB of driver pipeline blobs",
+                  pipeline_library_data_.size() >> 10);
+    }
+  }
+  if (!pipeline_library_) {
+    if (FAILED(device1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&pipeline_library_)))) {
+      REXGPU_ERROR("[pso-lib] failed to create an empty pipeline library");
+      pipeline_library_ = nullptr;
+    } else {
+      REXGPU_INFO("[pso-lib] starting an empty pipeline library");
+    }
+  }
+  device1->Release();
+  pipeline_library_stores_unserialized_.store(0, std::memory_order_relaxed);
+}
+
+void PipelineCache::SerializePipelineLibrary() {
+  if (!pipeline_library_) {
+    return;
+  }
+  uint32_t stores = pipeline_library_stores_unserialized_.exchange(0, std::memory_order_relaxed);
+  if (!stores) {
+    return;
+  }
+  std::vector<uint8_t> blob;
+  {
+    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+    size_t serialized_size = pipeline_library_->GetSerializedSize();
+    if (!serialized_size) {
+      return;
+    }
+    blob.resize(serialized_size);
+    if (FAILED(pipeline_library_->Serialize(blob.data(), serialized_size))) {
+      REXGPU_WARN("[pso-lib] serialize failed; blobs not saved this time");
+      pipeline_library_stores_unserialized_.fetch_add(stores, std::memory_order_relaxed);
+      return;
+    }
+  }
+  // Write to a temp file, then rename over the old library, so a crash mid
+  // write never leaves a truncated file behind.
+  std::filesystem::path temp_path = pipeline_library_path_;
+  temp_path += L".tmp";
+  FILE* file = rex::filesystem::OpenFile(temp_path, "wb");
+  bool written = false;
+  if (file) {
+    written = fwrite(blob.data(), 1, blob.size(), file) == blob.size();
+    fclose(file);
+  }
+  std::error_code ec;
+  if (written) {
+    std::filesystem::rename(temp_path, pipeline_library_path_, ec);
+  }
+  if (!written || ec) {
+    std::filesystem::remove(temp_path, ec);
+    REXGPU_WARN("[pso-lib] failed to write {}", rex::path_to_utf8(pipeline_library_path_));
+    pipeline_library_stores_unserialized_.fetch_add(stores, std::memory_order_relaxed);
+    return;
+  }
+  REXGPU_INFO("[pso-lib] serialized {} KB ({} new pipelines banked)", blob.size() >> 10, stores);
+}
+
+void PipelineCache::ShutdownPipelineLibrary() {
+  if (!pipeline_library_) {
+    return;
+  }
+  SerializePipelineLibrary();
+  pipeline_library_->Release();
+  pipeline_library_ = nullptr;
+  pipeline_library_data_.clear();
+  pipeline_library_stores_unserialized_.store(0, std::memory_order_relaxed);
+}
+
 void PipelineCache::StorageWriteThread() {
   ShaderStoredHeader shader_header;
   // Don't leak anything in unused bits.
@@ -3765,6 +4037,12 @@ void PipelineCache::StorageWriteThread() {
       flush_pipelines = false;
       assert_not_null(pipeline_storage_file_);
       fflush(pipeline_storage_file_);
+      // [PSO-LIB] Off the CP thread: bank driver blobs once enough new
+      // pipelines accumulate, so a hitchy first drive on a new machine saves
+      // its compiles progressively rather than only at a clean exit.
+      if (pipeline_library_stores_unserialized_.load(std::memory_order_relaxed) >= 16) {
+        SerializePipelineLibrary();
+      }
     }
 
     const Shader* shader = nullptr;

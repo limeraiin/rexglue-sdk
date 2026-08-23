@@ -215,6 +215,15 @@ class D3D12CommandProcessor : public CommandProcessor {
     return pipeline_cache_->GetD3D12PipelineByHandle(handle);
   }
 
+  // [PSO-LIB] N-10b: create a graphics PSO through the pipeline cache's
+  // persistent driver-blob library (falls back to a plain create when the
+  // library is unavailable). For CP-thread creates outside the pipeline
+  // cache, e.g. the render target cache's transfer pipelines.
+  ID3D12PipelineState* CreateGraphicsPipelineWithLibrary(
+      const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    return pipeline_cache_->CreateGraphicsPipelineWithLibrary(desc);
+  }
+
   // Sets the current cached values to external ones. This is for cache
   // invalidation primarily. A submission must be open.
   void SetExternalPipeline(ID3D12PipelineState* pipeline);

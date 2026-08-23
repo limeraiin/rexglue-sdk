@@ -20,11 +20,13 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/d3d12/hitch_probe.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
@@ -315,6 +317,11 @@ extern uint64_t g_tile_n_opost;
 }  // namespace rex::graphics
 
 namespace rex::graphics::d3d12 {
+
+// [hitch] N-10b hitch probe counters (see hitch_probe.h). Written here (fence
+// waits) and in pipeline_cache.cpp (PSO creates, EndSubmission wait, library
+// outcomes); reported once a second from EndSubmission's frame close.
+HitchProbe g_hitch_probe;
 
 namespace {
 // [PERF/CONST-DEDUPE] Cached once per frame from the gpu_dedupe_constants cvar.
@@ -7314,7 +7321,13 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                     SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
                         fence_value, fence_completion_event_)))) {
         PROFILE_CMD_BUFFER_STALL();
+        // [hitch] out-of-submission queue-operation fence wait on the CP.
+        uint64_t hitch_wait_start = rex::chrono::Clock::QueryHostTickCount();
         WaitForSingleObject(fence_completion_event_, INFINITE);
+        g_hitch_probe.qops_wait_ticks.fetch_add(
+            rex::chrono::Clock::QueryHostTickCount() - hitch_wait_start,
+            std::memory_order_relaxed);
+        g_hitch_probe.qops_waits.fetch_add(1, std::memory_order_relaxed);
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -7333,7 +7346,13 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (SUCCEEDED(
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
+      // [hitch] submission-fence wait on the CP (frame pacing + explicit
+      // awaits) - big in GPU-drowned pockets, small when CPU-bound.
+      uint64_t hitch_wait_start = rex::chrono::Clock::QueryHostTickCount();
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      g_hitch_probe.fence_wait_ticks.fetch_add(
+          rex::chrono::Clock::QueryHostTickCount() - hitch_wait_start, std::memory_order_relaxed);
+      g_hitch_probe.fence_waits.fetch_add(1, std::memory_order_relaxed);
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -10232,6 +10251,45 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
+
+    // [hitch] 1 Hz: everything that blocked the CP thread this window, plus
+    // PSO creation split by thread and driver-library outcomes. Silent when
+    // the window had nothing to report.
+    {
+      uint64_t hitch_now = rex::chrono::Clock::QueryHostTickCount();
+      uint64_t hitch_freq = rex::chrono::Clock::QueryHostTickFrequency();
+      static uint64_t hitch_last_report = 0;
+      if (!hitch_last_report) {
+        hitch_last_report = hitch_now;
+      }
+      if (hitch_now - hitch_last_report >= hitch_freq) {
+        hitch_last_report = hitch_now;
+        HitchProbe& hp = g_hitch_probe;
+        uint64_t fence_t = hp.fence_wait_ticks.exchange(0, std::memory_order_relaxed);
+        uint64_t fence_n = hp.fence_waits.exchange(0, std::memory_order_relaxed);
+        uint64_t qops_t = hp.qops_wait_ticks.exchange(0, std::memory_order_relaxed);
+        uint64_t qops_n = hp.qops_waits.exchange(0, std::memory_order_relaxed);
+        uint64_t endsub_t = hp.pso_endsub_wait_ticks.exchange(0, std::memory_order_relaxed);
+        uint64_t endsub_n = hp.pso_endsub_waits.exchange(0, std::memory_order_relaxed);
+        uint64_t cp_t = hp.pso_cp_ticks.exchange(0, std::memory_order_relaxed);
+        uint64_t cp_n = hp.pso_cp_creates.exchange(0, std::memory_order_relaxed);
+        uint64_t cp_max = hp.pso_cp_max_ticks.exchange(0, std::memory_order_relaxed);
+        uint64_t thr_t = hp.pso_thr_ticks.exchange(0, std::memory_order_relaxed);
+        uint64_t thr_n = hp.pso_thr_creates.exchange(0, std::memory_order_relaxed);
+        uint64_t lib_hit = hp.lib_hits.exchange(0, std::memory_order_relaxed);
+        uint64_t lib_miss = hp.lib_misses.exchange(0, std::memory_order_relaxed);
+        uint64_t lib_store = hp.lib_stores.exchange(0, std::memory_order_relaxed);
+        if (fence_n | qops_n | endsub_n | cp_n | thr_n | lib_hit | lib_miss | lib_store) {
+          double to_ms = 1000.0 / double(hitch_freq);
+          REXGPU_INFO(
+              "[hitch] fence {:.1f}ms/{} qops {:.1f}ms/{} psowait {:.1f}ms/{} | "
+              "pso cp {:.1f}ms/{} max {:.1f}ms thr {:.1f}ms/{} | lib hit {} miss {} store {}",
+              double(fence_t) * to_ms, fence_n, double(qops_t) * to_ms, qops_n,
+              double(endsub_t) * to_ms, endsub_n, double(cp_t) * to_ms, cp_n,
+              double(cp_max) * to_ms, double(thr_t) * to_ms, thr_n, lib_hit, lib_miss, lib_store);
+        }
+      }
+    }
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

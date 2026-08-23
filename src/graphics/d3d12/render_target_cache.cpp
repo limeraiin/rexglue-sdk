@@ -4480,7 +4480,6 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // ***************************************************************************
 
   ID3D12PipelineState* const* pipelines;
-  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   D3D12_INPUT_ELEMENT_DESC pipeline_input_element_desc;
   pipeline_input_element_desc.SemanticName = "POSITION";
   pipeline_input_element_desc.SemanticIndex = 0;
@@ -4528,8 +4527,11 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     bool stencil_pipelines_created = true;
     for (uint32_t i = 0; i < 8; ++i) {
       pipeline_desc.DepthStencilState.StencilWriteMask = UINT8(1) << i;
-      if (SUCCEEDED(device->CreateGraphicsPipelineState(&pipeline_desc,
-                                                        IID_PPV_ARGS(&stencil_bit_pipelines[i])))) {
+      // [PSO-LIB] Draw-time CP-thread create; route through the driver-blob
+      // library (also counts into the [hitch] probe).
+      stencil_bit_pipelines[i] =
+          command_processor_.CreateGraphicsPipelineWithLibrary(pipeline_desc);
+      if (stencil_bit_pipelines[i]) {
         continue;
       }
       stencil_pipelines_created = false;
@@ -4566,10 +4568,9 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       }
       pipeline_desc.DSVFormat = GetDepthDSVDXGIFormat(dest_depth_format);
     }
-    ID3D12PipelineState* pipeline;
-    if (FAILED(device->CreateGraphicsPipelineState(&pipeline_desc, IID_PPV_ARGS(&pipeline)))) {
-      pipeline = nullptr;
-    }
+    // [PSO-LIB] Draw-time CP-thread create; route through the driver-blob
+    // library (also counts into the [hitch] probe). Null on failure.
+    ID3D12PipelineState* pipeline = command_processor_.CreateGraphicsPipelineWithLibrary(pipeline_desc);
     // Even if creation fails, still store the null pointer not to try to create
     // again.
     // Return a pointer to the persistent location.
