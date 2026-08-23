@@ -244,6 +244,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // unless precord capture owns the draw path (same exclusion as the
   // gpu_nr_issue seam, counted there as precord_skip).
   bool NrSkipBackendEligible() const override;
+  // [N8F] The effect half of WriteRegistersFromMem, for a range whose values
+  // were already stored at decode time by the coalescer.
+  void NrApplyRangeEffects(uint32_t base, uint32_t n) override;
+  bool NrCoalesceEligible() const override { return true; }
   // [NR-BFC] Phase 5-4-6-0: buffer-replay census bracket -- Begin latches the
   // deferred-list stream position and the RT-update body-run counter, End
   // scans the emitted span (self-describing stream) and fills the sample.

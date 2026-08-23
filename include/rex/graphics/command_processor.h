@@ -211,6 +211,21 @@ class CommandProcessor {
   bool NrSkipApplyRegRange(uint32_t base, const uint32_t* values_be,
                            uint32_t n, uint32_t phys, bool from_memory);
 
+  // [N8F] Per-draw effect coalescing: store a walk-decoded range's VALUES
+  // immediately (register file + issue mirror, plain copy_and_swap, no
+  // virtual dispatch), accumulate the touched span, and fire the class side
+  // effects (cbuffer dirty evaluation, fetch texture/residency
+  // invalidations) once per MERGED span at the draw stop. Register-file
+  // READERS between ranges always see live values; only the draw-time dirty
+  // notifications are deferred, and every consumer of those is the draw.
+  // Returns false for a range that straddles a constant-window boundary --
+  // the caller falls through to the legacy apply.
+  bool N8fApplyRange(uint32_t base, uint32_t* be, uint32_t n);
+  // Fire the deferred effects for every accumulated span, in store order.
+  // Called before each draw/resolve dispatch, before a delegated nested
+  // indirect buffer, at an executor abort, and at buffer end.
+  void N8fFlush();
+
   // [NR-BFC] Phase 5-4-6-0: what the backend measured across one skip-driven
   // buffer execution, for the buffer-level native-replay census. Filled by
   // NrBfcBufEnd from deltas since the matching NrBfcBufBegin. Public for the
@@ -339,6 +354,13 @@ class CommandProcessor {
   // non-D3D12 backends refuse). Base default false keeps every backend that
   // has not opted in on the executor path.
   virtual bool NrSkipBackendEligible() const { return false; }
+  // [N8F] Deferred-effects support. NrApplyRangeEffects re-fires exactly the
+  // side-effect half of the backend's WriteRegistersFromMem for a range whose
+  // VALUES are already in the register file (the value copy has happened at
+  // decode time). A backend that does not implement it must return false
+  // from NrCoalesceEligible so the coalescer never arms there.
+  virtual void NrApplyRangeEffects(uint32_t base, uint32_t n) {}
+  virtual bool NrCoalesceEligible() const { return false; }
   // [NR-SKP] Runs one eligible depth-1 indirect buffer with the walk as the
   // ONLY decoder: native packets applied through NrSkipApplyRegWrite, draws
   // and the 5-4-1 delegate list dispatched to the executor's own handlers at

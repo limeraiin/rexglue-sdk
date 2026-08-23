@@ -580,6 +580,26 @@ REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, true, "GPU",
                     "of per-dword dwords captured, walk pool 1.26 -> 1.17 "
                     "us/draw).");
 
+// [N8F] Per-draw effect coalescing -- the rung N-8c priced at a ~7% floor
+// (naruto_601: 25.4 applies/draw -> 8.7, ~20 ns each). A walk-decoded range
+// >= 0x2000 stores its VALUES immediately (plain copy_and_swap into the
+// register file and the issue mirror -- no virtual dispatch, no per-range
+// dirty evaluation) and its touched span is accumulated; the class side
+// effects fire ONCE per merged span at the draw stop, which is when their
+// only consumers (cbuffer upload, texture cache, residency) actually read
+// them. Register-file readers between ranges always see live values, so
+// REG_RMW / COND_WRITE / WAIT_REG_MEM delegates need no flush. The gpu_n7 5
+// cycler prices it in place; the cvar is the standing switch.
+REXCVAR_DEFINE_BOOL(gpu_nr_coalesce, false, "GPU",
+                    "[n8f] Under gpu_nr_skip, defer constant/plain range "
+                    "side effects to the draw stop and fire them once per "
+                    "merged span (values are stored immediately). Vetoed "
+                    "(with a log line) under verify/ruse/memo/tile/instance/"
+                    "dedupe modes and on backends without the effects "
+                    "override. Pixel-identical by construction.");
+REXCVAR_DECLARE(bool, gpu_instance);
+REXCVAR_DECLARE(bool, gpu_dedupe_constants);
+
 // [NR-WM] Phase 5-4-8: the walk memo. A skip-driven buffer whose bytes are
 // identical to its previous compared execution (the ruse shadow compare, on
 // anyway under the fast path) replays the walker's recorded emission stream
@@ -1117,6 +1137,26 @@ thread_local uint64_t g_type0_split_ns = 0;
 //
 // Split factor per class, driven by the `gpu_n7 4` in-place cycler.
 int g_n8c_split_alu = 1, g_n8c_split_fetch = 1, g_n8c_split_other = 1;
+
+// [N8F] Coalescer state. Only the command-processor thread touches it (same
+// single-thread argument as every other g_* here). Spans are class-tagged so
+// a merge can never manufacture a range that straddles a constant-window
+// boundary (the effects dispatch classifies by address).
+bool g_n8f_eligible = false;  // latched once per worker init, veto logged
+bool g_n8f_on = false;        // live switch: cvar, or the gpu_n7 5 phase
+struct N8fSpan {
+  uint32_t base;  // first register
+  uint32_t end;   // exclusive
+  uint8_t cls;    // 0 alu, 1 fetch, 2 bool/loop (plain spans are not tracked)
+};
+constexpr uint32_t kN8fSpans = 24;  // [n8e]: union averages 8.7 spans/draw
+N8fSpan g_n8f_spans[kN8fSpans];
+uint32_t g_n8f_nspans = 0;
+uint64_t g_n8f_rng = 0;       // ranges deferred through the coalescer
+uint64_t g_n8f_applies = 0;   // merged spans flushed (the new apply count)
+uint64_t g_n8f_flushes = 0;   // flushes that had at least one span
+uint64_t g_n8f_ovf = 0;       // span-table overflow: effects fired inline
+uint64_t g_n8f_straddle = 0;  // window straddlers sent to the legacy apply
 
 // [N8D] The contiguity census. A range that begins exactly where the previous
 // one ended is a range a look-ahead merge could absorb; if it is also
@@ -3707,6 +3747,31 @@ void CommandProcessor::WorkerThreadMain() {
           kNrSkip, g_nr_tmpl, nr::TmplPlanMode());
     }
   }
+  // [N8F] Per-draw effect coalescing. Every veto is a mode whose machinery
+  // reads or replays the per-range apply stream (ruse/memo/verify/res), or
+  // adds a per-range side effect the deferred flush does not reproduce
+  // (gpu_instance's old-value compare, gpu_dedupe_constants' early return),
+  // or is a wrong-pixels diagnostic (tile probes). Declines are logged, not
+  // silent.
+  g_n8f_eligible = kNrSkip && NrCoalesceEligible() && !g_nr_verify_base &&
+                   !g_nr_res && !g_nr_ruse && !g_nr_wm && !g_nr_tmpl_swap &&
+                   !g_nr_tile_probe && !g_nr_tile_cycle &&
+                   !REXCVAR_GET(gpu_instance) &&
+                   !REXCVAR_GET(gpu_dedupe_constants);
+  g_n8f_on = g_n8f_eligible && REXCVAR_GET(gpu_nr_coalesce);
+  if (REXCVAR_GET(gpu_nr_coalesce) && !g_n8f_eligible) {
+    REXGPU_INFO(
+        "[n8f] REFUSED: skip={} backend={} verify={} res={} ruse={} wm={} "
+        "tmplswap={} tile={} instance={} dedupe={} -- the coalescer is "
+        "inert, do not read a perf number from this run",
+        kNrSkip, NrCoalesceEligible(), g_nr_verify_base, g_nr_res, g_nr_ruse,
+        g_nr_wm, g_nr_tmpl_swap, g_nr_tile_probe || g_nr_tile_cycle,
+        REXCVAR_GET(gpu_instance), REXCVAR_GET(gpu_dedupe_constants));
+  } else if (g_n8f_on) {
+    REXGPU_INFO(
+        "[n8f] ON: range side effects deferred to the draw stop, one apply "
+        "per merged span (values always live)");
+  }
   // [NR-DRAW] rides the same walk, and turns it into a lockstep one.
   const bool kNrDraw = REXCVAR_GET(gpu_nr_draw) || kNrIssue || kNrWalkFx;
   g_nr_draw = kNrDraw;
@@ -3748,7 +3813,16 @@ void CommandProcessor::WorkerThreadMain() {
           sdb_path.empty() ? "<unset>" : sdb_path);
     }
   }
-  const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState || kNrCtx;
+  // [N8D] The record/replay-gate probes are OPT-IN now. `|| kNrCtx` used to
+  // ride here, and kNrCtx is forced true by the skip chain, so every DEFAULT
+  // run paid the whole [NR-IBL]+[nrc] block per buffer execution: a registry
+  // range query, a CountBufferDraws re-walk (always, at city -- the registry
+  // is empty on default runs, so sum!=truth every time), and the full join
+  // walk. That was the [n7] "executor fallback" 10% of the CP second
+  // (naruto_593: ib 902ms vs skip buf 800ms, fb=0, n==bufs -- nothing ever
+  // declined the skip; the gap was this block). The gate is PASS and its
+  // consumers are counters only, so it runs when its own cvars ask.
+  const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState;
   g_nr_cache = kNrCache;
   const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger) || kNrCache;  // [NR-IBL] record/replay gate
   g_ib_ledger = kIbLedger;
@@ -4069,6 +4143,23 @@ void CommandProcessor::WorkerThreadMain() {
             g_n8e_rng[c] = g_n8e_grp[c] = g_n8e_dw[c] = g_n8e_udw[c] = 0;
           }
         }
+        // [N8F] the coalescer's own economics, printed for any window it ran
+        // in. deferred = ranges taken by the fast path; applies = merged
+        // spans flushed (the number that replaced them); ovf/straddle must
+        // stay ~0 or the span table / window model is wrong.
+        if (g_n8f_rng) {
+          REXGPU_INFO(
+              "[n8f] deferred rng/draw={:.2f} -> effect applies/draw={:.2f} "
+              "(-{:.0f}%) | flushes={} ovf={} straddle={}",
+              draws ? double(g_n8f_rng) / double(draws) : 0.0,
+              draws ? double(g_n8f_applies + g_n8f_ovf) / double(draws) : 0.0,
+              g_n8f_rng ? 100.0 * (1.0 - double(g_n8f_applies + g_n8f_ovf) /
+                                             double(g_n8f_rng))
+                        : 0.0,
+              g_n8f_flushes, g_n8f_ovf, g_n8f_straddle);
+          g_n8f_rng = g_n8f_applies = g_n8f_flushes = g_n8f_ovf = 0;
+          g_n8f_straddle = 0;
+        }
         n7_last_frames = frames_now;
         n7_last_draws = g_n7_draws;
         n7_last_spin_ns = prof_spin_ns;
@@ -4165,6 +4256,32 @@ void CommandProcessor::WorkerThreadMain() {
                 phase == 0   ? "no constant compare at all"
                 : phase == 1 ? "compare and count, act on nothing"
                              : "unchanged constant ranges skipped entirely");
+          }
+        }
+        // Mode 5: N-8f, per-draw effect coalescing, two 5 s phases IN PLACE.
+        // Both phases are pixel-correct (values are stored identically; only
+        // when the side effects fire changes, and every consumer of them is
+        // the draw), so the paired fps delta IS the rung's worth.
+        //   0 CLEAN     the legacy per-range applies
+        //   1 COALESCE  values stored at decode, effects once per merged
+        //               span at the draw stop
+        if (kN7 == 5) {
+          const int64_t el = std::chrono::duration_cast<std::chrono::seconds>(
+                                 n7_now - n7_t0).count();
+          const int phase = int((el / 5) % 2);
+          static int n8f_phase_prev = -1;
+          if (phase != n8f_phase_prev) {
+            n8f_phase_prev = phase;
+            if (g_n8f_eligible) {
+              g_n8f_on = phase == 1;
+              REXGPU_INFO(
+                  "[n7] N8F PHASE {} - both phases pixel-correct; pair "
+                  "adjacent phases for the fps answer.",
+                  phase == 1 ? "COALESCE" : "CLEAN");
+            } else if (n8f_phase_prev == phase) {
+              REXGPU_INFO("[n8f] cycler armed but INELIGIBLE (see the boot "
+                          "[n8f] line) - phases will not fire");
+            }
           }
         }
       }
@@ -6379,6 +6496,12 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
         ++g_tile_draws_skipped;
         continue;
       }
+      // [N8F] The draw is about to dispatch (direct or delegated): fire the
+      // deferred effects now, so IssueDraw's consumers (cbuffer dirty flags,
+      // texture cache, residency) read exactly what per-range applies would
+      // have left. Detile/tile-skipped draws never reach here and keep
+      // accumulating, which is the point.
+      if (g_n8f_nspans) N8fFlush();
       // Draw stop: the walk already sits past this draw's packet, so the
       // handler must consume THIS stop instead of advancing the walk.
       g_nr_skip_stop = stop;
@@ -6472,6 +6595,14 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     } else {
       ++g_skp_deleg;
       ++g_skp_deleg_op[stop.opcode & 0x7F];
+      // [N8F] A delegated nested indirect buffer runs the executor's own
+      // packet loop, whose draws consume the deferred effects: flush first.
+      // Every other delegate reads register VALUES at most (live already) or
+      // memory, never the dirty tails. depth2=0 at city, so this never fires
+      // in practice.
+      if (g_n8f_nspans && (stop.opcode & 0x7F) == PM4_INDIRECT_BUFFER) {
+        N8fFlush();
+      }
       // [NR-WM] a nested indirect buffer's content sits outside the byte
       // gate and can steer bin state through its own SET_BIN packets: this
       // buffer never gets a memo (measured zero among byte-identical city
@@ -6647,6 +6778,10 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   // leave the CP's bin members holding the walk's end state (an in-buffer
   // SET_BIN would otherwise be lost to the packets that follow).
   CtxFinishWalk();
+  // [N8F] Trailing ranges (applied by CtxFinishWalk above) and anything an
+  // abort left pending: flush before the buffer ends, so the next consumer
+  // -- whatever it is -- starts from fired effects.
+  if (g_n8f_nspans) N8fFlush();
   bin_select_ = g_ctx_walker.bin.select;
   bin_mask_ = g_ctx_walker.bin.mask;
   if (spp) {
@@ -6716,6 +6851,13 @@ bool CommandProcessor::NrSkipApplyRegRange(uint32_t base,
 
 bool CommandProcessor::NrSkipApplyRegRangeBody(uint32_t base, uint32_t* be,
                                                uint32_t n, bool from_memory) {
+  // [N8F] Coalesced fast path: values now, effects at the draw. Eligibility
+  // vetoed every mode below that reads the per-range apply stream, so their
+  // feeds are safely skipped here. A window straddler returns false and
+  // falls through to the legacy apply (counted, never silent).
+  if (g_n8f_on && N8fApplyRange(base, be, n)) {
+    return true;
+  }
   // [NR-RUSE] by-ref payloads bypass the buffer bytes; chain them so a draw's
   // prefix digest covers everything the packet dwords cannot. Every range
   // also drives the v2 stale set (inline via the diff bitmap, by-ref via the
@@ -6755,6 +6897,97 @@ bool CommandProcessor::NrSkipApplyRegRangeBody(uint32_t base, uint32_t* be,
   ++g_skp_rng;
   g_skp_rng_dw += n;
   return true;
+}
+
+// [N8F] The coalesced range apply. Stores the values exactly where the legacy
+// path would have (register file via copy_and_swap, issue mirror via memcpy),
+// keeps every counter the legacy body feeds so the [nr-skp]/[n8]/[n8d] lines
+// stay comparable across the cycler's phases, and defers only the class side
+// effects. Plain ranges have no deferred effect at all (gpu_instance is
+// vetoed), so they take the store and nothing else -- that is the whole win
+// for the 10.9 plain applies/draw.
+bool CommandProcessor::N8fApplyRange(uint32_t base, uint32_t* be, uint32_t n) {
+  const uint32_t end_index = base + n - 1;
+  uint8_t cls;
+  bool plain = false;
+  if (end_index < XE_GPU_REG_SHADER_CONSTANT_000_X ||
+      base > XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    plain = true;
+    cls = 0xFF;
+  } else if (base >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+             end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    cls = 0;
+  } else if (base >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+             end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    cls = 1;
+  } else if (base >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+             end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    cls = 2;
+  } else {
+    // Straddles a window boundary (or lands in the 0x48C0..0x48FF hole):
+    // the legacy apply owns the shape.
+    ++g_n8f_straddle;
+    return false;
+  }
+  memory::copy_and_swap(register_file_->values + base, be, n);
+  if (g_nr_issue && g_nri_seeded && !g_nri_live) {
+    std::memcpy(&g_nri_file.values[base], &register_file_->values[base],
+                n * sizeof(uint32_t));
+  }
+  ++g_n8f_rng;
+  N8Classify(base, n, false);
+  ++g_n8d_applied;
+  ++g_skp_rng;
+  g_skp_rng_dw += n;
+  if (plain) {
+    ++g_skp_plain_rng;
+    g_skp_plain_dw += n;
+    return true;
+  }
+  // Accumulate [base, base+n) into the span set: absorb every same-class
+  // span it overlaps or abuts (a widened span can newly touch an
+  // already-scanned one, so absorbing restarts the scan; the set is <= 24
+  // entries and multi-absorbs are rare).
+  uint32_t nb = base, ne = base + n;
+  bool absorbed = true;
+  while (absorbed) {
+    absorbed = false;
+    for (uint32_t i = 0; i < g_n8f_nspans; ++i) {
+      const N8fSpan& s = g_n8f_spans[i];
+      if (s.cls == cls && nb <= s.end && ne >= s.base) {
+        if (s.base < nb) nb = s.base;
+        if (s.end > ne) ne = s.end;
+        g_n8f_spans[i] = g_n8f_spans[--g_n8f_nspans];
+        absorbed = true;
+        break;
+      }
+    }
+  }
+  if (g_n8f_nspans == kN8fSpans) {
+    // No slot: fire this (merged) span's effects immediately. Values are
+    // stored, so this is only an early effect, never a lost one.
+    NrApplyRangeEffects(nb, ne - nb);
+    ++g_n8f_ovf;
+    return true;
+  }
+  g_n8f_spans[g_n8f_nspans++] = {nb, ne, cls};
+  return true;
+}
+
+// [N8F] Fire the deferred effects, one virtual call per merged span. Called
+// before every draw/resolve dispatch, before a delegated nested indirect
+// buffer, at an executor abort, and at buffer end -- the four places after
+// which something other than the walk's own range stream may consume them.
+void CommandProcessor::N8fFlush() {
+  const uint32_t k = g_n8f_nspans;
+  if (!k) return;
+  for (uint32_t i = 0; i < k; ++i) {
+    NrApplyRangeEffects(g_n8f_spans[i].base,
+                        g_n8f_spans[i].end - g_n8f_spans[i].base);
+  }
+  g_n8f_applies += k;
+  ++g_n8f_flushes;
+  g_n8f_nspans = 0;
 }
 
 // [NR-SKP] Phase 5-4-4a: one draw stop, issued by direct call. The walk has
