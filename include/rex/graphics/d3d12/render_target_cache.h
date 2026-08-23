@@ -127,7 +127,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   bool IsGammaFormatHostStorageSeparate() const override;
 
-  void RequestPixelShaderInterlockBarrier() override;
+  // [N-10b deletion c] the RequestPixelShaderInterlockBarrier override is
+  // DELETED - D3D12 never runs the interlock path; the base no-op stands.
 
  private:
   enum class EdramBufferModificationStatus {
@@ -852,13 +853,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Temporary storage for DXBC building.
   std::vector<uint32_t> built_shader_;
 
-  // For rasterizer-ordered view (pixel shader interlock).
-
-  ID3D12RootSignature* resolve_rov_clear_root_signature_ = nullptr;
-  // Clearing 32bpp color or depth.
-  ID3D12PipelineState* resolve_rov_clear_32bpp_pipeline_ = nullptr;
-  // Clearing 64bpp color.
-  ID3D12PipelineState* resolve_rov_clear_64bpp_pipeline_ = nullptr;
+  // [N-10b deletion c] the ROV resolve-clear root signature + pipelines are
+  // DELETED.
 };
 
 }  // namespace rex::graphics::d3d12

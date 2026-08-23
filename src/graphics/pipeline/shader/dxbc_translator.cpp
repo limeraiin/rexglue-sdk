@@ -56,7 +56,7 @@ using namespace ucode;
 //   within its space.
 
 DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID vendor_id,
-                                           bool bindless_resources_used, bool edram_rov_used,
+                                           bool bindless_resources_used,
                                            bool gamma_render_target_as_unorm8,
                                            bool msaa_2x_supported, uint32_t draw_resolution_scale_x,
                                            uint32_t draw_resolution_scale_y,
@@ -65,7 +65,6 @@ DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID ven
       ao_(shader_object_, statistics_),
       vendor_id_(vendor_id),
       bindless_resources_used_(bindless_resources_used),
-      edram_rov_used_(edram_rov_used),
       gamma_render_target_as_unorm8_(gamma_render_target_as_unorm8),
       msaa_2x_supported_(msaa_2x_supported),
       draw_resolution_scale_x_(draw_resolution_scale_x),
@@ -593,30 +592,8 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
 }
 
 void DxbcShaderTranslator::StartPixelShader() {
-  if (edram_rov_used_) {
-    // Load the EDRAM addresses and the coverage.
-    StartPixelShader_LoadROVParameters();
-
-    if (ROV_IsDepthStencilEarly()) {
-      // Do early 2x2 quad rejection if it's safe.
-      ROV_DepthStencilTest();
-    } else {
-      if (!current_shader().writes_depth()) {
-        // Get the derivatives of the screen-space (but not clamped to the
-        // viewport depth bounds yet - this happens after the pixel shader in
-        // Direct3D 11+; also linear within the triangle - thus constant
-        // derivatives along the triangle) Z for calculating per-sample depth
-        // values and the slope-scaled polygon offset to
-        // system_temp_depth_stencil_ before any return statement is possibly
-        // reached.
-        assert_true(system_temp_depth_stencil_ != UINT32_MAX);
-        dxbc::Src in_position_z(dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
-        in_position_used_ |= 0b0100;
-        a_.OpDerivRTXCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0001), in_position_z);
-        a_.OpDerivRTYCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0010), in_position_z);
-      }
-    }
-  }
+  // [N-10b deletion c] the ROV prologue (LoadROVParameters + early
+  // depth/stencil) is DELETED.
 
   // If not translating anything, we only need the depth.
   if (is_depth_only_pixel_shader_) {
@@ -844,29 +821,12 @@ void DxbcShaderTranslator::StartTranslation() {
       system_temp_instance_base_ = PushSystemTemp(0b0001);
     }
   } else if (is_pixel_shader()) {
-    if (edram_rov_used_) {
-      // Will be initialized unconditionally.
-      system_temp_rov_params_ = PushSystemTemp();
-    }
     if (IsDepthStencilSystemTempUsed()) {
-      uint32_t depth_stencil_temp_zero_mask;
-      if (current_shader().writes_depth()) {
-        // X holds the guest oDepth - make sure it's always initialized because
-        // assumptions can't be made about the integrity of the guest code.
-        depth_stencil_temp_zero_mask = 0b0001;
-      } else {
-        assert_true(edram_rov_used_);
-        if (ROV_IsDepthStencilEarly()) {
-          // XYZW hold per-sample depth / stencil after the early test - written
-          // conditionally based on the coverage, ensure registers are
-          // initialized unconditionally for safety.
-          depth_stencil_temp_zero_mask = 0b1111;
-        } else {
-          // XY hold Z gradients, written unconditionally in the beginning.
-          depth_stencil_temp_zero_mask = 0b0000;
-        }
-      }
-      system_temp_depth_stencil_ = PushSystemTemp(depth_stencil_temp_zero_mask);
+      // X holds the guest oDepth - make sure it's always initialized because
+      // assumptions can't be made about the integrity of the guest code.
+      // ([N-10b deletion c] the ROV zero-mask cases are DELETED - with the
+      // ROV path gone this temp exists only when the shader writes depth.)
+      system_temp_depth_stencil_ = PushSystemTemp(0b0001);
     }
     uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
     for (uint32_t i = 0; i < 4; ++i) {
@@ -1107,10 +1067,6 @@ void DxbcShaderTranslator::CompleteShaderCode() {
     }
     if (IsDepthStencilSystemTempUsed()) {
       // Release system_temp_depth_stencil_.
-      PopSystemTemp();
-    }
-    if (edram_rov_used_) {
-      // Release system_temp_rov_params_.
       PopSystemTemp();
     }
   }
@@ -1471,19 +1427,6 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
       assert_not_zero(used_write_mask);
       assert_true(current_shader().writes_color_target(result.storage_index));
       dest = dxbc::Dest::R(system_temps_color_[result.storage_index]);
-      if (edram_rov_used_) {
-        // For ROV output, mark that the color has been written to.
-        // According to:
-        // https://docs.microsoft.com/en-us/windows/desktop/direct3dhlsl/dx9-graphics-reference-asm-ps-registers-output-color
-        // if a color target hasn't been written to - including due to flow
-        // control - the render target must not be modified (the unwritten
-        // components of a written target are undefined, not sure if this
-        // behavior is respected on the real GPU, but the ROV code currently
-        // doesn't preserve unmodified components).
-        a_.OpOr(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
-                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
-                dxbc::Src::LU(uint32_t(1) << (8 + result.storage_index)));
-      }
       break;
     case InstructionStorageTarget::kDepth:
       // Writes X to scalar oDepth or to X of system_temp_depth_stencil_, no
@@ -3020,7 +2963,8 @@ void DxbcShaderTranslator::WriteOutputSignature() {
       semantic_offset += dxbc::AppendAlignedString(shader_object_, "XEPSIZE");
     }
   } else if (is_pixel_shader()) {
-    if (!edram_rov_used_) {
+    // [N-10b deletion c] was `if (!edram_rov_used_)`; RTV is the only path.
+    {
       uint32_t color_targets_written = current_shader().writes_color_targets();
 
       // Color render targets (SV_Target#).
@@ -3414,10 +3358,6 @@ void DxbcShaderTranslator::WriteShaderCode() {
                           dxbc::Name::kPosition);
     }
     bool sample_rate_memexport = current_shader().memexport_eM_written() && IsSampleRate();
-    // Sample-rate shading can't be done with UAV-only rendering (sample-rate
-    // shading is only needed for float24 depth conversion when using a float32
-    // host depth buffer).
-    assert_false(sample_rate_memexport && edram_rov_used_);
     uint32_t front_face_and_sample_index_mask =
         uint32_t(in_front_face_used_) | (uint32_t(sample_rate_memexport) << 1);
     if (front_face_and_sample_index_mask) {
@@ -3426,33 +3366,29 @@ void DxbcShaderTranslator::WriteShaderCode() {
           dxbc::Dest::V1D(in_reg_ps_front_face_sample_index_, front_face_and_sample_index_mask),
           dxbc::Name::kIsFrontFace);
     }
-    if (edram_rov_used_) {
+    // [N-10b deletion c] the ROV VCoverage declaration branch is DELETED.
+    if (sample_rate_memexport) {
       // Sample coverage input.
       ao_.OpDclInput(dxbc::Dest::VCoverage());
-    } else {
-      if (sample_rate_memexport) {
-        // Sample coverage input.
-        ao_.OpDclInput(dxbc::Dest::VCoverage());
+    }
+    // Color output.
+    uint32_t color_targets_written = current_shader().writes_color_targets();
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (color_targets_written & (uint32_t(1) << i)) {
+        ao_.OpDclOutput(dxbc::Dest::O(i));
       }
-      // Color output.
-      uint32_t color_targets_written = current_shader().writes_color_targets();
-      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-        if (color_targets_written & (uint32_t(1) << i)) {
-          ao_.OpDclOutput(dxbc::Dest::O(i));
-        }
-      }
-      // Coverage output for alpha to mask.
-      if ((color_targets_written & 0b1) && !global_flag_force_early_depth_stencil) {
-        ao_.OpDclOutput(dxbc::Dest::OMask());
-      }
-      // Depth output.
-      if (is_writing_float24_depth || shader_writes_depth) {
-        if (!shader_writes_depth && GetDxbcShaderModification().pixel.depth_stencil_mode ==
-                                        Modification::DepthStencilMode::kFloat24Truncating) {
-          ao_.OpDclOutput(dxbc::Dest::ODepthLE());
-        } else {
-          ao_.OpDclOutput(dxbc::Dest::ODepth());
-        }
+    }
+    // Coverage output for alpha to mask.
+    if ((color_targets_written & 0b1) && !global_flag_force_early_depth_stencil) {
+      ao_.OpDclOutput(dxbc::Dest::OMask());
+    }
+    // Depth output.
+    if (is_writing_float24_depth || shader_writes_depth) {
+      if (!shader_writes_depth && GetDxbcShaderModification().pixel.depth_stencil_mode ==
+                                      Modification::DepthStencilMode::kFloat24Truncating) {
+        ao_.OpDclOutput(dxbc::Dest::ODepthLE());
+      } else {
+        ao_.OpDclOutput(dxbc::Dest::ODepth());
       }
     }
   }

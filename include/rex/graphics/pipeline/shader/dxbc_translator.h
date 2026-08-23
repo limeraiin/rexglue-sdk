@@ -47,10 +47,13 @@ namespace rex::graphics {
 // SEE THE NOTES DXBC.H BEFORE WRITING ANYTHING RELATED TO DXBC!
 class DxbcShaderTranslator : public ShaderTranslator {
  public:
+  // [N-10b deletion c] the edram_rov_used constructor parameter and the whole
+  // ROV / pixel-shader-interlock output-merger codegen are DELETED - this
+  // translator emits the host-render-target (RTV) form only.
   DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID vendor_id, bool bindless_resources_used,
-                       bool edram_rov_used, bool gamma_render_target_as_unorm8 = false,
-                       bool msaa_2x_supported = true, uint32_t draw_resolution_scale_x = 1,
-                       uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false);
+                       bool gamma_render_target_as_unorm8 = false, bool msaa_2x_supported = true,
+                       uint32_t draw_resolution_scale_x = 1, uint32_t draw_resolution_scale_y = 1,
+                       bool force_emit_source_map = false);
   ~DxbcShaderTranslator() override;
 
   // Stage linkage ordering and rules (must be respected not only within the
@@ -677,7 +680,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     return is_pixel_shader() &&
            GetDxbcShaderModification().pixel.depth_stencil_mode ==
                Modification::DepthStencilMode::kEarlyHint &&
-           !edram_rov_used_ && current_shader().implicit_early_z_write_allowed();
+           current_shader().implicit_early_z_write_allowed();
   }
 
   uint32_t GetModificationInterpolatorMask() const {
@@ -706,73 +709,23 @@ class DxbcShaderTranslator : public ShaderTranslator {
   }
   bool IsDepthStencilSystemTempUsed() const {
     // See system_temp_depth_stencil_ documentation for explanation of cases.
-    if (edram_rov_used_) {
-      // Needed for all cases (early, late, late with oDepth).
-      return true;
-    }
     if (current_shader().writes_depth()) {
       // With host render targets, the depth format may be float24, in this
       // case, need to multiply it by 0.5 since 0...1 of the guest is stored as
       // 0...0.5 on the host, and also to convert it.
-      // With ROV, need to store it to write later.
       return true;
     }
     return false;
   }
-  // Whether the current non-ROV pixel shader should convert the depth to 20e4.
+  // Whether the current pixel shader should convert the depth to 20e4.
   bool DSV_IsWritingFloat24Depth() const {
-    if (edram_rov_used_) {
-      return false;
-    }
     Modification::DepthStencilMode depth_stencil_mode =
         GetDxbcShaderModification().pixel.depth_stencil_mode;
     return depth_stencil_mode == Modification::DepthStencilMode::kFloat24Truncating ||
            depth_stencil_mode == Modification::DepthStencilMode::kFloat24Rounding;
   }
-  // Whether it's possible and worth skipping running the translated shader for
-  // 2x2 quads.
-  bool ROV_IsDepthStencilEarly() const {
-    assert_true(edram_rov_used_);
-    return !is_depth_only_pixel_shader_ && !current_shader().writes_depth() &&
-           !current_shader().memexport_eM_written();
-  }
-  // Converts the pre-clamped depth value to 24-bit (storing the result in bits
-  // 0:23 and zeros in 24:31, not creating room for stencil - since this may be
-  // involved in comparisons) according to the format specified in the system
-  // constants. Source and destination may be the same, temporary must be
-  // different than both.
-  void ROV_DepthTo24Bit(uint32_t d24_temp, uint32_t d24_temp_component, uint32_t d32_temp,
-                        uint32_t d32_temp_component, uint32_t temp_temp,
-                        uint32_t temp_temp_component);
-  // Does all the related to depth / stencil, including or not including
-  // writing based on whether it's late, or on whether it's safe to do it early.
-  // Updates system_temp_rov_params_ result and coverage if allowed and safe,
-  // updates system_temp_depth_stencil_, and if early and the coverage is empty
-  // for all pixels in the 2x2 quad and safe to return early (stencil is
-  // unchanged or known that it's safe not to await kills/alphatest/AtoC),
-  // returns from the shader.
-  void ROV_DepthStencilTest();
-  // Unpacks a 32bpp or a 64bpp color in packed_temp.packed_temp_components to
-  // color_temp, using 2 temporary VGPRs.
-  void ROV_UnpackColor(uint32_t rt_index, uint32_t packed_temp, uint32_t packed_temp_components,
-                       uint32_t color_temp, uint32_t temp1, uint32_t temp1_component,
-                       uint32_t temp2, uint32_t temp2_component);
-  // Packs a float32x4 color value to 32bpp or a 64bpp in color_temp to
-  // packed_temp.packed_temp_components, using 2 temporary VGPR. color_temp and
-  // packed_temp may be the same if packed_temp_components is 0. If the format
-  // is 32bpp, will still write the high part to break register dependency.
-  void ROV_PackPreClampedColor(uint32_t rt_index, uint32_t color_temp, uint32_t packed_temp,
-                               uint32_t packed_temp_components, uint32_t temp1,
-                               uint32_t temp1_component, uint32_t temp2, uint32_t temp2_component);
-  // Emits a sequence of `case` labels for color blend factors, generating the
-  // factor from src_temp.rgb and dst_temp.rgb to factor_temp.rgb. factor_temp
-  // can be the same as src_temp or dst_temp.
-  void ROV_HandleColorBlendFactorCases(uint32_t src_temp, uint32_t dst_temp, uint32_t factor_temp);
-  // Emits a sequence of `case` labels for alpha blend factors, generating the
-  // factor from src_temp.a and dst_temp.a to factor_temp.factor_component.
-  // factor_temp can be the same as src_temp or dst_temp.
-  void ROV_HandleAlphaBlendFactorCases(uint32_t src_temp, uint32_t dst_temp, uint32_t factor_temp,
-                                       uint32_t factor_component);
+  // [N-10b deletion c] the ROV_* codegen helpers (depth/stencil test, color
+  // pack/unpack, blend factor cases) are DELETED with the ROV path.
 
   // Writing the prologue.
   // Applies the offset to vertex or tessellation patch indices in the source
@@ -784,29 +737,24 @@ class DxbcShaderTranslator : public ShaderTranslator {
   void StartVertexShader_LoadVertexIndex();
   void StartVertexOrDomainShader();
   void StartDomainShader();
-  void StartPixelShader_LoadROVParameters();
   void StartPixelShader();
 
   void CompleteVertexOrDomainShader();
-  // For RTV, adds the sample to coverage_temp.coverage_temp_component if it
-  // passes alpha to mask (or, if initialize == true (for the first sample
-  // tested), overwrites the output to initialize it).
-  // For ROV, masks the sample away from coverage_temp.coverage_temp_component
-  // if it doesn't pass alpha to mask.
+  // Adds the sample to coverage_temp.coverage_temp_component if it passes
+  // alpha to mask (or, if initialize == true (for the first sample tested),
+  // overwrites the output to initialize it).
   // threshold_offset and temp.temp_component can be the same if needed.
   void CompletePixelShader_AlphaToMaskSample(bool initialize, uint32_t sample_index,
                                              float threshold_base, dxbc::Src threshold_offset,
                                              float threshold_offset_scale, uint32_t coverage_temp,
                                              uint32_t coverage_temp_component, uint32_t temp,
                                              uint32_t temp_component);
-  // Performs alpha to coverage if necessary, for RTV, writing to oMask, and for
-  // ROV, updating the low (coverage) bits of system_temp_rov_params_.x. Done
-  // manually even for RTV to maintain the guest dithering pattern and because
-  // alpha can be exponent-biased.
+  // Performs alpha to coverage if necessary, writing to oMask. Done manually
+  // to maintain the guest dithering pattern and because alpha can be
+  // exponent-biased.
   void CompletePixelShader_AlphaToMask();
   void CompletePixelShader_WriteToRTVs();
   void CompletePixelShader_DSV_DepthTo24Bit();
-  void CompletePixelShader_WriteToROV();
   void CompletePixelShader();
 
   void CompleteShaderCode();
@@ -948,9 +896,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Whether textures and samplers should be bindless.
   bool bindless_resources_used_;
 
-  // Whether the output merger should be emulated in pixel shaders.
-  bool edram_rov_used_;
-
   // Whether with RTV-based output-merger, k_8_8_8_8_GAMMA render targets are
   // stored as 8-bit with shader-side gamma conversion.
   bool gamma_render_target_as_unorm8_;
@@ -1070,43 +1015,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t system_temp_position_;
   // Special exports in vertex shaders.
   uint32_t system_temp_point_size_edge_flag_kill_vertex_;
-  // ROV only - 4 persistent VGPRs when writing to color targets, 2 VGPRs when
-  // not:
-  // X - Bit masks:
-  // 0:3 - Per-sample coverage at the current stage of the shader's execution.
-  //       Affected by things like SV_Coverage, early or late depth / stencil
-  //       (always resets bits for failing, no matter if need to defer writing),
-  //       alpha to coverage.
-  // 4:7 - Depth write deferred mask - when early depth / stencil resulted in a
-  //       different value for the sample (like different stencil if the test
-  //       failed), but can't write it before running the shader because it's
-  //       not known if the sample will be discarded by the shader, alphatest or
-  //       AtoC.
-  // Early depth / stencil rejection of the pixel is possible when both 0:3 and
-  // 4:7 are zero.
-  // 8:11 - Whether color buffers have been written to, if not written on the
-  //        taken execution path, don't export according to Direct3D 9 register
-  //        documentation (some games rely on this behavior).
-  // Y - Absolute resolution-scaled EDRAM offset for depth / stencil, in dwords,
-  //     before and during depth testing. During color writing, when the depth /
-  //     stencil address is not needed anymore, current color sample address.
-  // Z - Base-relative resolution-scaled EDRAM offset for 32bpp color data, in
-  //     dwords.
-  // W - Base-relative resolution-scaled EDRAM offset for 64bpp color data, in
-  //     dwords.
-  uint32_t system_temp_rov_params_;
-  // Different purposes:
-  // - When writing to oDepth: X also used to hold the depth written by the
-  //   shader, which, for host render targets, if the depth buffer is float24,
-  //   needs to be remapped from guest 0...1 to host 0...0.5 and, if needed,
-  //   converted to float24 precision; and for ROV, needs to be written in the
-  //   end of the shader.
-  // - When not writing to oDepth, but using ROV:
-  //   - ROV_IsDepthStencilEarly: New per-sample depth / stencil values,
-  //     generated during early depth / stencil test (actual writing checks
-  //     the remaining coverage bits).
-  //   - Not ROV_IsDepthStencilEarly: Z gradients in .xy taken in the beginning
-  //     of the shader before any return statement is possibly reached.
+  // [N-10b deletion c] system_temp_rov_params_ is DELETED with the ROV path.
+  // When writing to oDepth: X holds the depth written by the shader, which,
+  // if the depth buffer is float24, needs to be remapped from guest 0...1 to
+  // host 0...0.5 and, if needed, converted to float24 precision.
   uint32_t system_temp_depth_stencil_;
   // Up to 4 color outputs in pixel shaders (needs to be readable, because of
   // alpha test, alpha to coverage, exponent bias, gamma, and also for ROV

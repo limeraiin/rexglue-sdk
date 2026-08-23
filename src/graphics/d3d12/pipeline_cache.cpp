@@ -171,18 +171,13 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
       bindless_resources_used_(bindless_resources_used) {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
 
-  bool edram_rov_used =
-      render_target_cache.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-
+  // [N-10b deletion c] the ROV path and the translator's edram_rov_used
+  // parameter are DELETED - RTV codegen is the only form.
   shader_translator_ = std::make_unique<DxbcShaderTranslator>(
-      provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
+      provider.GetAdapterVendorID(), bindless_resources_used_,
       !render_target_cache_.gamma_render_target_as_unorm16(),
       render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
-
-  if (edram_rov_used) {
-    depth_only_pixel_shader_ = std::move(shader_translator_->CreateDepthOnlyPixelShader());
-  }
 }
 
 PipelineCache::~PipelineCache() {
@@ -458,7 +453,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
       string::StringBuffer ucode_disasm_buffer;
       DxbcShaderTranslator translator(
-          provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
+          provider.GetAdapterVendorID(), bindless_resources_used_,
           !render_target_cache_.gamma_render_target_as_unorm16(),
           render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
           render_target_cache_.draw_resolution_scale_y(),
@@ -1662,10 +1657,8 @@ void PipelineCache::NrShaderCacheEnsure() {
     // the same two objects is deliberate -- what is being tested here is the
     // cache and the ucode path, not the choice of translator options.
     const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
-    const bool edram_rov_used =
-        render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
     nr_shader_translator_ = std::make_unique<DxbcShaderTranslator>(
-        provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
+        provider.GetAdapterVendorID(), bindless_resources_used_,
         !render_target_cache_.gamma_render_target_as_unorm16(),
         render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
         render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);

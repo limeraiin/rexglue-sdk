@@ -370,6 +370,9 @@ bool D3D12SharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  // [gpu-census] actual guest-memory upload copies get recorded below.
+  D3D12CommandProcessor::GpuCensusScope gpu_census_scope(
+      command_processor_, D3D12CommandProcessor::kGpuCensusMemUp);
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();

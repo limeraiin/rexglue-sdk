@@ -21,6 +21,7 @@
 #include <memory>
 #include <chrono>
 #include <map>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -77,9 +78,9 @@ REXCVAR_DEFINE_INT32(gpu_nr_dres_force_sample, -1, "GPU/D3D12",
                      "divergence on MSAA sources.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
-                      "D3D12 render target implementation path")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// [N-10b deletion c] render_target_path_d3d12 is DELETED: the D3D12 path is
+// host render targets, unconditionally. The ROV/pixel-shader-interlock path
+// died with it (naruto_626 proved RTV on Intel; NR requires host RTs).
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
@@ -149,10 +150,8 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/clear_uint2_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fullscreen_cw_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/passthrough_position_xy_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_cs.h"
-#include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_scaled_cs.h"
-#include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_cs.h"
-#include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_cs.h"
+// [N-10b deletion c] the 4 resolve_clear_* ROV EDRAM-clear blobs are DELETED
+// (D3D12; the Vulkan SPIR-V twins stay until the Vulkan pass).
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_4xmsaa_cs.h"
@@ -657,22 +656,12 @@ bool D3D12RenderTargetCache::Initialize() {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
-  if (REXCVAR_GET(render_target_path_d3d12) == "rtv") {
-    path_ = Path::kHostRenderTargets;
-  } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
-    path_ = Path::kPixelShaderInterlock;
-  } else {
-    // [NR] N-10b: RTV everywhere, Intel included. The old Intel ROV forcing
-    // dated to a 2021 driver stencil bug; measured 2026-08-23 (naruto_626,
-    // UHD 630 city drive) forced RTV boots with no hang, renders the city
-    // correctly, and skips the ROV pixel-shader compile storm that used to
-    // grind Intel boots. ROV stays reachable via render_target_path_d3d12
-    // for the A/B until the path is deleted.
-    path_ = Path::kHostRenderTargets;
-  }
-  if (path_ == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
-    path_ = Path::kHostRenderTargets;
-  }
+  // [N-10b deletion c] Host render targets, unconditionally. The ROV /
+  // pixel-shader-interlock path is DELETED on D3D12 (the old Intel ROV
+  // forcing dated to a 2021 driver stencil bug; naruto_626 proved RTV on
+  // UHD 630, and the NR path requires host RTs). Vulkan keeps its own
+  // path selection until the Vulkan pass.
+  path_ = Path::kHostRenderTargets;
 
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size =
@@ -1303,101 +1292,9 @@ bool D3D12RenderTargetCache::Initialize() {
     // FXC-compiled depth / stencil dumping shader is ~2 KB, reserve 4 KB for
     // some additional space.
     built_shader_.reserve(1024);
-  } else if (path_ == Path::kPixelShaderInterlock) {
-    // Pixel shader interlock (rasterizer-ordered view).
-
-    // Blending is done in linear space directly in shaders.
-    gamma_render_target_as_unorm16_ = false;
-
-    // Always true float24 depth rounded to the nearest even.
-    depth_float24_round_ = true;
-    depth_float24_convert_in_pixel_shader_ = true;
-
-    // Only ForcedSampleCount, which doesn't support 2x.
-    msaa_2x_supported_ = false;
-
-    // Create the resolve EDRAM buffer clearing root signature.
-    std::array<D3D12_ROOT_PARAMETER, 2> resolve_rov_clear_root_parameters;
-    // Parameter 0 is constants.
-    resolve_rov_clear_root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    resolve_rov_clear_root_parameters[0].Constants.ShaderRegister = 0;
-    resolve_rov_clear_root_parameters[0].Constants.RegisterSpace = 0;
-    // Binding all of the shared memory at 1x resolution, portions with scaled
-    // resolution.
-    resolve_rov_clear_root_parameters[0].Constants.Num32BitValues =
-        sizeof(draw_util::ResolveClearShaderConstants) / sizeof(uint32_t);
-    resolve_rov_clear_root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    // Parameter 1 is the destination (EDRAM).
-    D3D12_DESCRIPTOR_RANGE resolve_rov_clear_dest_range;
-    resolve_rov_clear_dest_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    resolve_rov_clear_dest_range.NumDescriptors = 1;
-    resolve_rov_clear_dest_range.BaseShaderRegister = 0;
-    resolve_rov_clear_dest_range.RegisterSpace = 0;
-    resolve_rov_clear_dest_range.OffsetInDescriptorsFromTableStart = 0;
-    resolve_rov_clear_root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    resolve_rov_clear_root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-    resolve_rov_clear_root_parameters[1].DescriptorTable.pDescriptorRanges =
-        &resolve_rov_clear_dest_range;
-    resolve_rov_clear_root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_ROOT_SIGNATURE_DESC resolve_rov_clear_root_signature_desc;
-    resolve_rov_clear_root_signature_desc.NumParameters =
-        UINT(resolve_rov_clear_root_parameters.size());
-    resolve_rov_clear_root_signature_desc.pParameters = resolve_rov_clear_root_parameters.data();
-    resolve_rov_clear_root_signature_desc.NumStaticSamplers = 0;
-    resolve_rov_clear_root_signature_desc.pStaticSamplers = nullptr;
-    resolve_rov_clear_root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-    resolve_rov_clear_root_signature_ =
-        ui::d3d12::util::CreateRootSignature(provider, resolve_rov_clear_root_signature_desc);
-    if (resolve_rov_clear_root_signature_ == nullptr) {
-      REXGPU_ERROR(
-          "D3D12RenderTargetCache: Failed to create the resolve EDRAM buffer "
-          "clear root signature");
-      Shutdown();
-      return false;
-    }
-
-    // Create the resolve EDRAM buffer clearing pipelines.
-    ResolveShaderBytecode resolve_clear_32bpp_bytecode(
-        draw_resolution_scaled ? shaders::resolve_clear_32bpp_scaled_cs
-                               : shaders::resolve_clear_32bpp_cs,
-        draw_resolution_scaled ? sizeof(shaders::resolve_clear_32bpp_scaled_cs)
-                               : sizeof(shaders::resolve_clear_32bpp_cs),
-        "resolve_clear_32bpp");
-    resolve_shaders_edram_wrap_patched += resolve_clear_32bpp_bytecode.patched ? 1 : 0;
-    resolve_shaders_edram_wrap_unpatched += resolve_clear_32bpp_bytecode.patched ? 0 : 1;
-    resolve_shaders_edram_wrap_by_shift += resolve_clear_32bpp_bytecode.by_shift ? 1 : 0;
-    resolve_rov_clear_32bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
-        device, resolve_clear_32bpp_bytecode.data, resolve_clear_32bpp_bytecode.size,
-        resolve_rov_clear_root_signature_);
-    if (resolve_rov_clear_32bpp_pipeline_ == nullptr) {
-      REXGPU_ERROR(
-          "D3D12RenderTargetCache: Failed to create the 32bpp resolve EDRAM "
-          "buffer clear pipeline");
-      Shutdown();
-      return false;
-    }
-    resolve_rov_clear_32bpp_pipeline_->SetName(L"Resolve Clear 32bpp");
-    ResolveShaderBytecode resolve_clear_64bpp_bytecode(
-        draw_resolution_scaled ? shaders::resolve_clear_64bpp_scaled_cs
-                               : shaders::resolve_clear_64bpp_cs,
-        draw_resolution_scaled ? sizeof(shaders::resolve_clear_64bpp_scaled_cs)
-                               : sizeof(shaders::resolve_clear_64bpp_cs),
-        "resolve_clear_64bpp");
-    resolve_shaders_edram_wrap_patched += resolve_clear_64bpp_bytecode.patched ? 1 : 0;
-    resolve_shaders_edram_wrap_unpatched += resolve_clear_64bpp_bytecode.patched ? 0 : 1;
-    resolve_shaders_edram_wrap_by_shift += resolve_clear_64bpp_bytecode.by_shift ? 1 : 0;
-    resolve_rov_clear_64bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
-        device, resolve_clear_64bpp_bytecode.data, resolve_clear_64bpp_bytecode.size,
-        resolve_rov_clear_root_signature_);
-    if (resolve_rov_clear_64bpp_pipeline_ == nullptr) {
-      REXGPU_ERROR(
-          "D3D12RenderTargetCache: Failed to create the 64bpp resolve EDRAM "
-          "buffer clear pipeline");
-      Shutdown();
-      return false;
-    }
-    resolve_rov_clear_64bpp_pipeline_->SetName(L"Resolve Clear 64bpp");
   } else {
+    // [N-10b deletion c] the ROV / pixel-shader-interlock init branch (the
+    // resolve EDRAM clear root signature + 2 compute pipelines) is DELETED.
     assert_unhandled_case(path_);
     Shutdown();
     return false;
@@ -1428,9 +1325,6 @@ bool D3D12RenderTargetCache::Initialize() {
 }
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
-  ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
-  ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
-  ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
 
   for (size_t i = 0; i < 2; ++i) {
     for (size_t j = size_t(xenos::MsaaSamples::k1X); j <= size_t(xenos::MsaaSamples::k4X); ++j) {
@@ -1543,17 +1437,7 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
                                        depth_and_color_render_targets, last_update_transfers());
       SetCommandListRenderTargets(depth_and_color_render_targets);
     } break;
-    case Path::kPixelShaderInterlock: {
-      // For ROV, only the barrier is needed - already scheduled if required.
-      // But the buffer will be used for ROV drawing now.
-      TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      // Commit preceding UAV (but not ROV) writes like clears as they aren't
-      // synchronized with ROV accesses.
-      CommitEdramBufferUAVWrites(EdramBufferModificationStatus::kAsUAV);
-      // TODO(Triang3l): Check if this draw call modifies color or depth /
-      // stencil, at least coarsely, to prevent useless barriers.
-      MarkEdramBufferModified(EdramBufferModificationStatus::kAsROV);
-    } break;
+    // [N-10b deletion c] the kPixelShaderInterlock (ROV) case is DELETED.
     default:
       assert_unhandled_case(GetPath());
       return false;
@@ -2016,64 +1900,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         }
         cleared = true;
       } break;
-      case Path::kPixelShaderInterlock: {
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_edram;
-        bool descriptor_edram_obtained;
-        if (bindless_resources_used_) {
-          descriptor_edram = command_processor_.GetSystemBindlessViewHandlePair(
-              D3D12CommandProcessor::SystemBindlessView ::kEdramR32G32B32A32UintUAV);
-          descriptor_edram_obtained = true;
-        } else {
-          descriptor_edram_obtained =
-              command_processor_.RequestOneUseSingleViewDescriptors(1, &descriptor_edram);
-          if (descriptor_edram_obtained) {
-            WriteEdramUintPow2UAVDescriptor(descriptor_edram.first, 4);
-          }
-        }
-        if (descriptor_edram_obtained) {
-          TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-          // Should be safe to only commit once (if was UAV / ROV previously -
-          // if there was nothing to copy, only to clear, for some reason, for
-          // instance), overlap of the depth and the color ranges is highly
-          // unlikely.
-          CommitEdramBufferUAVWrites();
-          command_list.D3DSetComputeRootSignature(resolve_rov_clear_root_signature_);
-          command_list.D3DSetComputeRootDescriptorTable(1, descriptor_edram.second);
-          std::pair<uint32_t, uint32_t> clear_group_count = resolve_info.GetClearShaderGroupCount(
-              draw_resolution_scale_x(), draw_resolution_scale_y());
-          assert_true(clear_group_count.first && clear_group_count.second);
-          if (clear_depth) {
-            draw_util::ResolveClearShaderConstants depth_clear_constants;
-            resolve_info.GetDepthClearShaderConstants(depth_clear_constants);
-            command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(depth_clear_constants) / sizeof(uint32_t), &depth_clear_constants, 0);
-            command_processor_.SetExternalPipeline(resolve_rov_clear_32bpp_pipeline_);
-            command_processor_.SubmitBarriers();
-            command_list.D3DDispatch(clear_group_count.first, clear_group_count.second, 1);
-          }
-          if (clear_color) {
-            draw_util::ResolveClearShaderConstants color_clear_constants;
-            resolve_info.GetColorClearShaderConstants(color_clear_constants);
-            if (clear_depth) {
-              // Non-RT-specific constants have already been set.
-              command_list.D3DSetComputeRoot32BitConstants(
-                  0, sizeof(color_clear_constants.rt_specific) / sizeof(uint32_t),
-                  &color_clear_constants.rt_specific,
-                  offsetof(draw_util::ResolveClearShaderConstants, rt_specific) / sizeof(uint32_t));
-            } else {
-              command_list.D3DSetComputeRoot32BitConstants(
-                  0, sizeof(color_clear_constants) / sizeof(uint32_t), &color_clear_constants, 0);
-            }
-            command_processor_.SetExternalPipeline(resolve_info.color_edram_info.format_is_64bpp
-                                                       ? resolve_rov_clear_64bpp_pipeline_
-                                                       : resolve_rov_clear_32bpp_pipeline_);
-            command_processor_.SubmitBarriers();
-            command_list.D3DDispatch(clear_group_count.first, clear_group_count.second, 1);
-          }
-          MarkEdramBufferModified();
-          cleared = true;
-        }
-      } break;
+      // [N-10b deletion c] the kPixelShaderInterlock (ROV) resolve-clear
+      // case - the ONE EDRAM-buffer clear path in the game - is DELETED.
       default:
         assert_unhandled_case(GetPath());
     }
@@ -2222,14 +2050,8 @@ void D3D12RenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
                                         nullptr);
     } break;
 
-    case Path::kPixelShaderInterlock: {
-      std::memcpy(upload_buffer_mapping, snapshot, xenos::kEdramSizeBytes);
-      TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
-      command_processor_.SubmitBarriers();
-      command_list.D3DCopyBufferRegion(edram_buffer_, 0, upload_buffer,
-                                       UINT64(upload_buffer_offset), xenos::kEdramSizeBytes);
-    } break;
-
+    // [N-10b deletion c] the kPixelShaderInterlock (ROV) snapshot-restore
+    // case is DELETED.
     default:
       assert_unhandled_case(GetPath());
   }
@@ -2528,10 +2350,6 @@ bool D3D12RenderTargetCache::IsHostDepthEncodingDifferent(
 
 bool D3D12RenderTargetCache::IsGammaFormatHostStorageSeparate() const {
   return gamma_render_target_as_unorm16_;
-}
-
-void D3D12RenderTargetCache::RequestPixelShaderInterlockBarrier() {
-  CommitEdramBufferUAVWrites();
 }
 
 void D3D12RenderTargetCache::TransitionEdramBuffer(D3D12_RESOURCE_STATES new_state) {
@@ -4733,6 +4551,24 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+
+  // [gpu-census] this function runs ~once per draw and almost always records
+  // nothing (the 52k/s "passes" are calls, not work) - only bracket the GPU
+  // class when there IS work, or two timestamps per draw would be emitted.
+  bool gpu_census_work = resolve_clear_needed;
+  if (!gpu_census_work && render_target_transfers) {
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i] && !render_target_transfers[i].empty()) {
+        gpu_census_work = true;
+        break;
+      }
+    }
+  }
+  std::optional<D3D12CommandProcessor::GpuCensusScope> gpu_census_scope;
+  if (gpu_census_work) {
+    gpu_census_scope.emplace(command_processor_, D3D12CommandProcessor::kGpuCensusXfer);
+  }
+
   D3D12_RECT clear_rect;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the

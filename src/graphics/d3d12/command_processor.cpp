@@ -316,6 +316,15 @@ extern uint64_t g_tile_ns_opost;
 extern uint64_t g_tile_n_opost;
 }  // namespace rex::graphics
 
+// [gpu-census] N-10c: the naruto_636 iGPU drive proved the Intel city wall
+// is the GPU (700-775 ms/s submission-fence blocking); this names what the
+// GPU second is spent on before anything is designed against it.
+REXCVAR_DEFINE_BOOL(d3d12_gpu_census, true, "GPU/D3D12",
+                    "[gpu-census] N-10c: price the GPU second by work class with "
+                    "timestamp queries (draw / RTC transfer / resolve / texture upload / "
+                    "shared-memory upload / swap), reported once a second. A few hundred "
+                    "bottom-of-pipe timestamps a second - kill switch only.");
+
 namespace rex::graphics::d3d12 {
 
 // [hitch] N-10b hitch probe counters (see hitch_probe.h). Written here (fence
@@ -4066,6 +4075,7 @@ bool D3D12CommandProcessor::SetupContext() {
   pix_capture_requested_.store(false, std::memory_order_relaxed);
   pix_capturing_ = false;
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  InitializeGpuCensusResources();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -4083,6 +4093,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
+  ShutdownGpuCensusResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -5162,6 +5173,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
     return;
   }
+  // [gpu-census] everything from here to the submission close is swap work.
+  GpuCensusSetClass(kGpuCensusSwap);
 
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
@@ -5829,6 +5842,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (!_dp_bs_ok) {
     return false;
   }
+  // [gpu-census] draw class; no-op when already there (one timestamp per
+  // class change, not per draw).
+  GpuCensusSetClass(kGpuCensusDraw);
 
   // [GPU-PRECORD] Phase 1a: at each segment boundary, force the following draws to
   // re-emit ALL command-list state (models a fresh per-segment command list). This
@@ -7075,6 +7091,9 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  // [gpu-census] the whole resolve (direct-resolve CS + dest copies) prices
+  // as resolve work; resolve clears re-class themselves to xfer inside.
+  GpuCensusScope gpu_census_scope(*this, kGpuCensusResolve);
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
@@ -10056,6 +10075,12 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    // [gpu-census] harvest whatever the fence check above completed, then
+    // claim this submission's timestamp region (ts0 lands first in the list).
+    if (gpu_census_available_) {
+      GpuCensusConsumeCompleted();
+      GpuCensusBeginSubmission();
+    }
     // [GPU-PRECORD] Phase 1a: count draws per submission (segment boundaries);
     // clear any segment streams (defensive — EndSubmission already drains them).
     parallel_record_counter_ = 0;
@@ -10185,6 +10210,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       active_occlusion_query_ = {};
     }
 
+    // [gpu-census] final stamp closes the last span; must precede the
+    // deferred list's Execute below.
+    GpuCensusCloseSubmission();
+
     pipeline_cache_->EndSubmission();
 
     // Submit barriers now because resources with the queued barriers may be
@@ -10211,6 +10240,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
     precord_segments_.clear();
     deferred_command_list_.Execute(command_list_, command_list_1_);
+    // [gpu-census] the timestamps are replayed into the real list now, so
+    // the resolve can be recorded directly on it.
+    GpuCensusResolveSubmission();
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
@@ -10288,6 +10320,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
               double(endsub_t) * to_ms, endsub_n, double(cp_t) * to_ms, cp_n,
               double(cp_max) * to_ms, double(thr_t) * to_ms, thr_n, lib_hit, lib_miss, lib_store);
         }
+        // [gpu-census] same 1 Hz window: what the GPU spent the second on.
+        GpuCensusReport1Hz();
       }
     }
 
@@ -13046,6 +13080,212 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
     readback_buffer_size_ = size;
   }
   return readback_buffer_;
+}
+
+// [gpu-census] N-10c: price the GPU second by work class. See the header
+// for the design; report format:
+//   [gpu-census] gpu <busy>ms/s | draw a/n xfer b/n resolve c/n texup d/n
+//   memup e/n swap f/n other g/n | trunc T drop D
+// where ms is GPU time inside recorded submissions and n is span count.
+bool D3D12CommandProcessor::InitializeGpuCensusResources() {
+  gpu_census_available_ = false;
+  gpu_census_sub_active_ = false;
+  gpu_census_pending_.clear();
+  gpu_census_ring_next_ = 0;
+  gpu_census_stack_depth_ = 0;
+  gpu_census_trunc_ = 0;
+  gpu_census_dropped_ = 0;
+  std::memset(gpu_census_class_ticks_, 0, sizeof(gpu_census_class_ticks_));
+  std::memset(gpu_census_class_spans_, 0, sizeof(gpu_census_class_spans_));
+  gpu_census_heap_.Reset();
+  gpu_census_readback_.Reset();
+  gpu_census_readback_mapping_ = nullptr;
+  if (!REXCVAR_GET(d3d12_gpu_census)) {
+    return false;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  if (!device || !direct_queue) {
+    return false;
+  }
+  uint64_t timestamp_frequency = 0;
+  if (FAILED(direct_queue->GetTimestampFrequency(&timestamp_frequency)) || !timestamp_frequency) {
+    REXGPU_WARN("[gpu-census] no timestamp frequency on the direct queue - census off");
+    return false;
+  }
+  gpu_census_ticks_to_ms_ = 1000.0 / double(timestamp_frequency);
+  D3D12_QUERY_HEAP_DESC heap_desc;
+  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  heap_desc.Count = kGpuCensusQueryPoolSize;
+  heap_desc.NodeMask = 0;
+  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&gpu_census_heap_)))) {
+    REXGPU_WARN("[gpu-census] timestamp query heap creation failed - census off");
+    return false;
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kGpuCensusQueryPoolSize,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                             GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+                                             &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&gpu_census_readback_)))) {
+    REXGPU_WARN("[gpu-census] readback buffer allocation failed - census off");
+    gpu_census_heap_.Reset();
+    return false;
+  }
+  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kGpuCensusQueryPoolSize};
+  void* mapping = nullptr;
+  if (FAILED(gpu_census_readback_->Map(0, &read_range, &mapping))) {
+    REXGPU_WARN("[gpu-census] readback buffer map failed - census off");
+    gpu_census_readback_.Reset();
+    gpu_census_heap_.Reset();
+    return false;
+  }
+  gpu_census_readback_mapping_ = reinterpret_cast<const uint64_t*>(mapping);
+  gpu_census_available_ = true;
+  REXGPU_INFO("[gpu-census] on: {} timestamp slots, tick {:.1f} ns", kGpuCensusQueryPoolSize,
+              gpu_census_ticks_to_ms_ * 1e6);
+  return true;
+}
+
+void D3D12CommandProcessor::ShutdownGpuCensusResources() {
+  gpu_census_available_ = false;
+  gpu_census_sub_active_ = false;
+  gpu_census_pending_.clear();
+  if (gpu_census_readback_ && gpu_census_readback_mapping_) {
+    gpu_census_readback_->Unmap(0, nullptr);
+  }
+  gpu_census_readback_mapping_ = nullptr;
+  gpu_census_readback_.Reset();
+  gpu_census_heap_.Reset();
+}
+
+void D3D12CommandProcessor::GpuCensusEmitTimestamp(uint8_t closing_tag) {
+  if (!gpu_census_sub_active_) {
+    return;
+  }
+  if (gpu_census_sub_count_ >= kGpuCensusMaxPerSubmission) {
+    ++gpu_census_trunc_;
+    return;
+  }
+  gpu_census_sub_tags_[gpu_census_sub_count_] = closing_tag;
+  deferred_command_list_.D3DEndQuery(gpu_census_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     gpu_census_sub_start_ + gpu_census_sub_count_);
+  ++gpu_census_sub_count_;
+}
+
+void D3D12CommandProcessor::GpuCensusBeginSubmission() {
+  if (!gpu_census_available_) {
+    return;
+  }
+  // Claim a contiguous ring region; wrap early rather than split. A region
+  // that would overwrite a still-pending readback means the consumer is
+  // very far behind - drop this submission's census and count it.
+  uint32_t start = gpu_census_ring_next_;
+  if (start + kGpuCensusMaxPerSubmission > kGpuCensusQueryPoolSize) {
+    start = 0;
+  }
+  bool overlap = gpu_census_pending_.size() >= 24;
+  if (!overlap) {
+    uint32_t region_end = start + kGpuCensusMaxPerSubmission;
+    for (const GpuCensusPending& pending : gpu_census_pending_) {
+      uint32_t pending_end = pending.start + pending.count;
+      if (start < pending_end && pending.start < region_end) {
+        overlap = true;
+        break;
+      }
+    }
+  }
+  if (overlap) {
+    ++gpu_census_dropped_;
+    return;
+  }
+  gpu_census_sub_start_ = start;
+  gpu_census_sub_count_ = 0;
+  gpu_census_class_ = kGpuCensusOther;
+  gpu_census_stack_depth_ = 0;
+  gpu_census_sub_active_ = true;
+  GpuCensusEmitTimestamp(kGpuCensusOther);  // ts0; its tag is never read
+}
+
+void D3D12CommandProcessor::GpuCensusCloseSubmission() {
+  if (!gpu_census_sub_active_) {
+    return;
+  }
+  // Close the final span. Must run while commands still land in the
+  // deferred list, i.e. before its Execute in EndSubmission.
+  GpuCensusEmitTimestamp(gpu_census_class_);
+}
+
+void D3D12CommandProcessor::GpuCensusResolveSubmission() {
+  if (!gpu_census_sub_active_) {
+    return;
+  }
+  gpu_census_sub_active_ = false;
+  if (gpu_census_sub_count_ < 2) {
+    return;  // no spans recorded - leave the ring cursor alone
+  }
+  // Recorded directly on the real command list, after the deferred replay
+  // (the timestamps are already in) and before Close.
+  command_list_->ResolveQueryData(gpu_census_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                  gpu_census_sub_start_, gpu_census_sub_count_,
+                                  gpu_census_readback_.Get(),
+                                  uint64_t(gpu_census_sub_start_) * sizeof(uint64_t));
+  GpuCensusPending& pending = gpu_census_pending_.emplace_back();
+  pending.submission = submission_current_;
+  pending.start = gpu_census_sub_start_;
+  pending.count = gpu_census_sub_count_;
+  std::memcpy(pending.tags, gpu_census_sub_tags_, gpu_census_sub_count_);
+  gpu_census_ring_next_ = gpu_census_sub_start_ + gpu_census_sub_count_;
+}
+
+void D3D12CommandProcessor::GpuCensusConsumeCompleted() {
+  while (!gpu_census_pending_.empty() &&
+         gpu_census_pending_.front().submission <= submission_completed_) {
+    const GpuCensusPending& pending = gpu_census_pending_.front();
+    const uint64_t* timestamps = gpu_census_readback_mapping_ + pending.start;
+    for (uint32_t i = 1; i < pending.count; ++i) {
+      uint64_t dt = timestamps[i] >= timestamps[i - 1] ? timestamps[i] - timestamps[i - 1] : 0;
+      uint8_t cls = pending.tags[i] < kGpuCensusClassCount ? pending.tags[i]
+                                                           : uint8_t(kGpuCensusOther);
+      gpu_census_class_ticks_[cls] += dt;
+      ++gpu_census_class_spans_[cls];
+    }
+    gpu_census_pending_.pop_front();
+  }
+}
+
+void D3D12CommandProcessor::GpuCensusReport1Hz() {
+  if (!gpu_census_available_) {
+    return;
+  }
+  GpuCensusConsumeCompleted();
+  uint64_t total_ticks = 0;
+  for (uint32_t i = 0; i < kGpuCensusClassCount; ++i) {
+    total_ticks += gpu_census_class_ticks_[i];
+  }
+  const double to_ms = gpu_census_ticks_to_ms_;
+  REXGPU_INFO(
+      "[gpu-census] gpu {:.1f}ms/s | draw {:.1f}/{} xfer {:.1f}/{} resolve {:.1f}/{} "
+      "texup {:.1f}/{} memup {:.1f}/{} swap {:.1f}/{} other {:.1f}/{} | trunc {} drop {}",
+      double(total_ticks) * to_ms, double(gpu_census_class_ticks_[kGpuCensusDraw]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusDraw],
+      double(gpu_census_class_ticks_[kGpuCensusXfer]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusXfer],
+      double(gpu_census_class_ticks_[kGpuCensusResolve]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusResolve],
+      double(gpu_census_class_ticks_[kGpuCensusTexUp]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusTexUp],
+      double(gpu_census_class_ticks_[kGpuCensusMemUp]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusMemUp],
+      double(gpu_census_class_ticks_[kGpuCensusSwap]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusSwap],
+      double(gpu_census_class_ticks_[kGpuCensusOther]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusOther], gpu_census_trunc_, gpu_census_dropped_);
+  std::memset(gpu_census_class_ticks_, 0, sizeof(gpu_census_class_ticks_));
+  std::memset(gpu_census_class_spans_, 0, sizeof(gpu_census_class_spans_));
+  gpu_census_trunc_ = 0;
+  gpu_census_dropped_ = 0;
 }
 
 bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {

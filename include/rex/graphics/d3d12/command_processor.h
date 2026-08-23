@@ -77,6 +77,62 @@ class D3D12CommandProcessor : public CommandProcessor {
     return deferred_command_list_;
   }
 
+  // [gpu-census] N-10c: GPU-time census. Timestamp queries bracket every
+  // class of GPU work the deferred command list records; per-submission
+  // spans are resolved into a readback buffer and accumulated once the
+  // submission fence passes, so a 1 Hz line can price the GPU second by
+  // class. The naruto_636 iGPU drive showed 700-775 ms/s of submission-
+  // fence blocking at the city - the GPU is the Intel wall - and this is
+  // the tool that names WHAT the GPU is spending that time on.
+  // Class changes cost one timestamp write (bottom-of-pipe, no pipeline
+  // flush); consecutive same-class calls are free, so per-draw SetClass
+  // calls are safe. All calls are CP-thread only, inside an open
+  // submission (no-ops otherwise).
+  enum : uint8_t {
+    kGpuCensusDraw = 0,     // guest draws + everything between them
+    kGpuCensusXfer,         // RTC ownership transfers + resolve clears
+    kGpuCensusResolve,      // IssueCopy: resolve CS + dest copies
+    kGpuCensusTexUp,        // texture-cache load-shader dispatches
+    kGpuCensusMemUp,        // shared-memory upload copies
+    kGpuCensusSwap,         // IssueSwap gamma/present pass
+    kGpuCensusOther,        // submission setup / untagged
+    kGpuCensusClassCount
+  };
+  void GpuCensusSetClass(uint8_t cls) {
+    if (!gpu_census_sub_active_ || cls == gpu_census_class_) {
+      return;
+    }
+    GpuCensusEmitTimestamp(gpu_census_class_);
+    gpu_census_class_ = cls;
+  }
+  void GpuCensusPush(uint8_t cls) {
+    if (!gpu_census_sub_active_) {
+      return;
+    }
+    if (gpu_census_stack_depth_ < kGpuCensusStackDepth) {
+      gpu_census_stack_[gpu_census_stack_depth_++] = gpu_census_class_;
+    }
+    GpuCensusSetClass(cls);
+  }
+  void GpuCensusPop() {
+    if (!gpu_census_sub_active_ || !gpu_census_stack_depth_) {
+      return;
+    }
+    GpuCensusSetClass(gpu_census_stack_[--gpu_census_stack_depth_]);
+  }
+  // RAII wrapper for scopes with early returns (texture loads, resolves).
+  class GpuCensusScope {
+   public:
+    GpuCensusScope(D3D12CommandProcessor& command_processor, uint8_t cls)
+        : command_processor_(command_processor) {
+      command_processor_.GpuCensusPush(cls);
+    }
+    ~GpuCensusScope() { command_processor_.GpuCensusPop(); }
+
+   private:
+    D3D12CommandProcessor& command_processor_;
+  };
+
   // [GPU-PRECORD] Phase 1b-1: the register file the DRAW PATH should read. Normally
   // the shared parse-thread register file; a worker replaying a captured segment
   // points this at its own per-segment local register file so the draw path (and,
@@ -645,6 +701,16 @@ class D3D12CommandProcessor : public CommandProcessor {
     return (uint64_t(first_base_address_dwords) << 32) | uint64_t(total_size);
   }
 
+  // [gpu-census] N-10c (see the public API block above for the design).
+  bool InitializeGpuCensusResources();
+  void ShutdownGpuCensusResources();
+  void GpuCensusEmitTimestamp(uint8_t closing_tag);
+  void GpuCensusBeginSubmission();
+  void GpuCensusCloseSubmission();   // final stamp, before the deferred replay
+  void GpuCensusResolveSubmission(); // ResolveQueryData on the real list
+  void GpuCensusConsumeCompleted();
+  void GpuCensusReport1Hz();
+
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
   bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
@@ -1031,6 +1097,39 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t readback_buffer_size_ = 0;
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+
+  // [gpu-census] N-10c state. The query heap is a ring across submissions;
+  // each open submission claims a contiguous region of at most
+  // kGpuCensusMaxPerSubmission slots (a region that would overlap a
+  // still-pending readback is dropped and counted). Tags are the class of
+  // the span ENDING at that timestamp; tags[0] is unused.
+  static constexpr uint32_t kGpuCensusQueryPoolSize = 16384;
+  static constexpr uint32_t kGpuCensusMaxPerSubmission = 512;
+  static constexpr uint32_t kGpuCensusStackDepth = 8;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_census_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_census_readback_;
+  const uint64_t* gpu_census_readback_mapping_ = nullptr;
+  bool gpu_census_available_ = false;
+  bool gpu_census_sub_active_ = false;
+  double gpu_census_ticks_to_ms_ = 0.0;
+  uint32_t gpu_census_ring_next_ = 0;
+  uint8_t gpu_census_class_ = kGpuCensusOther;
+  uint32_t gpu_census_sub_start_ = 0;
+  uint32_t gpu_census_sub_count_ = 0;
+  uint8_t gpu_census_sub_tags_[kGpuCensusMaxPerSubmission];
+  uint8_t gpu_census_stack_[kGpuCensusStackDepth];
+  uint32_t gpu_census_stack_depth_ = 0;
+  struct GpuCensusPending {
+    uint64_t submission;
+    uint32_t start;
+    uint32_t count;
+    uint8_t tags[kGpuCensusMaxPerSubmission];
+  };
+  std::deque<GpuCensusPending> gpu_census_pending_;
+  uint64_t gpu_census_class_ticks_[kGpuCensusClassCount] = {};
+  uint64_t gpu_census_class_spans_[kGpuCensusClassCount] = {};
+  uint64_t gpu_census_trunc_ = 0;
+  uint64_t gpu_census_dropped_ = 0;
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;

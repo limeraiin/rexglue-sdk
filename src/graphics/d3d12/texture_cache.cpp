@@ -1600,6 +1600,10 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                               bool load_mips) {
+  // [gpu-census] only reached when a texture actually needs (re)loading, so
+  // the whole impl prices as texture-upload GPU work.
+  D3D12CommandProcessor::GpuCensusScope gpu_census_scope(command_processor_,
+                                                         D3D12CommandProcessor::kGpuCensusTexUp);
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
 
