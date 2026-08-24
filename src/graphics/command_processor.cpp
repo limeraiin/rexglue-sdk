@@ -169,9 +169,10 @@ REXCVAR_DEFINE_BOOL(gpu_nr_compose, false, "GPU",
 
 // [NR-4A] N-9-4a: apply constants FROM THE RECORD at the draw stop. The
 // walker defers each group's inline constant-window ranges (ALU/fetch/
-// bool-loop -- the classes with no in-group ordering coupling: coher trio,
-// state, watched and below-0x2000 registers stay immediate, by-ref loads
-// are immediate and measured disjoint) and, at the draw stop, applies the
+// bool-loop) and -- since N-9-4b-ext -- the captured STATE-window ranges
+// (Nr4aStateWindow: the 40040 field families that arrive as bulk ranges;
+// mirror-crossing runs, the below-0x2000 coher pair, watched registers and
+// by-ref loads stay immediate) and, at the draw stop, applies the
 // record's composed runs instead when the record is valid AND its run shape
 // exactly matches the deferred list; any disagreement falls back to the
 // deferred packet ranges, counted by reason. This is the N-9-5 execution
@@ -1519,6 +1520,8 @@ uint64_t g_cmp_outside = 0;        // spans before the body floor: between-body
 struct CmpBref {
   uint32_t reg, cnt;
   uint32_t spans_before;  // span top at insert: covered spans after => interleaved
+  uint32_t off;           // [NR-4B-EXT] packet header byte offset (floor filter)
+  uint32_t raw[3];        // [NR-4B-EXT] the 0x2F's own dw1..dw3, raw guest bytes
 };
 constexpr uint32_t kCmpMaxBref = 8192;
 CmpBref g_cmp_bref[kCmpMaxBref];
@@ -1529,6 +1532,23 @@ uint64_t g_cmp_bref_overlap = 0;    // 0x2F range intersects a record run
 uint64_t g_cmp_bref_ilv = 0;        //   and covered spans follow it in-group
 uint64_t g_cmp_bref_drop = 0;       // census scratch overflowed (completeness)
 uint32_t g_cmp_bref_samp[3] = {};   // first overlap: reg, cnt, armed
+// [NR-4B-EXT] by-ref MARKER validation: the record body now carries each
+// group's 0x2F packets as tagged marker entries in sequence (game-side
+// CapStore, from the winning parse). The diff scores the stored markers
+// against the group's actually-executed 0x2F packets: same count, same
+// dwords ({addr|swap, byte_off, count} -- memcmp raw), same position among
+// the record's runs. This is the N-9-5 schema gate for by-refs: a suppressed
+// body must re-emit exactly these from the record.
+constexpr uint32_t kCmpMaxMk = 24;
+uint64_t g_cmp_mk_pred = 0;     // marker entries in scored bodies
+uint64_t g_cmp_mk_emit = 0;     // in-floor 0x2F packets in scored groups
+uint64_t g_cmp_mk_eq = 0;       // paired markers, dwords equal
+uint64_t g_cmp_mk_ne = 0;       // paired markers, dwords differ
+uint64_t g_cmp_mk_pos_ne = 0;   // paired equal, but position among runs differs
+uint64_t g_cmp_mk_cnt_ne = 0;   // groups where marker count != 0x2F count
+uint64_t g_cmp_mk_ovf = 0;      // groups skipped: marker scratch cap
+uint32_t g_cmp_mk_samp[5] = {};  // first anomaly: kind(1 val,2 pos,3 cnt),
+                                 // pred_pos, emit_pos, dw1; [4]=armed
 uint64_t g_cmp_first_div = 0;   // diverging groups that were first-in-buffer
 uint64_t g_cmp_div_groups = 0;  // groups with any divergence at all
 // First divergence each window, verbatim.
@@ -2177,6 +2197,8 @@ uint64_t g_4a_flush_end = 0;    // end-of-buffer trailing ranges
 uint64_t g_4a_fb_miss = 0, g_4a_fb_nostate = 0, g_4a_fb_stale = 0,
          g_4a_fb_torn = 0, g_4a_fb_shape = 0, g_4a_fb_ovf = 0;
 uint64_t g_4a_def_ranges = 0;   // ranges deferred
+uint64_t g_4a_def_state = 0;    // [NR-4B-EXT] ...of which state-window ranges
+uint64_t g_4a_mk_runs = 0;      // [NR-4B-EXT] by-ref marker entries seen in bodies
 uint64_t g_4a_ovf_ranges = 0;   // ranges applied immediately on list overflow
 // First shape mismatch each window: [0]=armed, [1]=record const runs (nf),
 // [2]=deferred ranges (ndef), [3]=first mismatched index, [4]/[5]=record
@@ -2228,6 +2250,37 @@ inline bool Nr4aConstWindow(uint32_t base, uint32_t n) {
           end <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
          (base >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
           end <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+}
+// [NR-4B-EXT] N-9-4b-ext: the STATE half of the record's captured surface --
+// the 40040 field-group windows (+ the 0x5000 fetch tail) the capture gate
+// proved exact at both scales. A range is deferable/composable only when the
+// walker would actually OFFER it in bulk: wholly inside one captured window
+// AND not touching the 27-reg recovery mirror (mirror-crossing runs arrive
+// per-dword and stay immediate -- the mirror needs their values live). The
+// register windows here are CapPredict's emission windows (record_map.cpp);
+// the CmpInScope windows over in [nr-cmp] are the same list plus the
+// below-0x2000 coher pair, which must never be deferred (stateful ports).
+inline bool Nr4aStateWindow(uint32_t base, uint32_t n) {
+  const uint32_t end = base + n;  // exclusive
+  const bool in_win =
+      (base >= 0x2000u && end <= 0x2010u) ||   // [dev+16] bits 42-57
+      (base >= 0x2100u && end <= 0x2115u) ||   // [dev+16] bits 21-41 + 0x2102
+      (base >= 0x2180u && end <= 0x2185u) ||   // [dev+16] bits 12-16
+      (base >= 0x2200u && end <= 0x220Cu) ||   // [dev+16] & 0xFFF
+      (base >= 0x2280u && end <= 0x2295u) ||   // [dev+24] bits 34-54
+      (base >= 0x2300u && end <= 0x2326u) ||   // [dev+32] bits 0-37
+      (base >= 0x2380u && end <= 0x23A0u) ||   // [dev+32] 38-45 + 0x2388 fam
+      (base >= 0x5000u && end <= 0x5003u);     // fetch-flush fixed tail
+  if (!in_win) return false;
+  // Mirror the walker's offer test exactly (CtxRangeOfferable): >= 0x2322 is
+  // always offerable, below it the mirror-overlap test decides.
+  return base >= 0x2322u || !nr::CtxRangeTouchesMirrorRegs(base, n);
+}
+// One predicate for both sides of the shape match: what the walker defers ==
+// what the compose filter expects from the record. Body MARKER entries
+// (by-ref 0x2F, tag bit 31) fail this naturally and are skipped.
+inline bool Nr4aComposable(uint32_t base, uint32_t n) {
+  return Nr4aConstWindow(base, n) || Nr4aStateWindow(base, n);
 }
 // Window counters for the [nr-skp] 1Hz line.
 uint64_t g_skp_bufs = 0;         // skip-driven depth-1 buffer executions
@@ -3503,8 +3556,12 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
     // [NR-4A] leak detector: a constant-window dword arriving per-dword
     // while a group is pending never reached the defer branch (measured 0;
     // if it ever fires, flush so ordering can never silently invert).
-    if (g_nr4a_bufactive && g_nr4a_ndef && Nr4aConstWindow(reg, 1)) {
-      if (!from_memory) ++g_4a_pdw_const;
+    if (g_nr4a_bufactive && g_nr4a_ndef && Nr4aComposable(reg, 1)) {
+      // pdw_const stays a CONST-window leak detector (measured 0); state
+      // per-dword writes here are EXPECTED (mirror-crossing runs, one-reg
+      // packets) and by construction never overlap a deferred range -- the
+      // loop below is the belt-and-braces order guard for both classes.
+      if (!from_memory && Nr4aConstWindow(reg, 1)) ++g_4a_pdw_const;
       for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
         const Nr4aDef& d = g_nr4a_def[i];
         if (reg >= d.base && reg < d.base + d.n) {
@@ -3566,6 +3623,32 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
           (end < XE_GPU_REG_SHADER_CONSTANT_000_X ||
            base > XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
       return false;
+    }
+    // [NR-4B-EXT] an inline STATE range inside the record's captured windows:
+    // defer to the stop, same as a constant range (Nr4aStateWindow replicates
+    // the walker's own offer test, so the record-side filter can never expect
+    // a range that would not have arrived here).
+    if (g_nr4a_bufactive && !from_memory && Nr4aStateWindow(base, n)) {
+      if (g_nr4a_ndef < kNr4aMaxDef) {
+        g_nr4a_def[g_nr4a_ndef++] = {base, n, phys, values_be};
+        ++g_4a_def_ranges;
+        ++g_4a_def_state;
+        return true;
+      }
+      g_nr4a_group_ovf = true;
+      ++g_4a_ovf_ranges;
+    } else if (g_nr4a_bufactive && from_memory && g_nr4a_ndef) {
+      // A by-ref load into the REGISTERS window (0x2F type 4) about to apply
+      // while ranges are pending: same stream-order guard as the constant
+      // branch below -- flush before it applies, group falls back at the stop.
+      for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
+        const Nr4aDef& d = g_nr4a_def[i];
+        if (base < d.base + d.n && d.base < base + n) {
+          ++g_4a_byref_conflict;
+          Nr4aFlush(static_cast<CommandProcessor*>(user));
+          break;
+        }
+      }
     }
   } else if (g_nr4a_bufactive && !from_memory) {
     // [NR-4A] an inline constant-window range: defer to the group's stop,
@@ -3674,7 +3757,15 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
       ++g_4a_fb_torn;
       return false;
     }
-    if (Nr4aConstWindow(reg, cnt)) {
+    // [NR-4B-EXT] by-ref marker entry (tag bit 31, payload = the 0x2F's own
+    // three dwords): carried for the N-9-5 schema, not composed here -- the
+    // walker still applies the by-ref packet itself, in stream order.
+    if (reg & 0x80000000u) {
+      ++g_4a_mk_runs;
+      p += 2 + cnt;
+      continue;
+    }
+    if (Nr4aComposable(reg, cnt)) {
       if (nf >= kNr4aMaxDef) {
         ++g_4a_fb_shape;
         return false;
@@ -5079,6 +5170,26 @@ void CommandProcessor::WorkerThreadMain() {
                           g_cmp_bref_samp[0], g_cmp_bref_samp[1]);
               g_cmp_bref_samp[2] = 0;
             }
+            // [NR-4B-EXT] the marker-schema verdict: pred==emit, eq==pred,
+            // ne/pos_ne/cnt_ne all 0 means a suppressed body could re-emit
+            // this group's 0x2F packets from the record exactly.
+            if (g_cmp_mk_pred || g_cmp_mk_emit || g_cmp_mk_ovf) {
+              REXGPU_INFO(
+                  "[nr-cmp]   mk: pred={} emit={} eq={} NE={} POS_NE={} "
+                  "CNT_NE={} ovf={}",
+                  g_cmp_mk_pred, g_cmp_mk_emit, g_cmp_mk_eq, g_cmp_mk_ne,
+                  g_cmp_mk_pos_ne, g_cmp_mk_cnt_ne, g_cmp_mk_ovf);
+              if (g_cmp_mk_samp[4]) {
+                static const char* kMkKinds[4] = {"?", "val_ne", "pos_ne",
+                                                  "cnt_ne"};
+                REXGPU_INFO(
+                    "[nr-cmp]   mk first: {} pred_pos={} emit_pos={} "
+                    "dw1={:08X}",
+                    kMkKinds[g_cmp_mk_samp[0] < 4 ? g_cmp_mk_samp[0] : 0],
+                    g_cmp_mk_samp[1], g_cmp_mk_samp[2], g_cmp_mk_samp[3]);
+                g_cmp_mk_samp[4] = 0;
+              }
+            }
             if (g_cmp_samp_armed) {
               static const char* kCmpKinds[4] = {"?", "pred_only", "emit_only",
                                                  "val_ne"};
@@ -5099,6 +5210,8 @@ void CommandProcessor::WorkerThreadMain() {
             g_cmp_bref_pkts = g_cmp_bref_groups = 0;
             for (uint32_t t = 0; t < 6; ++t) g_cmp_bref_type[t] = 0;
             g_cmp_bref_overlap = g_cmp_bref_ilv = g_cmp_bref_drop = 0;
+            g_cmp_mk_pred = g_cmp_mk_emit = g_cmp_mk_eq = 0;
+            g_cmp_mk_ne = g_cmp_mk_pos_ne = g_cmp_mk_cnt_ne = g_cmp_mk_ovf = 0;
           }
           // [NR-BUF] The serving verdict. served= is the fraction of
           // executions the renderer replays from a snapshot without
@@ -5443,12 +5556,12 @@ void CommandProcessor::WorkerThreadMain() {
           REXGPU_INFO(
               "[nr-4a] composed={} ({:.2f}% of 0x22 stops, {} runs {} dw) | "
               "flush: draw_fb={} d2={} deleg={} end={} | deferred={} "
-              "ovf_ranges={}",
+              "(state {}) mk={} ovf_ranges={}",
               g_4a_composed,
               stops ? 100.0 * double(g_4a_composed) / double(stops) : 0.0,
               g_4a_comp_runs, g_4a_comp_dw, g_4a_flush_draw, g_4a_flush_d2,
               g_4a_flush_deleg, g_4a_flush_end, g_4a_def_ranges,
-              g_4a_ovf_ranges);
+              g_4a_def_state, g_4a_mk_runs, g_4a_ovf_ranges);
           REXGPU_INFO(
               "[nr-4a]   fb: miss={} no_state={} stale={} torn={} shape={} "
               "val={} ovf={} | byref_conflict_flush={}",
@@ -5513,6 +5626,7 @@ void CommandProcessor::WorkerThreadMain() {
           g_4a_fb_torn = g_4a_fb_shape = g_4a_fb_ovf = 0;
           g_4a_fb_val = g_4a_byref_conflict = 0;
           g_4a_def_ranges = g_4a_ovf_ranges = 0;
+          g_4a_def_state = g_4a_mk_runs = 0;
           g_4a_ver = g_4a_unver = 0;
         }
         // [NR-SDB] The corpus verdict. Per-load hit% says how often a bind
@@ -6836,8 +6950,14 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                 ++g_cmp_bref_type[btype < 5 ? btype : 5];
                 if (btype < 5 && sz) {
                   if (cmp_nbref < kCmpMaxBref) {
-                    g_cmp_bref[cmp_nbref++] = {kBrefBase[btype] + (ot & 0x7FF),
-                                               sz, cmp_nspan};
+                    CmpBref& br = g_cmp_bref[cmp_nbref++];
+                    br.reg = kBrefBase[btype] + (ot & 0x7FF);
+                    br.cnt = sz;
+                    br.spans_before = cmp_nspan;
+                    br.off = j * 4;
+                    // Raw dw1..dw3 verbatim (guest byte order), for the
+                    // marker memcmp against the record body.
+                    __builtin_memcpy(br.raw, raw + (j + 1) * 4, 12);
                   } else {
                     ++g_cmp_bref_drop;
                   }
@@ -7015,17 +7135,38 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                       const uint32_t pkt_byte = pk.addr - ptr;
                       const uint32_t floor_byte =
                           pkt_byte > pre_span ? pkt_byte - pre_span : 0;
+                      // [NR-4B-EXT] marker entries (tag bit 31) separate from
+                      // the run table: they diff against the group's 0x2F
+                      // packets, never against type0 spans.
+                      uint32_t mk_pos[kCmpMaxMk], mk_boff[kCmpMaxMk];
+                      uint32_t nmk = 0;
+                      bool mk_ovf = false;
                       uint32_t nr_parsed = 0, p = 2;
-                      bool malformed = nruns > kCmpMaxRuns;
+                      bool malformed = nruns > kCmpMaxRuns + kCmpMaxMk;
                       for (uint32_t k = 0; !malformed && k < nruns; ++k) {
                         if (p + 2 > ndw || body[p + 1] == 0 ||
                             p + 2 + body[p + 1] > ndw) {
                           malformed = true;
                           break;
                         }
-                        r_reg[k] = body[p];
-                        r_cnt[k] = body[p + 1];
-                        r_off[k] = p + 2;
+                        if (body[p] & 0x80000000u) {
+                          if (nmk < kCmpMaxMk && body[p + 1] == 3) {
+                            mk_pos[nmk] = nr_parsed;
+                            mk_boff[nmk] = p + 2;
+                            ++nmk;
+                          } else {
+                            mk_ovf = true;
+                          }
+                          p += 2 + body[p + 1];
+                          continue;
+                        }
+                        if (nr_parsed >= kCmpMaxRuns) {
+                          malformed = true;
+                          break;
+                        }
+                        r_reg[nr_parsed] = body[p];
+                        r_cnt[nr_parsed] = body[p + 1];
+                        r_off[nr_parsed] = p + 2;
                         p += 2 + body[p + 1];
                         ++nr_parsed;
                       }
@@ -7088,6 +7229,59 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                           ++l_pred_only;
                           note(1, r_reg[pi], r_cnt[pi], 0);
                         }
+                        // [NR-4B-EXT] marker diff: pair the body's stored
+                        // by-ref markers, in order, against the group's
+                        // in-floor 0x2F packets. Outside spans form a prefix
+                        // of the group (byte order + fixed floor), so the
+                        // in-floor position of a packet is its span index
+                        // minus lo minus the outside count. All body reads
+                        // happen here, before VerifyState; commit below.
+                        uint64_t l_mk_eq = 0, l_mk_ne = 0, l_mk_pos_ne = 0;
+                        uint32_t l_mk_emit = 0, mi = 0;
+                        uint32_t mk_samp[4] = {};
+                        {
+                          const uint32_t mblo = g_cmp_pkt_blo[i];
+                          const uint32_t mbhi = g_cmp_pkt_bhi[i];
+                          for (uint32_t b = mblo; b < mbhi; ++b) {
+                            const CmpBref& br = g_cmp_bref[b];
+                            if (br.off < floor_byte) continue;
+                            const uint32_t sp_rel =
+                                br.spans_before > lo ? br.spans_before - lo : 0;
+                            const uint32_t emit_pos =
+                                sp_rel > l_outside ? sp_rel - uint32_t(l_outside)
+                                                   : 0;
+                            ++l_mk_emit;
+                            if (mi < nmk) {
+                              if (__builtin_memcmp(body + mk_boff[mi], br.raw,
+                                                   12) != 0) {
+                                ++l_mk_ne;
+                                if (!mk_samp[0]) {
+                                  mk_samp[0] = 1;
+                                  mk_samp[1] = mk_pos[mi];
+                                  mk_samp[2] = emit_pos;
+                                  mk_samp[3] = br.raw[0];
+                                }
+                              } else if (mk_pos[mi] != emit_pos) {
+                                ++l_mk_pos_ne;
+                                if (!mk_samp[0]) {
+                                  mk_samp[0] = 2;
+                                  mk_samp[1] = mk_pos[mi];
+                                  mk_samp[2] = emit_pos;
+                                  mk_samp[3] = br.raw[0];
+                                }
+                              } else {
+                                ++l_mk_eq;
+                              }
+                              ++mi;
+                            }
+                          }
+                        }
+                        const bool l_mk_cnt_ne = l_mk_emit != nmk;
+                        if (l_mk_cnt_ne && !mk_samp[0]) {
+                          mk_samp[0] = 3;
+                          mk_samp[1] = nmk;
+                          mk_samp[2] = l_mk_emit;
+                        }
                         // Commit only if the payload survived the diff
                         // un-overwritten; otherwise everything above was
                         // read against recycled arena bytes.
@@ -7095,6 +7289,24 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                           ++g_cmp_torn;
                         } else {
                           ++g_cmp_groups;
+                          // [NR-4B-EXT] marker verdict commit.
+                          if (mk_ovf) {
+                            ++g_cmp_mk_ovf;
+                          } else {
+                            g_cmp_mk_pred += nmk;
+                            g_cmp_mk_emit += l_mk_emit;
+                            g_cmp_mk_eq += l_mk_eq;
+                            g_cmp_mk_ne += l_mk_ne;
+                            g_cmp_mk_pos_ne += l_mk_pos_ne;
+                            if (l_mk_cnt_ne) ++g_cmp_mk_cnt_ne;
+                            if (mk_samp[0] && !g_cmp_mk_samp[4]) {
+                              g_cmp_mk_samp[0] = mk_samp[0];
+                              g_cmp_mk_samp[1] = mk_samp[1];
+                              g_cmp_mk_samp[2] = mk_samp[2];
+                              g_cmp_mk_samp[3] = mk_samp[3];
+                              g_cmp_mk_samp[4] = 1;
+                            }
+                          }
                           g_cmp_pred_runs += nr_parsed;
                           g_cmp_emit_runs += (hi - lo) - l_outside;
                           g_cmp_outside += l_outside;

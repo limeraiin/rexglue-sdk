@@ -696,6 +696,13 @@ CtxMemoStats* CtxMemoStatsPtr();
 // mirrored (nothing written).
 int32_t CtxApplyExternalWrite(StateContext* ctx, uint32_t reg, uint32_t value);
 
+// [NR-4B-EXT] Does [base, base+n) intersect the 27-reg recovery mirror? The
+// walker never offers such a range in bulk (CtxRangeOfferable), so any
+// consumer predicate that models "which ranges arrive as ranges" must apply
+// the same test. Exported so the defer/compose filter in the command
+// processor and the walker can never drift apart.
+bool CtxRangeTouchesMirrorRegs(uint32_t base, uint32_t n);
+
 }  // namespace nr
 }  // namespace graphics
 }  // namespace rex

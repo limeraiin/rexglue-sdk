@@ -170,6 +170,15 @@ uint32_t CtxConstantBase(uint32_t offset_type) {
   }
 }
 
+// [NR-4B-EXT] Public face of the mirror-overlap test (kRanges is file-local;
+// the walker's own CtxRangeTouchesMirror below stays inline in the hot path).
+bool CtxRangeTouchesMirrorRegs(uint32_t base, uint32_t n) {
+  for (const SlotRange& r : kRanges) {
+    if (base < r.first_reg + r.count && base + n > r.first_reg) return true;
+  }
+  return false;
+}
+
 int32_t CtxApplyExternalWrite(StateContext* ctx, uint32_t reg,
                               uint32_t value) {
   const int32_t s = CtxSlot(reg);
