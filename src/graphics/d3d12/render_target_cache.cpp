@@ -54,11 +54,11 @@ REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
 // (>= 2048 host tiles) the legacy chain reads the WRONG EDRAM region (11-bit
 // vendored base field, warned at boot) while the direct path returns real
 // depth. The cvar survives for the A/B and per-resolve fallback stays.
-REXCVAR_DEFINE_BOOL(gpu_nr_direct_resolve, true, "GPU/D3D12",
-                    "[NR-DRES] Resolve copies read the host render target directly and write "
-                    "the guest destination in one dispatch, skipping the EDRAM dump and the "
-                    "vendored resolve shader for the eligible closed set.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [NR-DRES] N-10a direct resolve is UNCONDITIONAL since 2026-08-24 (user
+// directive: confirmed wins are code, not flags). It was `gpu_nr_direct_
+// resolve`, default ON, city-gated at 100% coverage and bit-identical
+// everywhere legacy is trustworthy (naruto_614..625); the eligible-set
+// preflight + counted fallback below IS the safety, not a cvar.
 
 REXCVAR_DEFINE_BOOL(gpu_nr_direct_resolve_verify, false, "GPU/D3D12",
                     "[NR-DRES] Divergence gate: run the legacy dump+vendored resolve AND the "
@@ -1553,10 +1553,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       bool direct_resolved = false;
       bool dres_verify_this = false;
       if (GetPath() == Path::kHostRenderTargets) {
-        // [NR-DRES] The preflight only runs when the direct dispatch is armed:
-        // gpu_nr_direct_resolve is the N-10a bring-up gate, direct_host_resolve
-        // the outer switch.
-        if (REXCVAR_GET(direct_host_resolve) && REXCVAR_GET(gpu_nr_direct_resolve)) {
+        // [NR-DRES] Direct resolve is unconditional (N-10a shipped);
+        // direct_host_resolve stays the shared outer switch.
+        if (REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
@@ -1823,10 +1822,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     copied = true;
   }
 
-  // [NR-DRES] Flush the verify compare and print the 1 Hz census while armed.
-  if (REXCVAR_GET(gpu_nr_direct_resolve)) {
-    ReportDirectResolveStats();
-  }
+  // [NR-DRES] Flush the verify compare and print the 1 Hz census.
+  ReportDirectResolveStats();
 
   // Clearing.
   bool cleared = false;

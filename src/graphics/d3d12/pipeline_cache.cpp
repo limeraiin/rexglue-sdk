@@ -70,9 +70,9 @@ REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
 // [PSO-LIB] N-10b: keep the driver's compiled pipeline blobs between runs so
 // a later boot loads them instead of recompiling every stored pipeline (the
 // 52-64 s Intel boot grind). Default on; kill switch only.
-REXCVAR_DEFINE_BOOL(d3d12_pipeline_library, true, "GPU/D3D12",
-                    "Persist driver pipeline blobs between runs (skips the boot "
-                    "pipeline recompile).");
+// [PSO-LIB] The driver pipeline library (persisted blobs, skips the boot
+// recompile) is unconditional -- was `d3d12_pipeline_library` default ON,
+// removed 2026-08-24 (user directive: confirmed wins are code, not flags).
 
 // [NR-PSO] Phase 5-1: the state mirror. Phase 4 proved every register a draw
 // reads is recoverable from the buffer stream and then proved it by
@@ -3868,7 +3868,10 @@ ID3D12PipelineState* PipelineCache::CreateGraphicsPipelineWithLibrary(
 
 void PipelineCache::InitializePipelineLibrary(const std::filesystem::path& local_root,
                                               uint32_t title_id, bool edram_rov_used) {
-  if (!REXCVAR_GET(d3d12_pipeline_library) || pipeline_library_) {
+  // [PSO-LIB] Unconditional since 2026-08-24 (confirmed win, was the
+  // d3d12_pipeline_library cvar): feature-support probes below are the only
+  // gates; an unsupported driver just recompiles every boot as before.
+  if (pipeline_library_) {
     return;
   }
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();

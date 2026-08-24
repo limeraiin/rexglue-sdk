@@ -622,15 +622,12 @@ REXCVAR_DEFINE_INT32(gpu_nr_detile, 1, "GPU",
                      "sample. Kept as a cvar for the A/B and the in-place "
                      "cycle, not as a thing anyone has to set.");
 
-REXCVAR_DEFINE_BOOL(gpu_nr_plain_bulk, true, "GPU",
-                    "[nr-pb] N-2-2 item 0: under gpu_nr_skip, bulk-apply "
-                    "full-fit multi-register writes to PLAIN state registers "
-                    "(0x2000+, outside the constant windows) instead of the "
-                    "per-dword virtual WriteRegister. Stateful ports and "
-                    "mirror-window ranges keep the per-dword path. Default "
-                    "ON since the naruto_485/486 city gates (diverge=0, 68% "
-                    "of per-dword dwords captured, walk pool 1.26 -> 1.17 "
-                    "us/draw).");
+// [nr-pb] Plain-register bulk apply (N-2-2 item 0) is UNCONDITIONAL under
+// the skip -- was `gpu_nr_plain_bulk` default ON since the naruto_485/486
+// city gates (diverge=0, 68% of per-dword dwords captured, walk pool
+// 1.26 -> 1.17 us/draw); cvar removed 2026-08-24 (user directive:
+// confirmed wins are code, not flags). Stateful ports and mirror-window
+// ranges keep the per-dword path, decided in NrWalkRegRange itself.
 
 // [N8F] Per-draw effect coalescing -- the rung N-8c priced at a ~7% floor
 // (naruto_601: 25.4 applies/draw -> 8.7, ~20 ns each). A walk-decoded range
@@ -4217,8 +4214,8 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-SKP] 5-4-4a: the direct draw path only exists under the skip.
   g_nr_skip_direct = REXCVAR_GET(gpu_nr_skip_direct) && kNrSkip;
   // [NR-PB] N-2-2 item 0: the plain bulk apply only exists under the skip
-  // (NrWalkRegRange is dead everywhere else).
-  g_nr_plain_bulk = REXCVAR_GET(gpu_nr_plain_bulk) && kNrSkip;
+  // (NrWalkRegRange is dead everywhere else). Unconditional there.
+  g_nr_plain_bulk = kNrSkip;
   // [NR-RUSE] 5-4-5 inc 0: the reuse pricing probe rides the skip (the walk
   // is the only decoder there, so buffer bytes ARE the input stream).
   // 5-4-5-2: the fast path consumes the verdict, so it implies the probe
