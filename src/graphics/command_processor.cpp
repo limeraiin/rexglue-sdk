@@ -1473,6 +1473,26 @@ uint64_t g_cmp_skip_prevmiss = 0;  // previous packet missed the join (65535-
 uint64_t g_cmp_skip_ovf = 0;       // group tainted by span-scratch overflow
 uint64_t g_cmp_outside = 0;        // spans before the body floor: between-body
                                    //   emissions (standalone coher flushes)
+// [NR-CMP] N-9-4a ordering census: by-ref LOAD_ALU_CONSTANT (0x2F) packets
+// interleave with the captured type0 runs inside a group. N-9-5's suppressed
+// bodies force the composed record to be applied AT THE DRAW STOP, which is
+// order-safe iff no 0x2F target range ever overlaps the record's runs. This
+// measures exactly that: overlap = an 0x2F range intersecting a record run
+// in the same group; ilv_overlap = the killer subset where covered spans
+// also FOLLOW the 0x2F (true interleave, order actually flips).
+struct CmpBref {
+  uint32_t reg, cnt;
+  uint32_t spans_before;  // span top at insert: covered spans after => interleaved
+};
+constexpr uint32_t kCmpMaxBref = 8192;
+CmpBref g_cmp_bref[kCmpMaxBref];
+uint64_t g_cmp_bref_pkts = 0;       // 0x2F packets census'd (scored groups)
+uint64_t g_cmp_bref_groups = 0;     // diffed groups containing >=1 of them
+uint64_t g_cmp_bref_type[6] = {};   // ALU/FETCH/BOOL/LOOP/REGISTERS/other
+uint64_t g_cmp_bref_overlap = 0;    // 0x2F range intersects a record run
+uint64_t g_cmp_bref_ilv = 0;        //   and covered spans follow it in-group
+uint64_t g_cmp_bref_drop = 0;       // census scratch overflowed (completeness)
+uint32_t g_cmp_bref_samp[3] = {};   // first overlap: reg, cnt, armed
 uint64_t g_cmp_first_div = 0;   // diverging groups that were first-in-buffer
 uint64_t g_cmp_div_groups = 0;  // groups with any divergence at all
 // First divergence each window, verbatim.
@@ -1533,6 +1553,9 @@ nr::PacketRef g_nrb_pkts[kNrbMaxPkts];
 uint32_t g_cmp_pkt_lo[kNrbMaxPkts];
 uint32_t g_cmp_pkt_hi[kNrbMaxPkts];
 uint8_t g_cmp_pkt_flags[kNrbMaxPkts];
+// [NR-CMP] N-9-4a: the group's by-ref (0x2F) range list, same lifecycle.
+uint32_t g_cmp_pkt_blo[kNrbMaxPkts];
+uint32_t g_cmp_pkt_bhi[kNrbMaxPkts];
 
 // [NR-STATE] Increment-3 window counters: the state census, aggregated over
 // the executions scored this window, plus the per-draw context splits and the
@@ -4680,6 +4703,21 @@ void CommandProcessor::WorkerThreadMain() {
                 g_cmp_no_state, g_cmp_stale, g_cmp_torn, g_cmp_skip_prevmiss,
                 g_cmp_skip_ovf, g_cmp_outside, ss.state_stored,
                 ss.state_dwords, ss.state_ovf, ss.state_wraps);
+            // [N-9-4a] The ordering-census verdict: OVERLAP must read 0 for
+            // the draw-stop compose apply (the N-9-5 shape) to be order-safe.
+            REXGPU_INFO(
+                "[nr-cmp]   byref: pkts={} groups={} type "
+                "alu/fetch/bool/loop/reg/other={}/{}/{}/{}/{}/{} | OVERLAP={} "
+                "interleaved={} drop={}",
+                g_cmp_bref_pkts, g_cmp_bref_groups, g_cmp_bref_type[0],
+                g_cmp_bref_type[1], g_cmp_bref_type[2], g_cmp_bref_type[3],
+                g_cmp_bref_type[4], g_cmp_bref_type[5], g_cmp_bref_overlap,
+                g_cmp_bref_ilv, g_cmp_bref_drop);
+            if (g_cmp_bref_samp[2]) {
+              REXGPU_INFO("[nr-cmp]   first overlap: reg={:#06X} cnt={}",
+                          g_cmp_bref_samp[0], g_cmp_bref_samp[1]);
+              g_cmp_bref_samp[2] = 0;
+            }
             if (g_cmp_samp_armed) {
               static const char* kCmpKinds[4] = {"?", "pred_only", "emit_only",
                                                  "val_ne"};
@@ -4697,6 +4735,9 @@ void CommandProcessor::WorkerThreadMain() {
             g_cmp_no_state = g_cmp_stale = g_cmp_torn = 0;
             g_cmp_skip_prevmiss = g_cmp_skip_ovf = g_cmp_outside = 0;
             g_cmp_div_groups = g_cmp_first_div = 0;
+            g_cmp_bref_pkts = g_cmp_bref_groups = 0;
+            for (uint32_t t = 0; t < 6; ++t) g_cmp_bref_type[t] = 0;
+            g_cmp_bref_overlap = g_cmp_bref_ilv = g_cmp_bref_drop = 0;
           }
           // [NR-BUF] The serving verdict. served= is the fraction of
           // executions the renderer replays from a snapshot without
@@ -6278,6 +6319,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           // recorded payload's own in-group order is the body's emission
           // order, which the buffer preserves, so ordered matching holds.
           uint32_t cmp_nspan = 0, cmp_group_lo = 0;
+          uint32_t cmp_nbref = 0, cmp_bgroup_lo = 0;
           bool cmp_tainted = false, cmp_first22 = true;
           for (uint32_t j = 0; j < count;) {
             const uint32_t hdr =
@@ -6293,6 +6335,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                 if (g_nr_compose && (op == 0x22 || op == 0x36)) {
                   // A predicated-out draw still consumed its group's bytes.
                   cmp_group_lo = cmp_nspan;
+                  cmp_bgroup_lo = cmp_nbref;
                   cmp_tainted = false;
                 }
                 j += 1 + cnt;
@@ -6316,17 +6359,44 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                 if (g_nr_compose) {
                   g_cmp_pkt_lo[npkt] = cmp_group_lo;
                   g_cmp_pkt_hi[npkt] = cmp_nspan;
+                  g_cmp_pkt_blo[npkt] = cmp_bgroup_lo;
+                  g_cmp_pkt_bhi[npkt] = cmp_nbref;
                   g_cmp_pkt_flags[npkt] =
                       (cmp_tainted ? kCmpFlagTainted : 0) |
                       (cmp_first22 ? kCmpFlagFirst : 0);
                   cmp_group_lo = cmp_nspan;
+                  cmp_bgroup_lo = cmp_nbref;
                   cmp_tainted = false;
                   cmp_first22 = false;
                 }
                 g_nrb_pkts[npkt++] = {ptr + j * 4, init & 0x3F, init >> 16};
               } else if (g_nr_compose && op == 0x36) {
                 cmp_group_lo = cmp_nspan;
+                cmp_bgroup_lo = cmp_nbref;
                 cmp_tainted = false;
+              } else if (g_nr_compose && op == 0x2F && j + 3 < count) {
+                // [N-9-4a census] by-ref load: payload = {addr, offset_type,
+                // size}; target register range per the executor's own
+                // Write*RangeFromMem bases.
+                const uint32_t ot = __builtin_bswap32(
+                    *(const uint32_t*)(raw + (j + 2) * 4));
+                const uint32_t sz = __builtin_bswap32(
+                                        *(const uint32_t*)(raw + (j + 3) * 4)) &
+                                    0xFFF;
+                const uint32_t btype = (ot >> 16) & 0xFF;
+                static constexpr uint32_t kBrefBase[5] = {0x4000u, 0x4800u,
+                                                          0x4900u, 0x4908u,
+                                                          0x2000u};
+                ++g_cmp_bref_pkts;
+                ++g_cmp_bref_type[btype < 5 ? btype : 5];
+                if (btype < 5 && sz) {
+                  if (cmp_nbref < kCmpMaxBref) {
+                    g_cmp_bref[cmp_nbref++] = {kBrefBase[btype] + (ot & 0x7FF),
+                                               sz, cmp_nspan};
+                  } else {
+                    ++g_cmp_bref_drop;
+                  }
+                }
               }
               j += 1 + cnt;
             } else if (ty == 0) {
@@ -6583,6 +6653,31 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                           g_cmp_pred_runs += nr_parsed;
                           g_cmp_emit_runs += (hi - lo) - l_outside;
                           g_cmp_outside += l_outside;
+                          // [N-9-4a census] does any of this group's by-ref
+                          // (0x2F) target ranges overlap the record's runs?
+                          const uint32_t blo = g_cmp_pkt_blo[i];
+                          const uint32_t bhi = g_cmp_pkt_bhi[i];
+                          if (bhi > blo) {
+                            ++g_cmp_bref_groups;
+                            for (uint32_t b = blo; b < bhi; ++b) {
+                              const CmpBref& br = g_cmp_bref[b];
+                              bool ovl = false;
+                              for (uint32_t k = 0; k < nr_parsed && !ovl;
+                                   ++k) {
+                                ovl = br.reg < r_reg[k] + r_cnt[k] &&
+                                      r_reg[k] < br.reg + br.cnt;
+                              }
+                              if (ovl) {
+                                ++g_cmp_bref_overlap;
+                                if (hi > br.spans_before) ++g_cmp_bref_ilv;
+                                if (!g_cmp_bref_samp[2]) {
+                                  g_cmp_bref_samp[0] = br.reg;
+                                  g_cmp_bref_samp[1] = br.cnt;
+                                  g_cmp_bref_samp[2] = 1;
+                                }
+                              }
+                            }
+                          }
                           g_cmp_run_eq += l_run_eq;
                           g_cmp_val_eq += l_val_eq;
                           g_cmp_val_ne += l_val_ne;
