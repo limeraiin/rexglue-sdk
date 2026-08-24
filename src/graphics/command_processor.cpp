@@ -155,6 +155,18 @@ REXCVAR_DEFINE_BOOL(gpu_nr_cache, false, "GPU",
                     "draw-record cache against each executed indirect buffer's DRAW_INDX "
                     "packets. Needs nr_record_map; implies gpu_ib_ledger. Off by default.");
 
+// [NR-CMP] N-9-3d: the record store carries the captured state payload
+// (nr_rec_store on the game side writes it at the hook); at execution the
+// join walk accumulates each draw group's in-scope type0 spans and diffs the
+// record's composed payload against the buffer's actual bytes. The city gate
+// for the increment: diverge=0 outside the counted skip/torn classes.
+// Perf-neutral by construction (both paths run; naruto_605 rule).
+REXCVAR_DEFINE_BOOL(gpu_nr_compose, false, "GPU",
+                    "Diagnostic [nr-cmp]: compose each joined draw's state from its "
+                    "stored capture payload and diff against the executed buffer's "
+                    "type0 packets. Needs game-side nr_rec_store; implies "
+                    "gpu_nr_cache. Off by default.");
+
 // [NR-BUF] Increment 2: per-buffer draw-list snapshots (nr_buffer_cache.h).
 // Measures the renderer's actual serving model -- admit a snapshot on a clean
 // join, serve it while the range's dirty-epoch holds, re-admit after patches
@@ -1422,6 +1434,80 @@ constexpr uint32_t kNrcSamples = 4;
 NrcSample g_nrc_samp[kNrcSamples];
 uint32_t g_nrc_samp_n = 0;
 
+// [NR-CMP] N-9-3d compose+diff state. The join walk (below) additionally
+// collects, per draw group, the in-scope type0 spans the buffer actually
+// carries (a span = one type0 packet: register, count, payload offset in the
+// buffer); the join loop then diffs each hit's stored capture payload against
+// them, ordered scan-forward exactly like the record-side CapDiff
+// (naruto-recomp/src/record_map.cpp) so the two instruments agree on what a
+// divergence is. Scope must stay identical to the game-side CapInScope.
+// (The per-packet arrays live below, after kNrbMaxPkts is declared.)
+bool g_nr_compose = false;
+struct CmpSpan {
+  uint32_t reg, cnt;
+  uint32_t off;  // dword index of the payload in the walked buffer
+};
+constexpr uint32_t kCmpMaxSpans = 32768;  // city ~2.8k spans/buffer walk
+CmpSpan g_cmp_spans[kCmpMaxSpans];
+constexpr uint8_t kCmpFlagTainted = 1;  // span scratch overflowed in-group
+constexpr uint8_t kCmpFlagFirst = 2;    // first draw in the buffer (open
+                                        // framing may pollute its group)
+// Window counters. Diff verdicts mirror [nrcap]: run_eq/val_eq vs the
+// diverge classes; the skip classes are everything the diff refused, each
+// with its own name so coverage stays quotable (a gate over an unquoted
+// coverage is vacuous).
+uint64_t g_cmp_groups = 0;      // groups diffed
+uint64_t g_cmp_pred_runs = 0;   // runs composed from records
+uint64_t g_cmp_emit_runs = 0;   // in-scope type0 spans walked in diffed groups
+uint64_t g_cmp_run_eq = 0;      //   reg+count matched in order
+uint64_t g_cmp_val_eq = 0;      //     and payload bytes equal
+uint64_t g_cmp_val_ne = 0;      //     payload differed
+uint64_t g_cmp_pred_only = 0;   // composed, never emitted
+uint64_t g_cmp_emit_only = 0;   // emitted, never composed
+uint64_t g_cmp_no_state = 0;    // hit whose record has no payload (rid 0,
+                                //   parse fallback at record, alloc refusal)
+uint64_t g_cmp_stale = 0;       // payload lapped by the arena ring
+uint64_t g_cmp_torn = 0;        // payload overwritten mid-diff; discarded
+uint64_t g_cmp_skip_prevmiss = 0;  // previous packet missed the join (65535-
+                                   //   split groups register only their last)
+uint64_t g_cmp_skip_ovf = 0;       // group tainted by span-scratch overflow
+uint64_t g_cmp_outside = 0;        // spans before the body floor: between-body
+                                   //   emissions (standalone coher flushes)
+uint64_t g_cmp_first_div = 0;   // diverging groups that were first-in-buffer
+uint64_t g_cmp_div_groups = 0;  // groups with any divergence at all
+// First divergence each window, verbatim.
+struct CmpSample {
+  uint32_t kind;  // 1 pred_only, 2 emit_only, 3 val_ne
+  uint32_t reg, pred_cnt, emit_cnt, buf, pkt;
+};
+CmpSample g_cmp_samp;
+bool g_cmp_samp_armed = false;
+
+// Identical to the game-side CapInScope (record_map.cpp): the type0 windows
+// the capture predicts. Anything else in a group (below-0x2000 progress
+// writes, VGT draw payload regs outside these windows) is out of scope on
+// BOTH sides, so it can never read as a divergence.
+inline bool CmpInScope(uint32_t reg) {
+  return (reg >= 0x4000 && reg < 0x48C0) || reg == 0x5000 ||
+         (reg >= 0x2200 && reg < 0x220C) ||  // [dev+16] & 0xFFF
+         (reg >= 0x2180 && reg < 0x2185) ||  // [dev+16] bits 12-16
+         (reg >= 0x2000 && reg < 0x2010) ||  // [dev+16] bits 42-57 (+0x2007)
+         (reg >= 0x2100 && reg < 0x2115) ||  // [dev+16] bits 21-41 (+0x2102)
+         (reg >= 0x2280 && reg < 0x2295) ||  // [dev+24] bits 34-54
+         (reg >= 0x2300 && reg < 0x2326) ||  // [dev+32] bits 0-37
+         (reg >= 0x2380 && reg < 0x2388) ||  // [dev+32] bits 38-45
+         (reg >= 0x2388 && reg < 0x23A0) ||  // sub_82140100 payload family
+         (reg >= 0x4900 && reg < 0x4928) ||  // bit-56 wholesale bool/loop
+         reg == 0xA31 || reg == 0xA2F;       // 40100 coherency preamble
+}
+
+void CmpSampleSet(uint32_t kind, uint32_t reg, uint32_t pcnt, uint32_t ecnt,
+                  uint32_t buf, uint32_t pkt) {
+  if (g_cmp_samp_armed) return;
+  g_cmp_samp = {kind, reg, pcnt, ecnt, buf, pkt};
+  g_cmp_samp_armed = true;
+}
+
 // [NR-BUF] Increment-2 scoring: how executions would be SERVED by the
 // per-buffer snapshot cache, and whether any serve would be stale (the gate:
 // g_nrb_vne must stay ~0 -- a stale serve means the epoch invalidation rule
@@ -1443,6 +1529,10 @@ uint64_t g_nrb_walk_ovf = 0;      // walks over the packet scratch bound
 // One executed DRAW_INDX as walked, for the join + snapshot layers.
 constexpr uint32_t kNrbMaxPkts = 4096;  // city ~350/buffer; order of magnitude
 nr::PacketRef g_nrb_pkts[kNrbMaxPkts];
+// [NR-CMP] Per collected DRAW_INDX: its group's span range and flags.
+uint32_t g_cmp_pkt_lo[kNrbMaxPkts];
+uint32_t g_cmp_pkt_hi[kNrbMaxPkts];
+uint8_t g_cmp_pkt_flags[kNrbMaxPkts];
 
 // [NR-STATE] Increment-3 window counters: the state census, aggregated over
 // the executions scored this window, plus the per-draw context splits and the
@@ -3876,7 +3966,13 @@ void CommandProcessor::WorkerThreadMain() {
   // (naruto_593: ib 902ms vs skip buf 800ms, fb=0, n==bufs -- nothing ever
   // declined the skip; the gap was this block). The gate is PASS and its
   // consumers are counters only, so it runs when its own cvars ask.
-  const bool kNrCache = REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState;
+  // [NR-CMP] N-9-3d compose+diff rides the join walk, so it implies the
+  // cache probe (both opt-in diagnostics; the default path stays clean --
+  // the naruto_602 lesson about implied probes is about DEFAULT flags).
+  const bool kNrCompose = REXCVAR_GET(gpu_nr_compose);
+  g_nr_compose = kNrCompose;
+  const bool kNrCache =
+      REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState || kNrCompose;
   g_nr_cache = kNrCache;
   const bool kIbLedger = REXCVAR_GET(gpu_ib_ledger) || kNrCache;  // [NR-IBL] record/replay gate
   g_ib_ledger = kIbLedger;
@@ -4510,6 +4606,9 @@ void CommandProcessor::WorkerThreadMain() {
           // bucket: every executed DRAW_INDX found its hook context at its
           // own header address (success bar: city hit >= 95%, arg_eq ~100%).
           // Samples name any systematic difference.
+          // ([NR-CMP] snapshots the stats first: the block below resets them
+          // and the compose report still needs the store counters.)
+          const nr::CacheStats nr_cs_win = nr::GetCacheStats();
           if (g_nr_cache && g_nrc_execs) {
             const uint64_t known = g_nrc_hit - g_nrc_rid0;
             REXGPU_INFO(
@@ -4538,11 +4637,66 @@ void CommandProcessor::WorkerThreadMain() {
                     sm.rec_prim, sm.rec_start, sm.rec_cnt);
               }
             }
+            // [NR-CMP] moved the store stats into its own line below when
+            // compose is on; ResetCacheStats() here clears both either way.
             nr::ResetCacheStats();
             g_nrc_execs = g_nrc_execs_full = 0;
             g_nrc_pkts = g_nrc_hit = g_nrc_miss = 0;
             g_nrc_arg_eq = g_nrc_prim_ne = g_nrc_cnt_ne = g_nrc_rid0 = 0;
             g_nrc_samp_n = 0;
+          }
+          // [NR-CMP] N-9-3d compose+diff verdict. The gate: DIVERGE
+          // (val_ne + pred_only + emit_only) must read 0 at the city outside
+          // the counted skip classes; scored% quotes the coverage the gate
+          // actually ran over ([[swapped-out-gates-vacuous]]). stale= is the
+          // arena ring lapping a record that stopped re-recording; torn= is
+          // the known post-hook re-record window plus mid-diff overwrites.
+          if (g_nr_compose && (g_cmp_groups || g_cmp_no_state || g_cmp_stale ||
+                               g_cmp_torn || g_cmp_skip_prevmiss ||
+                               g_cmp_skip_ovf)) {
+            const uint64_t refused = g_cmp_no_state + g_cmp_stale + g_cmp_torn +
+                                     g_cmp_skip_prevmiss + g_cmp_skip_ovf;
+            const uint64_t offered = g_cmp_groups + refused;
+            REXGPU_INFO(
+                "[nr-cmp] groups={} scored={:.2f}% | runs pred={} emit={} "
+                "run_eq={:.2f}% val_eq={:.2f}% | DIVERGE val_ne={} "
+                "pred_only={} emit_only={} div_groups={} (first_in_buf={})",
+                g_cmp_groups,
+                offered ? 100.0 * double(g_cmp_groups) / double(offered) : 0.0,
+                g_cmp_pred_runs, g_cmp_emit_runs,
+                g_cmp_emit_runs
+                    ? 100.0 * double(g_cmp_run_eq) / double(g_cmp_emit_runs)
+                    : 0.0,
+                g_cmp_emit_runs
+                    ? 100.0 * double(g_cmp_val_eq) / double(g_cmp_emit_runs)
+                    : 0.0,
+                g_cmp_val_ne, g_cmp_pred_only, g_cmp_emit_only,
+                g_cmp_div_groups, g_cmp_first_div);
+            const nr::CacheStats& ss = nr_cs_win;
+            REXGPU_INFO(
+                "[nr-cmp]   skipped: no_state={} stale={} torn={} "
+                "prevmiss={} ovf={} outside_runs={} | store: stored={} "
+                "dwords={} ovf={} wraps={}",
+                g_cmp_no_state, g_cmp_stale, g_cmp_torn, g_cmp_skip_prevmiss,
+                g_cmp_skip_ovf, g_cmp_outside, ss.state_stored,
+                ss.state_dwords, ss.state_ovf, ss.state_wraps);
+            if (g_cmp_samp_armed) {
+              static const char* kCmpKinds[4] = {"?", "pred_only", "emit_only",
+                                                 "val_ne"};
+              REXGPU_INFO(
+                  "[nr-cmp]   first: {} reg={:#06X} pred_cnt={} emit_cnt={} "
+                  "buf={:08X} pkt@{:08X}",
+                  kCmpKinds[g_cmp_samp.kind < 4 ? g_cmp_samp.kind : 0],
+                  g_cmp_samp.reg, g_cmp_samp.pred_cnt, g_cmp_samp.emit_cnt,
+                  g_cmp_samp.buf, g_cmp_samp.pkt);
+              g_cmp_samp_armed = false;
+            }
+            g_cmp_groups = g_cmp_pred_runs = g_cmp_emit_runs = 0;
+            g_cmp_run_eq = g_cmp_val_eq = g_cmp_val_ne = 0;
+            g_cmp_pred_only = g_cmp_emit_only = 0;
+            g_cmp_no_state = g_cmp_stale = g_cmp_torn = 0;
+            g_cmp_skip_prevmiss = g_cmp_skip_ovf = g_cmp_outside = 0;
+            g_cmp_div_groups = g_cmp_first_div = 0;
           }
           // [NR-BUF] The serving verdict. served= is the fraction of
           // executions the renderer replays from a snapshot without
@@ -6118,6 +6272,13 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           // obeys the same predicate + bin rules the executor does: a
           // predicated-out draw never runs and must not be listed.
           nr::CtxBinState join_bin{bin_select_, bin_mask_};
+          // [NR-CMP] Group accumulation: a draw's group is everything since
+          // the previous draw-class packet (0x22 or 0x36, predicated or not
+          // -- the bytes belong to that draw's recording either way). The
+          // recorded payload's own in-group order is the body's emission
+          // order, which the buffer preserves, so ordered matching holds.
+          uint32_t cmp_nspan = 0, cmp_group_lo = 0;
+          bool cmp_tainted = false, cmp_first22 = true;
           for (uint32_t j = 0; j < count;) {
             const uint32_t hdr =
                 __builtin_bswap32(*(const uint32_t*)(raw + j * 4));
@@ -6129,6 +6290,11 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
             if (ty == 3) {
               const uint32_t op = (hdr >> 8) & 0x7F;
               if (nr::CtxPredicatedOut(join_bin, hdr)) {
+                if (g_nr_compose && (op == 0x22 || op == 0x36)) {
+                  // A predicated-out draw still consumed its group's bytes.
+                  cmp_group_lo = cmp_nspan;
+                  cmp_tainted = false;
+                }
                 j += 1 + cnt;
                 continue;
               }
@@ -6147,10 +6313,33 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                 }
                 const uint32_t init = __builtin_bswap32(
                     *(const uint32_t*)(raw + (j + 2) * 4));
+                if (g_nr_compose) {
+                  g_cmp_pkt_lo[npkt] = cmp_group_lo;
+                  g_cmp_pkt_hi[npkt] = cmp_nspan;
+                  g_cmp_pkt_flags[npkt] =
+                      (cmp_tainted ? kCmpFlagTainted : 0) |
+                      (cmp_first22 ? kCmpFlagFirst : 0);
+                  cmp_group_lo = cmp_nspan;
+                  cmp_tainted = false;
+                  cmp_first22 = false;
+                }
                 g_nrb_pkts[npkt++] = {ptr + j * 4, init & 0x3F, init >> 16};
+              } else if (g_nr_compose && op == 0x36) {
+                cmp_group_lo = cmp_nspan;
+                cmp_tainted = false;
               }
               j += 1 + cnt;
             } else if (ty == 0) {
+              if (g_nr_compose) {
+                const uint32_t reg = hdr & 0x7FFF;
+                if (CmpInScope(reg)) {
+                  if (cmp_nspan < kCmpMaxSpans) {
+                    g_cmp_spans[cmp_nspan++] = {reg, cnt, j + 1};
+                  } else {
+                    cmp_tainted = true;
+                  }
+                }
+              }
               j += 1 + cnt;
             } else {
               ++j;
@@ -6216,6 +6405,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
             // Increment 1: the per-packet join rates.
             ++g_nrc_execs;
             bool full = true;
+            bool cmp_prev_missed = false;  // [NR-CMP] split-group guard
             for (uint32_t i = 0; i < npkt; ++i) {
               const nr::PacketRef& pk = g_nrb_pkts[i];
               ++g_nrc_pkts;
@@ -6223,6 +6413,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
               if (!nr::LookupDraw(pk.addr, &rec)) {
                 ++g_nrc_miss;
                 full = false;
+                cmp_prev_missed = true;
                 // The miss-attribution the increment-3 flags enable: is the
                 // unhooked draw a resolve (copy mode), a draw whose mode the
                 // buffer inherits, or a plain geometry miss (torn window)?
@@ -6244,6 +6435,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                 }
               } else {
                 ++g_nrc_hit;
+                bool args_ok = true;
                 // rid 0 (sub_821375A0) draws entirely from device state
                 // and takes no draw arguments; there is nothing to
                 // compare, and counting it as a mismatch would misread
@@ -6259,6 +6451,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                     if (!prim_eq) ++g_nrc_prim_ne;
                     if (!cnt_eq) ++g_nrc_cnt_ne;
                     full = false;
+                    args_ok = false;
                     if (g_nrc_samp_n < kNrcSamples) {
                       g_nrc_samp[g_nrc_samp_n++] = {
                           ptr,     pk.addr,  i,         pk.prim, pk.count,
@@ -6267,6 +6460,151 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                     }
                   }
                 }
+                // [NR-CMP] N-9-3d: compose this draw's state from the stored
+                // capture payload and diff it against the group's actual
+                // in-scope type0 spans, ordered scan-forward exactly like the
+                // record-side CapDiff. Every refusal is a named counter so
+                // the gate's coverage stays quotable.
+                if (g_nr_compose) {
+                  if (!rec.state_gen) {
+                    ++g_cmp_no_state;
+                  } else if (cmp_prev_missed) {
+                    // A 65535-split group registers only its LAST packet; the
+                    // earlier splits miss the join and this group's span range
+                    // holds only the final split's writes.
+                    ++g_cmp_skip_prevmiss;
+                  } else if (g_cmp_pkt_flags[i] & kCmpFlagTainted) {
+                    ++g_cmp_skip_ovf;
+                  } else if (!args_ok) {
+                    // The known torn re-record window (record stored after
+                    // the packet): the args already read mixed, so the
+                    // payload cannot be paired with these bytes either.
+                    ++g_cmp_torn;
+                  } else {
+                    uint32_t ndw = 0;
+                    const uint32_t* body = nr::AcquireState(rec, &ndw);
+                    if (!body) {
+                      ++g_cmp_stale;
+                    } else {
+                      // Parse the body's run table into random-access form
+                      // (the scan-forward match needs to look ahead).
+                      constexpr uint32_t kCmpMaxRuns = 192;
+                      uint32_t r_reg[kCmpMaxRuns], r_cnt[kCmpMaxRuns],
+                          r_off[kCmpMaxRuns];
+                      const uint32_t nruns = body[0];
+                      // body[1] = pre_span: bytes from the recorder body's
+                      // start to the DRAW_INDX header. Spans BELOW that
+                      // floor were emitted between bodies (standalone
+                      // coherency flushes) and belong to no record.
+                      const uint32_t pre_span = ndw >= 2 ? body[1] : 0;
+                      const uint32_t pkt_byte = pk.addr - ptr;
+                      const uint32_t floor_byte =
+                          pkt_byte > pre_span ? pkt_byte - pre_span : 0;
+                      uint32_t nr_parsed = 0, p = 2;
+                      bool malformed = nruns > kCmpMaxRuns;
+                      for (uint32_t k = 0; !malformed && k < nruns; ++k) {
+                        if (p + 2 > ndw || body[p + 1] == 0 ||
+                            p + 2 + body[p + 1] > ndw) {
+                          malformed = true;
+                          break;
+                        }
+                        r_reg[k] = body[p];
+                        r_cnt[k] = body[p + 1];
+                        r_off[k] = p + 2;
+                        p += 2 + body[p + 1];
+                        ++nr_parsed;
+                      }
+                      if (malformed || p != ndw) {
+                        // A well-formed header over an inconsistent body can
+                        // only be a mid-overwrite read: torn, discard.
+                        ++g_cmp_torn;
+                      } else {
+                        uint64_t l_run_eq = 0, l_val_eq = 0, l_val_ne = 0,
+                                 l_pred_only = 0, l_emit_only = 0;
+                        CmpSample l_samp = {};
+                        bool l_samp_set = false;
+                        auto note = [&](uint32_t kind, uint32_t reg,
+                                        uint32_t pcnt, uint32_t ecnt) {
+                          if (l_samp_set) return;
+                          l_samp = {kind, reg, pcnt, ecnt, ptr, pk.addr};
+                          l_samp_set = true;
+                        };
+                        const uint32_t lo = g_cmp_pkt_lo[i];
+                        const uint32_t hi = g_cmp_pkt_hi[i];
+                        uint32_t pi = 0;
+                        uint32_t l_outside = 0;
+                        for (uint32_t s = lo; s < hi; ++s) {
+                          const CmpSpan& sp = g_cmp_spans[s];
+                          if ((sp.off - 1) * 4 < floor_byte) {
+                            // The span's packet HEADER (off-1) sits before
+                            // the body start: a between-body emission, not
+                            // this record's.
+                            ++l_outside;
+                            continue;
+                          }
+                          uint32_t look = pi;
+                          while (look < nr_parsed &&
+                                 !(r_reg[look] == sp.reg &&
+                                   r_cnt[look] == sp.cnt)) {
+                            ++look;
+                          }
+                          if (look < nr_parsed) {
+                            for (; pi < look; ++pi) {
+                              ++l_pred_only;
+                              note(1, r_reg[pi], r_cnt[pi], 0);
+                            }
+                            ++l_run_eq;
+                            if (__builtin_memcmp(
+                                    raw + sp.off * 4,
+                                    (const uint8_t*)(body + r_off[pi]),
+                                    (size_t)sp.cnt * 4) == 0) {
+                              ++l_val_eq;
+                            } else {
+                              ++l_val_ne;
+                              note(3, sp.reg, r_cnt[pi], sp.cnt);
+                            }
+                            ++pi;
+                          } else {
+                            ++l_emit_only;
+                            note(2, sp.reg, 0, sp.cnt);
+                          }
+                        }
+                        for (; pi < nr_parsed; ++pi) {
+                          ++l_pred_only;
+                          note(1, r_reg[pi], r_cnt[pi], 0);
+                        }
+                        // Commit only if the payload survived the diff
+                        // un-overwritten; otherwise everything above was
+                        // read against recycled arena bytes.
+                        if (!nr::VerifyState(rec)) {
+                          ++g_cmp_torn;
+                        } else {
+                          ++g_cmp_groups;
+                          g_cmp_pred_runs += nr_parsed;
+                          g_cmp_emit_runs += (hi - lo) - l_outside;
+                          g_cmp_outside += l_outside;
+                          g_cmp_run_eq += l_run_eq;
+                          g_cmp_val_eq += l_val_eq;
+                          g_cmp_val_ne += l_val_ne;
+                          g_cmp_pred_only += l_pred_only;
+                          g_cmp_emit_only += l_emit_only;
+                          if (l_val_ne | l_pred_only | l_emit_only) {
+                            ++g_cmp_div_groups;
+                            if (g_cmp_pkt_flags[i] & kCmpFlagFirst) {
+                              ++g_cmp_first_div;
+                            }
+                            if (l_samp_set) {
+                              CmpSampleSet(l_samp.kind, l_samp.reg,
+                                           l_samp.pred_cnt, l_samp.emit_cnt,
+                                           l_samp.buf, l_samp.pkt);
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                cmp_prev_missed = false;
               }
             }
             if (full) ++g_nrc_execs_full;
