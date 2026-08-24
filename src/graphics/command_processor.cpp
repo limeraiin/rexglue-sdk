@@ -183,6 +183,26 @@ REXCVAR_DEFINE_BOOL(gpu_nr_rec_apply, false, "GPU",
                     "shape match, fallback counted). Needs game-side "
                     "nr_rec_store. Reports [nr-4a]. Off by default.");
 
+// [NR-4B] N-9-4b: price the value-verify. The verify (memcmp of composed
+// bytes vs the deferred packet payloads) is the ONLY remaining read of the
+// covered payload on composed groups; N-9-5 deletes it together with the
+// packets. This cvar makes that deletion priceable NOW, in place:
+//   1  = verify every composed group (the shipping 4a behavior; default)
+//   N  = verify 1-in-N composed groups (the rest apply unverified)
+//   0  = never verify
+//  -1  = CYCLE: 10 s full-verify / 10 s verify-off, phase logged, so one
+//        city drive pairs the honest fps/us-per-draw delta at matched dpf
+//        ([[price-stages-in-place]]).
+// ⚠ MEASUREMENT MODE ONLY away from 1: an unverified composed group can
+// apply a one-generation-behind record (the naruto_663 post-hook torn
+// window, ~0.2/s at city) and flash for one draw until the next re-record.
+// Counters stay honest either way: ver/unver split, fb_val among verified.
+REXCVAR_DEFINE_INT32(gpu_nr_rec_verify, 1, "GPU",
+                     "N-9-4b: 4a value-verify rate. 1 = every composed group "
+                     "(default), N = 1-in-N sampled, 0 = off, -1 = 10 s "
+                     "on/off in-place cycle for pricing. Values != 1 are "
+                     "measurement-only (torn records may flash).");
+
 // [NR-BUF] Increment 2: per-buffer draw-list snapshots (nr_buffer_cache.h).
 // Measures the renderer's actual serving model -- admit a snapshot on a clean
 // join, serve it while the range's dirty-epoch holds, re-admit after patches
@@ -2165,6 +2185,16 @@ uint32_t g_4a_shape_samp[8] = {};
 // Full lists for that first mismatch (up to 8 each): reg,cnt pairs.
 uint32_t g_4a_shape_rec[16] = {};
 uint32_t g_4a_shape_def[16] = {};
+// [NR-4B] by-ref witness for the shape_ne open question: the from_memory
+// (0x2F-class) const-window ranges the CURRENT group applied before its
+// stop. If the record's "missing" inline runs show up here, the executed
+// group carries the files BY-REF while the record predicts them inline
+// (the full-invalidation class); if this is empty at a shape_ne, the
+// executed group and the record disagree for another reason entirely.
+uint32_t g_4a_byref_n = 0;          // ranges this group
+uint32_t g_4a_byref_rng[8] = {};    // first 4 {base,n}
+uint32_t g_4a_shape_byref[9] = {};  // sampled at the first shape_ne: n + 4 pairs
+uint32_t g_4a_shape_span[3] = {};   // {rec pre_span, stop addr, def0 phys}
 // [NR-4A] leak detector: per-dword virtual applies landing in the constant
 // windows while a 4a group is pending -- the walker took the per-dword path
 // for a packet the defer branch never saw (names the shape_ne mechanism).
@@ -2176,6 +2206,14 @@ uint64_t g_4a_byref_conflict = 0;
 // [NR-4A] value-verify: shape matched but composed bytes differed from the
 // packet bytes (the one-generation-behind torn window); fallback taken.
 uint64_t g_4a_fb_val = 0;
+// [NR-4B] verify pricing (see the gpu_nr_rec_verify cvar). g_nr4b_verify_n
+// is the LIVE rate (the cycler rewrites it); g_nr4b_cycle arms the 10 s
+// phase walk in the worker loop. ver/unver split the composed groups by
+// whether their memcmp ran; fb_val can only fire among ver.
+int32_t g_nr4b_verify_n = 1;
+bool g_nr4b_cycle = false;
+uint32_t g_nr4b_vctr = 0;  // sampling counter (composed groups)
+uint64_t g_4a_ver = 0, g_4a_unver = 0;
 void Nr4aFlush(CommandProcessor* cp);
 
 // The deferable predicate: full fit inside ONE of the three pure constant
@@ -3539,7 +3577,18 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
     }
     g_nr4a_group_ovf = true;
     ++g_4a_ovf_ranges;
-  } else if (g_nr4a_bufactive && from_memory && g_nr4a_ndef) {
+  } else if (g_nr4a_bufactive && from_memory) {
+    // [NR-4B] witness every by-ref const-window range of the group (the
+    // shape_ne sample prints them; reset at every stop/flush).
+    if (g_4a_byref_n < 4) {
+      g_4a_byref_rng[g_4a_byref_n * 2] = base;
+      g_4a_byref_rng[g_4a_byref_n * 2 + 1] = n;
+    }
+    ++g_4a_byref_n;
+    if (!g_nr4a_ndef) {
+      return static_cast<CommandProcessor*>(user)->NrSkipApplyRegRange(
+          base, values_be, n, phys, from_memory);
+    }
     // [NR-4A] a by-ref load about to apply while inline ranges are pending.
     // At city ~130/s of these OVERLAP a pending range with the by-ref
     // POSITIONED AFTER it (naruto_663: reg 0x43F0x16 per-draw constants) --
@@ -3659,6 +3708,19 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
         g_4a_shape_def[s * 2] = s < g_nr4a_ndef ? g_nr4a_def[s].base : 0;
         g_4a_shape_def[s * 2 + 1] = s < g_nr4a_ndef ? g_nr4a_def[s].n : 0;
       }
+      // [NR-4B] what the group applied BY-REF before this stop.
+      g_4a_shape_byref[0] = g_4a_byref_n;
+      for (uint32_t s = 0; s < 8; ++s) {
+        g_4a_shape_byref[1 + s] = s < 8 ? g_4a_byref_rng[s] : 0;
+      }
+      // [NR-4B] segment-split witness: the record's own body extent
+      // (pre_span, bytes from body start to the 0x22) vs where this stop
+      // and the first deferred payload actually sit. A pre_span far larger
+      // than (stop - def0_phys) means the body began in a PREVIOUS ring
+      // segment and this group is only its tail.
+      g_4a_shape_span[0] = g_nr4a_scratch[1];  // record pre_span
+      g_4a_shape_span[1] = pkt_addr;
+      g_4a_shape_span[2] = g_nr4a_ndef ? g_nr4a_def[0].phys : 0;
     }
   };
   if (nf != g_nr4a_ndef) {
@@ -3676,13 +3738,27 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
   // and applying it would put PREVIOUS-recording constants on this draw.
   // With this check 4a is incapable of diverging from packet execution;
   // N-9-5 removes the check together with the packets.
-  for (uint32_t i = 0; i < nf; ++i) {
-    if (!g_nr4a_def[i].be ||
-        __builtin_memcmp(g_nr4a_scratch + f_off[i], g_nr4a_def[i].be,
-                         size_t(f_cnt[i]) * 4) != 0) {
-      ++g_4a_fb_val;
-      return false;
+  // [NR-4B] the check is rate-gated so its removal can be priced in place
+  // (gpu_nr_rec_verify); an unverified group skips the ONLY payload read.
+  bool verify = true;
+  const int32_t vn = g_nr4b_verify_n;
+  if (vn == 0) {
+    verify = false;
+  } else if (vn > 1) {
+    verify = (g_nr4b_vctr++ % uint32_t(vn)) == 0;
+  }
+  if (verify) {
+    ++g_4a_ver;
+    for (uint32_t i = 0; i < nf; ++i) {
+      if (!g_nr4a_def[i].be ||
+          __builtin_memcmp(g_nr4a_scratch + f_off[i], g_nr4a_def[i].be,
+                           size_t(f_cnt[i]) * 4) != 0) {
+        ++g_4a_fb_val;
+        return false;
+      }
     }
+  } else {
+    ++g_4a_unver;
   }
   for (uint32_t i = 0; i < nf; ++i) {
     cp->NrSkipApplyRegRange(f_reg[i], g_nr4a_scratch + f_off[i], f_cnt[i], 0,
@@ -4249,6 +4325,19 @@ void CommandProcessor::WorkerThreadMain() {
         "[nr-4a] ON: draw-stop constant apply from stored records "
         "(shape-matched, fallback counted; needs game-side nr_rec_store)");
   }
+  // [NR-4B] verify-rate latch. -1 arms the 10 s cycler (starts FULL so the
+  // first phase is the baseline); any other value is the fixed live rate.
+  {
+    const int32_t v = REXCVAR_GET(gpu_nr_rec_verify);
+    g_nr4b_cycle = g_nr4a_on && v == -1;
+    g_nr4b_verify_n = v < 0 ? 1 : v;
+    if (g_nr4a_on && v != 1) {
+      REXGPU_INFO(
+          "[nr-4b] verify pricing armed: {} (MEASUREMENT MODE - torn "
+          "records may flash while verify is off/sampled)",
+          g_nr4b_cycle ? "10s FULL / 10s OFF cycle" : "fixed rate");
+    }
+  }
   const bool kNrCache =
       REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState || kNrCompose;
   g_nr_cache = kNrCache;
@@ -4376,6 +4465,23 @@ void CommandProcessor::WorkerThreadMain() {
                     phase == 0   ? "OFF, pixels correct"
                     : phase == 1 ? "repeat-band DRAWS skipped"
                                  : "repeat-band BUFFERS skipped");
+      }
+    }
+
+    // [NR-4B] verify-price cycle: 10 s FULL verify / 10 s verify OFF, in
+    // place, phases logged so the log pairs fps/us-per-draw at matched dpf.
+    if (g_nr4b_cycle) {
+      static auto nr4b_t0 = prof_clock::now();
+      const int phase =
+          int((std::chrono::duration_cast<std::chrono::seconds>(
+                   prof_clock::now() - nr4b_t0)
+                   .count() /
+               10) %
+              2);
+      const int32_t want = phase == 0 ? 1 : 0;
+      if (want != g_nr4b_verify_n) {
+        g_nr4b_verify_n = want;
+        REXGPU_INFO("[nr-4b] verify -> {}", want ? "FULL" : "OFF");
       }
     }
 
@@ -5348,6 +5454,16 @@ void CommandProcessor::WorkerThreadMain() {
               "val={} ovf={} | byref_conflict_flush={}",
               g_4a_fb_miss, g_4a_fb_nostate, g_4a_fb_stale, g_4a_fb_torn,
               g_4a_fb_shape, g_4a_fb_val, g_4a_fb_ovf, g_4a_byref_conflict);
+          // [NR-4B] only printed when the verify is rate-gated (ver+unver
+          // == composed + val fallbacks; unver groups applied unread).
+          if (g_4a_unver || g_nr4b_verify_n != 1) {
+            REXGPU_INFO(
+                "[nr-4b]   verify={} ver={} unver={} (phase {})",
+                g_nr4b_verify_n, g_4a_ver, g_4a_unver,
+                g_nr4b_verify_n == 1 ? "FULL"
+                : g_nr4b_verify_n == 0 ? "OFF"
+                                       : "SAMPLED");
+          }
           if (g_4a_shape_samp[0]) {
             REXGPU_INFO(
                 "[nr-4a]   first shape_ne: rec_runs={} deferred={} at[{}] "
@@ -5373,6 +5489,20 @@ void CommandProcessor::WorkerThreadMain() {
                 g_4a_shape_def[9], g_4a_shape_def[10], g_4a_shape_def[11],
                 g_4a_shape_def[12], g_4a_shape_def[13], g_4a_shape_def[14],
                 g_4a_shape_def[15]);
+            REXGPU_INFO(
+                "[nr-4b]   byref in that group: n={} {:04X}x{} {:04X}x{} "
+                "{:04X}x{} {:04X}x{}",
+                g_4a_shape_byref[0], g_4a_shape_byref[1], g_4a_shape_byref[2],
+                g_4a_shape_byref[3], g_4a_shape_byref[4], g_4a_shape_byref[5],
+                g_4a_shape_byref[6], g_4a_shape_byref[7],
+                g_4a_shape_byref[8]);
+            REXGPU_INFO(
+                "[nr-4b]   span: rec pre_span={} stop={:08X} def0_phys={:08X} "
+                "(stop-def0={})",
+                g_4a_shape_span[0], g_4a_shape_span[1], g_4a_shape_span[2],
+                g_4a_shape_span[2]
+                    ? int64_t(g_4a_shape_span[1]) - int64_t(g_4a_shape_span[2])
+                    : 0);
             g_4a_shape_samp[0] = 0;
           }
           g_4a_pdw_const = 0;
@@ -5383,6 +5513,7 @@ void CommandProcessor::WorkerThreadMain() {
           g_4a_fb_torn = g_4a_fb_shape = g_4a_fb_ovf = 0;
           g_4a_fb_val = g_4a_byref_conflict = 0;
           g_4a_def_ranges = g_4a_ovf_ranges = 0;
+          g_4a_ver = g_4a_unver = 0;
         }
         // [NR-SDB] The corpus verdict. Per-load hit% says how often a bind
         // resolves against the database; the DISTINCT line is the one the
@@ -7339,6 +7470,9 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
         Nr4aFlush(this);
       }
     }
+    // [NR-4B] every stop ends a group: the by-ref witness resets even when
+    // nothing was deferred (a pure by-ref group has ndef == 0).
+    g_4a_byref_n = 0;
     if (!stop.delegate) {
       // [NR-DETILE] N-5. OBSERVE FIRST, THEN DECIDE: the band pattern is
       // re-learned every frame from the packets themselves, including the ones
@@ -7701,6 +7835,7 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     Nr4aFlush(this);
   }
   g_nr4a_bufactive = false;
+  g_4a_byref_n = 0;
   bin_select_ = g_ctx_walker.bin.select;
   bin_mask_ = g_ctx_walker.bin.mask;
   if (spp) {
