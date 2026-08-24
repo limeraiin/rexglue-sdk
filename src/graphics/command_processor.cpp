@@ -167,6 +167,22 @@ REXCVAR_DEFINE_BOOL(gpu_nr_compose, false, "GPU",
                     "type0 packets. Needs game-side nr_rec_store; implies "
                     "gpu_nr_cache. Off by default.");
 
+// [NR-4A] N-9-4a: apply constants FROM THE RECORD at the draw stop. The
+// walker defers each group's inline constant-window ranges (ALU/fetch/
+// bool-loop -- the classes with no in-group ordering coupling: coher trio,
+// state, watched and below-0x2000 registers stay immediate, by-ref loads
+// are immediate and measured disjoint) and, at the draw stop, applies the
+// record's composed runs instead when the record is valid AND its run shape
+// exactly matches the deferred list; any disagreement falls back to the
+// deferred packet ranges, counted by reason. This is the N-9-5 execution
+// shape (records supply the values, packets only verify) proven live while
+// the packets still exist. Correctness-gated (naruto_605 rule), not fps.
+REXCVAR_DEFINE_BOOL(gpu_nr_rec_apply, false, "GPU",
+                    "N-9-4a: apply each draw's constant state from its stored "
+                    "record at the draw stop (packet ranges deferred, exact "
+                    "shape match, fallback counted). Needs game-side "
+                    "nr_rec_store. Reports [nr-4a]. Off by default.");
+
 // [NR-BUF] Increment 2: per-buffer draw-list snapshots (nr_buffer_cache.h).
 // Measures the renderer's actual serving model -- admit a snapshot on a clean
 // join, serve it while the range's dirty-epoch holds, re-admit after patches
@@ -2115,6 +2131,66 @@ uint64_t g_tile_bufs_skipped = 0, g_tile_bufs_kept = 0;
 // advancing the walk (which already sits past this draw).
 bool g_nr_skip_draw_pending = false;
 nr::CtxDrawStop g_nr_skip_stop = {};
+
+// [NR-4A] N-9-4a state (CP thread only; see the gpu_nr_rec_apply cvar).
+// The defer list holds one GROUP's inline constant-window ranges (resolved
+// at every stop, so it never spans a group); pointers reference the walked
+// buffer's bytes, stable for the duration of the execution.
+bool g_nr4a_on = false;         // latched cvar
+bool g_nr4a_bufactive = false;  // this buffer defers (per-buffer mode gate)
+struct Nr4aDef {
+  uint32_t base, n, phys;
+  const uint32_t* be;
+};
+constexpr uint32_t kNr4aMaxDef = 256;  // a group carries ~12 constant ranges
+Nr4aDef g_nr4a_def[kNr4aMaxDef];
+uint32_t g_nr4a_ndef = 0;
+bool g_nr4a_group_ovf = false;  // defer list overflowed: group must fall back
+uint32_t g_nr4a_scratch[4099];  // record body copy (validated before apply)
+// [nr-4a] window counters.
+uint64_t g_4a_composed = 0;     // draw stops whose constants applied FROM THE RECORD
+uint64_t g_4a_comp_runs = 0, g_4a_comp_dw = 0;
+uint64_t g_4a_flush_draw = 0;   // draw stops that fell back to packet ranges
+uint64_t g_4a_flush_d2 = 0;     // 0x36 stops (never recorded; packet ranges)
+uint64_t g_4a_flush_deleg = 0;  // delegate stops with pending ranges
+uint64_t g_4a_flush_end = 0;    // end-of-buffer trailing ranges
+uint64_t g_4a_fb_miss = 0, g_4a_fb_nostate = 0, g_4a_fb_stale = 0,
+         g_4a_fb_torn = 0, g_4a_fb_shape = 0, g_4a_fb_ovf = 0;
+uint64_t g_4a_def_ranges = 0;   // ranges deferred
+uint64_t g_4a_ovf_ranges = 0;   // ranges applied immediately on list overflow
+// First shape mismatch each window: [0]=armed, [1]=record const runs (nf),
+// [2]=deferred ranges (ndef), [3]=first mismatched index, [4]/[5]=record
+// reg/cnt there, [6]/[7]=deferred base/n there (0xFFFFFFFF = past the end).
+uint32_t g_4a_shape_samp[8] = {};
+// Full lists for that first mismatch (up to 8 each): reg,cnt pairs.
+uint32_t g_4a_shape_rec[16] = {};
+uint32_t g_4a_shape_def[16] = {};
+// [NR-4A] leak detector: per-dword virtual applies landing in the constant
+// windows while a 4a group is pending -- the walker took the per-dword path
+// for a packet the defer branch never saw (names the shape_ne mechanism).
+uint64_t g_4a_pdw_const = 0;
+// [NR-4A] by-ref order guard: a from_memory range overlapped a pending
+// deferred range and forced an early flush (stream order restored; the
+// group then falls back at the stop). The naruto_663 flashing class.
+uint64_t g_4a_byref_conflict = 0;
+// [NR-4A] value-verify: shape matched but composed bytes differed from the
+// packet bytes (the one-generation-behind torn window); fallback taken.
+uint64_t g_4a_fb_val = 0;
+void Nr4aFlush(CommandProcessor* cp);
+
+// The deferable predicate: full fit inside ONE of the three pure constant
+// windows -- exactly NrWalkRegRange's bulk-window test, and exactly the
+// record-run filter in Nr4aTryCompose. One predicate on both sides means
+// the shape match can never see a gap or a duplicate.
+inline bool Nr4aConstWindow(uint32_t base, uint32_t n) {
+  const uint32_t end = base + n - 1;
+  return (base >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+          end <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+         (base >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+          end <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+         (base >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+          end <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+}
 // Window counters for the [nr-skp] 1Hz line.
 uint64_t g_skp_bufs = 0;         // skip-driven depth-1 buffer executions
 uint64_t g_skp_fb = 0;           // cvar on but buffer refused (trace/backend)
@@ -3386,6 +3462,20 @@ void NrWalkRegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) 
   // fired on top (WriteRegister's own tail already ran).
   if (g_nr_skip_bufactive && user) {
     ++g_skp_pdw;
+    // [NR-4A] leak detector: a constant-window dword arriving per-dword
+    // while a group is pending never reached the defer branch (measured 0;
+    // if it ever fires, flush so ordering can never silently invert).
+    if (g_nr4a_bufactive && g_nr4a_ndef && Nr4aConstWindow(reg, 1)) {
+      if (!from_memory) ++g_4a_pdw_const;
+      for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
+        const Nr4aDef& d = g_nr4a_def[i];
+        if (reg >= d.base && reg < d.base + d.n) {
+          ++g_4a_byref_conflict;
+          Nr4aFlush(static_cast<CommandProcessor*>(user));
+          break;
+        }
+      }
+    }
     N8Classify(reg, 1, true);
     // [NR-RUSE] the one-reg by-ref fallback must feed the digest too, or a
     // patched single-dword LOAD_ALU would classify as reusable; every
@@ -3424,12 +3514,7 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
                     uint32_t n, uint32_t phys, bool from_memory) {
   if (!g_nr_skip_bufactive || !user || !n) return false;
   const uint32_t end = base + n - 1;
-  if (!((base >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
-         end <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
-        (base >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
-         end <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
-        (base >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
-         end <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
+  if (!Nr4aConstWindow(base, n)) {
     // [NR-PB] N-2-2 item 0: a range of PLAIN registers -- inside the register
     // file, at or above 0x2000 (every stateful port is below), and wholly
     // outside the constant windows (a range that INTERSECTS one would need
@@ -3444,9 +3529,170 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
            base > XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
       return false;
     }
+  } else if (g_nr4a_bufactive && !from_memory) {
+    // [NR-4A] an inline constant-window range: defer to the group's stop,
+    // where the record's composed runs replace it (or it flushes verbatim).
+    if (g_nr4a_ndef < kNr4aMaxDef) {
+      g_nr4a_def[g_nr4a_ndef++] = {base, n, phys, values_be};
+      ++g_4a_def_ranges;
+      return true;
+    }
+    g_nr4a_group_ovf = true;
+    ++g_4a_ovf_ranges;
+  } else if (g_nr4a_bufactive && from_memory && g_nr4a_ndef) {
+    // [NR-4A] a by-ref load about to apply while inline ranges are pending.
+    // At city ~130/s of these OVERLAP a pending range with the by-ref
+    // POSITIONED AFTER it (naruto_663: reg 0x43F0x16 per-draw constants) --
+    // stream order says the by-ref wins, so deferring the inline past it
+    // (or re-applying composed values at the stop) overwrites the by-ref's
+    // FRESH guest-memory values with the record-time snapshot. That was the
+    // naruto_663 flashing-black-squares regression. Restore stream order
+    // exactly: flush the pending inline ranges BEFORE the by-ref applies;
+    // the truncated defer list then shape-mismatches at the stop and the
+    // group falls back to packets, which is always correct.
+    for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
+      const Nr4aDef& d = g_nr4a_def[i];
+      if (base < d.base + d.n && d.base < base + n) {
+        ++g_4a_byref_conflict;
+        Nr4aFlush(static_cast<CommandProcessor*>(user));
+        break;
+      }
+    }
   }
   return static_cast<CommandProcessor*>(user)->NrSkipApplyRegRange(
       base, values_be, n, phys, from_memory);
+}
+
+// [NR-4A] Apply the deferred packet ranges in decode order (the fallback and
+// the non-draw resolution). Identical to the walk having applied them at
+// decode time, just later within the same group -- order-safe because the
+// deferable classes have no in-group coupling (see the cvar comment).
+void Nr4aFlush(CommandProcessor* cp) {
+  for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
+    const Nr4aDef& d = g_nr4a_def[i];
+    cp->NrSkipApplyRegRange(d.base, d.be, d.n, d.phys, false);
+  }
+  g_nr4a_ndef = 0;
+  g_nr4a_group_ovf = false;
+}
+
+// [NR-4A] The compose attempt at a draw stop. Succeeds ONLY when the record
+// is present, carries a payload, survives the arena validity round trip, and
+// its constant-window run shape matches the deferred list EXACTLY (same
+// ranges, same order) -- then the record's values are applied through the
+// same bulk path the packets would have taken, and the packets' payload is
+// never read. Any disagreement is a counted fallback; correctness never
+// depends on the record being right. Known window: a record one re-record
+// behind its packets (the measured 0.27% post-hook torn class) can pass the
+// shape match and apply the PREVIOUS recording's values for one execution;
+// the next record write heals it.
+bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
+  if (g_nr4a_group_ovf) {
+    ++g_4a_fb_ovf;
+    return false;
+  }
+  nr::DrawRecord rec;
+  if (!nr::LookupDraw(pkt_addr, &rec)) {
+    ++g_4a_fb_miss;
+    return false;
+  }
+  if (!rec.state_gen) {
+    ++g_4a_fb_nostate;
+    return false;
+  }
+  uint32_t ndw = 0;
+  const uint32_t* body = nr::AcquireState(rec, &ndw);
+  if (!body) {
+    ++g_4a_fb_stale;
+    return false;
+  }
+  std::memcpy(g_nr4a_scratch, body, size_t(ndw) * 4);
+  if (!nr::VerifyState(rec)) {
+    ++g_4a_fb_torn;
+    return false;
+  }
+  const uint32_t nruns = g_nr4a_scratch[0];
+  uint32_t f_reg[kNr4aMaxDef], f_cnt[kNr4aMaxDef], f_off[kNr4aMaxDef];
+  uint32_t nf = 0, p = 2;
+  for (uint32_t k = 0; k < nruns; ++k) {
+    if (p + 2 > ndw) {
+      ++g_4a_fb_torn;
+      return false;
+    }
+    const uint32_t reg = g_nr4a_scratch[p];
+    const uint32_t cnt = g_nr4a_scratch[p + 1];
+    if (!cnt || p + 2 + cnt > ndw) {
+      ++g_4a_fb_torn;
+      return false;
+    }
+    if (Nr4aConstWindow(reg, cnt)) {
+      if (nf >= kNr4aMaxDef) {
+        ++g_4a_fb_shape;
+        return false;
+      }
+      f_reg[nf] = reg;
+      f_cnt[nf] = cnt;
+      f_off[nf] = p + 2;
+      ++nf;
+    }
+    p += 2 + cnt;
+  }
+  if (p != ndw) {
+    ++g_4a_fb_torn;
+    return false;
+  }
+  const auto shape_fail = [&](uint32_t idx) {
+    ++g_4a_fb_shape;
+    if (!g_4a_shape_samp[0]) {
+      g_4a_shape_samp[0] = 1;
+      g_4a_shape_samp[1] = nf;
+      g_4a_shape_samp[2] = g_nr4a_ndef;
+      g_4a_shape_samp[3] = idx;
+      g_4a_shape_samp[4] = idx < nf ? f_reg[idx] : 0xFFFFFFFFu;
+      g_4a_shape_samp[5] = idx < nf ? f_cnt[idx] : 0xFFFFFFFFu;
+      g_4a_shape_samp[6] =
+          idx < g_nr4a_ndef ? g_nr4a_def[idx].base : 0xFFFFFFFFu;
+      g_4a_shape_samp[7] = idx < g_nr4a_ndef ? g_nr4a_def[idx].n : 0xFFFFFFFFu;
+      for (uint32_t s = 0; s < 8; ++s) {
+        g_4a_shape_rec[s * 2] = s < nf ? f_reg[s] : 0;
+        g_4a_shape_rec[s * 2 + 1] = s < nf ? f_cnt[s] : 0;
+        g_4a_shape_def[s * 2] = s < g_nr4a_ndef ? g_nr4a_def[s].base : 0;
+        g_4a_shape_def[s * 2 + 1] = s < g_nr4a_ndef ? g_nr4a_def[s].n : 0;
+      }
+    }
+  };
+  if (nf != g_nr4a_ndef) {
+    shape_fail(nf < g_nr4a_ndef ? nf : g_nr4a_ndef);
+    return false;
+  }
+  for (uint32_t i = 0; i < nf; ++i) {
+    if (f_reg[i] != g_nr4a_def[i].base || f_cnt[i] != g_nr4a_def[i].n) {
+      shape_fail(i);
+      return false;
+    }
+  }
+  // Value-verify: the composed bytes must equal the packet bytes, or the
+  // record is one re-record behind its packets (the post-hook torn window)
+  // and applying it would put PREVIOUS-recording constants on this draw.
+  // With this check 4a is incapable of diverging from packet execution;
+  // N-9-5 removes the check together with the packets.
+  for (uint32_t i = 0; i < nf; ++i) {
+    if (!g_nr4a_def[i].be ||
+        __builtin_memcmp(g_nr4a_scratch + f_off[i], g_nr4a_def[i].be,
+                         size_t(f_cnt[i]) * 4) != 0) {
+      ++g_4a_fb_val;
+      return false;
+    }
+  }
+  for (uint32_t i = 0; i < nf; ++i) {
+    cp->NrSkipApplyRegRange(f_reg[i], g_nr4a_scratch + f_off[i], f_cnt[i], 0,
+                            false);
+    g_4a_comp_dw += f_cnt[i];
+  }
+  g_4a_comp_runs += nf;
+  ++g_4a_composed;
+  g_nr4a_ndef = 0;
+  return true;
 }
 
 // [NR-TILE] N-4 probe mode 2: apply only the SYSTEM/SYNC half of a repeat
@@ -3994,6 +4240,15 @@ void CommandProcessor::WorkerThreadMain() {
   // the naruto_602 lesson about implied probes is about DEFAULT flags).
   const bool kNrCompose = REXCVAR_GET(gpu_nr_compose);
   g_nr_compose = kNrCompose;
+  // [NR-4A] independent of the diagnostic join walk: it joins via LookupDraw
+  // at the stop itself. Needs the game-side nr_rec_store hook feeding the
+  // record store; without it every draw counts a no_state/miss fallback.
+  g_nr4a_on = REXCVAR_GET(gpu_nr_rec_apply);
+  if (g_nr4a_on) {
+    REXGPU_INFO(
+        "[nr-4a] ON: draw-stop constant apply from stored records "
+        "(shape-matched, fallback counted; needs game-side nr_rec_store)");
+  }
   const bool kNrCache =
       REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState || kNrCompose;
   g_nr_cache = kNrCache;
@@ -5069,6 +5324,65 @@ void CommandProcessor::WorkerThreadMain() {
           for (uint32_t i = 0; i < kIbLedgerSize; ++i) g_ib_ledger_tab[i] = IbLedgerEntry{};
           g_ib_ledger_used = 0;
           g_ib_ledger_evictions = 0;
+        }
+        // [NR-4A] N-9-4a verdict (outside the ledger gate: 4a runs with no
+        // other probe on). composed= draws whose constants applied FROM THE
+        // RECORD; every fallback names its reason. The gate: composed ~= 0x22
+        // stops, fb classes at the known residual rates (miss ~0.2%, torn
+        // ~0.3% city), shape ~0, and the frame visually identical.
+        if (g_nr4a_on &&
+            (g_4a_composed || g_4a_flush_draw || g_4a_flush_d2 ||
+             g_4a_flush_deleg || g_4a_flush_end || g_4a_def_ranges)) {
+          const uint64_t stops = g_4a_composed + g_4a_flush_draw;
+          REXGPU_INFO(
+              "[nr-4a] composed={} ({:.2f}% of 0x22 stops, {} runs {} dw) | "
+              "flush: draw_fb={} d2={} deleg={} end={} | deferred={} "
+              "ovf_ranges={}",
+              g_4a_composed,
+              stops ? 100.0 * double(g_4a_composed) / double(stops) : 0.0,
+              g_4a_comp_runs, g_4a_comp_dw, g_4a_flush_draw, g_4a_flush_d2,
+              g_4a_flush_deleg, g_4a_flush_end, g_4a_def_ranges,
+              g_4a_ovf_ranges);
+          REXGPU_INFO(
+              "[nr-4a]   fb: miss={} no_state={} stale={} torn={} shape={} "
+              "val={} ovf={} | byref_conflict_flush={}",
+              g_4a_fb_miss, g_4a_fb_nostate, g_4a_fb_stale, g_4a_fb_torn,
+              g_4a_fb_shape, g_4a_fb_val, g_4a_fb_ovf, g_4a_byref_conflict);
+          if (g_4a_shape_samp[0]) {
+            REXGPU_INFO(
+                "[nr-4a]   first shape_ne: rec_runs={} deferred={} at[{}] "
+                "rec={:#06X}x{} def={:#06X}x{} | pdw_const={}",
+                g_4a_shape_samp[1], g_4a_shape_samp[2], g_4a_shape_samp[3],
+                g_4a_shape_samp[4], g_4a_shape_samp[5], g_4a_shape_samp[6],
+                g_4a_shape_samp[7], g_4a_pdw_const);
+            REXGPU_INFO(
+                "[nr-4a]   rec: {:04X}x{} {:04X}x{} {:04X}x{} {:04X}x{} "
+                "{:04X}x{} {:04X}x{} {:04X}x{} {:04X}x{}",
+                g_4a_shape_rec[0], g_4a_shape_rec[1], g_4a_shape_rec[2],
+                g_4a_shape_rec[3], g_4a_shape_rec[4], g_4a_shape_rec[5],
+                g_4a_shape_rec[6], g_4a_shape_rec[7], g_4a_shape_rec[8],
+                g_4a_shape_rec[9], g_4a_shape_rec[10], g_4a_shape_rec[11],
+                g_4a_shape_rec[12], g_4a_shape_rec[13], g_4a_shape_rec[14],
+                g_4a_shape_rec[15]);
+            REXGPU_INFO(
+                "[nr-4a]   def: {:04X}x{} {:04X}x{} {:04X}x{} {:04X}x{} "
+                "{:04X}x{} {:04X}x{} {:04X}x{} {:04X}x{}",
+                g_4a_shape_def[0], g_4a_shape_def[1], g_4a_shape_def[2],
+                g_4a_shape_def[3], g_4a_shape_def[4], g_4a_shape_def[5],
+                g_4a_shape_def[6], g_4a_shape_def[7], g_4a_shape_def[8],
+                g_4a_shape_def[9], g_4a_shape_def[10], g_4a_shape_def[11],
+                g_4a_shape_def[12], g_4a_shape_def[13], g_4a_shape_def[14],
+                g_4a_shape_def[15]);
+            g_4a_shape_samp[0] = 0;
+          }
+          g_4a_pdw_const = 0;
+          g_4a_composed = g_4a_comp_runs = g_4a_comp_dw = 0;
+          g_4a_flush_draw = g_4a_flush_d2 = 0;
+          g_4a_flush_deleg = g_4a_flush_end = 0;
+          g_4a_fb_miss = g_4a_fb_nostate = g_4a_fb_stale = 0;
+          g_4a_fb_torn = g_4a_fb_shape = g_4a_fb_ovf = 0;
+          g_4a_fb_val = g_4a_byref_conflict = 0;
+          g_4a_def_ranges = g_4a_ovf_ranges = 0;
         }
         // [NR-SDB] The corpus verdict. Per-load hit% says how often a bind
         // resolves against the database; the DISTINCT line is the one the
@@ -6982,6 +7296,15 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   const bool swap =
       g_nr_tmpl_swap && !wm_recording && !wm_replaying && !n9_active;
   const uint32_t swap_pbase = ptr & 0x1FFFFFFFu;
+  // [NR-4A] arm the record-apply deferral for this buffer. Every mode that
+  // reads or replaces the per-range apply stream vetoes it (their digests /
+  // recordings assume decode-order applies); the tile modes swap range_fn
+  // outright and never reach the defer branch anyway.
+  g_nr4a_bufactive = g_nr4a_on && !wm_recording && !wm_replaying &&
+                     !n9_active && !swap && !g_nr_tile_bufskip && !g_nr_ruse &&
+                     !g_nr_bfc && !g_n8f_on;
+  g_nr4a_ndef = 0;
+  g_nr4a_group_ovf = false;
   while (swap ? NrSwapNextStop(swap_pbase, raw, &stop)
               : nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
     // The delegated dispatch re-checks the predicate against the CP's own
@@ -6995,6 +7318,27 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // repeat bands re-execute the same packets in the same order; two
     // register loads that are already in hand make the key.
     nr_tile_draw_addr_ = (ptr & 0x1FFFFFFFu) + stop.dword * 4;
+    // [NR-4A] resolve the group's deferred constant ranges at EVERY stop --
+    // a 0x22 draw composes from its record (fallback counted by reason);
+    // everything else (0x36 resolves, delegates -- REG_RMW and COND_WRITE
+    // write registers, nested buffers run the executor loop) flushes the
+    // packet ranges first so it reads exactly the state decode-order applies
+    // would have left.
+    if (g_nr4a_bufactive && (g_nr4a_ndef || g_nr4a_group_ovf)) {
+      if (!stop.delegate && stop.opcode == 0x22) {
+        if (!Nr4aTryCompose(this, nr_tile_draw_addr_)) {
+          ++g_4a_flush_draw;
+          Nr4aFlush(this);
+        }
+      } else {
+        if (stop.delegate) {
+          ++g_4a_flush_deleg;
+        } else {
+          ++g_4a_flush_d2;
+        }
+        Nr4aFlush(this);
+      }
+    }
     if (!stop.delegate) {
       // [NR-DETILE] N-5. OBSERVE FIRST, THEN DECIDE: the band pattern is
       // re-learned every frame from the packets themselves, including the ones
@@ -7349,6 +7693,14 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   // abort left pending: flush before the buffer ends, so the next consumer
   // -- whatever it is -- starts from fired effects.
   if (g_n8f_nspans) N8fFlush();
+  // [NR-4A] trailing constant ranges past the last stop (CtxFinishWalk just
+  // decoded them into the defer list) and anything an abort left pending:
+  // they carry state to the NEXT buffer in ring order, so they must land.
+  if (g_nr4a_bufactive && (g_nr4a_ndef || g_nr4a_group_ovf)) {
+    ++g_4a_flush_end;
+    Nr4aFlush(this);
+  }
+  g_nr4a_bufactive = false;
   bin_select_ = g_ctx_walker.bin.select;
   bin_mask_ = g_ctx_walker.bin.mask;
   if (spp) {
