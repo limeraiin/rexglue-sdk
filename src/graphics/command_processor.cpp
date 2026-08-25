@@ -1525,6 +1525,7 @@ uint64_t g_cmp_torn = 0;        // payload overwritten mid-diff; discarded
 uint64_t g_cmp_skip_prevmiss = 0;  // previous packet missed the join (65535-
                                    //   split groups register only their last)
 uint64_t g_cmp_skip_ovf = 0;       // group tainted by span-scratch overflow
+uint64_t g_cmp_skip_sup = 0;       // [NR-5B-3] suppressed group: no spans to diff
 uint64_t g_cmp_outside = 0;        // spans before the body floor: between-body
                                    //   emissions (standalone coher flushes)
 // [NR-CMP] N-9-4a ordering census: by-ref LOAD_ALU_CONSTANT (0x2F) packets
@@ -2267,6 +2268,15 @@ uint64_t g_nr5_fb_mk = 0;            // marker/by-ref sequence mismatch -> fallb
 // until the next compose); consumed by NrSkipDrawDirect in the same stop.
 const uint32_t* g_nr5_draw_src = nullptr;
 uint32_t g_nr5_draw_ndw = 0;
+// [NR-5B-3] suppressed-group counters.
+uint64_t g_nr5b_sup_composed = 0;  // suppressed groups applied from record
+uint64_t g_nr5b_sup_argsne = 0;    // record draw entry != kept packet (diag)
+uint64_t g_nr5b_sup_refuse = 0;    // suppressed record, coherent off/no entry
+uint64_t g_nr5b_pdw_dw = 0;        // mirror/watched-class dwords applied per-dword
+uint64_t g_nr5b_pred_stops = 0;    // predicated-out apply-only stops surfaced
+// [NR-5B-DBG] swap-time register-file divergence probe.
+uint32_t g_nr5dbg_hash[4] = {};
+uint32_t g_nr5dbg_key[8] = {};
 void Nr4aFlush(CommandProcessor* cp);
 
 // The deferable predicate: full fit inside ONE of the three pure constant
@@ -3813,6 +3823,7 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
   uint32_t f_phys[kNr4aMaxDef];
   uint8_t f_byref[kNr4aMaxDef];
   uint32_t draw_off = 0, draw_ndw = 0;
+  bool draw_sup = false;
   uint32_t nf = 0, p = 2;
   for (uint32_t k = 0; k < nruns; ++k) {
     if (p + 2 > ndw) {
@@ -3827,9 +3838,12 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
     }
     if (reg & 0x80000000u) {
       // [NR-5A] draw entry (bit31|bit30): the draw packet's raw dwords.
+      // [NR-5B-3] tag bit 0 = the covered emission was SUPPRESSED at
+      // record time: no packets to shape-match or verify against.
       if (reg & 0x40000000u) {
         draw_off = p + 2;
         draw_ndw = cnt;
+        draw_sup = (reg & 1u) != 0;
         p += 2 + cnt;
         continue;
       }
@@ -3886,6 +3900,90 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
   if (p != ndw) {
     ++g_4a_fb_torn;
     return false;
+  }
+  // [NR-5B-3] SUPPRESSED group: the covered runs exist ONLY in the record.
+  // No shape match (there is no deferred list to match: the walker saw only
+  // the kept classes), no value verify (no packet bytes). Flush the kept
+  // deferred ranges in stream order, then apply the whole record in its
+  // recorded order -- runs from the payload, by-ref markers re-read from
+  // guest memory -- and issue the draw from the record. A one-generation-
+  // behind record here is the COHERENT previous draw by 5a's construction;
+  // the args compare against the kept draw packet is diagnostic only.
+  if (draw_sup) {
+    if (!g_nr5_coh || !draw_ndw) {
+      ++g_nr5b_sup_refuse;
+      return false;
+    }
+    Nr4aFlush(cp);
+    // Apply the WHOLE body in record order, per class exactly as the packet
+    // world applied it: Composable runs through the bulk range path, and
+    // mirror/watched-class runs (>= 0x2000, not Composable) PER DWORD
+    // through the walk's own write path (CtxExternalWrite: reg_fn + context
+    // mirror + watch). Dropping those is what blinded de-tile in naruto_685
+    // (scissor/surface-info never applied, repeat bands invisible, dpf
+    // 92 -> 155). Below-0x2000 runs (the 40100 preamble synths) stay
+    // skipped: the kept ring bytes still carry them, and COHER is stateful.
+    uint32_t q = 2;
+    for (uint32_t k = 0; k < nruns; ++k) {
+      const uint32_t reg = g_nr4a_scratch[q];
+      const uint32_t cnt = g_nr4a_scratch[q + 1];
+      if (reg & 0x80000000u) {
+        if (!(reg & 0x40000000u) && cnt == 3) {
+          // by-ref marker: re-read guest memory at the recorded address.
+          const uint32_t d1 = __builtin_bswap32(g_nr4a_scratch[q + 2]);
+          const uint32_t d2 = __builtin_bswap32(g_nr4a_scratch[q + 3]);
+          const uint32_t d3 = __builtin_bswap32(g_nr4a_scratch[q + 4]);
+          static constexpr uint32_t kBrefBase[5] = {0x4000u, 0x4800u, 0x4900u,
+                                                    0x4908u, 0x2000u};
+          const uint32_t btype = (d2 >> 16) & 0xFF;
+          const uint32_t mcnt = d3 & 0xFFF;
+          if (btype < 5 && mcnt) {
+            const uint32_t mreg = kBrefBase[btype] + (d2 & 0x7FF);
+            const uint32_t maddr = d1 & 0x1FFFFFFFu;
+            if (Nr4aComposable(mreg, mcnt)) {
+              cp->NrSkipApplyRegRange(mreg, nullptr, mcnt, maddr, true);
+              ++g_nr5_mk_applied;
+            } else if (mreg >= 0x2000u) {
+              const uint32_t* src = cp->NrTranslatePhys(maddr);
+              if (src) {
+                for (uint32_t m = 0; m < mcnt; ++m) {
+                  nr::CtxExternalWrite(&g_ctx_walker, mreg + m,
+                                       __builtin_bswap32(src[m]), true);
+                }
+                ++g_nr5_mk_applied;
+              }
+            }
+            g_4a_comp_dw += mcnt;
+          }
+        }
+        q += 2 + cnt;
+        continue;
+      }
+      if (Nr4aComposable(reg, cnt)) {
+        cp->NrSkipApplyRegRange(reg, g_nr4a_scratch + q + 2, cnt, 0, false);
+      } else if (reg >= 0x2000u) {
+        for (uint32_t m = 0; m < cnt; ++m) {
+          nr::CtxExternalWrite(&g_ctx_walker, reg + m,
+                               __builtin_bswap32(g_nr4a_scratch[q + 2 + m]),
+                               false);
+        }
+        g_nr5b_pdw_dw += cnt;
+      }
+      g_4a_comp_dw += cnt;
+      q += 2 + cnt;
+    }
+    g_4a_comp_runs += nf;
+    if (stop_dword + draw_ndw <= buf_dwords &&
+        __builtin_memcmp(g_nr4a_scratch + draw_off, raw + stop_dword * 4,
+                         size_t(draw_ndw) * 4) != 0) {
+      ++g_nr5b_sup_argsne;
+    }
+    g_nr5_draw_src = g_nr4a_scratch + draw_off;
+    g_nr5_draw_ndw = draw_ndw;
+    ++g_4a_composed;
+    ++g_nr5_composed;
+    ++g_nr5b_sup_composed;
+    return true;
   }
   const auto shape_fail = [&](uint32_t idx) {
     ++g_4a_fb_shape;
@@ -5311,11 +5409,11 @@ void CommandProcessor::WorkerThreadMain() {
             const nr::CacheStats& ss = nr_cs_win;
             REXGPU_INFO(
                 "[nr-cmp]   skipped: no_state={} stale={} torn={} "
-                "prevmiss={} ovf={} outside_runs={} | store: stored={} "
+                "prevmiss={} ovf={} sup={} outside_runs={} | store: stored={} "
                 "dwords={} ovf={} freed={} nomem={} badfree={} expired={} "
                 "dormant_rejoin={} | live={} bump={}MB",
                 g_cmp_no_state, g_cmp_stale, g_cmp_torn, g_cmp_skip_prevmiss,
-                g_cmp_skip_ovf, g_cmp_outside, ss.state_stored,
+                g_cmp_skip_ovf, g_cmp_skip_sup, g_cmp_outside, ss.state_stored,
                 ss.state_dwords, ss.state_ovf, ss.state_freed, ss.state_nomem,
                 ss.state_badfree, ss.state_expired, ss.dormant_rejoin,
                 ss.state_live, (ss.state_bump_dw * 4) >> 20);
@@ -5370,6 +5468,7 @@ void CommandProcessor::WorkerThreadMain() {
             g_cmp_pred_only = g_cmp_emit_only = 0;
             g_cmp_no_state = g_cmp_stale = g_cmp_torn = 0;
             g_cmp_skip_prevmiss = g_cmp_skip_ovf = g_cmp_outside = 0;
+            g_cmp_skip_sup = 0;
             g_cmp_div_groups = g_cmp_first_div = 0;
             g_cmp_bref_pkts = g_cmp_bref_groups = 0;
             for (uint32_t t = 0; t < 6; ++t) g_cmp_bref_type[t] = 0;
@@ -5745,6 +5844,29 @@ void CommandProcessor::WorkerThreadMain() {
             g_nr5_composed = g_nr5_draw_issued = 0;
             g_nr5_def_byref = g_nr5_mk_applied = g_nr5_mk_skipped = 0;
             g_nr5_fb_args = g_nr5_fb_nodraw = g_nr5_fb_mk = 0;
+            // [NR-5B-DBG] swap-aligned register-file fingerprint: diff two
+            // title runs (suppressed vs not) to name the diverging class.
+            REXGPU_INFO(
+                "[nr-rf] st={:08X} av={:08X} ap={:08X} fx={:08X} | surf={:08X} "
+                "col={:08X} dep={:08X} woff={:08X} scis={:08X} dctl={:08X} "
+                "mode={:08X} vte={:08X}",
+                g_nr5dbg_hash[0], g_nr5dbg_hash[1], g_nr5dbg_hash[2],
+                g_nr5dbg_hash[3], g_nr5dbg_key[0], g_nr5dbg_key[1],
+                g_nr5dbg_key[2], g_nr5dbg_key[3], g_nr5dbg_key[4],
+                g_nr5dbg_key[5], g_nr5dbg_key[6], g_nr5dbg_key[7]);
+            // [NR-5B-3] suppressed-group verdict. The gate: sup_composed
+            // tracks the game-side live= rate; argsne at the known torn
+            // rate (diagnostic: those draws rendered the previous coherent
+            // generation); refuse 0.
+            if (g_nr5b_sup_composed || g_nr5b_sup_refuse) {
+              REXGPU_INFO(
+                  "[nr-5b] sup_composed={} argsne={} refuse={} pdw_dw={} "
+                  "pred_stops={}",
+                  g_nr5b_sup_composed, g_nr5b_sup_argsne, g_nr5b_sup_refuse,
+                  g_nr5b_pdw_dw, g_nr5b_pred_stops);
+              g_nr5b_sup_composed = g_nr5b_sup_argsne = 0;
+              g_nr5b_sup_refuse = g_nr5b_pdw_dw = g_nr5b_pred_stops = 0;
+            }
           }
           // [NR-4B] only printed when the verify is rate-gated (ver+unver
           // == composed + val fallbacks; unver groups applied unread).
@@ -7321,6 +7443,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                       uint32_t nmk = 0;
                       bool mk_ovf = false;
                       uint32_t nr_parsed = 0, p = 2;
+                      bool cmp_body_sup = false;
                       bool malformed = nruns > kCmpMaxRuns + kCmpMaxMk;
                       for (uint32_t k = 0; !malformed && k < nruns; ++k) {
                         if (p + 2 > ndw || body[p + 1] == 0 ||
@@ -7331,7 +7454,10 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                         if (body[p] & 0x80000000u) {
                           // [NR-5A] draw entries (bit30) carry the draw
                           // packet's dwords; not part of the span/marker diff.
+                          // [NR-5B-3] tag bit 0 = suppressed: the group's
+                          // covered spans do not exist -- skip the diff.
                           if (body[p] & 0x40000000u) {
+                            if (body[p] & 1u) cmp_body_sup = true;
                             p += 2 + body[p + 1];
                             continue;
                           }
@@ -7359,6 +7485,10 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                         // A well-formed header over an inconsistent body can
                         // only be a mid-overwrite read: torn, discard.
                         ++g_cmp_torn;
+                      } else if (cmp_body_sup) {
+                        // [NR-5B-3] suppressed group: its covered spans were
+                        // never emitted -- the diff has nothing to pair.
+                        ++g_cmp_skip_sup;
                       } else {
                         uint64_t l_run_eq = 0, l_val_eq = 0, l_val_ne = 0,
                                  l_pred_only = 0, l_emit_only = 0;
@@ -7833,6 +7963,11 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
                      !g_nr_bfc && !g_n8f_on;
   g_nr4a_ndef = 0;
   g_nr4a_group_ovf = false;
+  // [NR-5B-3] with the stop-resolving compose active, predicated-out draws
+  // must surface as apply-only stops: under suppression their group state
+  // exists only in the record, and in the packet world it applied at decode
+  // regardless of the predicate (naruto_686's corruption was this class).
+  g_ctx_walker.surface_pred_draws = g_nr4a_bufactive;
   while (swap ? NrSwapNextStop(swap_pbase, raw, &stop)
               : nr::CtxWalkNextStop(&g_ctx_walker, &stop)) {
     // The delegated dispatch re-checks the predicate against the CP's own
@@ -7872,6 +8007,15 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // [NR-4B] every stop ends a group: the by-ref witness resets even when
     // nothing was deferred (a pure by-ref group has ndef == 0).
     g_4a_byref_n = 0;
+    // [NR-5B-3] apply-only stop: a predicated-out draw whose group state the
+    // compose above resolved (composed from the record, or flushed). The
+    // draw itself never executes -- nothing below (detile, census brackets,
+    // dispatch) may see it.
+    if (!stop.delegate && stop.pred_out) {
+      ++g_nr5b_pred_stops;
+      g_nr5_draw_src = nullptr;
+      continue;
+    }
     if (!stop.delegate) {
       // [NR-DETILE] N-5. OBSERVE FIRST, THEN DECIDE: the band pattern is
       // re-learned every frame from the packets themselves, including the ones
@@ -8455,6 +8599,10 @@ void CommandProcessor::N8fFlush() {
 // "packet too small" false return), immediate/invalid source select (the
 // logged drop). The caller then delegates, so those shapes keep the proven
 // path bit for bit.
+const uint32_t* CommandProcessor::NrTranslatePhys(uint32_t phys) {
+  return memory_->TranslatePhysical<const uint32_t*>(phys);
+}
+
 bool CommandProcessor::NrSkipDrawDirect(uint32_t opcode, uint32_t dword,
                                         const uint8_t* raw, uint32_t count) {
   // [NR-5A] coherent compose armed this stop: the draw's dwords come from
@@ -8981,6 +9129,35 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   ++counter_;
   // Pure presented-frame tally (real swaps only, no vblank pollution).
   swap_counter_.fetch_add(1, std::memory_order_relaxed);
+
+  // [NR-5B-DBG] register-file divergence probe: class hashes + the key
+  // visibility registers, snapshotted AT THE SWAP (frame-aligned, so two
+  // title runs -- suppressed vs not -- diff meaningfully). Printed 1 Hz in
+  // the [nr-5a] block. Cheap (one XOR pass over ~5k dwords per frame) and
+  // only when the 4a compose is on.
+  if (g_nr4a_on) {
+    const uint32_t* rv = register_file_->values;
+    auto hash_range = [rv](uint32_t lo, uint32_t hi) {
+      uint32_t h = 0;
+      for (uint32_t r = lo; r < hi; ++r) h ^= rv[r] * (r | 1u);
+      return h;
+    };
+    g_nr5dbg_hash[0] = hash_range(0x2000u, 0x2400u);   // render state
+    g_nr5dbg_hash[1] = hash_range(0x4000u, 0x4400u);   // ALU VS
+    g_nr5dbg_hash[2] = hash_range(0x4400u, 0x4800u);   // ALU PS
+    g_nr5dbg_hash[3] = hash_range(0x4800u, 0x4930u);   // fetch + bool/loop
+    static constexpr uint32_t kKeys[8] = {
+        0x2000u,  // RB_SURFACE_INFO
+        0x2001u,  // RB_COLOR_INFO
+        0x2002u,  // RB_DEPTH_INFO
+        0x2080u,  // PA_SC_WINDOW_OFFSET
+        0x200Eu,  // PA_SC_SCREEN_SCISSOR_TL
+        0x2200u,  // RB_DEPTHCONTROL
+        0x2208u,  // RB_MODECONTROL
+        0x210Fu,  // PA_CL_VTE_CNTL family
+    };
+    for (uint32_t k = 0; k < 8; ++k) g_nr5dbg_key[k] = rv[kKeys[k]];
+  }
 
   // [NR-DETILE] N-5: the frame boundary. Promote this frame's observation of
   // the tile bands into the next frame's arming, and report once a second.

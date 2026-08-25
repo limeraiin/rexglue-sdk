@@ -324,6 +324,13 @@ struct CtxDrawStop {
                     // (CtxWalkNextStop only). The cursor is left AT the
                     // packet header so the caller can hand it to the
                     // executor's own dispatch, then CtxWalkSkipDelegated.
+  // [NR-5B-3] 1 = a PREDICATED-OUT 0x22, surfaced only when the walker's
+  // surface_pred_draws is set: the draw never executes, but its group's
+  // record-carried state must still apply (in the packet world the group's
+  // type0 packets applied at decode regardless of the predicate; under
+  // suppression they exist only in the record). The cursor is already PAST
+  // the packet; the consumer applies state and continues, never dispatches.
+  uint8_t pred_out;
 };
 
 // ---- [NR-WM] 5-4-8: the walk memo ------------------------------------------
@@ -542,6 +549,11 @@ struct CtxWalker {
   const uint8_t* raw;
   uint32_t dwords;
   uint32_t buffer_phys;
+  // [NR-5B-3] surface predicated-out 0x22s as apply-only stops (pred_out=1).
+  // Set by the caller AFTER CtxWalkBegin, only in modes that resolve group
+  // state at stops (the 4a/5b compose); every other mode keeps the classic
+  // silent skip.
+  bool surface_pred_draws;
   StateContext* ctx;
   uint16_t* draw_flags;
   uint32_t max_draws;
@@ -702,6 +714,15 @@ int32_t CtxApplyExternalWrite(StateContext* ctx, uint32_t reg, uint32_t value);
 // the same test. Exported so the defer/compose filter in the command
 // processor and the walker can never drift apart.
 bool CtxRangeTouchesMirrorRegs(uint32_t base, uint32_t n);
+
+// [NR-5B-3] External per-dword write into the walk: fires reg_fn, the
+// context mirror and the watch hook exactly like a decoded type0 dword.
+// Used by the suppressed-group compose to apply record runs whose packets
+// no longer exist but whose registers the walk's per-dword path owns (the
+// mirror and watched classes) -- dropping them is what blinded de-tile in
+// naruto_685.
+void CtxExternalWrite(CtxWalker* w, uint32_t reg, uint32_t value,
+                      bool from_memory);
 
 }  // namespace nr
 }  // namespace graphics

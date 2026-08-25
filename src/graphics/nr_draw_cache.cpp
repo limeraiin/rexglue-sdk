@@ -126,9 +126,18 @@ inline void StateFree(uint32_t off) {
   --g_stats.state_live;
 }
 
-// Packet headers are word-aligned; multiplicative hash, top bits.
-inline uint32_t Slot(uint32_t addr) {
-  return ((addr >> 2) * 2654435761u) >> (32 - kTableBits);
+// [NR-5B-3] The table is 4-way set-associative (was direct-mapped): under
+// live suppression a record is the ONLY carrier of its draw's constants,
+// so a hash-collision eviction is a draw with lost state, not a counted
+// re-miss. Same 2^20 records; 2^18 sets of 4 ways; the victim within a
+// full set is the least-recently-used way by the last_use stamp the
+// reader already maintains. Packet headers are word-aligned;
+// multiplicative hash, top bits.
+constexpr uint32_t kWayBits = 2;
+constexpr uint32_t kWays = 1u << kWayBits;
+inline uint32_t SetBase(uint32_t addr) {
+  return (((addr >> 2) * 2654435761u) >> (32 - (kTableBits - kWayBits)))
+         << kWayBits;
 }
 
 }  // namespace
@@ -136,8 +145,11 @@ inline uint32_t Slot(uint32_t addr) {
 bool LookupDraw(uint32_t phys_addr, DrawRecord* out) {
   const uint32_t addr = phys_addr & kPhysMask;
   if (!addr) return false;
-  DrawRecord& slot = g_tab[Slot(addr)];
-  if (slot.addr != addr) return false;
+  const uint32_t base = SetBase(addr);
+  uint32_t w = 0;
+  while (w < kWays && g_tab[base + w].addr != addr) ++w;
+  if (w == kWays) return false;
+  DrawRecord& slot = g_tab[base + w];
   *out = slot;
   // Re-check after the copy: a concurrent displacement of this slot by a
   // different address can otherwise hand back a half-written record under the
@@ -228,7 +240,35 @@ extern "C" void rex_nr_record_draw_args_state(uint32_t guest_addr, uint32_t rid,
   using namespace rex::graphics::nr;
   const uint32_t addr = guest_addr & kPhysMask;
   if (!addr) return;
-  DrawRecord* slot = &g_tab[Slot(addr)];
+  // [NR-5B-3] way selection: match > empty > LRU victim (by the reader's
+  // last_use stamp; wrap-aware age against the current seq).
+  const uint32_t base = SetBase(addr);
+  DrawRecord* slot = nullptr;
+  for (uint32_t w = 0; w < kWays; ++w) {
+    if (g_tab[base + w].addr == addr) {
+      slot = &g_tab[base + w];
+      break;
+    }
+  }
+  if (!slot) {
+    for (uint32_t w = 0; w < kWays; ++w) {
+      if (!g_tab[base + w].addr) {
+        slot = &g_tab[base + w];
+        break;
+      }
+    }
+  }
+  if (!slot) {
+    uint32_t best_age = 0;
+    slot = &g_tab[base];
+    for (uint32_t w = 0; w < kWays; ++w) {
+      const uint32_t age = uint32_t(g_seq - g_tab[base + w].last_use);
+      if (age >= best_age) {
+        best_age = age;
+        slot = &g_tab[base + w];
+      }
+    }
+  }
 
   // [NR-5B-2] payload lifetime == record lifetime: whatever block this slot
   // pointed at before (replace, evict, or an args-only clear) is freed AFTER

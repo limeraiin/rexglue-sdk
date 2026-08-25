@@ -374,6 +374,19 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
   if (CtxPredicatedOut(w->bin, hdr)) {
     ++w->stats->pred_skipped;
     if (op == 0x22) ++w->stats->pred_draws;
+    // [NR-5B-3] under a stop-resolving compose, a predicated-out draw must
+    // still surface: its group's state (record-carried under suppression)
+    // has to apply even though the draw never executes. The cursor is
+    // already past the packet; pred_out tells the consumer apply-only.
+    if (op == 0x22 && w->surface_pred_draws && stop) {
+      stop->opcode = 0x22;
+      stop->dword = j;
+      stop->flags = 0;
+      stop->index = 0;
+      stop->delegate = 0;
+      stop->pred_out = 1;
+      return true;
+    }
     return false;
   }
   if (hdr & 1) {
@@ -392,6 +405,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     stop->flags = 0;
     stop->index = 0;
     stop->delegate = 1;
+    stop->pred_out = 0;
     return true;
   }
   if (op == 0x22 || op == 0x36) {
@@ -417,6 +431,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
       stop->flags = f;
       stop->index = index;
       stop->delegate = 0;
+    stop->pred_out = 0;
     }
     return true;
   }
@@ -921,6 +936,7 @@ bool CtxPlanNext(CtxWalker* w, CtxDrawStop* stop) {
           stop->flags = f;
           stop->index = index;
           stop->delegate = 0;
+    stop->pred_out = 0;
           return true;
         }
       } break;
@@ -935,6 +951,7 @@ bool CtxPlanNext(CtxWalker* w, CtxDrawStop* stop) {
           stop->flags = 0;
           stop->index = 0;
           stop->delegate = 1;
+    stop->pred_out = 0;
           return true;
         }
         break;  // finish-drain skips delegates, as the parsed walk does
@@ -954,6 +971,13 @@ bool CtxPlanNext(CtxWalker* w, CtxDrawStop* stop) {
 }
 
 }  // namespace
+
+// [NR-5B-3] See the header. One decoded-dword-equivalent write from outside
+// the walk: reg_fn + mirror + watch, exactly CtxWriteReg.
+void CtxExternalWrite(CtxWalker* w, uint32_t reg, uint32_t value,
+                      bool from_memory) {
+  CtxWriteReg(w, reg, value, from_memory);
+}
 
 void CtxWalkBegin(CtxWalker* w, const uint8_t* raw, uint32_t dwords,
                   uint32_t buffer_phys, StateContext* ctx, uint16_t* draw_flags,

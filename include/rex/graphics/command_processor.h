@@ -208,6 +208,9 @@ class CommandProcessor {
   bool NrSkipApplyRegRangeBody(uint32_t base, uint32_t* be, uint32_t n,
                                bool from_memory);
 
+  // [NR-5B-3] suppressed-compose helper: translate a guest physical address
+  // for a by-ref marker's per-dword apply (defined in the .cpp).
+  const uint32_t* NrTranslatePhys(uint32_t phys);
   bool NrSkipApplyRegRange(uint32_t base, const uint32_t* values_be,
                            uint32_t n, uint32_t phys, bool from_memory);
 
