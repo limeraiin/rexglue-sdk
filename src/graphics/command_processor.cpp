@@ -2274,6 +2274,9 @@ uint64_t g_nr5b_sup_argsne = 0;    // record draw entry != kept packet (diag)
 uint64_t g_nr5b_sup_refuse = 0;    // suppressed record, coherent off/no entry
 uint64_t g_nr5b_pdw_dw = 0;        // mirror/watched-class dwords applied per-dword
 uint64_t g_nr5b_pred_stops = 0;    // predicated-out apply-only stops surfaced
+uint64_t g_nr5b_sup_foreign = 0;   // record at a recycled address != this draw
+// [0]=armed, [1]=pkt addr, [2]=rec_prim<<16|pkt_prim, [3]=rec cnt, [4]=pkt cnt
+uint32_t g_nr5b_foreign_samp[5] = {};
 // [NR-5B-DBG] swap-time register-file divergence probe.
 uint32_t g_nr5dbg_hash[4] = {};
 uint32_t g_nr5dbg_key[8] = {};
@@ -3797,26 +3800,8 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
     return false;
   }
   nr::DrawRecord rec;
-  if (!nr::LookupDraw(pkt_addr, &rec)) {
-    ++g_4a_fb_miss;
-    return false;
-  }
-  if (!rec.state_gen) {
-    ++g_4a_fb_nostate;
-    return false;
-  }
   uint32_t ndw = 0;
-  const uint32_t* body = nr::AcquireState(rec, &ndw);
-  if (!body) {
-    ++g_4a_fb_stale;
-    return false;
-  }
-  std::memcpy(g_nr4a_scratch, body, size_t(ndw) * 4);
-  if (!nr::VerifyState(rec)) {
-    ++g_4a_fb_torn;
-    return false;
-  }
-  const uint32_t nruns = g_nr4a_scratch[0];
+  uint32_t nruns = 0;
   uint32_t f_reg[kNr4aMaxDef], f_cnt[kNr4aMaxDef], f_off[kNr4aMaxDef];
   // [NR-5A] coherent-mode entry attributes: a by-ref (marker-derived) entry
   // carries its guest memory address in f_phys and applies from memory.
@@ -3824,8 +3809,45 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
   uint8_t f_byref[kNr4aMaxDef];
   uint32_t draw_off = 0, draw_ndw = 0;
   bool draw_sup = false;
+  bool draw_bytes_eq = false;
   uint32_t nf = 0, p = 2;
-  for (uint32_t k = 0; k < nruns; ++k) {
+  // [NR-5B-3] identity-retry loop. A suppressed record whose draw bytes
+  // mismatch the kept packet is usually the SAME draw mid-re-record: the
+  // store completes microseconds after the body writes the packet, and the
+  // consumer racing that window used to lose the draw's constants for one
+  // execution (naruto_693: argsne 0, foreign 17-196/s, samples = changed
+  // counts at the same address). Spin ~a microsecond and re-fetch -- the
+  // fresh record arrives and the group composes CURRENT. A record that
+  // never converges (true recycling: a different draw now lives at the
+  // address) exits foreign below. Same spin-on-the-producer pattern the
+  // consumer already lives by at the ring.
+  for (uint32_t att = 0;; ++att) {
+    if (!nr::LookupDraw(pkt_addr, &rec)) {
+      ++g_4a_fb_miss;
+      return false;
+    }
+    if (!rec.state_gen) {
+      ++g_4a_fb_nostate;
+      return false;
+    }
+    ndw = 0;
+    const uint32_t* body = nr::AcquireState(rec, &ndw);
+    if (!body) {
+      ++g_4a_fb_stale;
+      return false;
+    }
+    std::memcpy(g_nr4a_scratch, body, size_t(ndw) * 4);
+    if (!nr::VerifyState(rec)) {
+      ++g_4a_fb_torn;
+      return false;
+    }
+    nruns = g_nr4a_scratch[0];
+    nf = 0;
+    p = 2;
+    draw_off = 0;
+    draw_ndw = 0;
+    draw_sup = false;
+    for (uint32_t k = 0; k < nruns; ++k) {
     if (p + 2 > ndw) {
       ++g_4a_fb_torn;
       return false;
@@ -3901,18 +3923,51 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
     ++g_4a_fb_torn;
     return false;
   }
+  if (!draw_sup) break;
+  draw_bytes_eq =
+      draw_ndw != 0 && stop_dword + draw_ndw <= buf_dwords &&
+      __builtin_memcmp(g_nr4a_scratch + draw_off, raw + stop_dword * 4,
+                       size_t(draw_ndw) * 4) == 0;
+  if (draw_bytes_eq || att >= 3) break;
+  for (volatile uint32_t spin = 0; spin < 600; ++spin) {
+  }
+  }  // identity-retry loop
   // [NR-5B-3] SUPPRESSED group: the covered runs exist ONLY in the record.
   // No shape match (there is no deferred list to match: the walker saw only
   // the kept classes), no value verify (no packet bytes). Flush the kept
   // deferred ranges in stream order, then apply the whole record in its
   // recorded order -- runs from the payload, by-ref markers re-read from
   // guest memory -- and issue the draw from the record. A one-generation-
-  // behind record here is the COHERENT previous draw by 5a's construction;
-  // the args compare against the kept draw packet is diagnostic only.
+  // behind record here is the COHERENT previous draw by 5a's construction.
   if (draw_sup) {
     if (!g_nr5_coh || !draw_ndw) {
       ++g_nr5b_sup_refuse;
       return false;
+    }
+    // Identity guard: after the retries, a record whose draw bytes still
+    // mismatch is either the same draw with stale bytes (prim and count
+    // match -- stale constants are benign) or a FOREIGN record left at a
+    // recycled ring address -- applying a foreign record's constants
+    // painted the naruto_691 whole-screen flashing. Foreign => a miss.
+    if (!draw_bytes_eq) {
+      uint32_t pkt_prim = 0xFFFFFFFFu, pkt_cnt = 0xFFFFFFFFu;
+      if (stop_dword + 2 < buf_dwords) {
+        const uint32_t init = __builtin_bswap32(
+            *reinterpret_cast<const uint32_t*>(raw + (stop_dword + 2) * 4));
+        pkt_prim = init & 0x3Fu;
+        pkt_cnt = init >> 16;
+      }
+      if ((rec.prim & 0x3Fu) != pkt_prim || rec.count != pkt_cnt) {
+        ++g_nr5b_sup_foreign;
+        if (!g_nr5b_foreign_samp[0]) {
+          g_nr5b_foreign_samp[1] = pkt_addr;
+          g_nr5b_foreign_samp[2] = (rec.prim << 16) | (pkt_prim & 0xFFFFu);
+          g_nr5b_foreign_samp[3] = rec.count;
+          g_nr5b_foreign_samp[4] = pkt_cnt;
+          g_nr5b_foreign_samp[0] = 1;
+        }
+        return false;
+      }
     }
     Nr4aFlush(cp);
     // Apply the WHOLE body in record order, per class exactly as the packet
@@ -3973,13 +4028,18 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       q += 2 + cnt;
     }
     g_4a_comp_runs += nf;
-    if (stop_dword + draw_ndw <= buf_dwords &&
-        __builtin_memcmp(g_nr4a_scratch + draw_off, raw + stop_dword * 4,
-                         size_t(draw_ndw) * 4) != 0) {
-      ++g_nr5b_sup_argsne;
+    // The draw issues from the record ONLY when the record's draw bytes
+    // equal the kept packet's. On a torn (one-behind, same-draw: identity
+    // guard above) record the PACKET is the current truth: an old
+    // VGT_DMA_BASE points at per-frame-recycled index memory -- garbage
+    // geometry ([[h3-overlap-live-guest-memory]]). Stale-by-one CONSTANTS
+    // are visually benign; stale POINTERS are not.
+    if (draw_bytes_eq) {
+      g_nr5_draw_src = g_nr4a_scratch + draw_off;
+      g_nr5_draw_ndw = draw_ndw;
+    } else {
+      ++g_nr5b_sup_argsne;  // draw issues from the current packet bytes
     }
-    g_nr5_draw_src = g_nr4a_scratch + draw_off;
-    g_nr5_draw_ndw = draw_ndw;
     ++g_4a_composed;
     ++g_nr5_composed;
     ++g_nr5b_sup_composed;
@@ -5860,11 +5920,20 @@ void CommandProcessor::WorkerThreadMain() {
             // generation); refuse 0.
             if (g_nr5b_sup_composed || g_nr5b_sup_refuse) {
               REXGPU_INFO(
-                  "[nr-5b] sup_composed={} argsne={} refuse={} pdw_dw={} "
-                  "pred_stops={}",
-                  g_nr5b_sup_composed, g_nr5b_sup_argsne, g_nr5b_sup_refuse,
-                  g_nr5b_pdw_dw, g_nr5b_pred_stops);
-              g_nr5b_sup_composed = g_nr5b_sup_argsne = 0;
+                  "[nr-5b] sup_composed={} argsne={} foreign={} refuse={} "
+                  "pdw_dw={} pred_stops={}",
+                  g_nr5b_sup_composed, g_nr5b_sup_argsne, g_nr5b_sup_foreign,
+                  g_nr5b_sup_refuse, g_nr5b_pdw_dw, g_nr5b_pred_stops);
+              if (g_nr5b_foreign_samp[0]) {
+                REXGPU_INFO(
+                    "[nr-5b]   foreign samp: pkt={:08X} rec_prim={} pkt_prim={} "
+                    "rec_cnt={} pkt_cnt={}",
+                    g_nr5b_foreign_samp[1], g_nr5b_foreign_samp[2] >> 16,
+                    g_nr5b_foreign_samp[2] & 0xFFFFu, g_nr5b_foreign_samp[3],
+                    g_nr5b_foreign_samp[4]);
+                g_nr5b_foreign_samp[0] = 0;
+              }
+              g_nr5b_sup_composed = g_nr5b_sup_argsne = g_nr5b_sup_foreign = 0;
               g_nr5b_sup_refuse = g_nr5b_pdw_dw = g_nr5b_pred_stops = 0;
             }
           }
