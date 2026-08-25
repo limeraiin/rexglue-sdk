@@ -36,19 +36,60 @@ constexpr uint32_t kGranuleShift = 14;  // 16KB
 constexpr uint32_t kEpochSlots = 8192;
 uint32_t g_gran_epoch[kEpochSlots] = {};
 
-// [NR-STORE] The state-payload ring arena. Sizing: the city stores ~195k
-// records/s at ~150 body dwords each (~115 payload + run headers), ~115MB/s,
-// so 64MB holds ~0.55s of traffic; a live city record re-stores every ~10
-// frames (~0.17s), a ~3x margin. A record whose payload the ring has lapped
-// reads as STALE at compose time (header mismatch) and is counted, never
-// mis-diffed. Block layout: {addr, gen, ndw} header + ndw body dwords,
-// contiguous (the ring wraps to 0 rather than splitting a block).
+// [NR-STORE] The state-payload store. Was a ring arena (N-9-3d..5a); now
+// [NR-5B-2] a size-class free-list allocator, because live suppression
+// needs RETENTION: a STABLE buffer never re-records, so its records'
+// payloads must live exactly as long as the records -- under the ring they
+// lapped (~800 stale/s at city), which reads as a counted fallback while
+// packets exist and as a draw with NO constants once they do not.
+//
+// Shape: blocks of {addr, gen, ndw} header + body, carved from the static
+// arena at power-of-two class sizes (32..8192 dwords); a virgin bump
+// pointer serves a class until its free list has a block. Lifetime: the
+// record-table upsert FREES the previous payload of the slot it overwrites
+// (replace, evict, and the args-only clear) AFTER the new record is
+// published. Freeing stamps gen = 0 (never a valid generation) and threads
+// the free list through blk[0], so a reader still holding the old record
+// fails Acquire/Verify deterministically -- the same stale/torn classes as
+// before, now rare instead of structural. Single guest-thread writer, no
+// locks, no OS allocation, exactly as before.
+//
+// Sizing: ~36k live city draws x ~150 body dwords ~= 22MB live; 64MB with
+// pow2 rounding leaves >2x headroom. Exhaustion returns null (counted
+// nomem) and the record publishes args-only -- the compose side already
+// treats that as a fallback.
 constexpr uint32_t kStateArenaDwords = 16u << 20;  // 64MB
 constexpr uint32_t kStateHdrDwords = 3;
 constexpr uint32_t kStateMaxBody = 4096;  // worst captured group ~2.8k dwords
+constexpr uint32_t kStateClassMin = 5;    // 2^5 = 32 dwords
+constexpr uint32_t kStateClassMax = 13;   // 2^13 = 8192 >= 3 + 4096
+constexpr uint32_t kStateClasses = kStateClassMax - kStateClassMin + 1;
 uint32_t g_state_arena[kStateArenaDwords];
-uint32_t g_state_head = 0;
+uint32_t g_state_bump = 0;                    // virgin space watermark
+uint32_t g_state_free[kStateClasses] = {};    // head offset + 1 (0 = empty)
 uint32_t g_state_gen = 0;
+
+// Class index for a block that must hold `need` dwords (header included).
+inline uint32_t StateClassFor(uint32_t need) {
+  uint32_t c = kStateClassMin;
+  while ((1u << c) < need) ++c;
+  return c - kStateClassMin;
+}
+
+// Free one block: kill its generation first (readers fail deterministically),
+// then thread it onto its class list via blk[0]. The class comes from the
+// block's own ndw -- alloc and free run on the one writer thread, so the
+// writer reads back exactly the ndw it stamped.
+inline void StateFree(uint32_t off) {
+  if (off + kStateHdrDwords > kStateArenaDwords) return;
+  uint32_t* blk = &g_state_arena[off];
+  const uint32_t ndw = blk[2];
+  if (!ndw || ndw > kStateMaxBody) return;  // never stamped by us: refuse
+  blk[1] = 0;  // gen 0: never valid, Acquire/Verify now always refuse
+  const uint32_t cls = StateClassFor(kStateHdrDwords + ndw);
+  blk[0] = g_state_free[cls];
+  g_state_free[cls] = off + 1;
+}
 
 // Packet headers are word-aligned; multiplicative hash, top bits.
 inline uint32_t Slot(uint32_t addr) {
@@ -115,7 +156,8 @@ void ResetCache() {
   for (uint32_t i = 0; i < kTableSize; ++i) g_tab[i].addr = 0;
   for (uint32_t i = 0; i < kEpochSlots; ++i) g_gran_epoch[i] = 0;
   g_seq = 0;
-  g_state_head = 0;
+  g_state_bump = 0;
+  for (uint32_t c = 0; c < kStateClasses; ++c) g_state_free[c] = 0;
   g_state_gen = 0;
   ResetCacheStats();
 }
@@ -133,6 +175,14 @@ extern "C" void rex_nr_record_draw_args_state(uint32_t guest_addr, uint32_t rid,
   const uint32_t addr = guest_addr & kPhysMask;
   if (!addr) return;
   DrawRecord* slot = &g_tab[Slot(addr)];
+
+  // [NR-5B-2] payload lifetime == record lifetime: whatever block this slot
+  // pointed at before (replace, evict, or an args-only clear) is freed AFTER
+  // the new record is published, so a reader that copied the old record can
+  // only ever read a deterministic stale, never a recycled body under a
+  // live-looking header.
+  const uint32_t old_off = slot->state_off;
+  const uint32_t old_gen = slot->state_gen;
 
   if (slot->addr == addr) {
     // The upsert: this packet address re-recorded. Under the city's
@@ -154,6 +204,10 @@ extern "C" void rex_nr_record_draw_args_state(uint32_t guest_addr, uint32_t rid,
   slot->vs = vs;
   slot->ps = ps;
   slot->addr = addr;  // key last: the record becomes visible complete
+  if (old_gen) {
+    StateFree(old_off);
+    ++g_stats.state_freed;
+  }
   g_gran_epoch[(addr >> kGranuleShift) & (kEpochSlots - 1)] += 1;
   ++g_stats.recorded;
   if (state_gen) ++g_stats.state_stored;
@@ -177,13 +231,24 @@ extern "C" uint32_t* rex_nr_state_alloc(uint32_t guest_addr, uint32_t body_ndw,
     ++g_stats.state_ovf;
     return nullptr;
   }
+  // [NR-5B-2] free-list first, virgin bump second. The block is NOT freed
+  // here on failure paths: the caller publishes {off, gen} via the record
+  // upsert, and the upsert frees the slot's PREVIOUS block -- payload
+  // lifetime == record lifetime.
   const uint32_t need = kStateHdrDwords + body_ndw;
-  uint32_t off = g_state_head;
-  if (off + need > kStateArenaDwords) {
-    off = 0;
-    ++g_stats.state_wraps;
+  const uint32_t cls = StateClassFor(need);
+  const uint32_t block_dw = 1u << (cls + kStateClassMin);
+  uint32_t off;
+  if (g_state_free[cls]) {
+    off = g_state_free[cls] - 1;
+    g_state_free[cls] = g_state_arena[off];  // pop (next threaded via blk[0])
+  } else if (g_state_bump + block_dw <= kStateArenaDwords) {
+    off = g_state_bump;
+    g_state_bump += block_dw;
+  } else {
+    ++g_stats.state_nomem;
+    return nullptr;
   }
-  g_state_head = off + need;
   uint32_t* blk = &g_state_arena[off];
   // Header first: a reader holding an older record that pointed here sees the
   // new {addr, gen} and reads its own payload as stale instead of as ours.

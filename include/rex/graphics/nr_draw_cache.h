@@ -111,11 +111,13 @@ struct CacheStats {
   uint64_t recorded;   // draws stored since the last reset
   uint64_t replaced;   // upserts: same-address re-records (patch-in-place rate)
   uint64_t evictions;  // records displaced by a direct-map conflict
-  // [NR-STORE] state-payload arena traffic.
+  // [NR-STORE] state-payload store traffic ([NR-5B-2]: retained free-list
+  // allocator -- payload lifetime == record lifetime, no ring laps).
   uint64_t state_stored;  // payload blocks published
-  uint64_t state_dwords;  // body dwords written (sizes the arena lifetime)
+  uint64_t state_dwords;  // body dwords written
   uint64_t state_ovf;     // alloc refusals: block over the size cap
-  uint64_t state_wraps;   // arena wrap-arounds (older payloads now stale)
+  uint64_t state_freed;   // blocks freed by record replace/evict/clear
+  uint64_t state_nomem;   // alloc refusals: arena exhausted (expect 0)
 };
 
 // [NR-STORE] Read one record's state payload on the execute side. Validates
