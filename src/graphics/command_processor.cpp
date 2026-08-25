@@ -204,6 +204,26 @@ REXCVAR_DEFINE_INT32(gpu_nr_rec_verify, 1, "GPU",
                      "on/off in-place cycle for pricing. Values != 1 are "
                      "measurement-only (torn records may flash).");
 
+// [NR-5A] N-9-5a: WHOLE-DRAW source coherence at the composed stop -- the
+// torn-window precondition for guest-emission suppression. Today's 4a mixes
+// sources on a composed draw: constants/state from the record, by-ref 0x2F
+// loads and the draw arguments from the packets. That mix is exactly the
+// naruto_663 hazard once packets stop existing (a record one re-record
+// behind its packets pairs OLD values with NEW args). Coherent mode makes a
+// composed draw single-source: the walker defers composable by-ref ranges
+// too, the stop applies them FROM the record's sequence markers (re-reading
+// guest memory, position preserved), and the draw issues from the record's
+// stored draw-packet dwords -- all still verified against the packets with
+// counted fallbacks, so behavior is bit-identical while packets exist. When
+// they stop existing (N-9-5b), a one-generation-behind record then yields
+// the PREVIOUS coherent draw, never a mixed one. Implies gpu_nr_rec_apply.
+REXCVAR_DEFINE_BOOL(gpu_nr_rec_coherent, false, "GPU",
+                    "N-9-5a: composed draws take by-refs (from markers) and "
+                    "draw args (from the record's draw entry) from the record "
+                    "too -- single-source, verified, fallback counted. Needs "
+                    "game-side nr_rec_store; implies gpu_nr_rec_apply. Off by "
+                    "default.");
+
 // [NR-BUF] Increment 2: per-buffer draw-list snapshots (nr_buffer_cache.h).
 // Measures the renderer's actual serving model -- admit a snapshot on a clean
 // join, serve it while the range's dirty-epoch holds, re-admit after patches
@@ -2233,6 +2253,20 @@ int32_t g_nr4b_verify_n = 1;
 bool g_nr4b_cycle = false;
 uint32_t g_nr4b_vctr = 0;  // sampling counter (composed groups)
 uint64_t g_4a_ver = 0, g_4a_unver = 0;
+// [NR-5A] coherent-compose state (CP thread only; see gpu_nr_rec_coherent).
+bool g_nr5_coh = false;              // latched cvar
+uint64_t g_nr5_composed = 0;         // coherent composes (subset of composed)
+uint64_t g_nr5_def_byref = 0;        // by-ref ranges deferred
+uint64_t g_nr5_mk_applied = 0;       // markers applied from the record
+uint64_t g_nr5_mk_skipped = 0;       // markers decoding out of scope (per-dword class)
+uint64_t g_nr5_draw_issued = 0;      // draws issued from record draw entries
+uint64_t g_nr5_fb_args = 0;          // draw entry != packet bytes (torn) -> fallback
+uint64_t g_nr5_fb_nodraw = 0;        // record carries no draw entry -> fallback
+uint64_t g_nr5_fb_mk = 0;            // marker/by-ref sequence mismatch -> fallback
+// The composed draw's packet dwords, pointing into g_nr4a_scratch (stable
+// until the next compose); consumed by NrSkipDrawDirect in the same stop.
+const uint32_t* g_nr5_draw_src = nullptr;
+uint32_t g_nr5_draw_ndw = 0;
 void Nr4aFlush(CommandProcessor* cp);
 
 // The deferable predicate: full fit inside ONE of the three pure constant
@@ -3634,6 +3668,19 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
       }
       g_nr4a_group_ovf = true;
       ++g_4a_ovf_ranges;
+    } else if (g_nr5_coh && g_nr4a_bufactive && from_memory &&
+               Nr4aStateWindow(base, n)) {
+      // [NR-5A] a composable by-ref into the state windows: defer with a
+      // null be (the tag) so the stop can pair it with the record's marker
+      // and apply it in the record's sequence, re-read from guest memory.
+      if (g_nr4a_ndef < kNr4aMaxDef) {
+        g_nr4a_def[g_nr4a_ndef++] = {base, n, phys, nullptr};
+        ++g_4a_def_ranges;
+        ++g_nr5_def_byref;
+        return true;
+      }
+      g_nr4a_group_ovf = true;
+      ++g_4a_ovf_ranges;
     } else if (g_nr4a_bufactive && from_memory && g_nr4a_ndef) {
       // A by-ref load into the REGISTERS window (0x2F type 4) about to apply
       // while ranges are pending: same stream-order guard as the constant
@@ -3665,6 +3712,21 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
       g_4a_byref_rng[g_4a_byref_n * 2 + 1] = n;
     }
     ++g_4a_byref_n;
+    // [NR-5A] coherent mode defers the by-ref itself (null-be tag); the stop
+    // pairs it with the record's marker and applies it in record order, so
+    // the 663-class overlap case composes instead of conflict-flushing.
+    if (g_nr5_coh) {
+      if (g_nr4a_ndef < kNr4aMaxDef) {
+        g_nr4a_def[g_nr4a_ndef++] = {base, n, phys, nullptr};
+        ++g_4a_def_ranges;
+        ++g_nr5_def_byref;
+        return true;
+      }
+      g_nr4a_group_ovf = true;
+      ++g_4a_ovf_ranges;
+      return static_cast<CommandProcessor*>(user)->NrSkipApplyRegRange(
+          base, values_be, n, phys, from_memory);
+    }
     if (!g_nr4a_ndef) {
       return static_cast<CommandProcessor*>(user)->NrSkipApplyRegRange(
           base, values_be, n, phys, from_memory);
@@ -3699,7 +3761,10 @@ bool NrWalkRegRange(void* user, uint32_t base, const uint32_t* values_be,
 void Nr4aFlush(CommandProcessor* cp) {
   for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
     const Nr4aDef& d = g_nr4a_def[i];
-    cp->NrSkipApplyRegRange(d.base, d.be, d.n, d.phys, false);
+    // [NR-5A] a null be is a deferred by-ref (coherent mode): apply it from
+    // guest memory at its own phys, exactly as the immediate path would --
+    // the list is in stream order, so the flush replays the group verbatim.
+    cp->NrSkipApplyRegRange(d.base, d.be, d.n, d.phys, d.be == nullptr);
   }
   g_nr4a_ndef = 0;
   g_nr4a_group_ovf = false;
@@ -3715,7 +3780,8 @@ void Nr4aFlush(CommandProcessor* cp) {
 // behind its packets (the measured 0.27% post-hook torn class) can pass the
 // shape match and apply the PREVIOUS recording's values for one execution;
 // the next record write heals it.
-bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
+bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
+                    uint32_t buf_dwords, uint32_t stop_dword) {
   if (g_nr4a_group_ovf) {
     ++g_4a_fb_ovf;
     return false;
@@ -3742,6 +3808,11 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
   }
   const uint32_t nruns = g_nr4a_scratch[0];
   uint32_t f_reg[kNr4aMaxDef], f_cnt[kNr4aMaxDef], f_off[kNr4aMaxDef];
+  // [NR-5A] coherent-mode entry attributes: a by-ref (marker-derived) entry
+  // carries its guest memory address in f_phys and applies from memory.
+  uint32_t f_phys[kNr4aMaxDef];
+  uint8_t f_byref[kNr4aMaxDef];
+  uint32_t draw_off = 0, draw_ndw = 0;
   uint32_t nf = 0, p = 2;
   for (uint32_t k = 0; k < nruns; ++k) {
     if (p + 2 > ndw) {
@@ -3754,11 +3825,47 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
       ++g_4a_fb_torn;
       return false;
     }
-    // [NR-4B-EXT] by-ref marker entry (tag bit 31, payload = the 0x2F's own
-    // three dwords): carried for the N-9-5 schema, not composed here -- the
-    // walker still applies the by-ref packet itself, in stream order.
     if (reg & 0x80000000u) {
+      // [NR-5A] draw entry (bit31|bit30): the draw packet's raw dwords.
+      if (reg & 0x40000000u) {
+        draw_off = p + 2;
+        draw_ndw = cnt;
+        p += 2 + cnt;
+        continue;
+      }
+      // [NR-4B-EXT] by-ref marker entry (tag bit 31, payload = the 0x2F's
+      // own three dwords, raw guest order). Non-coherent: carried, not
+      // composed (the walker applied the packet itself in stream order).
+      // Coherent: decode exactly as the walker decodes the packet and pair
+      // it with the deferred by-ref at this sequence position.
       ++g_4a_mk_runs;
+      if (g_nr5_coh && cnt == 3 && p + 5 <= ndw) {
+        const uint32_t d1 = __builtin_bswap32(g_nr4a_scratch[p + 2]);
+        const uint32_t d2 = __builtin_bswap32(g_nr4a_scratch[p + 3]);
+        const uint32_t d3 = __builtin_bswap32(g_nr4a_scratch[p + 4]);
+        static constexpr uint32_t kBrefBase[5] = {0x4000u, 0x4800u, 0x4900u,
+                                                  0x4908u, 0x2000u};
+        const uint32_t btype = (d2 >> 16) & 0xFF;
+        const uint32_t mcnt = d3 & 0xFFF;
+        const uint32_t mreg =
+            btype < 5 ? kBrefBase[btype] + (d2 & 0x7FF) : 0xFFFFFFFFu;
+        if (btype < 5 && mcnt && Nr4aComposable(mreg, mcnt)) {
+          if (nf >= kNr4aMaxDef) {
+            ++g_4a_fb_shape;
+            return false;
+          }
+          f_reg[nf] = mreg;
+          f_cnt[nf] = mcnt;
+          f_off[nf] = 0;
+          f_phys[nf] = d1 & 0x1FFFFFFFu;
+          f_byref[nf] = 1;
+          ++nf;
+        } else {
+          // Out-of-scope decode: its packet took the per-dword path and was
+          // never deferred; skip it in the sequence match.
+          ++g_nr5_mk_skipped;
+        }
+      }
       p += 2 + cnt;
       continue;
     }
@@ -3770,6 +3877,8 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
       f_reg[nf] = reg;
       f_cnt[nf] = cnt;
       f_off[nf] = p + 2;
+      f_phys[nf] = 0;
+      f_byref[nf] = 0;
       ++nf;
     }
     p += 2 + cnt;
@@ -3820,6 +3929,33 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
       shape_fail(i);
       return false;
     }
+    // [NR-5A] kind + address must agree too: a marker pairs only with a
+    // deferred by-ref (null be) at the same guest address, an inline run
+    // only with a deferred packet range. A mismatch is a marker-sequence
+    // divergence (the torn/segmentation classes), counted separately.
+    const bool def_byref = g_nr4a_def[i].be == nullptr;
+    if (def_byref != (f_byref[i] != 0) ||
+        (def_byref && f_phys[i] != g_nr4a_def[i].phys)) {
+      ++g_nr5_fb_mk;
+      return false;
+    }
+  }
+  // [NR-5A] the draw entry is the coherence anchor: the composed draw's own
+  // packet dwords must equal the executed packet's bytes, or the record is
+  // one re-record behind (the torn window) and the whole group falls back.
+  // Runs unconditionally in coherent mode (it is ~24 bytes and it is the
+  // check that makes single-source issue safe).
+  if (g_nr5_coh) {
+    if (!draw_ndw) {
+      ++g_nr5_fb_nodraw;
+      return false;
+    }
+    if (stop_dword + draw_ndw > buf_dwords ||
+        __builtin_memcmp(g_nr4a_scratch + draw_off, raw + stop_dword * 4,
+                         size_t(draw_ndw) * 4) != 0) {
+      ++g_nr5_fb_args;
+      return false;
+    }
   }
   // Value-verify: the composed bytes must equal the packet bytes, or the
   // record is one re-record behind its packets (the post-hook torn window)
@@ -3838,6 +3974,11 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
   if (verify) {
     ++g_4a_ver;
     for (uint32_t i = 0; i < nf; ++i) {
+      // [NR-5A] a by-ref pair has no packet payload to compare (both sides
+      // read the same guest memory); its verify is the {reg,cnt,phys} match
+      // above. An inline run without packet bytes can only be a kind
+      // mismatch, already refused there in coherent mode.
+      if (f_byref[i]) continue;
       if (!g_nr4a_def[i].be ||
           __builtin_memcmp(g_nr4a_scratch + f_off[i], g_nr4a_def[i].be,
                            size_t(f_cnt[i]) * 4) != 0) {
@@ -3849,12 +3990,28 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr) {
     ++g_4a_unver;
   }
   for (uint32_t i = 0; i < nf; ++i) {
-    cp->NrSkipApplyRegRange(f_reg[i], g_nr4a_scratch + f_off[i], f_cnt[i], 0,
-                            false);
+    if (f_byref[i]) {
+      // [NR-5A] apply the by-ref from guest memory at the marker's address,
+      // at its recorded position in the group's sequence.
+      cp->NrSkipApplyRegRange(f_reg[i], nullptr, f_cnt[i], f_phys[i], true);
+      ++g_nr5_mk_applied;
+    } else {
+      cp->NrSkipApplyRegRange(f_reg[i], g_nr4a_scratch + f_off[i], f_cnt[i], 0,
+                              false);
+    }
     g_4a_comp_dw += f_cnt[i];
   }
   g_4a_comp_runs += nf;
   ++g_4a_composed;
+  // [NR-5A] arm the single-source draw issue: NrSkipDrawDirect reads the
+  // draw's dwords from the record scratch (verified equal to the packet
+  // above) instead of the buffer bytes. Cleared at every stop and on
+  // consumption, so it can never leak across draws.
+  if (g_nr5_coh && draw_ndw) {
+    g_nr5_draw_src = g_nr4a_scratch + draw_off;
+    g_nr5_draw_ndw = draw_ndw;
+    ++g_nr5_composed;
+  }
   g_nr4a_ndef = 0;
   return true;
 }
@@ -4407,11 +4564,18 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-4A] independent of the diagnostic join walk: it joins via LookupDraw
   // at the stop itself. Needs the game-side nr_rec_store hook feeding the
   // record store; without it every draw counts a no_state/miss fallback.
-  g_nr4a_on = REXCVAR_GET(gpu_nr_rec_apply);
+  // [NR-5A] coherent compose implies the 4a apply it extends.
+  g_nr5_coh = REXCVAR_GET(gpu_nr_rec_coherent);
+  g_nr4a_on = REXCVAR_GET(gpu_nr_rec_apply) || g_nr5_coh;
   if (g_nr4a_on) {
     REXGPU_INFO(
         "[nr-4a] ON: draw-stop constant apply from stored records "
         "(shape-matched, fallback counted; needs game-side nr_rec_store)");
+  }
+  if (g_nr5_coh) {
+    REXGPU_INFO(
+        "[nr-5a] ON: coherent compose -- by-refs from markers, draw args "
+        "from the record's draw entry, single-source per composed draw");
   }
   // [NR-4B] verify-rate latch. -1 arms the 10 s cycler (starts FULL so the
   // first phase is the baseline); any other value is the fixed live rate.
@@ -5564,6 +5728,21 @@ void CommandProcessor::WorkerThreadMain() {
               "val={} ovf={} | byref_conflict_flush={}",
               g_4a_fb_miss, g_4a_fb_nostate, g_4a_fb_stale, g_4a_fb_torn,
               g_4a_fb_shape, g_4a_fb_val, g_4a_fb_ovf, g_4a_byref_conflict);
+          // [NR-5A] coherent-compose verdict. The gate: composed tracks the
+          // 4a composed count, draw_issued == composed, fb args/nodraw/mk at
+          // the known torn/segmentation residual rates, mk_applied at the
+          // deferred by-ref rate.
+          if (g_nr5_coh) {
+            REXGPU_INFO(
+                "[nr-5a] composed={} draw_issued={} | byref def={} "
+                "mk_applied={} mk_skipped={} | fb: args={} nodraw={} mk={}",
+                g_nr5_composed, g_nr5_draw_issued, g_nr5_def_byref,
+                g_nr5_mk_applied, g_nr5_mk_skipped, g_nr5_fb_args,
+                g_nr5_fb_nodraw, g_nr5_fb_mk);
+            g_nr5_composed = g_nr5_draw_issued = 0;
+            g_nr5_def_byref = g_nr5_mk_applied = g_nr5_mk_skipped = 0;
+            g_nr5_fb_args = g_nr5_fb_nodraw = g_nr5_fb_mk = 0;
+          }
           // [NR-4B] only printed when the verify is rate-gated (ver+unver
           // == composed + val fallbacks; unver groups applied unread).
           if (g_4a_unver || g_nr4b_verify_n != 1) {
@@ -7147,6 +7326,12 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                           break;
                         }
                         if (body[p] & 0x80000000u) {
+                          // [NR-5A] draw entries (bit30) carry the draw
+                          // packet's dwords; not part of the span/marker diff.
+                          if (body[p] & 0x40000000u) {
+                            p += 2 + body[p + 1];
+                            continue;
+                          }
                           if (nmk < kCmpMaxMk && body[p + 1] == 3) {
                             mk_pos[nmk] = nr_parsed;
                             mk_boff[nmk] = p + 2;
@@ -7664,9 +7849,11 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // write registers, nested buffers run the executor loop) flushes the
     // packet ranges first so it reads exactly the state decode-order applies
     // would have left.
+    // [NR-5A] the record-sourced draw arm never survives a stop boundary.
+    g_nr5_draw_src = nullptr;
     if (g_nr4a_bufactive && (g_nr4a_ndef || g_nr4a_group_ovf)) {
       if (!stop.delegate && stop.opcode == 0x22) {
-        if (!Nr4aTryCompose(this, nr_tile_draw_addr_)) {
+        if (!Nr4aTryCompose(this, nr_tile_draw_addr_, raw, count, stop.dword)) {
           ++g_4a_flush_draw;
           Nr4aFlush(this);
         }
@@ -8267,7 +8454,17 @@ void CommandProcessor::N8fFlush() {
 // path bit for bit.
 bool CommandProcessor::NrSkipDrawDirect(uint32_t opcode, uint32_t dword,
                                         const uint8_t* raw, uint32_t count) {
-  const auto rd = [raw](uint32_t k) {
+  // [NR-5A] coherent compose armed this stop: the draw's dwords come from
+  // the record (verified byte-equal to the packet), so a composed draw is
+  // single-source end to end. Consumed here; never survives the call.
+  const uint32_t* rec_src = g_nr5_draw_src;
+  const uint32_t rec_ndw = g_nr5_draw_ndw;
+  g_nr5_draw_src = nullptr;
+  if (rec_src) ++g_nr5_draw_issued;
+  const auto rd = [raw, rec_src, rec_ndw, dword](uint32_t k) {
+    if (rec_src && k >= dword && k - dword < rec_ndw) {
+      return __builtin_bswap32(rec_src[k - dword]);
+    }
     return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(raw + k * 4));
   };
   const uint32_t hdr = rd(dword);
