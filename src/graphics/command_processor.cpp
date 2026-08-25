@@ -5312,10 +5312,13 @@ void CommandProcessor::WorkerThreadMain() {
             REXGPU_INFO(
                 "[nr-cmp]   skipped: no_state={} stale={} torn={} "
                 "prevmiss={} ovf={} outside_runs={} | store: stored={} "
-                "dwords={} ovf={} freed={} nomem={}",
+                "dwords={} ovf={} freed={} nomem={} badfree={} expired={} "
+                "dormant_rejoin={} | live={} bump={}MB",
                 g_cmp_no_state, g_cmp_stale, g_cmp_torn, g_cmp_skip_prevmiss,
                 g_cmp_skip_ovf, g_cmp_outside, ss.state_stored,
-                ss.state_dwords, ss.state_ovf, ss.state_freed, ss.state_nomem);
+                ss.state_dwords, ss.state_ovf, ss.state_freed, ss.state_nomem,
+                ss.state_badfree, ss.state_expired, ss.dormant_rejoin,
+                ss.state_live, (ss.state_bump_dw * 4) >> 20);
             // [N-9-4a] The ordering-census verdict: OVERLAP must read 0 for
             // the draw-stop compose apply (the N-9-5 shape) to be order-safe.
             REXGPU_INFO(

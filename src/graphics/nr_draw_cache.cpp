@@ -58,37 +58,72 @@ uint32_t g_gran_epoch[kEpochSlots] = {};
 // pow2 rounding leaves >2x headroom. Exhaustion returns null (counted
 // nomem) and the record publishes args-only -- the compose side already
 // treats that as a fallback.
-constexpr uint32_t kStateArenaDwords = 16u << 20;  // 64MB
+// [NR-5B-2b] Sizing, corrected after the naruto_680 city exhaustion: the
+// retained set spans EVERY address recorded since boot (menus + village +
+// city -- the ring used to reclaim those by lapping), and pow2 classes
+// wasted up to ~67% per block (a ~153-dw body burned a 256-dw block, the
+// full-invalidation class a 4096-dw one). 256MB + quarter-step classes
+// (waste <= 25%) with live/bump counters so the real live set is a
+// measured number. Committed on touch, so the resident cost is the bump
+// watermark, not the reservation.
+constexpr uint32_t kStateArenaDwords = 64u << 20;  // 256MB
 constexpr uint32_t kStateHdrDwords = 3;
 constexpr uint32_t kStateMaxBody = 4096;  // worst captured group ~2.8k dwords
-constexpr uint32_t kStateClassMin = 5;    // 2^5 = 32 dwords
-constexpr uint32_t kStateClassMax = 13;   // 2^13 = 8192 >= 3 + 4096
-constexpr uint32_t kStateClasses = kStateClassMax - kStateClassMin + 1;
+// Quarter-step class sizes: {2^k, 1.25*2^k, 1.5*2^k, 1.75*2^k} per octave.
+constexpr uint32_t kStateClassSizes[] = {
+    32,   40,   48,   56,   64,   80,   96,   112,  128,  160,  192,
+    224,  256,  320,  384,  448,  512,  640,  768,  896,  1024, 1280,
+    1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192};
+constexpr uint32_t kStateClasses =
+    uint32_t(sizeof(kStateClassSizes) / sizeof(kStateClassSizes[0]));
 uint32_t g_state_arena[kStateArenaDwords];
 uint32_t g_state_bump = 0;                    // virgin space watermark
 uint32_t g_state_free[kStateClasses] = {};    // head offset + 1 (0 = empty)
 uint32_t g_state_gen = 0;
 
 // Class index for a block that must hold `need` dwords (header included).
+// Alloc and free MUST round identically; both call this.
 inline uint32_t StateClassFor(uint32_t need) {
-  uint32_t c = kStateClassMin;
-  while ((1u << c) < need) ++c;
-  return c - kStateClassMin;
+  uint32_t c = 0;
+  while (kStateClassSizes[c] < need) ++c;
+  return c;
 }
+
+// [NR-5B-2b] Dormancy horizon and sweep. The clock is g_seq (recordings):
+// no OS clock on the raised-IRQL writer, and the horizon self-scales with
+// activity -- ~2s at the city's ~150k stores/s, ~a minute on a quiet
+// title. A record neither re-stored nor joined for the horizon is expired
+// by the writer's incremental sweep (whole record cleared, payload freed):
+// the consumer joins every live buffer every frame, so dormancy means the
+// address is abandoned (the recorder moved on) or its buffer stopped
+// executing -- either way a later miss is a counted fallback, and the
+// dormant_rejoin witness measures exactly how often that gamble would
+// lose. Sweep pace: kStateSweepPerStore slots per store call ~= the whole
+// 1M-slot table per second at city rates.
+constexpr uint32_t kStateDormantSeq = 300000;
+constexpr uint32_t kStateSweepPerStore = 8;
+uint32_t g_state_sweep_cursor = 0;
 
 // Free one block: kill its generation first (readers fail deterministically),
 // then thread it onto its class list via blk[0]. The class comes from the
 // block's own ndw -- alloc and free run on the one writer thread, so the
 // writer reads back exactly the ndw it stamped.
 inline void StateFree(uint32_t off) {
-  if (off + kStateHdrDwords > kStateArenaDwords) return;
+  if (off + kStateHdrDwords > kStateArenaDwords) {
+    ++g_stats.state_badfree;  // never stamped by us: refuse (a leak if >0)
+    return;
+  }
   uint32_t* blk = &g_state_arena[off];
   const uint32_t ndw = blk[2];
-  if (!ndw || ndw > kStateMaxBody) return;  // never stamped by us: refuse
+  if (!ndw || ndw > kStateMaxBody) {
+    ++g_stats.state_badfree;
+    return;
+  }
   blk[1] = 0;  // gen 0: never valid, Acquire/Verify now always refuse
   const uint32_t cls = StateClassFor(kStateHdrDwords + ndw);
   blk[0] = g_state_free[cls];
   g_state_free[cls] = off + 1;
+  --g_stats.state_live;
 }
 
 // Packet headers are word-aligned; multiplicative hash, top bits.
@@ -101,14 +136,24 @@ inline uint32_t Slot(uint32_t addr) {
 bool LookupDraw(uint32_t phys_addr, DrawRecord* out) {
   const uint32_t addr = phys_addr & kPhysMask;
   if (!addr) return false;
-  const DrawRecord& slot = g_tab[Slot(addr)];
+  DrawRecord& slot = g_tab[Slot(addr)];
   if (slot.addr != addr) return false;
   *out = slot;
   // Re-check after the copy: a concurrent displacement of this slot by a
   // different address can otherwise hand back a half-written record under the
   // old key. A same-address upsert racing the copy can still mix old and new
   // ARGUMENTS -- that is the accepted one-sample tear, same as v2.
-  return out->addr == addr;
+  if (out->addr != addr) return false;
+  // [NR-5B-2b] liveness stamp (reader-side u32 store, torn = one sweep
+  // round). A hit on a record already dormant past the horizon is the
+  // policy witness: it would have been expired, and 5b-3 must see ~0.
+  const uint32_t now = g_seq;
+  if (uint32_t(now - out->last_use) > kStateDormantSeq &&
+      uint32_t(now - out->seq) > kStateDormantSeq) {
+    ++g_stats.dormant_rejoin;
+  }
+  slot.last_use = now;
+  return true;
 }
 
 uint64_t SumRangeEpoch(uint32_t phys_addr, uint32_t bytes) {
@@ -150,7 +195,15 @@ bool VerifyState(const DrawRecord& rec) {
 
 const CacheStats& GetCacheStats() { return g_stats; }
 
-void ResetCacheStats() { g_stats = CacheStats{}; }
+void ResetCacheStats() {
+  // state_live and state_bump_dw are GAUGES (current allocator state), not
+  // window rates: they survive the per-second reset.
+  const uint64_t live = g_stats.state_live;
+  const uint64_t bump = g_stats.state_bump_dw;
+  g_stats = CacheStats{};
+  g_stats.state_live = live;
+  g_stats.state_bump_dw = bump;
+}
 
 void ResetCache() {
   for (uint32_t i = 0; i < kTableSize; ++i) g_tab[i].addr = 0;
@@ -159,7 +212,8 @@ void ResetCache() {
   g_state_bump = 0;
   for (uint32_t c = 0; c < kStateClasses; ++c) g_state_free[c] = 0;
   g_state_gen = 0;
-  ResetCacheStats();
+  g_state_sweep_cursor = 0;
+  g_stats = CacheStats{};  // full reset, gauges included
 }
 
 }  // namespace nr
@@ -195,6 +249,7 @@ extern "C" void rex_nr_record_draw_args_state(uint32_t guest_addr, uint32_t rid,
     slot->addr = 0;
   }
   slot->seq = ++g_seq;
+  slot->last_use = g_seq;
   slot->rid = rid;
   slot->prim = prim;
   slot->start = start;
@@ -211,6 +266,26 @@ extern "C" void rex_nr_record_draw_args_state(uint32_t guest_addr, uint32_t rid,
   g_gran_epoch[(addr >> kGranuleShift) & (kEpochSlots - 1)] += 1;
   ++g_stats.recorded;
   if (state_gen) ++g_stats.state_stored;
+  // [NR-5B-2b] the incremental dormancy sweep rides every store call.
+  const uint32_t now = g_seq;
+  for (uint32_t k = 0; k < kStateSweepPerStore; ++k) {
+    DrawRecord* s = &g_tab[g_state_sweep_cursor];
+    g_state_sweep_cursor = (g_state_sweep_cursor + 1) & (kTableSize - 1);
+    if (!s->addr) continue;
+    if (uint32_t(now - s->last_use) <= kStateDormantSeq ||
+        uint32_t(now - s->seq) <= kStateDormantSeq) {
+      continue;
+    }
+    const uint32_t doff = s->state_off;
+    const uint32_t dgen = s->state_gen;
+    s->addr = 0;  // invalidate first: a racing lookup misses, never mixes
+    s->state_gen = 0;
+    if (dgen) {
+      StateFree(doff);
+      ++g_stats.state_freed;
+    }
+    ++g_stats.state_expired;
+  }
 }
 
 extern "C" void rex_nr_record_draw_args(uint32_t guest_addr, uint32_t rid,
@@ -237,7 +312,7 @@ extern "C" uint32_t* rex_nr_state_alloc(uint32_t guest_addr, uint32_t body_ndw,
   // lifetime == record lifetime.
   const uint32_t need = kStateHdrDwords + body_ndw;
   const uint32_t cls = StateClassFor(need);
-  const uint32_t block_dw = 1u << (cls + kStateClassMin);
+  const uint32_t block_dw = kStateClassSizes[cls];
   uint32_t off;
   if (g_state_free[cls]) {
     off = g_state_free[cls] - 1;
@@ -245,10 +320,12 @@ extern "C" uint32_t* rex_nr_state_alloc(uint32_t guest_addr, uint32_t body_ndw,
   } else if (g_state_bump + block_dw <= kStateArenaDwords) {
     off = g_state_bump;
     g_state_bump += block_dw;
+    g_stats.state_bump_dw = g_state_bump;
   } else {
     ++g_stats.state_nomem;
     return nullptr;
   }
+  ++g_stats.state_live;
   uint32_t* blk = &g_state_arena[off];
   // Header first: a reader holding an older record that pointed here sees the
   // new {addr, gen} and reads its own payload as stale instead of as ours.

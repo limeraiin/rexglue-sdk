@@ -69,6 +69,13 @@ namespace nr {
 struct DrawRecord {
   uint32_t addr;   // masked physical address of the draw's DRAW_INDX header
   uint32_t seq;    // global recording order (diagnostic: record age)
+  // [NR-5B-2b] liveness stamp for the retained store's reclamation: the
+  // reader (LookupDraw) writes the current recording seq here on every hit
+  // (unsynchronised u32; a torn stamp costs one sweep round). The writer's
+  // incremental sweep expires records neither stored nor joined for a
+  // horizon -- forward-advancing phases (boot/intro ~45k NEW addrs/s,
+  // naruto_681) abandon addresses at rates no fixed arena survives.
+  uint32_t last_use;
   uint32_t rid;    // which of the three DRAW_INDX recorders fired (0/1/2)
   uint32_t prim;   // r4: primitive type (4 = TRIANGLELIST on this title)
   uint32_t start;  // start index (the recorder scales it x2/x4 to bytes)
@@ -118,6 +125,15 @@ struct CacheStats {
   uint64_t state_ovf;     // alloc refusals: block over the size cap
   uint64_t state_freed;   // blocks freed by record replace/evict/clear
   uint64_t state_nomem;   // alloc refusals: arena exhausted (expect 0)
+  uint64_t state_badfree; // frees refused on an implausible header (leak if >0)
+  uint64_t state_expired; // records reclaimed by the dormancy sweep
+  // [NR-5B-2b] policy witness: a JOIN HIT on a record dormant past the
+  // horizon (it would have been expired had the sweep reached it). Must
+  // read ~0 before 5b-3 makes payloads load-bearing.
+  uint64_t dormant_rejoin;
+  // Gauges (survive ResetCacheStats): current allocator state.
+  uint64_t state_live;    // blocks currently allocated
+  uint64_t state_bump_dw; // virgin-space watermark, dwords
 };
 
 // [NR-STORE] Read one record's state payload on the execute side. Validates
