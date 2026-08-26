@@ -333,22 +333,6 @@ REXCVAR_DEFINE_BOOL(gpu_nr_band_cycle, false, "GPU",
 // The PARSE deliberately stays: N-9a already refuted memoizing it at its
 // strongest design point ([[subtraction-buckets-mislabel]] -- the parse was
 // never the cost). This removes the TRAFFIC, which is the half that measured.
-// DEFAULT 1 since 2026-08-26 (naruto_746 + naruto_747, two user city drives on
-// different routes, paired in place at matched dpf, 0 fatals): -6.7 to -9.3%
-// CP us/draw, and the user could not tell the phases apart in either drive.
-// The register file is byte-identical to a full apply by construction, so the
-// naruto_742 flashing class cannot recur; lostdraws read 0 in every window.
-REXCVAR_DEFINE_INT32(gpu_nr_band_walk, 1, "GPU",
-                     "N-9-7: for a buffer execution de-tile calls a repeat "
-                     "band, STORE its register values but skip the per-range "
-                     "side effects, and re-apply the touched ranges once when "
-                     "the band run ends. Parse, delegates and every write "
-                     "below 0x2000 run unchanged. 0 = off, 1 = on.");
-// One in-place cycler, 10 s per phase ([[price-stages-in-place]]). The census
-// runs in BOTH phases, so the OFF phase prices exactly what the ON phase did.
-REXCVAR_DEFINE_BOOL(gpu_nr_band_walk_cycle, false, "GPU",
-                    "N-9-7: cycle the band walk-skip 10 s off / 10 s on in "
-                    "place for the paired fps read at matched draws/frame.");
 
 REXCVAR_DEFINE_BOOL(gpu_nr_compose_prof, false, "GPU",
                     "[nr-5c] Diagnostic: time the record compose per draw "
@@ -2477,9 +2461,75 @@ uint64_t g_nr6_pred_ne = 0;
 uint64_t g_nr6_pre_dw = 0, g_nr6_late = 0, g_nr6_pre_mk = 0;
 
 // [NR-97] N-9-7 phase A: the repeat-band walk skip (see the cvars).
-int32_t g_n97_mode = 0;
-bool g_n97_cycle = false;
-int32_t g_n97_phase = -1;
+// UNCONDITIONAL since 2026-08-26 (user directive: a confirmed win is code, not
+// a flag -- the same sweep that deleted gpu_nr_direct_resolve,
+// d3d12_pipeline_library and gpu_nr_plain_bulk). The only gate left is the
+// PRECONDITION, not a preference: the band predicate is de-tile's own, and the
+// walk is the only decoder under the skip, so without either there is nothing
+// to classify. It is derived, announced once, and never read from a cvar.
+bool g_n97_on = false;
+// The live register file and the guest translator, stamped once per buffer
+// execution so the free-function filters can reach them.
+RegisterFile* g_n97_rf = nullptr;
+memory::Memory* g_n97_mem = nullptr;
+
+// THE DEFERRED SIDE-EFFECT SET: which registers a band run stored without
+// firing their side effects, so the run's end can fire them once from the
+// CURRENT values. Last-writer-wins IS the run's net effect, and re-reading the
+// live file means that if something after the band moved a register first, the
+// re-apply carries the newer value rather than a stale one.
+//
+// ⚠ THE FIRST CUT OF THIS WAS AN EXACT {base,n} LIST AND IT OVERFLOWED
+// (naruto_743: `pend ovf=22340` in one window). The city does not reuse ~150
+// ranges, it emits thousands of distinct bases, so an exact list is unbounded
+// in the one direction that matters: a range that overflows the cap is stored
+// but never re-applied, which resurrects the naruto_742 flashing class for
+// exactly the registers the cap dropped. COVERAGE cannot overflow, so this is
+// a bitmap of 64-register BLOCKS instead. Marking costs (n/64)+1 stores per
+// range, the flush emits one apply per CONTIGUOUS RUN of marked blocks, and
+// the worst case is the whole register file: 321 blocks, bounded, always
+// complete. Over-covering by up to 63 registers per block is harmless -- they
+// are re-applied with the values they already hold.
+constexpr uint32_t kN97Blk = 64;
+constexpr uint32_t kN97Blocks = (RegisterFile::kRegisterCount + kN97Blk - 1) / kN97Blk;
+uint8_t g_n97_blk[kN97Blocks] = {};
+uint32_t g_n97_blk_n = 0;  // marked blocks, so an empty run costs one compare
+std::vector<uint32_t> g_n97_pend_scratch;
+uint64_t g_n97_flush_runs = 0, g_n97_flush_rng = 0, g_n97_flush_dw = 0;
+uint64_t g_n97_store_rng = 0, g_n97_store_dw = 0;
+
+// [NR-97b] The per-stop half, and the only part of the fence replay that is
+// provably free rather than merely plausible. A band execution surfaces ~300k
+// draw stops a second at the city and does the same three things at each:
+// rebuild the 8-register DetileRegs tuple, call DetileObserve, call
+// DetileIsRepeatBand. For a NON-RESOLVE stop all three are pure functions of
+// that tuple -- DetileIsRepeatBand is a pure predicate, and DetileObserve's
+// band branch is idempotent for an identical tuple (obs_band_rows is a min,
+// obs_full_height is a max, obs_sig is a first-write, obs_consistent is a
+// conjunction of compares). So skipping a repeat is EXACTLY equivalent, and
+// the learner still sees every distinct band pattern every frame:
+// naruto_505's self-latch needs the PATTERN, not the repetitions.
+// ⚠ A RESOLVE ALWAYS OBSERVES -- its branch is stateful (band0_dest,
+// band_taps, the destination-stride guard). That also closes the guard-trip
+// hazard for free: only a resolve can trip the guard, and a resolve always
+// overwrites the cache with is_resolve=1 in its key, so the next non-resolve
+// necessarily misses and re-evaluates against the tripped guard.
+uint32_t g_n97o_key[8] = {};   // the last tuple observed, verbatim
+bool g_n97o_valid = false;     // ...and whether it is usable
+bool g_n97o_repeat = false;    // ...its DetileIsRepeatBand verdict
+uint64_t g_n97o_hit = 0, g_n97o_miss = 0, g_n97o_resolve = 0;
+
+// (SS) The other way a deferred side effect could be READ rather than merely
+// re-fired later: a delegate inside the band execution itself. Every delegate
+// still runs -- that is trap naruto_503 and it is not negotiable -- but three
+// classes read the register file: REG_RMW, COND_WRITE and WAIT_REG_MEM on a
+// register poll. WAIT_REG_MEM needs splitting rather than counting: it waits
+// on MEMORY when its wait_info carries bit 0x10 and on a REGISTER otherwise,
+// and a register wait below 0x2000 is still fed. wait_other must read 0.
+uint64_t g_n97_deleg = 0, g_n97_deleg_read = 0;
+uint64_t g_n97_wait_mem = 0, g_n97_wait_coher = 0, g_n97_wait_other = 0;
+uint32_t g_n97_wait_reg = 0xFFFFFFFFu;
+uint64_t g_n97_deleg_op[128] = {};
 // Per buffer execution, set at entry from de-tile's own predicate.
 bool g_n97_armed = false;      // the mode (or its cycler) owns this execution
 bool g_n97_bufband = false;    // entry state says this execution is a band
@@ -2498,145 +2548,6 @@ uint64_t g_n97_pre_dw = 0;      // dwords applied before a mid-buffer activation
 uint64_t g_n97_pre_mark = 0;    // ...its snapshot, taken at buffer entry
 uint64_t g_n97_dropped_draws = 0;  // mixed draws the activation forced us to
                                    // drop (their state was already gone)
-// (SS) THE SOUNDNESS INSTRUMENT. The whole increment rests on one claim: a
-// repeat band's applies leave the register file where band 1 already left it,
-// so dropping them is invisible to every reader downstream. That is checkable,
-// not merely arguable.
-//
-// ⚠ THE FIRST CUT OF THIS ASKED THE WRONG QUESTION (naruto_733). Comparing
-// each dropped dword against the register it is about to overwrite reads 14.7%
-// "would change" -- and that number is meaningless, because it measures churn
-// INSIDE the execution (a buffer re-loads 72 float4s per draw across ~220
-// draws, so of course consecutive writes differ). It says nothing about
-// whether the execution's NET effect differs from what was already there.
-//
-// ⚠ AND THE SECOND CUT ASKED IT AT THE WRONG BOUNDARY (naruto_734). Per
-// EXECUTION the answer is not zero and cannot be: band 2 runs buffers A,B,C
-// in order, so B starts from A's end state rather than from its own, and
-// SQ_PROGRAM_CNTL (0x2180, the first offender the counter named) legitimately
-// moves. The claim was never about one buffer. It is about the RUN: band 1
-// ends the frame's first pass at some state, band 2 replays the same buffers
-// with the same bytes and therefore ends at the SAME state, and so does band
-// 3 -- so the whole band-2+3 sequence is a round trip, and only the round trip
-// nets to zero.
-//
-// So the sweep boundary is the FRAME. Every dropped register is remembered at
-// its FIRST touch in the frame with the value it held BEFORE that touch, and
-// the list is swept at the swap: net_chg = registers the frame's band
-// executions left different from how they found them, and it must read 0.
-// Covers 100% of the dropped class including by-ref ranges -- the sweep never
-// needs the written value, only the register index and the live file.
-// ⚠ AND THE THIRD CUT HAD A FALSE POSITIVE (naruto_737): reading the "after"
-// value off the LIVE file at the swap blames the band for everything the
-// post-pass did. The frame is [band 1][band 2][band 3][post-pass + UI], and
-// the post-pass rebinds shaders and textures after the last band execution --
-// which is exactly the register profile the counter named (SQ_PROGRAM_CNTL,
-// the 0x4800 fetch window, VGT_DRAW_INITIATOR, a few ALU constants, all with
-// the same before->after every single frame, i.e. a steady oscillation, not
-// drift). So the "after" value is snapshotted at the end of each band
-// execution instead, and the sweep compares entry against the last band
-// execution's snapshot. Nothing after the bands can reach it now.
-// Sampled 1 frame in 8 so it cannot bias the paired fps read it rides along
-// with ([[price-stages-in-place]]).
-RegisterFile* g_n97_rf = nullptr;
-memory::Memory* g_n97_mem = nullptr;  // by-ref payloads, stamped at entry
-bool g_n97_sample = false;
-std::vector<uint32_t> g_n97_touched;  // per register: index into tlist, +1
-std::vector<uint32_t> g_n97_tlist;    // ...the registers, to sweep and clear
-std::vector<uint32_t> g_n97_tentry;   // ...their value BEFORE the first touch
-std::vector<uint32_t> g_n97_tlast;    // ...and as the last band execution left
-                                      //    it, which is the "after" that
-                                      //    belongs to the bands alone
-std::vector<uint8_t> g_n97_exec_seen;  // touched in THIS execution
-std::vector<uint32_t> g_n97_exec_list;
-uint64_t g_n97_net_chg = 0;   // registers a band execution NET-changed
-uint64_t g_n97_net_same = 0;  // ...left exactly as it found them
-uint64_t g_n97_net_frames = 0;  // sampled frames swept
-uint64_t g_n97_net_dirty = 0;   // ...of which changed at least one register
-uint64_t g_n97_frame_n = 0;     // frames seen, for the 1-in-8 sample
-// (SS) The other way a dropped apply could be READ instead of merely
-// overwritten: a delegate inside the band execution itself. Every delegate
-// still runs -- that is trap naruto_503 and it is not negotiable -- but three
-// classes READ the register file the drop has stopped feeding: REG_RMW
-// (read-modify-write), COND_WRITE (compares a register) and WAIT_REG_MEM on a
-// register poll. The EVENT_WRITE family and MEM_WRITE do not. Counted per
-// class so the risk has a size instead of an argument; deleg_read must be 0,
-// or the keep-list needs the registers those delegates touch.
-// WAIT_REG_MEM is the one that needs splitting rather than counting: it waits
-// on MEMORY when its wait_info carries bit 0x10, and on a REGISTER otherwise.
-// A register wait on COHER_STATUS_HOST (0x0A31) is below 0x2000 and therefore
-// still fed; a wait on anything at or above 0x2000 would be spinning on a
-// value this mode has stopped writing, which is a hang, not a glitch.
-// wait_other must read 0.
-// THE DEFERRED SIDE-EFFECT SET: which registers a band run stored without
-// firing their side effects, so the run's end can fire them once from the
-// CURRENT values. Last-writer-wins IS the run's net effect, and re-reading the
-// live file means that if something after the band moved a register first, the
-// re-apply carries the newer value rather than a stale one.
-//
-// ⚠ THE FIRST CUT OF THIS WAS AN EXACT {base,n} LIST AND IT OVERFLOWED
-// (naruto_743: `pend ovf=22340` in one window). The city does not reuse ~150
-// ranges, it emits thousands of distinct bases, so an exact list is unbounded
-// in the one direction that matters: a range that overflows the cap is stored
-// but never re-applied, which resurrects the naruto_742 class for exactly the
-// registers the cap dropped. COVERAGE cannot overflow, so this is a bitmap of
-// 64-register BLOCKS instead. Marking costs (n/64)+1 stores per range rather
-// than one hash probe, the flush emits one apply per CONTIGUOUS RUN of marked
-// blocks, and the worst case is the whole register file: 321 blocks, bounded,
-// always complete. Over-covering by up to 63 registers per block is harmless -
-// those registers are re-applied with the values they already hold, so the
-// only effect is that their (correct) side effects fire too.
-constexpr uint32_t kN97Blk = 64;
-constexpr uint32_t kN97Blocks = (RegisterFile::kRegisterCount + kN97Blk - 1) / kN97Blk;
-uint8_t g_n97_blk[kN97Blocks] = {};
-uint32_t g_n97_blk_n = 0;  // marked blocks, so an empty run costs one compare
-std::vector<uint32_t> g_n97_pend_scratch;
-uint64_t g_n97_flush_runs = 0, g_n97_flush_rng = 0, g_n97_flush_dw = 0;
-uint64_t g_n97_store_rng = 0, g_n97_store_dw = 0;
-
-// [NR-97b] The per-stop half of the fence replay, and the only part of it that
-// is provably free rather than merely plausible.
-//
-// A band execution surfaces ~300k draw stops a second at the city and does the
-// same three things at every one: rebuild the 8-register DetileRegs tuple, call
-// DetileObserve, call DetileIsRepeatBand. For a NON-RESOLVE stop all three are
-// pure functions of that tuple:
-//   - DetileIsRepeatBand is a pure predicate.
-//   - DetileObserve's band branch is idempotent for an identical tuple --
-//     obs_band_rows is a min, obs_full_height is a max, obs_sig is a
-//     first-write, and obs_consistent is a conjunction of compares. Calling it
-//     twice with the same registers cannot reach a state one call did not.
-// So skipping a repeat of the SAME tuple is exactly equivalent, not an
-// approximation, and the de-tile learner still sees every distinct band
-// pattern every frame (naruto_505's self-latch needs the pattern, not the
-// repetitions).
-// ⚠ A RESOLVE always observes: its branch is stateful (band0_dest, band_taps,
-// the destination-stride guard), so repeats are NOT idempotent there.
-uint32_t g_n97o_key[8] = {};   // the last tuple observed, verbatim
-bool g_n97o_valid = false;     // ...and whether it is usable
-bool g_n97o_repeat = false;    // ...its DetileIsRepeatBand verdict
-uint64_t g_n97o_hit = 0, g_n97o_miss = 0, g_n97o_resolve = 0;
-
-uint64_t g_n97_deleg = 0, g_n97_deleg_read = 0;
-uint64_t g_n97_wait_mem = 0, g_n97_wait_coher = 0, g_n97_wait_other = 0;
-uint32_t g_n97_wait_reg = 0xFFFFFFFFu;
-uint64_t g_n97_deleg_op[128] = {};
-uint32_t g_n97_chg_reg = 0xFFFFFFFFu;  // the first register that disagreed
-// A silent count is ambiguous between "a real class" and "my predicate is
-// wrong", so the sweep NAMES what it found: the distinct registers, with the
-// value they held before the frame's band executions and after.
-constexpr uint32_t kN97ChgSamples = 24;
-struct N97ChgRec {
-  uint32_t reg, before, after;
-  uint64_t n;
-};
-N97ChgRec g_n97_chg_rec[kN97ChgSamples] = {};
-uint32_t g_n97_chg_rec_n = 0;
-uint64_t g_n97_chg_rec_ovf = 0;
-// The write-by-write read is kept beside it, clearly labelled, because it is
-// the number that looks alarming and it must stay visible next to the one that
-// actually decides ([[subtraction-buckets-mislabel]] in miniature).
-uint64_t g_n97_chg_dw = 0, g_n97_same_dw = 0, g_n97_skip_dw = 0;
 uint64_t g_n97_bufs = 0;        // depth-1 executions seen
 uint64_t g_n97_bufs_drop = 0;   // ...and were actually walk-skipped
 uint64_t g_n97_bufs_ref = 0;    // ...refused: a past execution came out mixed
@@ -5189,92 +5100,6 @@ inline bool N97KeepReg(uint32_t reg) {
   return nr::CtxRangeTouchesMirrorRegs(reg, 1);
 }
 
-// (SS) Remember a dropped register at its FIRST touch, with the value it held
-// BEFORE the write lands, so the buffer-end sweep can ask the net question.
-inline void N97Touch(uint32_t reg) {
-  if (reg >= RegisterFile::kRegisterCount) return;
-  if (!g_n97_touched[reg]) {
-    g_n97_tlist.push_back(reg);
-    g_n97_tentry.push_back(g_n97_rf->values[reg]);
-    g_n97_tlast.push_back(g_n97_rf->values[reg]);
-    g_n97_touched[reg] = uint32_t(g_n97_tlist.size());  // index + 1
-  }
-  if (!g_n97_exec_seen[reg]) {
-    g_n97_exec_seen[reg] = 1;
-    g_n97_exec_list.push_back(reg);
-  }
-}
-
-// (SS) Close a band execution: whatever it left in the registers it touched is
-// the newest "after" the BANDS are answerable for. Bounded by what this one
-// execution touched, so a long run stays linear.
-void N97ExecEnd() {
-  for (uint32_t reg : g_n97_exec_list) {
-    // The sweep clears g_n97_touched, so a slot of 0 means this execution's
-    // list outlived its sweep. It cannot happen on one thread (touches and
-    // this call are inside the same buffer execution), and a 0 here would
-    // index tlast at -1, so it is checked rather than assumed.
-    const uint32_t slot = g_n97_touched[reg];
-    if (slot) g_n97_tlast[slot - 1] = g_n97_rf->values[reg];
-    g_n97_exec_seen[reg] = 0;
-  }
-  g_n97_exec_list.clear();
-}
-
-// The write-by-write read (churn, NOT the verdict -- see the globals) plus the
-// touch recording that feeds the one that is.
-void N97CountChanged(uint32_t base, const uint32_t* be, uint32_t n) {
-  if (!g_n97_rf || base + n > RegisterFile::kRegisterCount) {
-    g_n97_skip_dw += n;
-    return;
-  }
-  const uint32_t* live = &g_n97_rf->values[base];
-  for (uint32_t i = 0; i < n; ++i) {
-    N97Touch(base + i);
-    if (!be) {
-      ++g_n97_skip_dw;  // by-ref: no packet value to compare, net sweep covers
-    } else if (__builtin_bswap32(be[i]) == live[i]) {
-      ++g_n97_same_dw;
-    } else {
-      ++g_n97_chg_dw;
-    }
-  }
-}
-
-// (SS) The verdict, swept at the swap. Did this frame's band executions leave
-// any register different from how they found it?
-void N97NetSweep() {
-  if (g_n97_tlist.empty()) return;
-  ++g_n97_net_frames;
-  bool dirty = false;
-  for (size_t i = 0; i < g_n97_tlist.size(); ++i) {
-    const uint32_t reg = g_n97_tlist[i];
-    g_n97_touched[reg] = 0;
-    if (g_n97_tlast[i] == g_n97_tentry[i]) {
-      ++g_n97_net_same;
-    } else {
-      ++g_n97_net_chg;
-      dirty = true;
-      if (g_n97_chg_reg == 0xFFFFFFFFu) g_n97_chg_reg = reg;
-      uint32_t k = 0;
-      for (; k < g_n97_chg_rec_n; ++k) {
-        if (g_n97_chg_rec[k].reg == reg) break;
-      }
-      if (k < g_n97_chg_rec_n) {
-        ++g_n97_chg_rec[k].n;
-      } else if (g_n97_chg_rec_n < kN97ChgSamples) {
-        g_n97_chg_rec[g_n97_chg_rec_n++] =
-            N97ChgRec{reg, g_n97_tentry[i], g_n97_tlast[i], 1};
-      } else {
-        ++g_n97_chg_rec_ovf;
-      }
-    }
-  }
-  if (dirty) ++g_n97_net_dirty;
-  g_n97_tlist.clear();
-  g_n97_tentry.clear();
-  g_n97_tlast.clear();
-}
 
 // Mark the blocks a deferred range covers. Cannot fail and cannot overflow,
 // which is the whole point.
@@ -5298,15 +5123,6 @@ void N97RegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) {
     return;
   }
   ++g_n97_drop_pdw;
-  if (g_n97_sample && !g_n97_bufdrop && g_n97_rf &&
-      reg < RegisterFile::kRegisterCount) {
-    N97Touch(reg);
-    if (value == g_n97_rf->values[reg]) {
-      ++g_n97_same_dw;
-    } else {
-      ++g_n97_chg_dw;
-    }
-  }
   if (!g_n97_bufdrop) {
     NrWalkRegWrite(user, reg, value, from_memory);
     return;
@@ -5340,7 +5156,6 @@ bool N97RegRange(void* user, uint32_t base, const uint32_t* values_be,
   }
   ++g_n97_drop_rng;
   g_n97_drop_dw += n;
-  if (g_n97_sample && !g_n97_bufdrop) N97CountChanged(base, values_be, n);
   if (!g_n97_bufdrop) {
     return NrWalkRegRange(user, base, values_be, n, phys, from_memory);
   }
@@ -5426,15 +5241,15 @@ void N97Activate(bool at_entry) {
     if (now >= g_n97_pre_mark) g_n97_pre_dw += now - g_n97_pre_mark;
   }
   g_n97_filter = true;
-  g_n97_bufdrop = g_n97_mode > 0 && N97MemoGet(g_n97_bufkey) != kN97Mixed;
+  g_n97_bufdrop = N97MemoGet(g_n97_bufkey) != kN97Mixed;
   if (g_n97_bufdrop) {
     ++g_n97_bufs_drop;
     // The 4a defer path assumes decode-order applies that are about to stop
     // happening; pending ranges are already resolved at this stop, so simply
     // standing it down for the rest of the buffer is exact.
     g_nr4a_bufactive = false;
-  } else if (N97MemoGet(g_n97_bufkey) == kN97Mixed) {
-    ++g_n97_bufs_ref;
+  } else {
+    ++g_n97_bufs_ref;  // a past execution of this buffer came out mixed
   }
   // The census runs in BOTH cycler phases: the filter is installed either way
   // and only DROPS when the phase is live, so the OFF phase prices exactly the
@@ -6055,23 +5870,21 @@ void CommandProcessor::WorkerThreadMain() {
     // walk is the only decoder there) and de-tile (its predicate IS the band
     // test, so an unarmed or guard-tripped de-tile disarms this outright).
     {
-      const int32_t m = REXCVAR_GET(gpu_nr_band_walk);
-      g_n97_mode = (m > 0 && kNrSkip && g_nr_detile_mode) ? 1 : 0;
-      g_n97_cycle = REXCVAR_GET(gpu_nr_band_walk_cycle) && kNrSkip &&
-                    g_nr_detile_mode;
-      if (m > 0 && !(kNrSkip && g_nr_detile_mode)) {
-        REXGPU_WARN(
-            "[nr-97] DISARMED: needs the skip walk and gpu_nr_detile (the "
-            "band predicate is de-tile's own).");
-      }
-      if (g_n97_mode || g_n97_cycle) {
-        REXGPU_INFO(
-            "[nr-97] repeat-band WALK SKIP armed: mode={}{} -- a buffer "
-            "execution de-tile calls a repeat band keeps its parse, its "
-            "delegates and every write below 0x2000, and applies NOTHING "
-            "above it but the 27-slot recovery mirror. mixed must stay 0.",
-            g_n97_mode,
-            g_n97_cycle ? " CYCLE 10 s off / 10 s on in place" : "");
+      const bool on = kNrSkip && g_nr_detile_mode;
+      if (on != g_n97_on) {
+        g_n97_on = on;
+        if (on) {
+          REXGPU_INFO(
+              "[nr-97] repeat-band value-store ON (unconditional): a buffer "
+              "execution de-tile calls a repeat band STORES its register "
+              "values but defers the per-range side effects, and re-applies "
+              "the touched coverage once when the run ends. Parse, delegates "
+              "and every write below 0x2000 run unchanged. mixed must stay 0.");
+        } else {
+          REXGPU_WARN(
+              "[nr-97] INERT: needs the skip walk and gpu_nr_detile (the band "
+              "predicate is de-tile's own), so there is nothing to classify.");
+        }
       }
     }
     if (g_nr5c_prof) {
@@ -6274,27 +6087,6 @@ void CommandProcessor::WorkerThreadMain() {
       }
     }
 
-    // [NR-97] the repeat-band walk-skip cycle: 10 s off, 10 s on, in place.
-    // Two phases only -- this lever has no classes, it either applies a band's
-    // register stream or it does not. The census counts in BOTH phases, so the
-    // OFF phase reports exactly the traffic and the risk the ON phase carried
-    // ([[price-stages-in-place]]).
-    if (g_n97_cycle) {
-      static auto n97_t0 = prof_clock::now();
-      const int32_t phase =
-          int32_t((std::chrono::duration_cast<std::chrono::seconds>(
-                       prof_clock::now() - n97_t0)
-                       .count() /
-                   10) %
-                  2);
-      if (phase != g_n97_phase) {
-        g_n97_phase = phase;
-        g_n97_mode = phase;
-        REXGPU_INFO("[nr-97] PHASE {} - {}", phase,
-                    phase == 0 ? "OFF (baseline: repeat bands apply in full)"
-                               : "ON (repeat-band applies above 0x2000 DROPPED)");
-      }
-    }
 
     // [NR-5B-3i] the ALU-half visual bisect: 5 s per by-ref source, in place,
     // phase logged so the log names what the eye was looking at.
@@ -7618,7 +7410,8 @@ void CommandProcessor::WorkerThreadMain() {
               "act={} (atentry={}) refused={} mixedbufs={} lateband={} | "
               "dw drop={} keep={} pre={} ({}% of band traffic dropped) | "
               "rng drop={} keep={} pdw drop={} keep={} | mixed={} lostdraws={}",
-              g_n97_mode, g_n97_bufs, g_n97_bufs_eband, g_n97_bufs_fband,
+              g_n97_on ? 1 : 0, g_n97_bufs, g_n97_bufs_eband,
+              g_n97_bufs_fband,
               g_n97_bufs ? g_n97_bufs_fband * 100 / g_n97_bufs : 0,
               g_n97_bufs_drop, g_n97_bufs_entry, g_n97_bufs_ref,
               g_n97_bufs_mixed, g_n97_late_band, drop_dw,
@@ -7644,73 +7437,6 @@ void CommandProcessor::WorkerThreadMain() {
           }
           g_n97_store_rng = g_n97_store_dw = 0;
           g_n97_flush_runs = g_n97_flush_rng = g_n97_flush_dw = 0;
-          // (SS) the soundness read, 1-in-16 sampled, OFF-phase only.
-          // net_chg IS THE VERDICT: registers a repeat-band execution left
-          // different from how it found them. It must be 0. `churn` is the
-          // write-by-write number and is expected to be large and to mean
-          // nothing on its own -- it is printed only so it cannot be
-          // rediscovered later and mistaken for the verdict.
-          if (g_n97_net_frames || g_n97_net_chg) {
-            const uint64_t regs = g_n97_net_chg + g_n97_net_same;
-            const uint64_t churn = g_n97_chg_dw + g_n97_same_dw;
-            REXGPU_INFO(
-                "[nr-97]   NET net_chg={} of {} regs over {} sampled frames "
-                "(dirty frames={}) first={:04X} | churn {}/{} dw uncmp={}",
-                g_n97_net_chg, regs, g_n97_net_frames, g_n97_net_dirty,
-                g_n97_chg_reg == 0xFFFFFFFFu ? 0u : g_n97_chg_reg,
-                g_n97_chg_dw, churn, g_n97_skip_dw);
-          }
-          if (g_n97_chg_rec_n) {
-            char buf[512];
-            size_t at = 0;
-            for (uint32_t k = 0; k < g_n97_chg_rec_n && at + 40 < sizeof(buf);
-                 ++k) {
-              at += size_t(snprintf(buf + at, sizeof(buf) - at,
-                                    "%s%04X:%08X->%08X x%llu", k ? " " : "",
-                                    g_n97_chg_rec[k].reg,
-                                    g_n97_chg_rec[k].before,
-                                    g_n97_chg_rec[k].after,
-                                    (unsigned long long)g_n97_chg_rec[k].n));
-            }
-            buf[sizeof(buf) - 1] = 0;
-            REXGPU_INFO("[nr-97]   NET regs ({} distinct, +{} unlisted): {}",
-                        g_n97_chg_rec_n, g_n97_chg_rec_ovf, buf);
-          }
-          if (g_n97o_hit || g_n97o_miss) {
-            const uint64_t tot = g_n97o_hit + g_n97o_miss + g_n97o_resolve;
-            REXGPU_INFO(
-                "[nr-97]   observe hit={} miss={} resolve={} ({:.1f}% of {} "
-                "stops skipped the tuple rebuild + observe + predicate)",
-                g_n97o_hit, g_n97o_miss, g_n97o_resolve,
-                tot ? 100.0 * double(g_n97o_hit) / double(tot) : 0.0, tot);
-            g_n97o_hit = g_n97o_miss = g_n97o_resolve = 0;
-          }
-          if (g_n97_deleg) {
-            char db[256];
-            size_t da = 0;
-            for (uint32_t op = 0; op < 128 && da + 24 < sizeof(db); ++op) {
-              if (!g_n97_deleg_op[op]) continue;
-              da += size_t(snprintf(db + da, sizeof(db) - da, " %02X=%llu", op,
-                                    (unsigned long long)g_n97_deleg_op[op]));
-            }
-            db[sizeof(db) - 1] = 0;
-            REXGPU_INFO(
-                "[nr-97]   band delegates={} reg-reading={} | wait mem={} "
-                "low={} OTHER={} (first {:04X}) |{}",
-                g_n97_deleg, g_n97_deleg_read, g_n97_wait_mem,
-                g_n97_wait_coher, g_n97_wait_other,
-                g_n97_wait_reg == 0xFFFFFFFFu ? 0u : g_n97_wait_reg, db);
-            g_n97_deleg = g_n97_deleg_read = 0;
-            g_n97_wait_mem = g_n97_wait_coher = g_n97_wait_other = 0;
-            g_n97_wait_reg = 0xFFFFFFFFu;
-            for (uint32_t op = 0; op < 128; ++op) g_n97_deleg_op[op] = 0;
-          }
-          g_n97_chg_rec_n = 0;
-          g_n97_chg_rec_ovf = 0;
-          g_n97_net_chg = g_n97_net_same = g_n97_net_frames = 0;
-          g_n97_net_dirty = 0;
-          g_n97_chg_dw = g_n97_same_dw = g_n97_skip_dw = 0;
-          g_n97_chg_reg = 0xFFFFFFFFu;
           g_n97_bufs = g_n97_bufs_drop = 0;
           g_n97_bufs_eband = g_n97_bufs_fband = g_n97_bufs_entry = 0;
           g_n97_bufs_ref = g_n97_bufs_mixed = g_n97_stops = 0;
@@ -8850,7 +8576,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           // the first draw stop rules, and the prefix before it is applied
           // normally (counted as pre_dw: at ~220 draws per city buffer that
           // prefix is a couple of hundredths of the execution).
-          g_n97_armed = (g_n97_mode || g_n97_cycle) && !g_nr_tile_bufskip;
+          g_n97_armed = g_n97_on && !g_nr_tile_bufskip;
           g_n97_bufband = false;
           g_n97_filter = false;
           g_n97_bufdrop = false;
@@ -8867,14 +8593,6 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           g_n97_pre_mark = g_skp_pdw + g_skp_rng_dw;
           g_n97_rf = register_file_;
           g_n97_mem = memory_;
-          if (g_n97_touched.size() != RegisterFile::kRegisterCount) {
-            g_n97_touched.assign(RegisterFile::kRegisterCount, 0);
-            g_n97_exec_seen.assign(RegisterFile::kRegisterCount, 0);
-            g_n97_tlist.reserve(16384);
-            g_n97_tentry.reserve(16384);
-            g_n97_tlast.reserve(16384);
-            g_n97_exec_list.reserve(4096);
-          }
           if (g_n97_armed) {
             ++g_n97_bufs;
             const uint32_t* n97_rf = register_file_->values;
@@ -10451,9 +10169,6 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       g_n97_stops_band == g_n97_stops_seen) {
     N97MemoSet(g_n97_bufkey, kN97Clean);
   }
-  // (SS) snapshot what THIS band execution left, before anything after the
-  // bands can touch it.
-  if (g_n97_sample && g_n97_filter && !g_n97_bufdrop) N97ExecEnd();
   g_n97_armed = g_n97_bufband = g_n97_bufmixed = false;
   g_n97_filter = g_n97_bufdrop = false;
   g_n97_decided = false;
@@ -11335,23 +11050,12 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       }
       nr::DetileSetTailMode(dt_tail);
     }
-    // (SS) [NR-97] the frame is the sweep boundary -- see the instrument's
-    // comment. Swept BEFORE DetileFrameEnd so the reading belongs to the frame
-    // that just ran, and only in the census (non-dropping) phase, where the
-    // applies still happen and the live file is the thing being questioned.
     // [NR-97] nothing may be owed across a frame boundary.
     if (g_n97_blk_n) N97FlushPending(this);
     // [NR-97b] DetileFrameEnd re-arms the learner from this frame's
     // observations, so every cached verdict is about the PREVIOUS arming and
     // must not survive the promotion.
     g_n97o_valid = false;
-    if (g_n97_sample) N97NetSweep();
-    ++g_n97_frame_n;
-    // 1 frame in 16. The census phase is the BASELINE half of the paired fps
-    // read, so every cost it pays that the ON half does not overstates the
-    // win: the touch bitmap runs on each dropped dword, and this keeps it to
-    // ~6% of frames while still sampling several a second.
-    g_n97_sample = g_n97_mode == 0 && (g_n97_frame_n & 15) == 0;
     const nr::DetileFrameVerdict dtv = nr::DetileFrameEnd();
     if (dtv.guard_tripped) {
       REXGPU_ERROR(
