@@ -262,10 +262,19 @@ REXCVAR_DEFINE_BOOL(gpu_nr_apply_cycle, false, "GPU",
 // dropped band's. Modes escalate by class so a visual defect names its own
 // cause; the predicate is hoisted above the compose and CROSS-CHECKED against
 // the dispatch-site test every stop (`pred_ne` must stay 0).
-REXCVAR_DEFINE_INT32(gpu_nr_band_skip, 0, "GPU",
+// DEFAULT 1 since 2026-08-26 (naruto_720 paired + naruto_722 fixed-mode
+// visual drive, user-confirmed zero flashing over a whole session): mode 1
+// is -13 to -16% CP us/draw at city and modes 2/3 add nothing measurable on
+// top of it, so the conservative class is also the fast one. ⚠ Modes 2 and 3
+// are NOT exonerated: one of them produced an alternating black-frame strobe
+// in the naruto_720 cycle. They buy no fps -- do not re-enable without a
+// reason. ⚠ A probe that measures compose COVERAGE (nr-cmp/nrcap gates)
+// must set this to 0, or its denominator loses every repeat-band stop.
+REXCVAR_DEFINE_INT32(gpu_nr_band_skip, 1, "GPU",
                      "N-9-6: at a repeat-band draw stop, DROP the deferred "
                      "ranges instead of composing them. 0 = off, 1 = ALU + "
-                     "bool/loop, 2 = + fetch, 3 = + state windows.");
+                     "bool/loop (DEFAULT, gated), 2 = + fetch, 3 = + state "
+                     "windows (2 and 3 buy nothing and one of them flashes).");
 // One in-place cycler, 10 s per phase: 0 off / 1 / 2 / 3. The visual gate
 // rides it ([[visual-defect-needs-a-visual-bisect]]) -- the phase is logged
 // so the eye and the log agree on what was live.
