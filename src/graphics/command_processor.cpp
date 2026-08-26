@@ -333,7 +333,12 @@ REXCVAR_DEFINE_BOOL(gpu_nr_band_cycle, false, "GPU",
 // The PARSE deliberately stays: N-9a already refuted memoizing it at its
 // strongest design point ([[subtraction-buckets-mislabel]] -- the parse was
 // never the cost). This removes the TRAFFIC, which is the half that measured.
-REXCVAR_DEFINE_INT32(gpu_nr_band_walk, 0, "GPU",
+// DEFAULT 1 since 2026-08-26 (naruto_746 + naruto_747, two user city drives on
+// different routes, paired in place at matched dpf, 0 fatals): -6.7 to -9.3%
+// CP us/draw, and the user could not tell the phases apart in either drive.
+// The register file is byte-identical to a full apply by construction, so the
+// naruto_742 flashing class cannot recur; lostdraws read 0 in every window.
+REXCVAR_DEFINE_INT32(gpu_nr_band_walk, 1, "GPU",
                      "N-9-7: for a buffer execution de-tile calls a repeat "
                      "band, STORE its register values but skip the per-range "
                      "side effects, and re-apply the touched ranges once when "
