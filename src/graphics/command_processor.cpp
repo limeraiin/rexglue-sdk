@@ -249,6 +249,30 @@ REXCVAR_DEFINE_BOOL(gpu_nr_apply_cycle, false, "GPU",
 // the delta per phase even when a 1 Hz window straddles a phase flip. The
 // drawstop dispatch bracket ([n7] skip, gpu_nr_skip_profile) is binned the
 // same way, so compose / drawstop / walk+bulk are all readable per phase.
+// [NR-6] N-9-6: THE REPEAT-BAND COMPOSE SKIP. naruto_717 measured that the
+// guest emits every draw once per EDRAM tile band (3x256 rows at city), and
+// de-tile drops bands 2-3 -- but it drops them at the DISPATCH, which sits
+// BELOW the compose. So two thirds of every compose second (240 ms/s of a
+// 1000 ms CP second, ~65% of 300-355k composes/s vs 110-134k issued draws/s)
+// applies constants to draws that are then thrown away. This drops the
+// group's deferred ranges at a repeat-band stop instead of composing or
+// flushing them: the work unit disappears rather than moving.
+// Soundness rests on N-9-1's census: 288 ALU constants (72 float4s) are
+// RE-EMITTED PER DRAW, so a later kept draw carries its own and never reads a
+// dropped band's. Modes escalate by class so a visual defect names its own
+// cause; the predicate is hoisted above the compose and CROSS-CHECKED against
+// the dispatch-site test every stop (`pred_ne` must stay 0).
+REXCVAR_DEFINE_INT32(gpu_nr_band_skip, 0, "GPU",
+                     "N-9-6: at a repeat-band draw stop, DROP the deferred "
+                     "ranges instead of composing them. 0 = off, 1 = ALU + "
+                     "bool/loop, 2 = + fetch, 3 = + state windows.");
+// One in-place cycler, 10 s per phase: 0 off / 1 / 2 / 3. The visual gate
+// rides it ([[visual-defect-needs-a-visual-bisect]]) -- the phase is logged
+// so the eye and the log agree on what was live.
+REXCVAR_DEFINE_BOOL(gpu_nr_band_cycle, false, "GPU",
+                    "N-9-6: cycle band-skip {off, alu, +fetch, +state} 10 s "
+                    "each in place for the paired fps + visual read.");
+
 REXCVAR_DEFINE_BOOL(gpu_nr_compose_prof, false, "GPU",
                     "[nr-5c] Diagnostic: time the record compose per draw "
                     "stop, split suppressed vs packet-sourced. Read beside "
@@ -2355,6 +2379,21 @@ uint64_t g_n7_cmp_ns[2] = {}, g_n7_cmp_calls[2] = {};
 bool g_nr5c_prof = false;     // bracket armed (latched cvar || levers)
 bool g_nr5c_cur_sup = false;  // the stop in flight composed a SUPPRESSED record
 
+// [NR-6] N-9-6 repeat-band compose skip (see the cvars).
+int32_t g_nr6_mode = 0;
+bool g_nr6_cycle = false;
+int32_t g_nr6_phase = -1;
+uint64_t g_nr6_stops = 0;      // 0x22 stops the hoisted predicate called a band
+uint64_t g_nr6_groups = 0;     // ...of which had a deferred group to drop
+uint64_t g_nr6_drop_rng = 0, g_nr6_drop_dw = 0;  // ranges/dwords never applied
+uint64_t g_nr6_keep_rng = 0;   // ranges the mode still applied at a band stop
+// ⚠ THE SAFETY COUNTER. The predicate is read BEFORE the compose and again at
+// the dispatch site (where DetileObserve has since run and may have tripped
+// the guard). A disagreement means constants were dropped for a draw the
+// dispatch would have kept: the drop wins (the invariant is "a draw whose
+// constants we dropped never renders"), and this counts how often.
+uint64_t g_nr6_pred_ne = 0;
+
 // [NR-5C] all buckets of [base, base+n) untouched since applied_seq
 // (wrap-safe signed compare; the seq bumps ~2x per draw stop).
 inline bool NrbRangeClean(uint32_t base, uint32_t n, uint32_t applied_seq) {
@@ -4014,6 +4053,39 @@ void Nr4aFlush(CommandProcessor* cp) {
   g_nr4a_group_ovf = false;
 }
 
+// [NR-6] N-9-6: the repeat-band group resolution. Everything the mode says a
+// band-2/3 draw does not need is DROPPED (never applied, never composed); the
+// rest is applied in stream order exactly as Nr4aFlush would, so a partial
+// mode leaves the register file in the same order-dependent state the full
+// flush does. Classification is by (base,n) only, so a coherent-mode by-ref
+// entry (be == nullptr) rides with the class it belongs to.
+void Nr4aBandDrop(CommandProcessor* cp, int32_t mode) {
+  for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
+    const Nr4aDef& d = g_nr4a_def[i];
+    bool drop;
+    if (Nr4aConstWindow(d.base, d.n)) {
+      const bool is_fetch =
+          d.base >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+          d.base + d.n - 1 <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5;
+      // Fetch is its own mode step: its residency/texture invalidations are
+      // the one class this project has never deduped ([N8B] rule), so it
+      // escalates separately even though this draw never renders.
+      drop = is_fetch ? mode >= 2 : mode >= 1;
+    } else {
+      drop = mode >= 3;  // 40040 state windows
+    }
+    if (drop) {
+      ++g_nr6_drop_rng;
+      g_nr6_drop_dw += d.n;
+      continue;
+    }
+    ++g_nr6_keep_rng;
+    cp->NrSkipApplyRegRange(d.base, d.be, d.n, d.phys, d.be == nullptr);
+  }
+  g_nr4a_ndef = 0;
+  g_nr4a_group_ovf = false;
+}
+
 // [NR-4A] The compose attempt at a draw stop. Succeeds ONLY when the record
 // is present, carries a payload, survives the arena validity round trip, and
 // its constant-window run shape matches the deferred list EXACTLY (same
@@ -5284,6 +5356,21 @@ void CommandProcessor::WorkerThreadMain() {
                   g_nr5c_skip_mode,
                   g_nr5c_cycle ? " CYCLE off/arena/arena+skip 10 s each" : "");
     }
+    // [NR-6] the repeat-band compose skip. Off unless asked for; the cycler
+    // owns the live mode while armed.
+    {
+      const int32_t m = REXCVAR_GET(gpu_nr_band_skip);
+      g_nr6_mode = m > 0 ? (m > 3 ? 3 : m) : 0;
+      g_nr6_cycle = REXCVAR_GET(gpu_nr_band_cycle);
+      if (g_nr6_mode || g_nr6_cycle) {
+        REXGPU_INFO(
+            "[nr-6] repeat-band compose skip ARMED: mode={}{} -- a band-2/3 "
+            "draw's deferred ranges are DROPPED, not composed. pred_ne must "
+            "stay 0.",
+            g_nr6_mode,
+            g_nr6_cycle ? " CYCLE off/alu/+fetch/+state 10 s each" : "");
+      }
+    }
     if (g_nr5c_prof) {
       REXGPU_INFO(
           "[nr-5c] compose bracket ARMED (per stop, split sup/pkt){}",
@@ -5458,6 +5545,29 @@ void CommandProcessor::WorkerThreadMain() {
                     phase == 0   ? "OFF (baseline: scratch memcpy, full applies)"
                     : phase == 1 ? "ARENA (apply in place, no memcpy)"
                                  : "ARENA+SKIP (clean record runs skipped)");
+      }
+    }
+
+    // [NR-6] the repeat-band drop cycle: 10 s per class, in place, phase
+    // logged so the eye and the log agree ([[visual-defect-needs-a-visual-
+    // bisect]]). 0 = off (baseline), 1 = ALU + bool/loop dropped, 2 = +
+    // fetch, 3 = + state windows.
+    if (g_nr6_cycle) {
+      static auto nr6_t0 = prof_clock::now();
+      const int32_t phase =
+          int32_t((std::chrono::duration_cast<std::chrono::seconds>(
+                       prof_clock::now() - nr6_t0)
+                       .count() /
+                   10) %
+                  4);
+      if (phase != g_nr6_phase) {
+        g_nr6_phase = phase;
+        g_nr6_mode = phase;
+        REXGPU_INFO("[nr-6] PHASE {} - {}", phase,
+                    phase == 0   ? "OFF (baseline: repeat bands compose)"
+                    : phase == 1 ? "DROP alu+bool (fetch/state still apply)"
+                    : phase == 2 ? "DROP alu+bool+fetch"
+                                 : "DROP alu+bool+fetch+state (everything)");
       }
     }
 
@@ -6652,6 +6762,19 @@ void CommandProcessor::WorkerThreadMain() {
           // [NR-5C] the fps-increment levers, 1 Hz. tear must stay ~0 (a
           // restart heals it); dirty vs skip is the overlap-reality answer
           // the design was waiting on; genmiss tracks the re-record rate.
+          // [NR-6] the repeat-band drop, 1 Hz. stops = draws the hoisted
+          // predicate called a band; drop rng/dw = the applies that no longer
+          // happen at all. pred_ne is the safety counter and must read 0.
+          if (g_nr6_stops || g_nr6_drop_rng || g_nr6_pred_ne) {
+            REXGPU_INFO(
+                "[nr-6] mode={} band stops={} groups={} | dropped rng={} "
+                "dw={} | kept rng={} | pred_ne={}",
+                g_nr6_mode, g_nr6_stops, g_nr6_groups, g_nr6_drop_rng,
+                g_nr6_drop_dw, g_nr6_keep_rng, g_nr6_pred_ne);
+            g_nr6_stops = g_nr6_groups = 0;
+            g_nr6_drop_rng = g_nr6_drop_dw = g_nr6_keep_rng = 0;
+            g_nr6_pred_ne = 0;
+          }
           // [NR-5C-ATTR] the compose line prints on its OWN gate now: the
           // bracket arms without any lever (gpu_nr_compose_prof), and the
           // sup/pkt split is the attribution drive's primary read.
@@ -8811,12 +8934,39 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // reaches the compose (nothing deferred, delegate, 0x36) must not inherit
     // the previous stop's tag when the drawstop bracket bins below.
     g_nr5c_cur_sup = false;
+    // [NR-6] N-9-6: is this stop a draw de-tile is about to throw away? The
+    // test is HOISTED above the compose, which is legal because every register
+    // it reads (window offset, both scissors, surface/color/depth info) is
+    // mirror-class and therefore never deferrable -- the walk has already
+    // applied them. DetileObserve stays at the dispatch site (observing early
+    // would re-order the band learner; naruto_505's self-latching trap), so
+    // the only way the two reads can disagree is a guard trip in between --
+    // counted as pred_ne, and the drop wins.
+    bool nr6_band = false;
+    if (g_nr6_mode > 0 && g_nr_detile_mode && !stop.delegate &&
+        stop.opcode == 0x22 && g_nr4a_bufactive) {
+      const uint32_t* n6_rf = register_file_->values;
+      const nr::DetileRegs n6_regs{n6_rf[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+                                   n6_rf[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                                   n6_rf[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+                                   n6_rf[XE_GPU_REG_RB_SURFACE_INFO],
+                                   n6_rf[XE_GPU_REG_RB_COLOR_INFO],
+                                   n6_rf[XE_GPU_REG_RB_DEPTH_INFO]};
+      nr6_band = nr::DetileIsRepeatBand(n6_regs);
+      if (nr6_band) ++g_nr6_stops;
+    }
     // [NR-5B-3j] set when THIS stop's compose declined while suppression is
     // live: the draw is about to render with no constants of its own.
     bool nr5b_fb_decline = false;
     g_nr5b_gen_skip = false;
     if (g_nr4a_bufactive && (g_nr4a_ndef || g_nr4a_group_ovf)) {
-      if (!stop.delegate && stop.opcode == 0x22) {
+      if (nr6_band) {
+        // [NR-6] a draw de-tile will drop: resolve the group by DROPPING what
+        // the mode says it does not need. No compose, no flush -- the work
+        // unit is gone, which is the only shape that has ever moved fps here.
+        ++g_nr6_groups;
+        Nr4aBandDrop(this, g_nr6_mode);
+      } else if (!stop.delegate && stop.opcode == 0x22) {
         // [NR-5C] compose-time bracket while the levers/cycler are armed:
         // splits "the compose second" from everything else per phase, so a
         // null fps delta still names where the sup cost does NOT live.
@@ -8895,7 +9045,13 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
         const bool dt_is_resolve =
             (dt_rf[XE_GPU_REG_RB_MODECONTROL] & 0x7) == uint32_t(xenos::EdramMode::kCopy);
         nr::DetileObserve(dt_regs, dt_is_resolve, dt_rf[XE_GPU_REG_RB_COPY_DEST_BASE]);
-        if (nr::DetileIsRepeatBand(dt_regs)) {
+        // [NR-6] the cross-check: the hoisted read (above the compose) and
+        // this one must agree. If they do not, the hoisted one already threw
+        // this draw's constants away, so the draw MUST NOT render -- the drop
+        // wins and the disagreement is counted, never silent.
+        const bool dt_repeat = nr::DetileIsRepeatBand(dt_regs);
+        if (nr6_band && !dt_repeat) ++g_nr6_pred_ne;
+        if (dt_repeat || nr6_band) {
           if (dt_is_resolve) {
             nr::DetileCountSkippedResolve();
           } else {
