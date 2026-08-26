@@ -240,6 +240,21 @@ REXCVAR_DEFINE_BOOL(gpu_nr_apply_cycle, false, "GPU",
                     "N-9-5c: cycle {off, arena, arena+skip} 10 s each in "
                     "place for the paired fps read.");
 
+// [NR-5C-ATTR] The compose bracket, armable ON ITS OWN. naruto_716 priced the
+// compose at ~39% of the SUPPRESSED CP second, but the bracket only existed
+// while the 5c levers/cycler were armed, so the sup-vs-pkt DELTA (the ~15 fps
+// that keeps suppression opt-in) has never been read. With this on, every
+// composed 0x22 stop is timed and BINNED BY ITS OWN RECORD (suppressed record
+// vs packet-sourced record), so one `--nr_rec_supcover -1` drive attributes
+// the delta per phase even when a 1 Hz window straddles a phase flip. The
+// drawstop dispatch bracket ([n7] skip, gpu_nr_skip_profile) is binned the
+// same way, so compose / drawstop / walk+bulk are all readable per phase.
+REXCVAR_DEFINE_BOOL(gpu_nr_compose_prof, false, "GPU",
+                    "[nr-5c] Diagnostic: time the record compose per draw "
+                    "stop, split suppressed vs packet-sourced. Read beside "
+                    "gpu_nr_skip_profile under a supcover cycle. Off by "
+                    "default.");
+
 // [NR-5A] N-9-5a: WHOLE-DRAW source coherence at the composed stop -- the
 // torn-window precondition for guest-emission suppression. Today's 4a mixes
 // sources on a composed draw: constants/state from the record, by-ref 0x2F
@@ -2328,7 +2343,17 @@ uint64_t g_nr5c_skip_pdw_rng = 0, g_nr5c_skip_pdw_dw = 0;  // per-dword runs ski
 uint64_t g_nr5c_dirty_rng = 0;   // skippable runs blocked: buckets touched since
 uint64_t g_nr5c_genmiss = 0;     // records ineligible: applied_gen != state_gen
 uint64_t g_nr5c_stamped = 0;     // StampApplied calls (full-apply completions)
-uint64_t g_nr5c_ns = 0, g_nr5c_calls = 0;  // compose-time bracket (cycler-armed)
+// [NR-5C-ATTR] compose-time bracket, binned [0] = packet-sourced record,
+// [1] = suppressed record (the draw whose emission the shims ate). Armed by
+// gpu_nr_compose_prof OR by any 5c lever/cycler (the 716 behaviour).
+uint64_t g_nr5c_ns[2] = {}, g_nr5c_calls[2] = {};
+// The [n7] 1 Hz gate and the [nr-*] 1 Hz gate are INDEPENDENT clocks: each
+// window owner needs its own accumulator or one line reports the other's
+// window ([[price-stages-in-place]] applies to windows too). These are the
+// n7 line's copy, zeroed there.
+uint64_t g_n7_cmp_ns[2] = {}, g_n7_cmp_calls[2] = {};
+bool g_nr5c_prof = false;     // bracket armed (latched cvar || levers)
+bool g_nr5c_cur_sup = false;  // the stop in flight composed a SUPPRESSED record
 
 // [NR-5C] all buckets of [base, base+n) untouched since applied_seq
 // (wrap-safe signed compare; the seq bumps ~2x per draw stop).
@@ -2565,6 +2590,10 @@ bool g_skp_prof = false;
 uint64_t g_spp_buf_ns = 0;    // whole NrSkipExecuteBuffer
 uint64_t g_spp_draw_ns = 0;   // ExecutePacket at draw stops (incl. IssueDraw)
 uint64_t g_spp_deleg_ns = 0;  // ExecutePacket at delegated stops
+// [NR-5C-ATTR] the draw-stop dispatch bracket split by the record the stop
+// composed from ([0] packet-sourced, [1] suppressed). Filled only while the
+// compose bracket is armed; the sum stays == g_spp_draw_ns.
+uint64_t g_spp_draw_bin_ns[2] = {}, g_spp_draw_bin_n[2] = {};
 
 // [NR-WM] Phase 5-4-8: walk-memo master latch + window counters.
 bool g_nr_wm = false;
@@ -4172,6 +4201,11 @@ nr5c_restart:
   for (volatile uint32_t spin = 0; spin < 600; ++spin) {
   }
   }  // identity-retry loop
+  // [NR-5C-ATTR] the compose bracket's bin for THIS stop, known as soon as the
+  // record parsed. A compose that declines before the parse (miss/torn/ovf)
+  // stays in the pkt bin -- those classes are counted by name in [nr-4a], so
+  // the mis-binned time is bounded by a printed rate, not a guess.
+  g_nr5c_cur_sup = draw_sup;
   // [NR-5C] lever (b) eligibility, shared by both apply paths below: the
   // record's payload generation is unchanged since its last full apply on
   // this thread. Per-run cleanliness (bucket epochs) is checked at each run.
@@ -5241,10 +5275,21 @@ void CommandProcessor::WorkerThreadMain() {
     g_nr5c_skip_mode = s > 0 ? s : 0;
     g_nr5c_cycle = REXCVAR_GET(gpu_nr_apply_cycle);
     g_nrb_track = g_nr5c_skip_mode > 0 || g_nr5c_cycle;
+    // [NR-5C-ATTR] the bracket is armable on its own now; any lever still
+    // implies it, so the 716 reading protocol is unchanged.
+    g_nr5c_prof = REXCVAR_GET(gpu_nr_compose_prof) || g_nr5c_arena_on ||
+                  g_nr5c_skip_mode > 0 || g_nr5c_cycle;
     if (g_nr5c_arena_on || g_nr5c_skip_mode || g_nr5c_cycle) {
       REXGPU_INFO("[nr-5c] levers armed: arena={} skip={}{}", g_nr5c_arena_on,
                   g_nr5c_skip_mode,
                   g_nr5c_cycle ? " CYCLE off/arena/arena+skip 10 s each" : "");
+    }
+    if (g_nr5c_prof) {
+      REXGPU_INFO(
+          "[nr-5c] compose bracket ARMED (per stop, split sup/pkt){}",
+          REXCVAR_GET(gpu_nr_skip_profile)
+              ? " + [n7] skip drawstop split -- supcover-cycle attribution"
+              : " (add --gpu_nr_skip_profile true for walk/drawstop ms)");
     }
   }
   const bool kNrCache =
@@ -5527,12 +5572,38 @@ void CommandProcessor::WorkerThreadMain() {
           const double b_ms = g_spp_buf_ns / 1e6;
           const double d_ms = g_spp_draw_ns / 1e6;
           const double g_ms = g_spp_deleg_ns / 1e6;
+          // [NR-5C-ATTR] the compose sits INSIDE the buffer bracket and
+          // OUTSIDE both stop brackets, so it is part of this line's
+          // remainder: print it and the true walk+bulk (remainder - compose)
+          // so no one has to subtract two lines by hand.
+          const double c_ms =
+              g_nr5c_prof ? double(g_n7_cmp_ns[0] + g_n7_cmp_ns[1]) / 1e6 : 0.0;
           REXGPU_INFO(
               "[n7] skip buf={:.1f}ms drawstop={:.1f}ms delegstop={:.1f}ms "
               "walk+bulk={:.1f}ms (wall={:.0f}ms, exec={:.1f}ms)",
-              b_ms, d_ms, g_ms, b_ms - d_ms - g_ms, wall_ms, exec_ms);
+              b_ms, d_ms, g_ms, b_ms - d_ms - g_ms - c_ms, wall_ms, exec_ms);
+          if (g_nr5c_prof) {
+            REXGPU_INFO(
+                "[n7] skip   compose={:.1f}ms sup={:.1f}ms({} calls, "
+                "{:.0f}ns) pkt={:.1f}ms({} calls, {:.0f}ns) | drawstop "
+                "sup={:.1f}ms({}) pkt={:.1f}ms({})",
+                c_ms, double(g_n7_cmp_ns[1]) / 1e6, g_n7_cmp_calls[1],
+                g_n7_cmp_calls[1]
+                    ? double(g_n7_cmp_ns[1]) / double(g_n7_cmp_calls[1])
+                    : 0.0,
+                double(g_n7_cmp_ns[0]) / 1e6, g_n7_cmp_calls[0],
+                g_n7_cmp_calls[0]
+                    ? double(g_n7_cmp_ns[0]) / double(g_n7_cmp_calls[0])
+                    : 0.0,
+                double(g_spp_draw_bin_ns[1]) / 1e6, g_spp_draw_bin_n[1],
+                double(g_spp_draw_bin_ns[0]) / 1e6, g_spp_draw_bin_n[0]);
+          }
         }
         g_spp_buf_ns = g_spp_draw_ns = g_spp_deleg_ns = 0;
+        g_spp_draw_bin_ns[0] = g_spp_draw_bin_ns[1] = 0;
+        g_spp_draw_bin_n[0] = g_spp_draw_bin_n[1] = 0;
+        g_n7_cmp_ns[0] = g_n7_cmp_ns[1] = 0;
+        g_n7_cmp_calls[0] = g_n7_cmp_calls[1] = 0;
         // [N7] the ring remainder, itemised. ib = every indirect buffer;
         // swap = the presenter and frame-end work; inline = what is left in
         // ExecutePrimaryBuffer, which is the primary ring's own packets.
@@ -6581,7 +6652,23 @@ void CommandProcessor::WorkerThreadMain() {
           // [NR-5C] the fps-increment levers, 1 Hz. tear must stay ~0 (a
           // restart heals it); dirty vs skip is the overlap-reality answer
           // the design was waiting on; genmiss tracks the re-record rate.
-          if (g_nr5c_calls || g_nr5c_inplace || g_nr5c_copies ||
+          // [NR-5C-ATTR] the compose line prints on its OWN gate now: the
+          // bracket arms without any lever (gpu_nr_compose_prof), and the
+          // sup/pkt split is the attribution drive's primary read.
+          if (g_nr5c_calls[0] || g_nr5c_calls[1]) {
+            const auto line = [](const char* tag, uint64_t calls, uint64_t ns) {
+              REXGPU_INFO("[nr-5c]   compose {} {} calls, {:.0f} ns/call, "
+                          "{:.1f} ms/s",
+                          tag, calls,
+                          calls ? double(ns) / double(calls) : 0.0,
+                          double(ns) / 1e6);
+            };
+            line("SUP", g_nr5c_calls[1], g_nr5c_ns[1]);
+            line("pkt", g_nr5c_calls[0], g_nr5c_ns[0]);
+            g_nr5c_ns[0] = g_nr5c_ns[1] = 0;
+            g_nr5c_calls[0] = g_nr5c_calls[1] = 0;
+          }
+          if (g_nr5c_inplace || g_nr5c_copies ||
               g_nr5c_skip_rng || g_nr5c_dirty_rng || g_nr5c_tear ||
               g_nr5c_tear_pkt || g_nr5c_genmiss) {
             REXGPU_INFO(
@@ -6593,14 +6680,6 @@ void CommandProcessor::WorkerThreadMain() {
                 g_nr5c_skip_rng, g_nr5c_skip_dw, g_nr5c_skip_pdw_rng,
                 g_nr5c_skip_pdw_dw, g_nr5c_dirty_rng, g_nr5c_genmiss,
                 g_nr5c_stamped);
-            if (g_nr5c_calls) {
-              REXGPU_INFO("[nr-5c]   compose {} calls, {:.0f} ns/call, "
-                          "{:.1f} ms/s",
-                          g_nr5c_calls,
-                          double(g_nr5c_ns) / double(g_nr5c_calls),
-                          double(g_nr5c_ns) / 1e6);
-            }
-            g_nr5c_ns = g_nr5c_calls = 0;
             g_nr5c_inplace = g_nr5c_copies = 0;
             g_nr5c_tear = g_nr5c_tear_pkt = g_nr5c_restart = 0;
             g_nr5c_skip_rng = g_nr5c_skip_dw = 0;
@@ -7009,21 +7088,13 @@ void CommandProcessor::WorkerThreadMain() {
           g_bfc_backend_missing = 0;
           g_bfc_wait_reg_sample = 0xFFFFFFFFu;
         }
-        // [NR-SPP] 5-4-4 step 0b. walk+rng = buf minus the two stop-dispatch
-        // brackets: the walk decode plus the bulk range applies. drawstop
-        // minus [gpu-split]'s draw bracket = the per-draw delegation
-        // round-trip.
-        if (kSkpProf && g_spp_buf_ns) {
-          const double spp_buf_ms = g_spp_buf_ns / 1e6;
-          const double spp_draw_ms = g_spp_draw_ns / 1e6;
-          const double spp_deleg_ms = g_spp_deleg_ns / 1e6;
-          REXGPU_INFO(
-              "[nr-spp] buf={:.1f}ms drawstop={:.1f}ms delegstop={:.1f}ms "
-              "walk+rng={:.1f}ms (wall={:.0f}ms)",
-              spp_buf_ms, spp_draw_ms, spp_deleg_ms,
-              spp_buf_ms - spp_draw_ms - spp_deleg_ms, wall_ms);
-          g_spp_buf_ns = g_spp_draw_ns = g_spp_deleg_ns = 0;
-        }
+        // [NR-SPP] 5-4-4 step 0b lived here and was DEAD CODE: the [n7] 1 Hz
+        // block above (a separate, earlier gate) zeroes g_spp_* unconditionally
+        // every window, so this print could never see a non-zero buffer time.
+        // The live line is `[n7] skip buf=... drawstop=... walk+bulk=...`,
+        // which carries the same brackets plus the 5c-attr sup/pkt split.
+        // ([[reporter-gate-must-follow-implication]] -- two reporters, one
+        // counter set, whoever zeroes first owns it.)
         // [NR-PKT] Phase 5-4-1. The header carries the buffer split and the
         // stateful-port classes; one sub-line per NON-STREAM op actually
         // seen, with how many buffer executions carry it and how many of
@@ -8736,6 +8807,10 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // would have left.
     // [NR-5A] the record-sourced draw arm never survives a stop boundary.
     g_nr5_draw_src = nullptr;
+    // [NR-5C-ATTR] per-stop bin, cleared for EVERY stop: a stop that never
+    // reaches the compose (nothing deferred, delegate, 0x36) must not inherit
+    // the previous stop's tag when the drawstop bracket bins below.
+    g_nr5c_cur_sup = false;
     // [NR-5B-3j] set when THIS stop's compose declined while suppression is
     // live: the draw is about to render with no constants of its own.
     bool nr5b_fb_decline = false;
@@ -8745,18 +8820,25 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
         // [NR-5C] compose-time bracket while the levers/cycler are armed:
         // splits "the compose second" from everything else per phase, so a
         // null fps delta still names where the sup cost does NOT live.
-        const bool nr5c_timed =
-            g_nr5c_cycle || g_nr5c_arena_on || g_nr5c_skip_mode;
+        // [NR-5C-ATTR] armable on its own (gpu_nr_compose_prof) and binned by
+        // the record's own SUPPRESSED tag, so a supcover cycle attributes the
+        // sup-vs-pkt delta even across a phase flip inside one window.
+        const bool nr5c_timed = g_nr5c_prof;
         const auto nr5c_t0 = nr5c_timed
                                  ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
         const bool nr5c_ok =
             Nr4aTryCompose(this, nr_tile_draw_addr_, raw, count, stop.dword);
         if (nr5c_timed) {
-          g_nr5c_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - nr5c_t0)
-                                    .count());
-          ++g_nr5c_calls;
+          const int bin = g_nr5c_cur_sup ? 1 : 0;
+          const uint64_t d =
+              uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - nr5c_t0)
+                           .count());
+          g_nr5c_ns[bin] += d;
+          ++g_nr5c_calls[bin];
+          g_n7_cmp_ns[bin] += d;
+          ++g_n7_cmp_calls[bin];
         }
         if (!nr5c_ok) {
           ++g_4a_flush_draw;
@@ -8946,10 +9028,16 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
             g_tile_orep = false;
           }
           if (spp) {
-            g_spp_draw_ns +=
+            const uint64_t d =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - spp_direct_t0)
                     .count();
+            g_spp_draw_ns += d;
+            // [NR-5C-ATTR] same bin as the compose that fed this stop.
+            if (g_nr5c_prof) {
+              g_spp_draw_bin_ns[g_nr5c_cur_sup ? 1 : 0] += d;
+              ++g_spp_draw_bin_n[g_nr5c_cur_sup ? 1 : 0];
+            }
           }
           ++g_skp_direct;
           if (g_nr_skip_draw_pending) {
@@ -9079,6 +9167,12 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
                              std::chrono::steady_clock::now() - spp_stop_t0)
                              .count();
       (stop.delegate ? g_spp_deleg_ns : g_spp_draw_ns) += d;
+      // [NR-5C-ATTR] the delegated draw-stop path, binned by the record the
+      // compose used (delegates never compose and stay in the pkt bin).
+      if (g_nr5c_prof && !stop.delegate) {
+        g_spp_draw_bin_ns[g_nr5c_cur_sup ? 1 : 0] += d;
+        ++g_spp_draw_bin_n[g_nr5c_cur_sup ? 1 : 0];
+      }
     }
     if (g_nr_skip_draw_pending) {
       // The handler returned before reaching the lockstep block (short
