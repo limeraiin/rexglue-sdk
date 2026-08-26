@@ -224,6 +224,71 @@ REXCVAR_DEFINE_BOOL(gpu_nr_rec_coherent, false, "GPU",
                     "game-side nr_rec_store; implies gpu_nr_rec_apply. Off by "
                     "default.");
 
+// [NR-5B-3i] N-9-5b-3: the BY-REF SOURCE under live suppression. F88 (the
+// 0x2F emitter) is deliberately NOT shimmed -- markers are parsed FROM the
+// emitted group, so suppressing it amputates by-refs entirely (naruto_689).
+// So a suppressed group's REAL 0x2F packets are still in the ring, the walker
+// still defers them (null be) in stream order, and the stop still flushes
+// them from their LIVE address. Mode 0 then walks the record and applies the
+// SAME by-refs a second time from the address the RECORD remembers -- and a
+// record one recording behind names last frame's constant memory, so the
+// stale copy wins the write. That is the identical failure mode the fetch
+// half proved (a stale pointer re-read at execute time), in the class that
+// paints objects. Mode 1 drops the record's markers (the live packets are
+// the only source, applied at the flush). Mode 2 keeps the marker's ORDER
+// but takes reg/count/address from the live deferred by-ref it pairs with,
+// so the interleave with the record's runs survives without the staleness.
+// `mk_addr_ne` prices the hypothesis numerically in EVERY mode.
+REXCVAR_DEFINE_INT32(gpu_nr_sup_marker, 0, "GPU",
+                     "N-9-5b-3: by-ref source on a SUPPRESSED group. 0 = from "
+                     "the record's marker address (stale-capable), 1 = drop "
+                     "the markers (live 0x2F packets only), 2 = live address "
+                     "at the marker's recorded position, -1 = cycle 0/1/2 5 s "
+                     "each in place. Reports '[nr-5b] mk'.");
+
+// [NR-5B-3j] N-9-5b-3: WHAT A FALLBACK MEANS ONCE THE PACKETS ARE GONE.
+// Every fallback class in 4a/5a was correct by construction: decline the
+// record, flush the packet ranges, render from the packets. Under live
+// suppression the packets for the suppressed classes DO NOT EXIST, so a
+// declined compose now issues the draw against whatever the register file
+// happened to be left holding -- a silent, per-draw wrong-constants defect
+// that the counters still report in the reassuring language of the packet
+// era. naruto_703 measured the pool at city: miss ~450/s + shape ~450/s +
+// foreign ~220/s = ~1100/s against 455k composes, ~22 executions a frame,
+// and the game side confirms armed == live (every draw suppressed), so all
+// of it lands on draws with no constants. Mode 1 SKIPS the dispatch instead
+// of issuing it: if the flashing objects become briefly ABSENT objects at
+// the same cadence, the fallback pool is the ALU defect and the fix is
+// structural (the arm must be revocable), not a rate reduction -- which is
+// why four fallback-reduction drives moved nothing.
+REXCVAR_DEFINE_INT32(gpu_nr_sup_fallback, 0, "GPU",
+                     "N-9-5b-3: draw whose compose DECLINED while live "
+                     "suppression is on. 0 = issue it anyway (today, stale "
+                     "registers), 1 = skip the dispatch, -1 = cycle 0/1 5 s "
+                     "each in place. Reports '[nr-5b] fb'.");
+
+// [NR-5B-3k] N-9-5b-3: GENERATION, NOT ADDRESS. The city re-records 96-98%
+// of its draws IN PLACE every frame. Under live suppression a draw's
+// constants exist only in its record, so if the guest replaces that record
+// while the consumer is still behind, the consumer composes the NEWER
+// recording onto the OLDER draw. Every measurement fits: addr_ne 0 (the
+// address is right), torn 0 and fb_val 0 (the read is clean), argsne 0 (the
+// 5a draw-entry anchor passes, because an in-place re-record usually keeps
+// identical draw bytes -- same prim, same count, same VB -- while the
+// constants differ, so the anchor is structurally blind to this class), and
+// city-only + intermittent + per-object matches the in-place population
+// exactly. This probe stamps the comparison the anchor cannot make: the
+// record's own recording seq against the seq the executing buffer STARTED
+// at. rec.seq ahead of that means the record belongs to a later frame than
+// the draw being replayed. Mode 1 skips those draws, so a flash that turns
+// into a brief ABSENCE at the same cadence proves the class by eye the way
+// the fetch half was proved.
+REXCVAR_DEFINE_INT32(gpu_nr_sup_gen, 0, "GPU",
+                     "N-9-5b-3: record-generation probe under suppression. "
+                     "0 = count only, 1 = skip draws whose record is AHEAD of "
+                     "the executing buffer, -1 = cycle 0/1 5 s each in place. "
+                     "Reports '[nr-5b] gen'.");
+
 // [NR-BUF] Increment 2: per-buffer draw-list snapshots (nr_buffer_cache.h).
 // Measures the renderer's actual serving model -- admit a snapshot on a clean
 // join, serve it while the range's dirty-epoch holds, re-admit after patches
@@ -2277,6 +2342,64 @@ uint64_t g_nr5b_pred_stops = 0;    // predicated-out apply-only stops surfaced
 uint64_t g_nr5b_sup_foreign = 0;   // record at a recycled address != this draw
 // [0]=armed, [1]=pkt addr, [2]=rec_prim<<16|pkt_prim, [3]=rec cnt, [4]=pkt cnt
 uint32_t g_nr5b_foreign_samp[5] = {};
+
+// [NR-5B-3i] by-ref source mode on suppressed groups (see gpu_nr_sup_marker).
+// g_nr5b_mk_mode is the LIVE value; g_nr5b_mk_cycle arms the 5 s cycler.
+int32_t g_nr5b_mk_mode = 0;
+bool g_nr5b_mk_cycle = false;
+uint64_t g_nr5b_mk_stale = 0;    // applied from the record's remembered address
+uint64_t g_nr5b_mk_live = 0;     // applied from the live deferred by-ref
+uint64_t g_nr5b_mk_drop = 0;     // marker dropped (redundant with the flush)
+uint64_t g_nr5b_mk_addr_ne = 0;  // paired, record address != live address
+uint64_t g_nr5b_mk_unpaired = 0; // composable marker with no live by-ref left
+uint64_t g_nr5b_mk_paired = 0;   // composable markers paired with a live by-ref
+
+// [NR-5B-3j] fallback-under-suppression (see gpu_nr_sup_fallback).
+int32_t g_nr5b_fbmode = 0;
+bool g_nr5b_fbcycle = false;
+// Latched the first time a SUPPRESSED record is seen: from then on the run is
+// known to be emitting suppressed groups, so a declined compose is known to
+// be a draw with no packet-side constants. Latched, never cleared -- live
+// suppression is a launch flag, and a per-window read would go blind exactly
+// in the windows where every compose declined.
+bool g_nr5b_sup_live = false;
+uint64_t g_nr5b_fb_skipped = 0;  // draws whose dispatch mode 1 dropped
+uint64_t g_nr5b_stop_nodef = 0;  // 0x22 stops with NOTHING deferred
+
+// [NR-5B-3k] record-generation probe (see gpu_nr_sup_gen).
+int32_t g_nr5b_genmode = 0;
+bool g_nr5b_gencycle = false;
+uint32_t g_nr5b_exec_seq0 = 0;   // recording seq when THIS buffer began
+bool g_nr5b_gen_skip = false;    // this stop's record is ahead; skip if armed
+uint64_t g_nr5b_gen_ahead = 0;   // composes whose record post-dates the buffer
+uint64_t g_nr5b_gen_seen = 0;    // suppressed composes examined
+uint64_t g_nr5b_gen_skipped = 0; // draws mode 1 dropped
+int32_t g_nr5b_gen_maxlead = 0;  // largest (rec.seq - exec_seq0) seen
+uint64_t g_nr5b_gen_leadsum = 0; // for the mean lead of the ahead class
+// [NR-5B-3k] LIVENESS for the ahead counter above. ahead=0 is only a result
+// if the comparison is actually running: lag = exec_seq0 - rec.seq, how many
+// recordings OLD the consumed record is. A sane, varying, small-positive lag
+// says the probe is live and the zero is real; lag pinned at 0, or absurd,
+// says the zero is vacuous ([[swapped-out-gates-vacuous]]).
+uint64_t g_nr5b_lagsum = 0;
+int32_t g_nr5b_lagmin = 0x7FFFFFFF;
+int32_t g_nr5b_lagmax = -0x7FFFFFFF;
+
+// [NR-5B-3l] RUN OVERLAP. Every gate so far compared record VALUES against
+// packet values and passed. None ever tested the ORDER the record applies
+// them in. Under suppression the observed emission positions collapse (the
+// packets are gone), so the record's run order is the PREDICTION's order --
+// VS, PS, fields, fetch -- not necessarily the order the guest emitted. That
+// only matters if two runs in one group touch the same registers: then the
+// last writer decides the value, and a reordered pair silently paints the
+// wrong constants. This census counts overlapping run pairs per record and
+// how many of them actually disagree on the overlapping dwords. Sampled
+// 1-in-256: the test is O(runs^2) against ~450k composes a second.
+uint64_t g_nr5b_ovl_ctr = 0;
+uint64_t g_nr5b_ovl_samples = 0;
+uint64_t g_nr5b_ovl_pairs = 0;
+uint64_t g_nr5b_ovl_valne = 0;
+uint32_t g_nr5b_ovl_samp[5] = {};  // first disagreeing pair: {set,regA,cntA,regB,cntB}
 // [NR-5B-DBG] swap-time register-file divergence probe.
 uint32_t g_nr5dbg_hash[4] = {};
 uint32_t g_nr5dbg_key[8] = {};
@@ -3940,6 +4063,25 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
   // guest memory -- and issue the draw from the record. A one-generation-
   // behind record here is the COHERENT previous draw by 5a's construction.
   if (draw_sup) {
+    g_nr5b_sup_live = true;
+    // [NR-5B-3k] Is this record NEWER than the buffer being replayed? A
+    // positive lead means the guest re-recorded this draw in place after the
+    // execution started, so its constants belong to a later frame. Signed
+    // difference: both are wrap-around u32 recording counters.
+    {
+      const int32_t lead = int32_t(rec.seq - g_nr5b_exec_seq0);
+      const int32_t lag = -lead;
+      g_nr5b_lagsum += uint64_t(uint32_t(lag));
+      if (lag < g_nr5b_lagmin) g_nr5b_lagmin = lag;
+      if (lag > g_nr5b_lagmax) g_nr5b_lagmax = lag;
+      ++g_nr5b_gen_seen;
+      if (lead > 0) {
+        ++g_nr5b_gen_ahead;
+        g_nr5b_gen_leadsum += uint64_t(lead);
+        if (lead > g_nr5b_gen_maxlead) g_nr5b_gen_maxlead = lead;
+        g_nr5b_gen_skip = g_nr5b_genmode == 1;
+      }
+    }
     if (!g_nr5_coh || !draw_ndw) {
       ++g_nr5b_sup_refuse;
       return false;
@@ -3969,7 +4111,71 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
         return false;
       }
     }
-    Nr4aFlush(cp);
+    // [NR-5B-3i] The group's LIVE by-refs. F88 is never shimmed, so the real
+    // 0x2F packets are still in the ring and the walker deferred the
+    // composable ones (null be) in stream order. Snapshot them before the
+    // flush clears the list: they are the FRESH source for exactly the
+    // constants the record's markers also name, and the record's copy of the
+    // address can be a recording behind.
+    struct { uint32_t base, n, phys; } live_br[kNr4aMaxDef];
+    uint32_t nlive = 0, live_i = 0;
+    for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
+      if (g_nr4a_def[i].be == nullptr) {
+        live_br[nlive].base = g_nr4a_def[i].base;
+        live_br[nlive].n = g_nr4a_def[i].n;
+        live_br[nlive].phys = g_nr4a_def[i].phys;
+        ++nlive;
+      }
+    }
+    if (g_nr5b_mk_mode == 2) {
+      // Mode 2 holds the by-refs back so each applies at ITS marker's
+      // recorded position, interleaved with the record's runs; only the
+      // packet-sourced (inline) deferred ranges flush here.
+      for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
+        const Nr4aDef& d = g_nr4a_def[i];
+        if (d.be) cp->NrSkipApplyRegRange(d.base, d.be, d.n, d.phys, false);
+      }
+      g_nr4a_ndef = 0;
+      g_nr4a_group_ovf = false;
+    } else {
+        Nr4aFlush(cp);
+    }
+    // [NR-5B-3l] order census, sampled. f_[0..nf) is this record's composable
+    // run list in RECORD order (markers carry no inline payload and are
+    // skipped: their source was settled by gpu_nr_sup_marker). Two inline
+    // runs whose register ranges intersect are order-sensitive by definition,
+    // and if their overlapping dwords also differ, the order the record
+    // replays them in decides what the draw sees.
+    if ((g_nr5b_ovl_ctr++ & 255u) == 0u) {
+      ++g_nr5b_ovl_samples;
+      for (uint32_t i = 0; i < nf; ++i) {
+        if (f_byref[i]) continue;
+        for (uint32_t j = i + 1; j < nf; ++j) {
+          if (f_byref[j]) continue;
+          const uint32_t lo = f_reg[i] > f_reg[j] ? f_reg[i] : f_reg[j];
+          const uint32_t hi_i = f_reg[i] + f_cnt[i];
+          const uint32_t hi_j = f_reg[j] + f_cnt[j];
+          const uint32_t hi = hi_i < hi_j ? hi_i : hi_j;
+          if (lo >= hi) continue;
+          ++g_nr5b_ovl_pairs;
+          bool ne = false;
+          for (uint32_t r = lo; r < hi && !ne; ++r) {
+            ne = g_nr4a_scratch[f_off[i] + (r - f_reg[i])] !=
+                 g_nr4a_scratch[f_off[j] + (r - f_reg[j])];
+          }
+          if (ne) {
+            ++g_nr5b_ovl_valne;
+            if (!g_nr5b_ovl_samp[0]) {
+              g_nr5b_ovl_samp[0] = 1;
+              g_nr5b_ovl_samp[1] = f_reg[i];
+              g_nr5b_ovl_samp[2] = f_cnt[i];
+              g_nr5b_ovl_samp[3] = f_reg[j];
+              g_nr5b_ovl_samp[4] = f_cnt[j];
+            }
+          }
+        }
+      }
+    }
     // Apply the WHOLE body in record order, per class exactly as the packet
     // world applied it: Composable runs through the bulk range path, and
     // mirror/watched-class runs (>= 0x2000, not Composable) PER DWORD
@@ -3984,18 +4190,60 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       const uint32_t cnt = g_nr4a_scratch[q + 1];
       if (reg & 0x80000000u) {
         if (!(reg & 0x40000000u) && cnt == 3) {
-          // by-ref marker: re-read guest memory at the recorded address.
+          // by-ref marker: re-read guest memory (address per mk_mode below).
           const uint32_t d1 = __builtin_bswap32(g_nr4a_scratch[q + 2]);
           const uint32_t d2 = __builtin_bswap32(g_nr4a_scratch[q + 3]);
           const uint32_t d3 = __builtin_bswap32(g_nr4a_scratch[q + 4]);
           static constexpr uint32_t kBrefBase[5] = {0x4000u, 0x4800u, 0x4900u,
                                                     0x4908u, 0x2000u};
           const uint32_t btype = (d2 >> 16) & 0xFF;
-          const uint32_t mcnt = d3 & 0xFFF;
+          uint32_t mcnt = d3 & 0xFFF;
           if (btype < 5 && mcnt) {
-            const uint32_t mreg = kBrefBase[btype] + (d2 & 0x7FF);
-            const uint32_t maddr = d1 & 0x1FFFFFFFu;
-            if (Nr4aComposable(mreg, mcnt)) {
+            uint32_t mreg = kBrefBase[btype] + (d2 & 0x7FF);
+            uint32_t maddr = d1 & 0x1FFFFFFFu;
+            // [NR-5B-3i] pick the by-ref's SOURCE. A composable marker pairs,
+            // in sequence, with the live deferred by-ref the walker took from
+            // this group's own 0x2F packets; a non-composable one has no
+            // deferred twin (the walker applied it per-dword the moment it
+            // parsed the packet), so under any non-zero mode it is pure
+            // duplication. The address diff is counted in every mode -- it is
+            // the numeric form of the stale-marker hypothesis.
+            // Pair on {reg,count}, not on position alone: a drifted sequence
+            // must not hand a marker some other constant's address. The scan
+            // is forward-only and bounded by the group's own by-ref list
+            // (~14 at city), so it stays O(group).
+            const bool composable = Nr4aComposable(mreg, mcnt);
+            bool paired = false;
+            if (composable) {
+              for (uint32_t j = live_i; j < nlive; ++j) {
+                if (live_br[j].base != mreg || live_br[j].n != mcnt) continue;
+                ++g_nr5b_mk_paired;
+                if (live_br[j].phys != maddr) ++g_nr5b_mk_addr_ne;
+                if (g_nr5b_mk_mode == 2) {
+                  maddr = live_br[j].phys;
+                  ++g_nr5b_mk_live;
+                }
+                live_i = j + 1;
+                paired = true;
+                break;
+              }
+              if (!paired) ++g_nr5b_mk_unpaired;
+            }
+            // Mode 1 drops every marker whose live twin exists; mode 2
+            // drops only the per-dword class (already applied at parse) and
+            // re-sources the rest. An UNPAIRED composable marker has no live
+            // source at all, so it still applies from the record in both
+            // modes -- dropping it would delete the constant outright.
+            if ((g_nr5b_mk_mode == 1 && (paired || !composable)) ||
+                (g_nr5b_mk_mode == 2 && !composable)) {
+              // Redundant: the live packet already applied (at the flush for a
+              // composable range, immediately for a per-dword one).
+              ++g_nr5b_mk_drop;
+              q += 2 + cnt;
+              continue;
+            }
+            if (g_nr5b_mk_mode == 0) ++g_nr5b_mk_stale;
+            if (composable) {
               cp->NrSkipApplyRegRange(mreg, nullptr, mcnt, maddr, true);
               ++g_nr5_mk_applied;
             } else if (mreg >= 0x2000u) {
@@ -4735,6 +4983,43 @@ void CommandProcessor::WorkerThreadMain() {
         "[nr-5a] ON: coherent compose -- by-refs from markers, draw args "
         "from the record's draw entry, single-source per composed draw");
   }
+  // [NR-5B-3i] by-ref source on suppressed groups. -1 arms the 5 s cycler
+  // and starts at 0 so the first phase is today's behaviour (the baseline
+  // the eye compares against, in place -- [[visual-defect-needs-visual-bisect]]).
+  {
+    const int32_t m = REXCVAR_GET(gpu_nr_sup_marker);
+    g_nr5b_mk_cycle = g_nr5_coh && m == -1;
+    g_nr5b_mk_mode = m < 0 ? 0 : (m > 2 ? 0 : m);
+    if (g_nr5_coh && m != 0) {
+      REXGPU_INFO(
+          "[nr-5b] suppressed by-ref source: {}",
+          g_nr5b_mk_cycle  ? "CYCLE 0/1/2 5 s each in place"
+          : g_nr5b_mk_mode == 1 ? "1 = drop markers (live 0x2F packets only)"
+                                : "2 = live address at the marker's position");
+    }
+  }
+  // [NR-5B-3j] declined-compose policy under live suppression. -1 arms the
+  // 5 s cycler and starts at 0 so the first phase is today's behaviour.
+  {
+    const int32_t g = REXCVAR_GET(gpu_nr_sup_gen);
+    g_nr5b_gencycle = g_nr5_coh && g == -1;
+    g_nr5b_genmode = g == 1 ? 1 : 0;
+    if (g_nr5_coh && g != 0) {
+      REXGPU_INFO("[nr-5b] record-generation probe: {}",
+                  g_nr5b_gencycle ? "CYCLE count/SKIP-AHEAD 5 s each in place"
+                                  : "SKIP draws whose record is AHEAD");
+    }
+  }
+  {
+    const int32_t f = REXCVAR_GET(gpu_nr_sup_fallback);
+    g_nr5b_fbcycle = g_nr5_coh && f == -1;
+    g_nr5b_fbmode = f == 1 ? 1 : 0;
+    if (g_nr5_coh && f != 0) {
+      REXGPU_INFO("[nr-5b] declined compose under suppression: {}",
+                  g_nr5b_fbcycle ? "CYCLE issue/SKIP 5 s each in place"
+                                 : "SKIP the dispatch");
+    }
+  }
   // [NR-4B] verify-rate latch. -1 arms the 10 s cycler (starts FULL so the
   // first phase is the baseline); any other value is the fixed live rate.
   {
@@ -4892,6 +5177,61 @@ void CommandProcessor::WorkerThreadMain() {
       if (want != g_nr4b_verify_n) {
         g_nr4b_verify_n = want;
         REXGPU_INFO("[nr-4b] verify -> {}", want ? "FULL" : "OFF");
+      }
+    }
+
+    // [NR-5B-3i] the ALU-half visual bisect: 5 s per by-ref source, in place,
+    // phase logged so the log names what the eye was looking at.
+    if (g_nr5b_mk_cycle) {
+      static auto nr5bmk_t0 = prof_clock::now();
+      const int32_t phase =
+          int32_t((std::chrono::duration_cast<std::chrono::seconds>(
+                       prof_clock::now() - nr5bmk_t0)
+                       .count() /
+                   5) %
+                  3);
+      if (phase != g_nr5b_mk_mode) {
+        g_nr5b_mk_mode = phase;
+        REXGPU_INFO("[nr-5b] mk source -> {} ({})", phase,
+                    phase == 0   ? "RECORD address (today)"
+                    : phase == 1 ? "DROP markers"
+                                 : "LIVE address, record position");
+      }
+    }
+
+    // [NR-5B-3j] the fallback bisect: 5 s issuing declined draws (today) /
+    // 5 s skipping them, in place. Flashing that turns into ABSENCE on the
+    // beat names the pool.
+    if (g_nr5b_fbcycle) {
+      static auto nr5bfb_t0 = prof_clock::now();
+      const int32_t phase =
+          int32_t((std::chrono::duration_cast<std::chrono::seconds>(
+                       prof_clock::now() - nr5bfb_t0)
+                       .count() /
+                   5) %
+                  2);
+      if (phase != g_nr5b_fbmode) {
+        g_nr5b_fbmode = phase;
+        REXGPU_INFO("[nr-5b] declined draw -> {}",
+                    phase ? "SKIPPED" : "ISSUED (today)");
+      }
+    }
+
+    // [NR-5B-3k] the generation bisect: 5 s counting only / 5 s skipping the
+    // ahead class, in place. Flashing that becomes ABSENCE on the beat names
+    // the class the 5a draw anchor cannot see.
+    if (g_nr5b_gencycle) {
+      static auto nr5bgen_t0 = prof_clock::now();
+      const int32_t phase =
+          int32_t((std::chrono::duration_cast<std::chrono::seconds>(
+                       prof_clock::now() - nr5bgen_t0)
+                       .count() /
+                   5) %
+                  2);
+      if (phase != g_nr5b_genmode) {
+        g_nr5b_genmode = phase;
+        REXGPU_INFO("[nr-5b] ahead record -> {}",
+                    phase ? "SKIPPED" : "COMPOSED (today)");
       }
     }
 
@@ -5924,6 +6264,71 @@ void CommandProcessor::WorkerThreadMain() {
                   "pdw_dw={} pred_stops={}",
                   g_nr5b_sup_composed, g_nr5b_sup_argsne, g_nr5b_sup_foreign,
                   g_nr5b_sup_refuse, g_nr5b_pdw_dw, g_nr5b_pred_stops);
+              // [NR-5B-3i] the by-ref source line. addr_ne is the hypothesis
+              // itself: paired markers whose recorded address differs from
+              // the live 0x2F's. A non-trivial rate at mode 0 means the ALU
+              // class is being painted from last frame's constant memory.
+              {
+                const uint64_t paired = g_nr5b_mk_paired;
+                REXGPU_INFO(
+                    "[nr-5b]   mk mode={} stale={} live={} drop={} "
+                    "addr_ne={} ({:.3f}%) unpaired={}",
+                    g_nr5b_mk_mode, g_nr5b_mk_stale, g_nr5b_mk_live,
+                    g_nr5b_mk_drop, g_nr5b_mk_addr_ne,
+                    paired ? 100.0 * double(g_nr5b_mk_addr_ne) / double(paired)
+                           : 0.0,
+                    g_nr5b_mk_unpaired);
+                g_nr5b_mk_stale = g_nr5b_mk_live = g_nr5b_mk_drop = 0;
+                g_nr5b_mk_addr_ne = g_nr5b_mk_unpaired = g_nr5b_mk_paired = 0;
+              }
+              // [NR-5B-3j] the declined-compose pool: what it costs and what
+              // mode 1 dropped. nodef = stops that never reached a compose.
+              REXGPU_INFO("[nr-5b]   fb mode={} declined={} skipped={} "
+                          "nodef={}",
+                          g_nr5b_fbmode,
+                          g_4a_fb_miss + g_4a_fb_shape + g_4a_fb_torn +
+                              g_4a_fb_val + g_4a_fb_ovf + g_4a_fb_stale +
+                              g_nr5b_sup_foreign,
+                          g_nr5b_fb_skipped, g_nr5b_stop_nodef);
+              g_nr5b_fb_skipped = g_nr5b_stop_nodef = 0;
+              // [NR-5B-3k] the generation verdict. ahead% is the share of
+              // suppressed composes whose record post-dates the buffer being
+              // replayed; lead is how many recordings newer.
+              REXGPU_INFO(
+                  "[nr-5b]   gen mode={} seen={} ahead={} ({:.3f}%) "
+                  "meanlead={:.1f} maxlead={} skipped={}",
+                  g_nr5b_genmode, g_nr5b_gen_seen, g_nr5b_gen_ahead,
+                  g_nr5b_gen_seen
+                      ? 100.0 * double(g_nr5b_gen_ahead) / double(g_nr5b_gen_seen)
+                      : 0.0,
+                  g_nr5b_gen_ahead
+                      ? double(g_nr5b_gen_leadsum) / double(g_nr5b_gen_ahead)
+                      : 0.0,
+                  g_nr5b_gen_maxlead, g_nr5b_gen_skipped);
+              // [NR-5B-3k] liveness for that zero, and [3l] the order census.
+              REXGPU_INFO(
+                  "[nr-5b]   lag mean={:.1f} min={} max={} | ovl samp={} "
+                  "pairs={} valne={}",
+                  g_nr5b_gen_seen ? double(g_nr5b_lagsum) /
+                                        double(g_nr5b_gen_seen)
+                                  : 0.0,
+                  g_nr5b_lagmin == 0x7FFFFFFF ? 0 : g_nr5b_lagmin,
+                  g_nr5b_lagmax == -0x7FFFFFFF ? 0 : g_nr5b_lagmax,
+                  g_nr5b_ovl_samples, g_nr5b_ovl_pairs, g_nr5b_ovl_valne);
+              if (g_nr5b_ovl_samp[0]) {
+                REXGPU_INFO(
+                    "[nr-5b]   ovl samp: regA={:04X}x{} regB={:04X}x{}",
+                    g_nr5b_ovl_samp[1], g_nr5b_ovl_samp[2],
+                    g_nr5b_ovl_samp[3], g_nr5b_ovl_samp[4]);
+                g_nr5b_ovl_samp[0] = 0;
+              }
+              g_nr5b_lagsum = 0;
+              g_nr5b_lagmin = 0x7FFFFFFF;
+              g_nr5b_lagmax = -0x7FFFFFFF;
+              g_nr5b_ovl_samples = g_nr5b_ovl_pairs = g_nr5b_ovl_valne = 0;
+              g_nr5b_gen_seen = g_nr5b_gen_ahead = g_nr5b_gen_skipped = 0;
+              g_nr5b_gen_leadsum = 0;
+              g_nr5b_gen_maxlead = 0;
               if (g_nr5b_foreign_samp[0]) {
                 REXGPU_INFO(
                     "[nr-5b]   foreign samp: pkt={:08X} rec_prim={} pkt_prim={} "
@@ -7947,6 +8352,11 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
                    nr::SumRangeEpoch(ptr, count * 4),
                    nr::EpochActivity() != 0);
   }
+  // [NR-5B-3k] the generation reference: every record written from here on
+  // belongs to a LATER frame than the one this buffer is replaying. Read
+  // once per execution, before any packet is decoded, so a re-record racing
+  // the walk lands on the far side of the comparison.
+  g_nr5b_exec_seq0 = uint32_t(nr::EpochActivity());
   // [NR-BFC] 5-4-6-0: census bracket. Candidacy is read from the ruse facts
   // at buffer end; the backend latches its stream anchor here.
   if (g_nr_bfc) {
@@ -8058,11 +8468,16 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // would have left.
     // [NR-5A] the record-sourced draw arm never survives a stop boundary.
     g_nr5_draw_src = nullptr;
+    // [NR-5B-3j] set when THIS stop's compose declined while suppression is
+    // live: the draw is about to render with no constants of its own.
+    bool nr5b_fb_decline = false;
+    g_nr5b_gen_skip = false;
     if (g_nr4a_bufactive && (g_nr4a_ndef || g_nr4a_group_ovf)) {
       if (!stop.delegate && stop.opcode == 0x22) {
         if (!Nr4aTryCompose(this, nr_tile_draw_addr_, raw, count, stop.dword)) {
           ++g_4a_flush_draw;
           Nr4aFlush(this);
+          nr5b_fb_decline = g_nr5b_sup_live;
         }
       } else {
         if (stop.delegate) {
@@ -8072,6 +8487,14 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
         }
         Nr4aFlush(this);
       }
+    } else if (g_nr5b_sup_live && g_nr4a_bufactive && !stop.delegate &&
+               stop.opcode == 0x22) {
+      // [NR-5B-3j] the SILENT hole: a draw stop with nothing deferred never
+      // reaches the compose at all, so it is in none of the fallback classes
+      // -- yet under suppression its group's constants were eaten by the
+      // shims just the same. Counted here so the pool has a size before
+      // anything is designed around it ([[count-refusals-every-granularity]]).
+      ++g_nr5b_stop_nodef;
     }
     // [NR-4B] every stop ends a group: the by-ref witness resets even when
     // nothing was deferred (a pure by-ref group has ndef == 0).
@@ -8142,6 +8565,22 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
       // write somewhere meaningless.
       if (g_nr_tile_bufskip) {
         ++g_tile_draws_skipped;
+        continue;
+      }
+      // [NR-5B-3j] the fallback experiment. Placed HERE, after DetileObserve
+      // and before the dispatch, for the same reason tile probe 1 is: the
+      // band pattern must keep being learned from every packet, including
+      // the ones whose dispatch we drop (naruto_505's self-latching trap).
+      // Only the dispatch goes; the walk's applies, the delegates and their
+      // EVENT_WRITE fences, and everything below 0x2000 are untouched.
+      if (nr5b_fb_decline && g_nr5b_fbmode == 1) {
+        ++g_nr5b_fb_skipped;
+        continue;
+      }
+      // [NR-5B-3k] the generation bisect. Same position and same reasoning as
+      // the fallback skip above: dispatch only, everything else intact.
+      if (g_nr5b_gen_skip) {
+        ++g_nr5b_gen_skipped;
         continue;
       }
       // [N8F] The draw is about to dispatch (direct or delegated): fire the
