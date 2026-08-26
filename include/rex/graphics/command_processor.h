@@ -237,6 +237,14 @@ class CommandProcessor {
   const uint32_t* NrTranslatePhys(uint32_t phys);
   bool NrSkipApplyRegRange(uint32_t base, const uint32_t* values_be,
                            uint32_t n, uint32_t phys, bool from_memory);
+  // [NR-6] Live register read for the file-local compose helpers (they are
+  // free functions, so the protected ReadRegisterValue is out of reach).
+  // The N-9-6 band predicate must re-read the surface signature AFTER a
+  // suppressed record's mirror-class writes land, which happens inside the
+  // compose (naruto_724).
+  uint32_t NrPeekReg(uint32_t index) const {
+    return register_file_->values[index];
+  }
 
   // [N8F] Per-draw effect coalescing: store a walk-decoded range's VALUES
   // immediately (register file + issue mirror, plain copy_and_swap, no

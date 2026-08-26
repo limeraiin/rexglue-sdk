@@ -2402,6 +2402,11 @@ uint64_t g_nr6_keep_rng = 0;   // ranges the mode still applied at a band stop
 // dispatch would have kept: the drop wins (the invariant is "a draw whose
 // constants we dropped never renders"), and this counts how often.
 uint64_t g_nr6_pred_ne = 0;
+// [NR-6] the suppression-safe path (naruto_724): dwords the mirror pre-pass
+// applied before re-testing the band, and bands caught by that LATE test --
+// the ones the hoisted read could not see because their surface signature
+// was still inside the record.
+uint64_t g_nr6_pre_dw = 0, g_nr6_late = 0, g_nr6_pre_mk = 0;
 
 // [NR-5C] all buckets of [base, base+n) untouched since applied_seq
 // (wrap-safe signed compare; the seq bumps ~2x per draw stop).
@@ -4068,21 +4073,28 @@ void Nr4aFlush(CommandProcessor* cp) {
 // mode leaves the register file in the same order-dependent state the full
 // flush does. Classification is by (base,n) only, so a coherent-mode by-ref
 // entry (be == nullptr) rides with the class it belongs to.
+// [NR-6] ONE class filter for both paths. ⚠ naruto_725: the suppressed path
+// first shipped as "skip the whole remaining apply", which is mode 3
+// semantics no matter what mode was set -- so a mode-1 run was silently
+// executing the class that strobes. A band draw must drop exactly what the
+// packet path drops, no more.
+inline bool Nr6DropRange(uint32_t base, uint32_t n, int32_t mode) {
+  if (mode <= 0) return false;
+  if (Nr4aConstWindow(base, n)) {
+    const bool is_fetch = base >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+                          base + n - 1 <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5;
+    // Fetch is its own mode step: its residency/texture invalidations are the
+    // one class this project has never deduped ([N8B] rule), so it escalates
+    // separately even though this draw never renders.
+    return is_fetch ? mode >= 2 : mode >= 1;
+  }
+  return mode >= 3;  // 40040 state windows
+}
+
 void Nr4aBandDrop(CommandProcessor* cp, int32_t mode) {
   for (uint32_t i = 0; i < g_nr4a_ndef; ++i) {
     const Nr4aDef& d = g_nr4a_def[i];
-    bool drop;
-    if (Nr4aConstWindow(d.base, d.n)) {
-      const bool is_fetch =
-          d.base >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
-          d.base + d.n - 1 <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5;
-      // Fetch is its own mode step: its residency/texture invalidations are
-      // the one class this project has never deduped ([N8B] rule), so it
-      // escalates separately even though this draw never renders.
-      drop = is_fetch ? mode >= 2 : mode >= 1;
-    } else {
-      drop = mode >= 3;  // 40040 state windows
-    }
+    const bool drop = Nr6DropRange(d.base, d.n, mode);
     if (drop) {
       ++g_nr6_drop_rng;
       g_nr6_drop_dw += d.n;
@@ -4414,6 +4426,97 @@ nr5c_restart:
         }
       }
     }
+    // [NR-6] ⚠⚠ THE SUPPRESSION ORDERING TRAP (naruto_724, band-shaped
+    // glitch in the middle third of the screen). Under suppression
+    // RB_SURFACE_INFO / RB_COLOR_INFO / RB_DEPTH_INFO (0x2000..0x2004) are
+    // MIRROR class, so they are not deferrable and arrive FROM THIS RECORD,
+    // inside this compose. The band predicate hoisted above the compose
+    // therefore read the PREVIOUS draw's surface signature and misclassified
+    // ~24 draws/s (`pred_ne` 6-25/s here, 0 in every packet-path window):
+    // their constants were dropped AND the draw was skipped, which is a
+    // band's worth of missing draws.
+    bool nr6_band_drop = false;
+    // The fix is ordering, not a retreat: apply the mirror/state per-dword
+    // class FIRST, then re-test the band on CURRENT registers. The pre-pass
+    // is idempotent (the full loop below re-applies the same values in
+    // record order, and mirror-class and composable ranges are disjoint by
+    // construction) and small (~27k dwords/s at city against 32M).
+    // The six registers the predicate reads -- RB_SURFACE_INFO(0x2000),
+    // RB_COLOR_INFO(0x2001), RB_DEPTH_INFO(0x2004), PA_SC_WINDOW_OFFSET
+    // (0x2080) and both scissors (0x2081/2) -- are ALL inside the recovery
+    // mirror ({0x2000,6} RT + {0x2080,3} scissor in nr_context's kRanges), so
+    // a composable range can never touch them (Nr4aStateWindow rejects any
+    // mirror-crossing run outright). That is what makes this pre-pass
+    // complete: the ONLY record items that can move the predicate are
+    // non-composable runs and non-composable by-ref MARKERS, and both are
+    // replayed here. Missing the markers is a silent misclassification that
+    // pred_ne cannot catch, because by then both predicate reads sit on the
+    // same incomplete state.
+    if (g_nr6_mode > 0 && g_nr_detile_mode) {
+      uint32_t s = 2;
+      for (uint32_t k = 0; k < nruns; ++k) {
+        const uint32_t sreg = rb[s];
+        const uint32_t scnt = rb[s + 1];
+        if (sreg & 0x80000000u) {
+          // A by-ref marker. Mirror-class ones (btype 4 => 0x2000 base) apply
+          // per dword FROM GUEST MEMORY in the main loop whenever the marker
+          // mode leaves them in (mode 0); modes 1 and 2 drop them precisely
+          // because the walker already applied them at parse, so the register
+          // file is current either way and only mode 0 needs the replay.
+          if (!(sreg & 0x40000000u) && scnt == 3 && g_nr5b_mk_mode == 0) {
+            const uint32_t d2 = __builtin_bswap32(rb[s + 3]);
+            const uint32_t d3 = __builtin_bswap32(rb[s + 4]);
+            static constexpr uint32_t kPreBase[5] = {0x4000u, 0x4800u, 0x4900u,
+                                                     0x4908u, 0x2000u};
+            const uint32_t btype = (d2 >> 16) & 0xFF;
+            const uint32_t mcnt = d3 & 0xFFF;
+            if (btype == 4 && mcnt) {
+              const uint32_t mreg = kPreBase[4] + (d2 & 0x7FF);
+              if (mreg >= 0x2000u && !Nr4aComposable(mreg, mcnt)) {
+                const uint32_t maddr = __builtin_bswap32(rb[s + 2]) & 0x1FFFFFFFu;
+                const uint32_t* src = cp->NrTranslatePhys(maddr);
+                if (src) {
+                  for (uint32_t m = 0; m < mcnt; ++m) {
+                    nr::CtxExternalWrite(&g_ctx_walker, mreg + m,
+                                         __builtin_bswap32(src[m]), true);
+                  }
+                  ++g_nr6_pre_mk;
+                }
+              }
+            }
+          }
+          s += 2 + scnt;
+          continue;
+        }
+        if (sreg >= 0x2000u && !Nr4aComposable(sreg, scnt)) {
+          for (uint32_t m = 0; m < scnt; ++m) {
+            nr::CtxExternalWrite(&g_ctx_walker, sreg + m,
+                                 __builtin_bswap32(rb[s + 2 + m]), false);
+          }
+          g_nr6_pre_dw += scnt;
+        }
+        s += 2 + scnt;
+      }
+      const nr::DetileRegs n6r{
+          cp->NrPeekReg(XE_GPU_REG_PA_SC_WINDOW_OFFSET),
+          cp->NrPeekReg(XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL),
+          cp->NrPeekReg(XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR),
+          cp->NrPeekReg(XE_GPU_REG_RB_SURFACE_INFO),
+          cp->NrPeekReg(XE_GPU_REG_RB_COLOR_INFO),
+          cp->NrPeekReg(XE_GPU_REG_RB_DEPTH_INFO)};
+      if (nr::DetileIsRepeatBand(n6r)) {
+        // A repeat band, decided on state this compose just made current.
+        // The body still runs: only the classes Nr6DropRange names are
+        // skipped, exactly as on the packet path. ⚠ Do NOT skip the whole
+        // body (naruto_725): state and fetch runs a later KEPT draw inherits
+        // live in this record too, and under suppression the record is their
+        // ONLY source -- the guest's dirty tracking will not re-emit them.
+        // The draw itself is left to the dispatch site's predicate, which now
+        // reads the same registers and drops it too.
+        ++g_nr6_late;
+        nr6_band_drop = true;
+      }
+    }
     // Apply the WHOLE body in record order, per class exactly as the packet
     // world applied it: Composable runs through the bulk range path, and
     // mirror/watched-class runs (>= 0x2000, not Composable) PER DWORD
@@ -4450,6 +4553,15 @@ nr5c_restart:
             // must not hand a marker some other constant's address. The scan
             // is forward-only and bounded by the group's own by-ref list
             // (~14 at city), so it stays O(group).
+            // [NR-6] band draw: a marker naming a dropped class is dropped
+            // with it (the pre-pass above already replayed the mirror-class
+            // markers, which are never in a droppable class).
+            if (nr6_band_drop && Nr6DropRange(mreg, mcnt, g_nr6_mode)) {
+              ++g_nr6_drop_rng;
+              g_nr6_drop_dw += mcnt;
+              q += 2 + cnt;
+              continue;
+            }
             const bool composable = Nr4aComposable(mreg, mcnt);
             bool paired = false;
             if (composable) {
@@ -4501,6 +4613,14 @@ nr5c_restart:
         continue;
       }
       if (Nr4aComposable(reg, cnt)) {
+        // [NR-6] this draw is a repeat band the dispatch will drop: the
+        // classes the mode names never need to reach the register file.
+        if (nr6_band_drop && Nr6DropRange(reg, cnt, g_nr6_mode)) {
+          ++g_nr6_drop_rng;
+          g_nr6_drop_dw += cnt;
+          q += 2 + cnt;
+          continue;
+        }
         // [NR-5C] lever (b): a gen-stable record run whose buckets nobody
         // touched since its last apply is already in the register file.
         bool skip = false;
@@ -4570,7 +4690,10 @@ nr5c_restart:
     } else {
       ++g_nr5b_sup_argsne;  // draw issues from the current packet bytes
     }
-    if (g_nrb_track && apply_valid) {
+    // [NR-6] a band draw applied only PART of the record, so it must never
+    // claim the record is in the register file (lever (b) would then skip a
+    // later kept draw's real applies).
+    if (g_nrb_track && apply_valid && !nr6_band_drop) {
       nr::StampApplied(pkt_addr, rec.state_gen, g_nrb_apply_seq);
       ++g_nr5c_stamped;
     }
@@ -6774,15 +6897,16 @@ void CommandProcessor::WorkerThreadMain() {
           // [NR-6] the repeat-band drop, 1 Hz. stops = draws the hoisted
           // predicate called a band; drop rng/dw = the applies that no longer
           // happen at all. pred_ne is the safety counter and must read 0.
-          if (g_nr6_stops || g_nr6_drop_rng || g_nr6_pred_ne) {
+          if (g_nr6_stops || g_nr6_drop_rng || g_nr6_pred_ne || g_nr6_late) {
             REXGPU_INFO(
                 "[nr-6] mode={} band stops={} groups={} | dropped rng={} "
-                "dw={} | kept rng={} | pred_ne={}",
+                "dw={} | kept rng={} | late(sup)={} pre_dw={} pre_mk={} | pred_ne={}",
                 g_nr6_mode, g_nr6_stops, g_nr6_groups, g_nr6_drop_rng,
-                g_nr6_drop_dw, g_nr6_keep_rng, g_nr6_pred_ne);
+                g_nr6_drop_dw, g_nr6_keep_rng, g_nr6_late, g_nr6_pre_dw,
+                g_nr6_pre_mk, g_nr6_pred_ne);
             g_nr6_stops = g_nr6_groups = 0;
             g_nr6_drop_rng = g_nr6_drop_dw = g_nr6_keep_rng = 0;
-            g_nr6_pred_ne = 0;
+            g_nr6_pred_ne = g_nr6_late = g_nr6_pre_dw = g_nr6_pre_mk = 0;
           }
           // [NR-5C-ATTR] the compose line prints on its OWN gate now: the
           // bracket arms without any lever (gpu_nr_compose_prof), and the
@@ -8951,9 +9075,15 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // would re-order the band learner; naruto_505's self-latching trap), so
     // the only way the two reads can disagree is a guard trip in between --
     // counted as pred_ne, and the drop wins.
+    // ⚠ naruto_724: the hoisted read is sound ONLY while no record can write
+    // the surface signature between it and the dispatch. That holds on the
+    // packet path (pred_ne 0 over 81 windows) and FAILS under suppression,
+    // where 0x2000..0x2004 come from the record. Once a suppressed record has
+    // been seen, the hoist stands down and the LATE test inside the compose
+    // (after the mirror pre-pass) owns the decision instead.
     bool nr6_band = false;
     if (g_nr6_mode > 0 && g_nr_detile_mode && !stop.delegate &&
-        stop.opcode == 0x22 && g_nr4a_bufactive) {
+        stop.opcode == 0x22 && g_nr4a_bufactive && !g_nr5b_sup_live) {
       const uint32_t* n6_rf = register_file_->values;
       const nr::DetileRegs n6_regs{n6_rf[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
                                    n6_rf[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
