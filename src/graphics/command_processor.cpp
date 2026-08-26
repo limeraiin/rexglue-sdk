@@ -293,10 +293,30 @@ REXCVAR_DEFINE_BOOL(gpu_nr_band_cycle, false, "GPU",
 // into a file whose only reader for those registers is a draw we then throw
 // away.
 //
-// This mode says so at the BUFFER. When de-tile's own predicate calls the
-// register state at buffer ENTRY a repeat band, the execution keeps its parse,
-// every delegate, and every write below 0x2000 -- and loses every apply at or
-// above it plus the draw dispatch. Three traps, each already paid for once:
+// ⚠⚠ THE FIRST CUT DROPPED THE VALUES TOO, AND THE CITY REFUTED IT
+// (naruto_742: whole-screen flashing with random textures in the ON phase).
+// Its premise was "band 1 already wrote these values, so a repeat band's
+// applies are re-writes of what is there". FALSE for shader constants: a city
+// band run leaves ~160 pixel-shader float constants (0x4099-0x409F,
+// 0x4424-0x4432) different from how it found them, which is a fullscreen
+// post-pass quad sampling with the wrong constants. The soundness instrument
+// had already named that exact class before the drive; the drive only
+// confirmed the size.
+//
+// SO THE LEVER WAS INVERTED, AND N-8b IS WHY IT STILL PAYS. That measurement
+// priced a range at ~72 ns of which ~4 ns is the data copy: the other ~95% is
+// the per-range dirty-tail evaluation and side effects (cbuffer up_to_date,
+// TextureFetchConstantsWritten, InvalidateVertexBufferResidencyRange). So a
+// repeat band now KEEPS the value store -- the register file stays
+// byte-identical to a full apply, which makes the whole 742 class impossible
+// by construction -- and skips only the side effects, because every draw in
+// that band is thrown away and nothing else reads a dirty flag until the run
+// ends. When it ends, the ranges the run touched are re-applied ONCE through
+// the normal path from their CURRENT values, so every side effect fires with
+// the right value at the right time. ~150 ranges instead of ~1.5M/s.
+//
+// The band execution keeps its parse, every delegate, and every write below
+// 0x2000 unchanged. Three traps, each already paid for once:
 //   naruto_503  a buffer may never be skipped WHOLESALE: its delegates carry
 //               the EVENT_WRITE fences the producer spin-waits on (86.3% of
 //               city groups end in one), and the guest dies in ~1 s.
@@ -315,10 +335,10 @@ REXCVAR_DEFINE_BOOL(gpu_nr_band_cycle, false, "GPU",
 // never the cost). This removes the TRAFFIC, which is the half that measured.
 REXCVAR_DEFINE_INT32(gpu_nr_band_walk, 0, "GPU",
                      "N-9-7: for a buffer execution de-tile calls a repeat "
-                     "band, drop every register apply at or above 0x2000 (the "
-                     "recovery mirror excepted) and the draw dispatch. Parse, "
-                     "delegates and every write below 0x2000 still run. "
-                     "0 = off, 1 = on.");
+                     "band, STORE its register values but skip the per-range "
+                     "side effects, and re-apply the touched ranges once when "
+                     "the band run ends. Parse, delegates and every write "
+                     "below 0x2000 run unchanged. 0 = off, 1 = on.");
 // One in-place cycler, 10 s per phase ([[price-stages-in-place]]). The census
 // runs in BOTH phases, so the OFF phase prices exactly what the ON phase did.
 REXCVAR_DEFINE_BOOL(gpu_nr_band_walk_cycle, false, "GPU",
@@ -2513,7 +2533,8 @@ uint64_t g_n97_dropped_draws = 0;  // mixed draws the activation forced us to
 // execution's snapshot. Nothing after the bands can reach it now.
 // Sampled 1 frame in 8 so it cannot bias the paired fps read it rides along
 // with ([[price-stages-in-place]]).
-const RegisterFile* g_n97_rf = nullptr;
+RegisterFile* g_n97_rf = nullptr;
+memory::Memory* g_n97_mem = nullptr;  // by-ref payloads, stamped at entry
 bool g_n97_sample = false;
 std::vector<uint32_t> g_n97_touched;  // per register: index into tlist, +1
 std::vector<uint32_t> g_n97_tlist;    // ...the registers, to sweep and clear
@@ -2542,6 +2563,32 @@ uint64_t g_n97_frame_n = 0;     // frames seen, for the 1-in-8 sample
 // still fed; a wait on anything at or above 0x2000 would be spinning on a
 // value this mode has stopped writing, which is a hang, not a glitch.
 // wait_other must read 0.
+// THE DEFERRED SIDE-EFFECT SET: which registers a band run stored without
+// firing their side effects, so the run's end can fire them once from the
+// CURRENT values. Last-writer-wins IS the run's net effect, and re-reading the
+// live file means that if something after the band moved a register first, the
+// re-apply carries the newer value rather than a stale one.
+//
+// ⚠ THE FIRST CUT OF THIS WAS AN EXACT {base,n} LIST AND IT OVERFLOWED
+// (naruto_743: `pend ovf=22340` in one window). The city does not reuse ~150
+// ranges, it emits thousands of distinct bases, so an exact list is unbounded
+// in the one direction that matters: a range that overflows the cap is stored
+// but never re-applied, which resurrects the naruto_742 class for exactly the
+// registers the cap dropped. COVERAGE cannot overflow, so this is a bitmap of
+// 64-register BLOCKS instead. Marking costs (n/64)+1 stores per range rather
+// than one hash probe, the flush emits one apply per CONTIGUOUS RUN of marked
+// blocks, and the worst case is the whole register file: 321 blocks, bounded,
+// always complete. Over-covering by up to 63 registers per block is harmless -
+// those registers are re-applied with the values they already hold, so the
+// only effect is that their (correct) side effects fire too.
+constexpr uint32_t kN97Blk = 64;
+constexpr uint32_t kN97Blocks = (RegisterFile::kRegisterCount + kN97Blk - 1) / kN97Blk;
+uint8_t g_n97_blk[kN97Blocks] = {};
+uint32_t g_n97_blk_n = 0;  // marked blocks, so an empty run costs one compare
+std::vector<uint32_t> g_n97_pend_scratch;
+uint64_t g_n97_flush_runs = 0, g_n97_flush_rng = 0, g_n97_flush_dw = 0;
+uint64_t g_n97_store_rng = 0, g_n97_store_dw = 0;
+
 uint64_t g_n97_deleg = 0, g_n97_deleg_read = 0;
 uint64_t g_n97_wait_mem = 0, g_n97_wait_coher = 0, g_n97_wait_other = 0;
 uint32_t g_n97_wait_reg = 0xFFFFFFFFu;
@@ -5201,8 +5248,21 @@ void N97NetSweep() {
   g_n97_tlast.clear();
 }
 
-// The per-dword half. Counts in both cycler phases; drops only when the mode
-// is live, so the OFF phase measures exactly the traffic the ON phase removed.
+// Mark the blocks a deferred range covers. Cannot fail and cannot overflow,
+// which is the whole point.
+inline void N97Pending(uint32_t base, uint32_t n) {
+  const uint32_t first = base / kN97Blk;
+  const uint32_t last = (base + n - 1) / kN97Blk;
+  for (uint32_t b = first; b <= last && b < kN97Blocks; ++b) {
+    if (!g_n97_blk[b]) {
+      g_n97_blk[b] = 1;
+      ++g_n97_blk_n;
+    }
+  }
+}
+
+// The per-dword half. The value is STORED either way; only the side effects
+// are deferred, and only while the phase is live.
 void N97RegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) {
   if (N97KeepReg(reg)) {
     ++g_n97_keep_pdw;
@@ -5219,7 +5279,22 @@ void N97RegWrite(void* user, uint32_t reg, uint32_t value, bool from_memory) {
       ++g_n97_chg_dw;
     }
   }
-  if (!g_n97_bufdrop) NrWalkRegWrite(user, reg, value, from_memory);
+  if (!g_n97_bufdrop) {
+    NrWalkRegWrite(user, reg, value, from_memory);
+    return;
+  }
+  // Value now, effects at the end of the run. The store is the whole reason
+  // the naruto_742 class cannot come back: the register file is left exactly
+  // where a full apply would have left it.
+  if (reg < RegisterFile::kRegisterCount) {
+    g_n97_rf->values[reg] = value;
+    if (g_nr_issue && g_nri_seeded && !g_nri_live) {
+      g_nri_file.values[reg] = value;
+    }
+    N97Pending(reg, 1);
+    ++g_n97_store_rng;
+    ++g_n97_store_dw;
+  }
 }
 
 // The bulk half. A range only reaches range_fn once CtxRangeOfferable has
@@ -5241,7 +5316,70 @@ bool N97RegRange(void* user, uint32_t base, const uint32_t* values_be,
   if (!g_n97_bufdrop) {
     return NrWalkRegRange(user, base, values_be, n, phys, from_memory);
   }
-  return true;  // consumed and dropped: never falls back to per-dword
+  // Value now, effects at the end of the run. `be` is big-endian exactly as
+  // the apply path copy_and_swaps it; a null one is a by-ref load whose
+  // payload lives in guest memory at `phys`.
+  const uint32_t* be = values_be;
+  if (!be) {
+    be = g_n97_mem ? g_n97_mem->TranslatePhysical<uint32_t*>(phys) : nullptr;
+    if (!be) return false;  // cannot store it: let the normal path have it
+  }
+  if (base + n > RegisterFile::kRegisterCount) return false;
+  // The same SIMD swap the normal apply path uses -- a scalar loop here would
+  // hand back part of what the deferral just won (~144 MB/s at city rates).
+  uint32_t* dst = g_n97_rf->values + base;
+  memory::copy_and_swap(dst, be, n);
+  if (g_nr_issue && g_nri_seeded && !g_nri_live) {
+    std::memcpy(&g_nri_file.values[base], dst, n * sizeof(uint32_t));
+  }
+  N97Pending(base, n);
+  ++g_n97_store_rng;
+  g_n97_store_dw += n;
+  return true;  // consumed: stored, side effects deferred to the run's end
+}
+
+// (SS) The run ended: re-apply every deferred range through the NORMAL path,
+// from the values now in the register file. Idempotent (the store already put
+// them there), so its only job is to fire the dirty tails and the texture /
+// residency invalidations exactly once each, with the right values, before
+// anything that reads them. On pending overflow the list is short, not wrong:
+// ranges past the cap were stored but never listed, so the cap is chosen far
+// above the ~150 distinct ranges a city run actually uses and the overflow is
+// counted so silence can never be mistaken for coverage.
+void N97FlushPending(CommandProcessor* cp) {
+  if (!g_n97_blk_n) return;
+  ++g_n97_flush_runs;
+  // Nothing below 0x2000 can be marked (the keep-list takes every one of those
+  // writes, and re-applying a stateful port -- COHER's OR-write above all --
+  // would be actively wrong), but the bound is asserted rather than assumed.
+  const uint32_t first_blk = 0x2000u / kN97Blk;
+  uint32_t b = first_blk;
+  while (b < kN97Blocks) {
+    if (!g_n97_blk[b]) {
+      ++b;
+      continue;
+    }
+    uint32_t e = b;
+    while (e < kN97Blocks && g_n97_blk[e]) {
+      g_n97_blk[e] = 0;
+      ++e;
+    }
+    const uint32_t base = b * kN97Blk;
+    uint32_t n = (e - b) * kN97Blk;
+    if (base + n > RegisterFile::kRegisterCount) {
+      n = RegisterFile::kRegisterCount - base;
+    }
+    if (g_n97_pend_scratch.size() < n) g_n97_pend_scratch.resize(n);
+    memory::copy_and_swap(g_n97_pend_scratch.data(), g_n97_rf->values + base, n);
+    cp->NrSkipApplyRegRange(base, g_n97_pend_scratch.data(), n, 0, false);
+    ++g_n97_flush_rng;
+    g_n97_flush_dw += n;
+    b = e;
+  }
+  // Anything below the floor was never legal to mark; clear it so a stray bit
+  // cannot survive into the next run.
+  for (uint32_t i = 0; i < first_blk; ++i) g_n97_blk[i] = 0;
+  g_n97_blk_n = 0;
 }
 
 // Arm the filter for the rest of this execution. Called either at buffer entry
@@ -7460,6 +7598,24 @@ void CommandProcessor::WorkerThreadMain() {
               tot_dw ? drop_dw * 100 / tot_dw : 0, g_n97_drop_rng,
               g_n97_keep_rng, g_n97_drop_pdw, g_n97_keep_pdw,
               g_n97_mixed_stops, g_n97_dropped_draws);
+          // The lever itself: ranges STORED without their side effects, and
+          // the far smaller set re-applied WITH them when each run ended.
+          // flush rng / store rng is the whole reduction, in one ratio.
+          if (g_n97_store_rng || g_n97_flush_rng) {
+            REXGPU_INFO(
+                "[nr-97]   store rng={} dw={} | flush runs={} rng={} dw={} "
+                "({:.3f}% of stored ranges re-applied, {:.1f} per run)",
+                g_n97_store_rng, g_n97_store_dw, g_n97_flush_runs,
+                g_n97_flush_rng, g_n97_flush_dw,
+                g_n97_store_rng
+                    ? 100.0 * double(g_n97_flush_rng) / double(g_n97_store_rng)
+                    : 0.0,
+                g_n97_flush_runs
+                    ? double(g_n97_flush_rng) / double(g_n97_flush_runs)
+                    : 0.0);
+          }
+          g_n97_store_rng = g_n97_store_dw = 0;
+          g_n97_flush_runs = g_n97_flush_rng = g_n97_flush_dw = 0;
           // (SS) the soundness read, 1-in-16 sampled, OFF-phase only.
           // net_chg IS THE VERDICT: registers a repeat-band execution left
           // different from how it found them. It must be 0. `churn` is the
@@ -8665,8 +8821,15 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           g_n97_decided = false;
           g_n97_stops_seen = g_n97_stops_band = 0;
           g_n97_bufkey = ptr & 0x1FFFFFFFu;
+          // [NR-97] The band run ends here if this execution cannot be a band.
+          // The entry hint OVER-approximates (it is true for any buffer that
+          // merely follows a band, see the naruto_731 note), so a false hint
+          // is proof: a real band execution always has it true. A buffer that
+          // slips through with a true hint flushes at its first non-band draw
+          // stop instead, which is still before anything renders.
           g_n97_pre_mark = g_skp_pdw + g_skp_rng_dw;
           g_n97_rf = register_file_;
+          g_n97_mem = memory_;
           if (g_n97_touched.size() != RegisterFile::kRegisterCount) {
             g_n97_touched.assign(RegisterFile::kRegisterCount, 0);
             g_n97_exec_seen.assign(RegisterFile::kRegisterCount, 0);
@@ -8687,6 +8850,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                 n97_rf[XE_GPU_REG_RB_DEPTH_INFO]};
             g_n97_bufband = nr::DetileIsRepeatBand(n97_regs);
             if (g_n97_bufband) ++g_n97_bufs_eband;
+            if (!g_n97_bufband && g_n97_blk_n) N97FlushPending(this);
             if (g_n97_bufband && N97MemoGet(g_n97_bufkey) == kN97Clean) {
               // Both the entry hint and this buffer's own history agree:
               // activate before the first packet and lose no prefix.
@@ -9788,8 +9952,14 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
             ++g_n97_late_band;
           }
           if (g_n97_filter && !dt_repeat) {
-            // Counted in BOTH phases (the filter installs either way), so the
-            // OFF phase prices the exact risk the ON phase takes.
+            // A stop inside a band execution whose own registers say band 1:
+            // the buffer writes the band registers mid-stream (the N-2-0
+            // in-place finalize class). Its state is CORRECT -- the store put
+            // it there -- so nothing is lost and nothing is dropped. Only the
+            // deferred side effects are owed, so the run ends here, before
+            // this draw renders, and the rest of the buffer takes the normal
+            // path. This is the whole point of storing instead of dropping:
+            // the naruto_742 lost-draw class simply does not exist any more.
             ++g_n97_mixed_stops;
             if (!g_n97_bufmixed) {
               g_n97_bufmixed = true;
@@ -9797,8 +9967,8 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
               N97MemoSet(g_n97_bufkey, kN97Mixed);
             }
             if (g_n97_bufdrop) {
-              ++g_n97_dropped_draws;
-              continue;  // its constants are gone; it must not render
+              N97FlushPending(this);
+              g_n97_bufdrop = false;  // stand down for the rest of the buffer
             }
           }
         }
@@ -11107,6 +11277,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     // comment. Swept BEFORE DetileFrameEnd so the reading belongs to the frame
     // that just ran, and only in the census (non-dropping) phase, where the
     // applies still happen and the live file is the thing being questioned.
+    // [NR-97] nothing may be owed across a frame boundary.
+    if (g_n97_blk_n) N97FlushPending(this);
     if (g_n97_sample) N97NetSweep();
     ++g_n97_frame_n;
     // 1 frame in 16. The census phase is the BASELINE half of the paired fps
