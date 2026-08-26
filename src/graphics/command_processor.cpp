@@ -2594,6 +2594,29 @@ std::vector<uint32_t> g_n97_pend_scratch;
 uint64_t g_n97_flush_runs = 0, g_n97_flush_rng = 0, g_n97_flush_dw = 0;
 uint64_t g_n97_store_rng = 0, g_n97_store_dw = 0;
 
+// [NR-97b] The per-stop half of the fence replay, and the only part of it that
+// is provably free rather than merely plausible.
+//
+// A band execution surfaces ~300k draw stops a second at the city and does the
+// same three things at every one: rebuild the 8-register DetileRegs tuple, call
+// DetileObserve, call DetileIsRepeatBand. For a NON-RESOLVE stop all three are
+// pure functions of that tuple:
+//   - DetileIsRepeatBand is a pure predicate.
+//   - DetileObserve's band branch is idempotent for an identical tuple --
+//     obs_band_rows is a min, obs_full_height is a max, obs_sig is a
+//     first-write, and obs_consistent is a conjunction of compares. Calling it
+//     twice with the same registers cannot reach a state one call did not.
+// So skipping a repeat of the SAME tuple is exactly equivalent, not an
+// approximation, and the de-tile learner still sees every distinct band
+// pattern every frame (naruto_505's self-latch needs the pattern, not the
+// repetitions).
+// ⚠ A RESOLVE always observes: its branch is stateful (band0_dest, band_taps,
+// the destination-stride guard), so repeats are NOT idempotent there.
+uint32_t g_n97o_key[8] = {};   // the last tuple observed, verbatim
+bool g_n97o_valid = false;     // ...and whether it is usable
+bool g_n97o_repeat = false;    // ...its DetileIsRepeatBand verdict
+uint64_t g_n97o_hit = 0, g_n97o_miss = 0, g_n97o_resolve = 0;
+
 uint64_t g_n97_deleg = 0, g_n97_deleg_read = 0;
 uint64_t g_n97_wait_mem = 0, g_n97_wait_coher = 0, g_n97_wait_other = 0;
 uint32_t g_n97_wait_reg = 0xFFFFFFFFu;
@@ -7653,6 +7676,15 @@ void CommandProcessor::WorkerThreadMain() {
             REXGPU_INFO("[nr-97]   NET regs ({} distinct, +{} unlisted): {}",
                         g_n97_chg_rec_n, g_n97_chg_rec_ovf, buf);
           }
+          if (g_n97o_hit || g_n97o_miss) {
+            const uint64_t tot = g_n97o_hit + g_n97o_miss + g_n97o_resolve;
+            REXGPU_INFO(
+                "[nr-97]   observe hit={} miss={} resolve={} ({:.1f}% of {} "
+                "stops skipped the tuple rebuild + observe + predicate)",
+                g_n97o_hit, g_n97o_miss, g_n97o_resolve,
+                tot ? 100.0 * double(g_n97o_hit) / double(tot) : 0.0, tot);
+            g_n97o_hit = g_n97o_miss = g_n97o_resolve = 0;
+          }
           if (g_n97_deleg) {
             char db[256];
             size_t da = 0;
@@ -9925,12 +9957,37 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
                                      dt_rf[XE_GPU_REG_RB_DEPTH_INFO]};
         const bool dt_is_resolve =
             (dt_rf[XE_GPU_REG_RB_MODECONTROL] & 0x7) == uint32_t(xenos::EdramMode::kCopy);
-        nr::DetileObserve(dt_regs, dt_is_resolve, dt_rf[XE_GPU_REG_RB_COPY_DEST_BASE]);
-        // [NR-6] the cross-check: the hoisted read (above the compose) and
-        // this one must agree. If they do not, the hoisted one already threw
-        // this draw's constants away, so the draw MUST NOT render -- the drop
-        // wins and the disagreement is counted, never silent.
-        const bool dt_repeat = nr::DetileIsRepeatBand(dt_regs);
+        const uint32_t dt_dest = dt_rf[XE_GPU_REG_RB_COPY_DEST_BASE];
+        // [NR-97b] observe once per DISTINCT tuple; see the memo's comment for
+        // why a repeat is exactly equivalent and why a resolve is exempt.
+        bool dt_repeat;
+        const uint32_t dt_key[8] = {dt_regs.window_offset, dt_regs.scissor_tl,
+                                    dt_regs.scissor_br,    dt_regs.surface_info,
+                                    dt_regs.color_info,    dt_regs.depth_info,
+                                    dt_dest,               uint32_t(dt_is_resolve)};
+        bool dt_same = g_n97o_valid;
+        for (uint32_t i = 0; i < 8 && dt_same; ++i) {
+          dt_same = g_n97o_key[i] == dt_key[i];
+        }
+        if (dt_same && !dt_is_resolve) {
+          ++g_n97o_hit;
+          dt_repeat = g_n97o_repeat;
+        } else {
+          if (dt_is_resolve) {
+            ++g_n97o_resolve;
+          } else {
+            ++g_n97o_miss;
+          }
+          nr::DetileObserve(dt_regs, dt_is_resolve, dt_dest);
+          // [NR-6] the cross-check: the hoisted read (above the compose) and
+          // this one must agree. If they do not, the hoisted one already threw
+          // this draw's constants away, so the draw MUST NOT render -- the
+          // drop wins and the disagreement is counted, never silent.
+          dt_repeat = nr::DetileIsRepeatBand(dt_regs);
+          for (uint32_t i = 0; i < 8; ++i) g_n97o_key[i] = dt_key[i];
+          g_n97o_repeat = dt_repeat;
+          g_n97o_valid = true;
+        }
         if (nr6_band && !dt_repeat) ++g_nr6_pred_ne;
         // [NR-97] the band rule, evaluated at the only place it is sound: a
         // DRAW STOP, against de-tile's own predicate.
@@ -11284,6 +11341,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     // applies still happen and the live file is the thing being questioned.
     // [NR-97] nothing may be owed across a frame boundary.
     if (g_n97_blk_n) N97FlushPending(this);
+    // [NR-97b] DetileFrameEnd re-arms the learner from this frame's
+    // observations, so every cached verdict is about the PREVIOUS arming and
+    // must not survive the promotion.
+    g_n97o_valid = false;
     if (g_n97_sample) N97NetSweep();
     ++g_n97_frame_n;
     // 1 frame in 16. The census phase is the BASELINE half of the paired fps
