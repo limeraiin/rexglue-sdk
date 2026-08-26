@@ -84,6 +84,12 @@ struct DrawRecord {
   uint32_t state_gen;  // arena generation stamp; 0 = no state payload
   uint32_t vs;     // shader object pointers at record time (dev+12684/12688):
   uint32_t ps;     //   per-draw shader identity (city churn is 69%/59%)
+  // [NR-5C] reader-owned (command processor) skip-unchanged stamps: the
+  // state_gen this record last FULLY applied under, and the apply sequence
+  // it was stamped at (see g_nrb_apply_seq). The writer clears applied_gen
+  // on every upsert, so a re-recorded payload can never read as applied.
+  uint32_t applied_gen;
+  uint32_t applied_seq;
 };
 
 // Join one executed DRAW_INDX packet to its recorded draw: look up the record
@@ -144,6 +150,12 @@ struct CacheStats {
 // block was already overwritten. Same unsynchronised model as LookupDraw.
 const uint32_t* AcquireState(const DrawRecord& rec, uint32_t* out_ndw);
 bool VerifyState(const DrawRecord& rec);
+
+// [NR-5C] Stamp the record at phys_addr as fully applied under {gen, seq}
+// (see DrawRecord::applied_gen). Reader-side unsynchronised u32 stores, same
+// model as LookupDraw's last_use stamp; a stamp racing a same-address upsert
+// can only pair an OLD gen with the slot, which reads as not-applied.
+void StampApplied(uint32_t phys_addr, uint32_t gen, uint32_t seq);
 
 const CacheStats& GetCacheStats();
 void ResetCacheStats();

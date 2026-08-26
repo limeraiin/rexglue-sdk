@@ -205,6 +205,20 @@ bool VerifyState(const DrawRecord& rec) {
   return blk[0] == rec.addr && blk[1] == rec.state_gen;
 }
 
+void StampApplied(uint32_t phys_addr, uint32_t gen, uint32_t seq) {
+  const uint32_t addr = phys_addr & kPhysMask;
+  if (!addr) return;
+  const uint32_t base = SetBase(addr);
+  for (uint32_t w = 0; w < kWays; ++w) {
+    DrawRecord& slot = g_tab[base + w];
+    if (slot.addr == addr) {
+      slot.applied_seq = seq;  // seq first: gen is the validity gate
+      slot.applied_gen = gen;
+      return;
+    }
+  }
+}
+
 const CacheStats& GetCacheStats() { return g_stats; }
 
 void ResetCacheStats() {
@@ -298,6 +312,9 @@ extern "C" void rex_nr_record_draw_args_state(uint32_t guest_addr, uint32_t rid,
   slot->state_gen = state_gen;
   slot->vs = vs;
   slot->ps = ps;
+  // [NR-5C] a re-recorded payload was never applied: the reader's skip
+  // predicate must see gen-mismatch until it fully applies the new body.
+  slot->applied_gen = 0;
   slot->addr = addr;  // key last: the record becomes visible complete
   if (old_gen) {
     StateFree(old_off);

@@ -4365,6 +4365,13 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   if (!num_registers) {
     return;
   }
+  // [NR-5C] overlap tracking: the constant-window fast paths below never
+  // reach the base per-dword WriteRegister, so stamp the whole range here
+  // (the base path re-stamps per dword; redundant stores are harmless).
+  // The N8B dedupe early-return skips value-identical ranges only, and an
+  // unchanged range needs no stamp -- but it is stamped here anyway, which
+  // is merely conservative for the skip lever.
+  NrbStampRange(start_index, num_registers);
   // [GPU-PRECORD] Phase 1b-0: log the bulk write (raw guest dwords) for replay.
   // See WriteRegister; offset into the segment's frommem_data is stored, not a pointer,
   // so the side buffer may grow without invalidating earlier events. A range that

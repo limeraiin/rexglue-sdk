@@ -2178,6 +2178,9 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
   if (!num_registers) {
     return;
   }
+  // [NR-5C] overlap tracking: the constant-window fast paths below never
+  // reach the base per-dword WriteRegister, so stamp the whole range here.
+  NrbStampRange(start_index, num_registers);
   uint32_t end_index = start_index + num_registers - 1;
 
   auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,

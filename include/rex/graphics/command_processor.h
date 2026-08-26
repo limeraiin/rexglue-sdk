@@ -47,6 +47,30 @@ class Shader;
 // Command-processor thread only, so a plain int is correct.
 extern int g_n7_n8b_phase;
 
+// [NR-5C] Register-write epoch map for the skip-unchanged-record-applies
+// lever (gpu_nr_apply_skip). Every path that writes the register file at or
+// above 0x2000 stamps its 32-register bucket with the current apply
+// sequence; a record whose runs' buckets are all untouched since its last
+// full apply still has its values in the register file and may skip
+// re-applying them. The sequence is bumped once at each compose entry and
+// once at each compose exit, so any write OUTSIDE a record's own apply pass
+// (walk per-dword, ring inline, delegates, the executor fallback) always
+// stamps strictly later than the seq the record stored -- a same-seq stamp
+// can only be the record's own apply. CP thread only, plain ints.
+constexpr uint32_t kNrbBucketShift = 5;  // 32 registers per bucket
+constexpr uint32_t kNrbBuckets =
+    (RegisterFile::kRegisterCount >> kNrbBucketShift) + 1;
+extern bool g_nrb_track;
+extern uint32_t g_nrb_apply_seq;
+extern uint32_t g_nrb_reg_epoch[kNrbBuckets];
+inline void NrbStampRange(uint32_t base, uint32_t n) {
+  if (!g_nrb_track || !n) return;
+  const uint32_t b1 = (base + n - 1) >> kNrbBucketShift;
+  for (uint32_t b = base >> kNrbBucketShift; b <= b1 && b < kNrbBuckets; ++b) {
+    g_nrb_reg_epoch[b] = g_nrb_apply_seq;
+  }
+}
+
 enum class ReadbackResolveMode {
   kDisabled,
   kFast,

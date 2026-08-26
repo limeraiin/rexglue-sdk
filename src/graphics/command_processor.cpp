@@ -204,6 +204,42 @@ REXCVAR_DEFINE_INT32(gpu_nr_rec_verify, 1, "GPU",
                      "on/off in-place cycle for pricing. Values != 1 are "
                      "measurement-only (torn records may flash).");
 
+// [NR-5C] The N-9-5 fps increment, lever (a): compose reads the record body
+// IN PLACE in the retained arena instead of memcpying every payload byte to
+// scratch per execution. The retained store makes tears deterministic (free
+// stamps gen=0, a re-claimed block re-stamps {addr,gen} first), so the
+// in-place walk re-validates with VerifyState after the parse and after the
+// applies; a tear restarts the compose once with a forced scratch copy
+// (counted). The only copy left is the ~6-dword draw entry, which must
+// outlive the compose (the stop issues from it).
+REXCVAR_DEFINE_INT32(gpu_nr_arena_apply, 0, "GPU",
+                     "N-9-5c lever (a): apply composed groups directly from "
+                     "the retained record arena (no scratch memcpy). 0 = "
+                     "off, 1 = on.");
+
+// [NR-5C] Lever (b): skip re-applying UNCHANGED record runs. A stable city
+// record re-executes ~2.66x/frame x many frames with identical content; if
+// its payload generation is unchanged since its last full apply AND no other
+// write touched its registers since (the 32-reg bucket epoch map, see
+// command_processor.h), the register file already holds exactly these values
+// and the apply is pure re-touching. Fetch-constant runs are NEVER skipped
+// (the residency/texture invalidations are correctness, not bookkeeping --
+// the N8B precedent). Mode 2 also skips the per-dword mirror/state-class
+// runs (walker mirror and register file move together through the stamped
+// chokepoints, so the same cleanliness predicate covers both).
+REXCVAR_DEFINE_INT32(gpu_nr_apply_skip, 0, "GPU",
+                     "N-9-5c lever (b): skip clean record applies. 0 = off, "
+                     "1 = float/bool inline runs, 2 = + per-dword state "
+                     "runs. Fetch always applies.");
+
+// [NR-5C] The one-drive pricing cycler: 10 s per phase, in place --
+// phase 0 = both levers off, 1 = arena only, 2 = arena + skip 2. Overrides
+// the two cvars above while set. Pair [n7] fps/us-per-draw at matched dpf
+// across adjacent phases ([[price-stages-in-place]]).
+REXCVAR_DEFINE_BOOL(gpu_nr_apply_cycle, false, "GPU",
+                    "N-9-5c: cycle {off, arena, arena+skip} 10 s each in "
+                    "place for the paired fps read.");
+
 // [NR-5A] N-9-5a: WHOLE-DRAW source coherence at the composed stop -- the
 // torn-window precondition for guest-emission suppression. Today's 4a mixes
 // sources on a composed draw: constants/state from the record, by-ref 0x2F
@@ -1252,6 +1288,12 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 // [N8B] see the header: the constant-census phase the `gpu_n7 3` cycler drives.
 int g_n7_n8b_phase = -1;
 
+// [NR-5C] definitions for the header externs (see command_processor.h):
+// the register-write epoch map every backend write path stamps.
+bool g_nrb_track = false;
+uint32_t g_nrb_apply_seq = 0;
+uint32_t g_nrb_reg_epoch[kNrbBuckets] = {};
+
 namespace {
 // [GPU-EXEC-PROFILE] Per-category timing, broken out of gpu_worker_profile's total
 // ExecutePrimaryBuffer time, to find WHERE the cmd-proc thread's 100% goes:
@@ -2270,6 +2312,43 @@ Nr4aDef g_nr4a_def[kNr4aMaxDef];
 uint32_t g_nr4a_ndef = 0;
 bool g_nr4a_group_ovf = false;  // defer list overflowed: group must fall back
 uint32_t g_nr4a_scratch[4099];  // record body copy (validated before apply)
+// [NR-5C] the fps-increment levers (see the cvars). The three header
+// externs (g_nrb_track/apply_seq/reg_epoch) are defined OUTSIDE this
+// anonymous namespace, next to g_n7_n8b_phase.
+bool g_nr5c_arena_on = false;   // lever (a) live value (cycler-owned if cycling)
+int32_t g_nr5c_skip_mode = 0;   // lever (b) live value
+bool g_nr5c_cycle = false;
+int32_t g_nr5c_phase = -1;
+// window counters, reported [nr-5c] 1 Hz
+uint64_t g_nr5c_inplace = 0, g_nr5c_copies = 0;      // compose source split
+uint64_t g_nr5c_tear = 0, g_nr5c_tear_pkt = 0;       // post-apply VerifyState fails
+uint64_t g_nr5c_restart = 0;                         // forced-copy restarts taken
+uint64_t g_nr5c_skip_rng = 0, g_nr5c_skip_dw = 0;    // inline runs skipped clean
+uint64_t g_nr5c_skip_pdw_rng = 0, g_nr5c_skip_pdw_dw = 0;  // per-dword runs skipped
+uint64_t g_nr5c_dirty_rng = 0;   // skippable runs blocked: buckets touched since
+uint64_t g_nr5c_genmiss = 0;     // records ineligible: applied_gen != state_gen
+uint64_t g_nr5c_stamped = 0;     // StampApplied calls (full-apply completions)
+uint64_t g_nr5c_ns = 0, g_nr5c_calls = 0;  // compose-time bracket (cycler-armed)
+
+// [NR-5C] all buckets of [base, base+n) untouched since applied_seq
+// (wrap-safe signed compare; the seq bumps ~2x per draw stop).
+inline bool NrbRangeClean(uint32_t base, uint32_t n, uint32_t applied_seq) {
+  const uint32_t b1 = (base + n - 1) >> kNrbBucketShift;
+  for (uint32_t b = base >> kNrbBucketShift; b <= b1 && b < kNrbBuckets; ++b) {
+    if (int32_t(g_nrb_reg_epoch[b] - applied_seq) > 0) return false;
+  }
+  return true;
+}
+// [NR-5C] inline runs eligible for the skip: wholly inside the float or
+// bool/loop constant windows. Fetch is deliberately excluded -- its texture/
+// residency invalidations are correctness ([N8B] fetch-never-deduped rule).
+inline bool Nr5cSkippableInline(uint32_t base, uint32_t n) {
+  const uint32_t end = base + n - 1;
+  return (base >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+          end <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+         (base >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+          end <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+}
 // [nr-4a] window counters.
 uint64_t g_4a_composed = 0;     // draw stops whose constants applied FROM THE RECORD
 uint64_t g_4a_comp_runs = 0, g_4a_comp_dw = 0;
@@ -3934,6 +4013,24 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
   bool draw_sup = false;
   bool draw_bytes_eq = false;
   uint32_t nf = 0, p = 2;
+  // [NR-5C] apply-seq bracket: bump at entry and again at EVERY exit, so a
+  // write outside this compose's own apply pass (walk per-dword between
+  // stops, ring inline, delegates, executor fallback) always stamps the
+  // epoch map strictly later than the applied_seq a record stores here --
+  // a same-seq stamp can only be this compose's own apply.
+  struct Nr5cSeqBracket {
+    Nr5cSeqBracket() { ++g_nrb_apply_seq; }
+    ~Nr5cSeqBracket() { ++g_nrb_apply_seq; }
+  } nr5c_seq_bracket;
+  // [NR-5C] lever (a): rb is the record body -- the arena block itself when
+  // apply-from-arena is on (no scratch memcpy; VerifyState re-checked after
+  // the parse and after the applies, a tear restarts once with force_copy),
+  // the validated scratch copy otherwise.
+  const uint32_t* rb = g_nr4a_scratch;
+  bool force_copy = false;
+  uint32_t arena_restarts = 0;
+  bool apply_valid = true;
+nr5c_restart:
   // [NR-5B-3] identity-retry loop. A suppressed record whose draw bytes
   // mismatch the kept packet is usually the SAME draw mid-re-record: the
   // store completes microseconds after the body writes the packet, and the
@@ -3959,12 +4056,19 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       ++g_4a_fb_stale;
       return false;
     }
-    std::memcpy(g_nr4a_scratch, body, size_t(ndw) * 4);
+    if (g_nr5c_arena_on && !force_copy) {
+      rb = body;
+      ++g_nr5c_inplace;
+    } else {
+      std::memcpy(g_nr4a_scratch, body, size_t(ndw) * 4);
+      rb = g_nr4a_scratch;
+      ++g_nr5c_copies;
+    }
     if (!nr::VerifyState(rec)) {
       ++g_4a_fb_torn;
       return false;
     }
-    nruns = g_nr4a_scratch[0];
+    nruns = rb[0];
     nf = 0;
     p = 2;
     draw_off = 0;
@@ -3975,8 +4079,8 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       ++g_4a_fb_torn;
       return false;
     }
-    const uint32_t reg = g_nr4a_scratch[p];
-    const uint32_t cnt = g_nr4a_scratch[p + 1];
+    const uint32_t reg = rb[p];
+    const uint32_t cnt = rb[p + 1];
     if (!cnt || p + 2 + cnt > ndw) {
       ++g_4a_fb_torn;
       return false;
@@ -3999,9 +4103,9 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       // it with the deferred by-ref at this sequence position.
       ++g_4a_mk_runs;
       if (g_nr5_coh && cnt == 3 && p + 5 <= ndw) {
-        const uint32_t d1 = __builtin_bswap32(g_nr4a_scratch[p + 2]);
-        const uint32_t d2 = __builtin_bswap32(g_nr4a_scratch[p + 3]);
-        const uint32_t d3 = __builtin_bswap32(g_nr4a_scratch[p + 4]);
+        const uint32_t d1 = __builtin_bswap32(rb[p + 2]);
+        const uint32_t d2 = __builtin_bswap32(rb[p + 3]);
+        const uint32_t d3 = __builtin_bswap32(rb[p + 4]);
         static constexpr uint32_t kBrefBase[5] = {0x4000u, 0x4800u, 0x4900u,
                                                   0x4908u, 0x2000u};
         const uint32_t btype = (d2 >> 16) & 0xFF;
@@ -4046,15 +4150,34 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
     ++g_4a_fb_torn;
     return false;
   }
+  // [NR-5C] the in-place parse read live arena memory: re-validate before
+  // anything derived from it is used. A tear restarts once with a forced
+  // scratch copy (no applies have happened yet).
+  if (rb != g_nr4a_scratch && !nr::VerifyState(rec)) {
+    ++g_nr5c_tear;
+    if (arena_restarts++ == 0) {
+      ++g_nr5c_restart;
+      force_copy = true;
+      goto nr5c_restart;
+    }
+    ++g_4a_fb_torn;
+    return false;
+  }
   if (!draw_sup) break;
   draw_bytes_eq =
       draw_ndw != 0 && stop_dword + draw_ndw <= buf_dwords &&
-      __builtin_memcmp(g_nr4a_scratch + draw_off, raw + stop_dword * 4,
+      __builtin_memcmp(rb + draw_off, raw + stop_dword * 4,
                        size_t(draw_ndw) * 4) == 0;
   if (draw_bytes_eq || att >= 3) break;
   for (volatile uint32_t spin = 0; spin < 600; ++spin) {
   }
   }  // identity-retry loop
+  // [NR-5C] lever (b) eligibility, shared by both apply paths below: the
+  // record's payload generation is unchanged since its last full apply on
+  // this thread. Per-run cleanliness (bucket epochs) is checked at each run.
+  const bool rec_clean = g_nr5c_skip_mode > 0 && rec.applied_gen != 0 &&
+                         rec.applied_gen == rec.state_gen;
+  if (g_nr5c_skip_mode > 0 && !rec_clean) ++g_nr5c_genmiss;
   // [NR-5B-3] SUPPRESSED group: the covered runs exist ONLY in the record.
   // No shape match (there is no deferred list to match: the walker saw only
   // the kept classes), no value verify (no packet bytes). Flush the kept
@@ -4160,8 +4283,8 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
           ++g_nr5b_ovl_pairs;
           bool ne = false;
           for (uint32_t r = lo; r < hi && !ne; ++r) {
-            ne = g_nr4a_scratch[f_off[i] + (r - f_reg[i])] !=
-                 g_nr4a_scratch[f_off[j] + (r - f_reg[j])];
+            ne = rb[f_off[i] + (r - f_reg[i])] !=
+                 rb[f_off[j] + (r - f_reg[j])];
           }
           if (ne) {
             ++g_nr5b_ovl_valne;
@@ -4186,14 +4309,14 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
     // skipped: the kept ring bytes still carry them, and COHER is stateful.
     uint32_t q = 2;
     for (uint32_t k = 0; k < nruns; ++k) {
-      const uint32_t reg = g_nr4a_scratch[q];
-      const uint32_t cnt = g_nr4a_scratch[q + 1];
+      const uint32_t reg = rb[q];
+      const uint32_t cnt = rb[q + 1];
       if (reg & 0x80000000u) {
         if (!(reg & 0x40000000u) && cnt == 3) {
           // by-ref marker: re-read guest memory (address per mk_mode below).
-          const uint32_t d1 = __builtin_bswap32(g_nr4a_scratch[q + 2]);
-          const uint32_t d2 = __builtin_bswap32(g_nr4a_scratch[q + 3]);
-          const uint32_t d3 = __builtin_bswap32(g_nr4a_scratch[q + 4]);
+          const uint32_t d1 = __builtin_bswap32(rb[q + 2]);
+          const uint32_t d2 = __builtin_bswap32(rb[q + 3]);
+          const uint32_t d3 = __builtin_bswap32(rb[q + 4]);
           static constexpr uint32_t kBrefBase[5] = {0x4000u, 0x4800u, 0x4900u,
                                                     0x4908u, 0x2000u};
           const uint32_t btype = (d2 >> 16) & 0xFF;
@@ -4263,19 +4386,60 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
         continue;
       }
       if (Nr4aComposable(reg, cnt)) {
-        cp->NrSkipApplyRegRange(reg, g_nr4a_scratch + q + 2, cnt, 0, false);
-      } else if (reg >= 0x2000u) {
-        for (uint32_t m = 0; m < cnt; ++m) {
-          nr::CtxExternalWrite(&g_ctx_walker, reg + m,
-                               __builtin_bswap32(g_nr4a_scratch[q + 2 + m]),
-                               false);
+        // [NR-5C] lever (b): a gen-stable record run whose buckets nobody
+        // touched since its last apply is already in the register file.
+        bool skip = false;
+        if (rec_clean && Nr5cSkippableInline(reg, cnt)) {
+          if (NrbRangeClean(reg, cnt, rec.applied_seq)) {
+            skip = true;
+            ++g_nr5c_skip_rng;
+            g_nr5c_skip_dw += cnt;
+          } else {
+            ++g_nr5c_dirty_rng;
+          }
         }
-        g_nr5b_pdw_dw += cnt;
+        if (!skip) {
+          cp->NrSkipApplyRegRange(reg, rb + q + 2, cnt, 0, false);
+        }
+      } else if (reg >= 0x2000u) {
+        if (rec_clean && g_nr5c_skip_mode >= 2 &&
+            NrbRangeClean(reg, cnt, rec.applied_seq)) {
+          // mirror/state class: register file and walker mirror move
+          // together through the stamped chokepoints, so clean means both
+          // already hold these values.
+          ++g_nr5c_skip_pdw_rng;
+          g_nr5c_skip_pdw_dw += cnt;
+        } else {
+          for (uint32_t m = 0; m < cnt; ++m) {
+            nr::CtxExternalWrite(&g_ctx_walker, reg + m,
+                                 __builtin_bswap32(rb[q + 2 + m]), false);
+          }
+          g_nr5b_pdw_dw += cnt;
+        }
       }
       g_4a_comp_dw += cnt;
       q += 2 + cnt;
     }
     g_4a_comp_runs += nf;
+    // [NR-5C] the draw entry must outlive the compose (the stop issues from
+    // it), so copy it out of the arena; then re-validate the whole in-place
+    // apply pass. A tear restarts once with a forced scratch copy -- the
+    // stable pass re-applies over whatever the torn pass wrote.
+    if (rb != g_nr4a_scratch) {
+      if (draw_bytes_eq && draw_ndw) {
+        std::memcpy(g_nr4a_scratch, rb + draw_off, size_t(draw_ndw) * 4);
+      }
+      if (!nr::VerifyState(rec)) {
+        ++g_nr5c_tear;
+        if (arena_restarts++ == 0) {
+          ++g_nr5c_restart;
+          force_copy = true;
+          goto nr5c_restart;
+        }
+        apply_valid = false;   // never stamp a torn pass as applied
+        draw_bytes_eq = false; // and never issue the draw from torn bytes
+      }
+    }
     // The draw issues from the record ONLY when the record's draw bytes
     // equal the kept packet's. On a torn (one-behind, same-draw: identity
     // guard above) record the PACKET is the current truth: an old
@@ -4283,10 +4447,17 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
     // geometry ([[h3-overlap-live-guest-memory]]). Stale-by-one CONSTANTS
     // are visually benign; stale POINTERS are not.
     if (draw_bytes_eq) {
-      g_nr5_draw_src = g_nr4a_scratch + draw_off;
+      // in-place pass copied the draw entry to scratch[0]; copy pass left
+      // the whole body in scratch.
+      g_nr5_draw_src = rb != g_nr4a_scratch ? g_nr4a_scratch
+                                            : g_nr4a_scratch + draw_off;
       g_nr5_draw_ndw = draw_ndw;
     } else {
       ++g_nr5b_sup_argsne;  // draw issues from the current packet bytes
+    }
+    if (g_nrb_track && apply_valid) {
+      nr::StampApplied(pkt_addr, rec.state_gen, g_nrb_apply_seq);
+      ++g_nr5c_stamped;
     }
     ++g_4a_composed;
     ++g_nr5_composed;
@@ -4321,7 +4492,7 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       // and the first deferred payload actually sit. A pre_span far larger
       // than (stop - def0_phys) means the body began in a PREVIOUS ring
       // segment and this group is only its tail.
-      g_4a_shape_span[0] = g_nr4a_scratch[1];  // record pre_span
+      g_4a_shape_span[0] = rb[1];  // record pre_span
       g_4a_shape_span[1] = pkt_addr;
       g_4a_shape_span[2] = g_nr4a_ndef ? g_nr4a_def[0].phys : 0;
     }
@@ -4357,7 +4528,7 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       return false;
     }
     if (stop_dword + draw_ndw > buf_dwords ||
-        __builtin_memcmp(g_nr4a_scratch + draw_off, raw + stop_dword * 4,
+        __builtin_memcmp(rb + draw_off, raw + stop_dword * 4,
                          size_t(draw_ndw) * 4) != 0) {
       ++g_nr5_fb_args;
       return false;
@@ -4386,7 +4557,7 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       // mismatch, already refused there in coherent mode.
       if (f_byref[i]) continue;
       if (!g_nr4a_def[i].be ||
-          __builtin_memcmp(g_nr4a_scratch + f_off[i], g_nr4a_def[i].be,
+          __builtin_memcmp(rb + f_off[i], g_nr4a_def[i].be,
                            size_t(f_cnt[i]) * 4) != 0) {
         ++g_4a_fb_val;
         return false;
@@ -4401,22 +4572,50 @@ bool Nr4aTryCompose(CommandProcessor* cp, uint32_t pkt_addr, const uint8_t* raw,
       // at its recorded position in the group's sequence.
       cp->NrSkipApplyRegRange(f_reg[i], nullptr, f_cnt[i], f_phys[i], true);
       ++g_nr5_mk_applied;
+    } else if (rec_clean && Nr5cSkippableInline(f_reg[i], f_cnt[i]) &&
+               NrbRangeClean(f_reg[i], f_cnt[i], rec.applied_seq)) {
+      // [NR-5C] lever (b), packet phase: the run is verified equal to the
+      // packets above AND unchanged since its last apply -- the register
+      // file already holds it.
+      ++g_nr5c_skip_rng;
+      g_nr5c_skip_dw += f_cnt[i];
     } else {
-      cp->NrSkipApplyRegRange(f_reg[i], g_nr4a_scratch + f_off[i], f_cnt[i], 0,
-                              false);
+      if (rec_clean && Nr5cSkippableInline(f_reg[i], f_cnt[i])) {
+        ++g_nr5c_dirty_rng;
+      }
+      cp->NrSkipApplyRegRange(f_reg[i], rb + f_off[i], f_cnt[i], 0, false);
     }
     g_4a_comp_dw += f_cnt[i];
   }
   g_4a_comp_runs += nf;
+  // [NR-5C] in-place pass: copy the draw entry out of the arena FIRST (the
+  // stop issues from it after this function returns), then re-validate the
+  // whole in-place read+apply. On a tear, refuse -- the caller flushes the
+  // deferred packet ranges over whatever the torn pass wrote (the defer
+  // list is intact until the clear below), which is the packet truth.
+  if (rb != g_nr4a_scratch) {
+    if (g_nr5_coh && draw_ndw) {
+      std::memcpy(g_nr4a_scratch, rb + draw_off, size_t(draw_ndw) * 4);
+    }
+    if (!nr::VerifyState(rec)) {
+      ++g_nr5c_tear_pkt;
+      return false;
+    }
+  }
   ++g_4a_composed;
   // [NR-5A] arm the single-source draw issue: NrSkipDrawDirect reads the
   // draw's dwords from the record scratch (verified equal to the packet
   // above) instead of the buffer bytes. Cleared at every stop and on
   // consumption, so it can never leak across draws.
   if (g_nr5_coh && draw_ndw) {
-    g_nr5_draw_src = g_nr4a_scratch + draw_off;
+    g_nr5_draw_src = rb != g_nr4a_scratch ? g_nr4a_scratch
+                                          : g_nr4a_scratch + draw_off;
     g_nr5_draw_ndw = draw_ndw;
     ++g_nr5_composed;
+  }
+  if (g_nrb_track) {
+    nr::StampApplied(pkt_addr, rec.state_gen, g_nrb_apply_seq);
+    ++g_nr5c_stamped;
   }
   g_nr4a_ndef = 0;
   return true;
@@ -5033,6 +5232,21 @@ void CommandProcessor::WorkerThreadMain() {
           g_nr4b_cycle ? "10s FULL / 10s OFF cycle" : "fixed rate");
     }
   }
+  // [NR-5C] the fps-increment levers. The cycler owns the live values while
+  // armed (phase flips in the 1 Hz block below); tracking runs in every
+  // phase so records accumulate applied stamps before a skip phase starts.
+  {
+    g_nr5c_arena_on = REXCVAR_GET(gpu_nr_arena_apply) != 0;
+    const int32_t s = REXCVAR_GET(gpu_nr_apply_skip);
+    g_nr5c_skip_mode = s > 0 ? s : 0;
+    g_nr5c_cycle = REXCVAR_GET(gpu_nr_apply_cycle);
+    g_nrb_track = g_nr5c_skip_mode > 0 || g_nr5c_cycle;
+    if (g_nr5c_arena_on || g_nr5c_skip_mode || g_nr5c_cycle) {
+      REXGPU_INFO("[nr-5c] levers armed: arena={} skip={}{}", g_nr5c_arena_on,
+                  g_nr5c_skip_mode,
+                  g_nr5c_cycle ? " CYCLE off/arena/arena+skip 10 s each" : "");
+    }
+  }
   const bool kNrCache =
       REXCVAR_GET(gpu_nr_cache) || kNrBuf || kNrState || kNrCompose;
   g_nr_cache = kNrCache;
@@ -5177,6 +5391,28 @@ void CommandProcessor::WorkerThreadMain() {
       if (want != g_nr4b_verify_n) {
         g_nr4b_verify_n = want;
         REXGPU_INFO("[nr-4b] verify -> {}", want ? "FULL" : "OFF");
+      }
+    }
+
+    // [NR-5C] the fps-increment pricing cycle: 10 s per phase, in place --
+    // 0 = both levers off (baseline), 1 = apply-from-arena, 2 = arena +
+    // skip-unchanged (mode 2). Pair [n7] fps at matched dpf across phases.
+    if (g_nr5c_cycle) {
+      static auto nr5c_t0 = prof_clock::now();
+      const int32_t phase =
+          int32_t((std::chrono::duration_cast<std::chrono::seconds>(
+                       prof_clock::now() - nr5c_t0)
+                       .count() /
+                   10) %
+                  3);
+      if (phase != g_nr5c_phase) {
+        g_nr5c_phase = phase;
+        g_nr5c_arena_on = phase >= 1;
+        g_nr5c_skip_mode = phase == 2 ? 2 : 0;
+        REXGPU_INFO("[nr-5c] PHASE {} - {}", phase,
+                    phase == 0   ? "OFF (baseline: scratch memcpy, full applies)"
+                    : phase == 1 ? "ARENA (apply in place, no memcpy)"
+                                 : "ARENA+SKIP (clean record runs skipped)");
       }
     }
 
@@ -6342,6 +6578,34 @@ void CommandProcessor::WorkerThreadMain() {
               g_nr5b_sup_refuse = g_nr5b_pdw_dw = g_nr5b_pred_stops = 0;
             }
           }
+          // [NR-5C] the fps-increment levers, 1 Hz. tear must stay ~0 (a
+          // restart heals it); dirty vs skip is the overlap-reality answer
+          // the design was waiting on; genmiss tracks the re-record rate.
+          if (g_nr5c_inplace || g_nr5c_skip_rng || g_nr5c_dirty_rng ||
+              g_nr5c_tear || g_nr5c_tear_pkt || g_nr5c_genmiss) {
+            REXGPU_INFO(
+                "[nr-5c] arena={} skip={} | inplace={} copy={} tear={} "
+                "tearpkt={} restart={} | skip rng={} dw={} pdw={} pdw_dw={} "
+                "dirty={} genmiss={} stamped={}",
+                g_nr5c_arena_on ? 1 : 0, g_nr5c_skip_mode, g_nr5c_inplace,
+                g_nr5c_copies, g_nr5c_tear, g_nr5c_tear_pkt, g_nr5c_restart,
+                g_nr5c_skip_rng, g_nr5c_skip_dw, g_nr5c_skip_pdw_rng,
+                g_nr5c_skip_pdw_dw, g_nr5c_dirty_rng, g_nr5c_genmiss,
+                g_nr5c_stamped);
+            if (g_nr5c_calls) {
+              REXGPU_INFO("[nr-5c]   compose {} calls, {:.0f} ns/call, "
+                          "{:.1f} ms/s",
+                          g_nr5c_calls,
+                          double(g_nr5c_ns) / double(g_nr5c_calls),
+                          double(g_nr5c_ns) / 1e6);
+            }
+            g_nr5c_ns = g_nr5c_calls = 0;
+            g_nr5c_inplace = g_nr5c_copies = 0;
+            g_nr5c_tear = g_nr5c_tear_pkt = g_nr5c_restart = 0;
+            g_nr5c_skip_rng = g_nr5c_skip_dw = 0;
+            g_nr5c_skip_pdw_rng = g_nr5c_skip_pdw_dw = 0;
+            g_nr5c_dirty_rng = g_nr5c_genmiss = g_nr5c_stamped = 0;
+          }
           // [NR-4B] only printed when the verify is rate-gated (ver+unver
           // == composed + val fallbacks; unver groups applied unread).
           if (g_4a_unver || g_nr4b_verify_n != 1) {
@@ -6925,6 +7189,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+  // [NR-5C] overlap tracking: every register-file write dirties its bucket.
+  NrbStampRange(index, 1);
 
   // [NR-RING] Increment 4b-0: the ring observer. The 4a city verdict proved
   // per-frame swap state (PA_SC_WINDOW_OFFSET/SCISSOR_TL/BR +
@@ -7093,6 +7359,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 // store buys nothing here.
 void CommandProcessor::WriteRegisterRangePlain(uint32_t base, uint32_t* values_be, uint32_t n) {
   memory::copy_and_swap(register_file_->values + base, values_be, n);
+  NrbStampRange(base, n);  // [NR-5C] overlap tracking
 }
 
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
@@ -8474,7 +8741,23 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     g_nr5b_gen_skip = false;
     if (g_nr4a_bufactive && (g_nr4a_ndef || g_nr4a_group_ovf)) {
       if (!stop.delegate && stop.opcode == 0x22) {
-        if (!Nr4aTryCompose(this, nr_tile_draw_addr_, raw, count, stop.dword)) {
+        // [NR-5C] compose-time bracket while the levers/cycler are armed:
+        // splits "the compose second" from everything else per phase, so a
+        // null fps delta still names where the sup cost does NOT live.
+        const bool nr5c_timed =
+            g_nr5c_cycle || g_nr5c_arena_on || g_nr5c_skip_mode;
+        const auto nr5c_t0 = nr5c_timed
+                                 ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+        const bool nr5c_ok =
+            Nr4aTryCompose(this, nr_tile_draw_addr_, raw, count, stop.dword);
+        if (nr5c_timed) {
+          g_nr5c_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - nr5c_t0)
+                                    .count());
+          ++g_nr5c_calls;
+        }
+        if (!nr5c_ok) {
           ++g_4a_flush_draw;
           Nr4aFlush(this);
           nr5b_fb_decline = g_nr5b_sup_live;
@@ -9035,6 +9318,7 @@ bool CommandProcessor::N8fApplyRange(uint32_t base, uint32_t* be, uint32_t n) {
     return false;
   }
   memory::copy_and_swap(register_file_->values + base, be, n);
+  NrbStampRange(base, n);  // [NR-5C] overlap tracking
   if (g_nr_issue && g_nri_seeded && !g_nri_live) {
     std::memcpy(&g_nri_file.values[base], &register_file_->values[base],
                 n * sizeof(uint32_t));
