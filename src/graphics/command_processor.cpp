@@ -6581,8 +6581,9 @@ void CommandProcessor::WorkerThreadMain() {
           // [NR-5C] the fps-increment levers, 1 Hz. tear must stay ~0 (a
           // restart heals it); dirty vs skip is the overlap-reality answer
           // the design was waiting on; genmiss tracks the re-record rate.
-          if (g_nr5c_inplace || g_nr5c_skip_rng || g_nr5c_dirty_rng ||
-              g_nr5c_tear || g_nr5c_tear_pkt || g_nr5c_genmiss) {
+          if (g_nr5c_calls || g_nr5c_inplace || g_nr5c_copies ||
+              g_nr5c_skip_rng || g_nr5c_dirty_rng || g_nr5c_tear ||
+              g_nr5c_tear_pkt || g_nr5c_genmiss) {
             REXGPU_INFO(
                 "[nr-5c] arena={} skip={} | inplace={} copy={} tear={} "
                 "tearpkt={} restart={} | skip rng={} dw={} pdw={} pdw_dw={} "
