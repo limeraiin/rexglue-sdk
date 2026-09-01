@@ -1619,6 +1619,20 @@ uint32_t g_tile_cur_ord = 0; // this draw's ordinal
 uint32_t g_tile_prim = 0, g_tile_icount = 0, g_tile_ibbase = 0;
 // Record bracket.
 bool g_tile_rec_open = false;
+// [NR-TIL-DORMANT] 2026-09-01 audit (naruto_754/755): under de-tile the
+// repeat bands are dropped BELOW IssueDraw, so every draw here is a base
+// band, the recorder records ~147k draws/s and the replay serves ZERO
+// (ret tile=0, [gpu-draw2] tilr=27 ms/s + the ctx capture in head + the
+// emission-tail capture, all for nothing). The latch: a frame that follows
+// a frame with ZERO repeat-band draws takes a two-branch fast path in
+// BeginDraw - no seg bookkeeping, no ctx capture, no record - and only
+// keeps counting bands. The first repeat-band draw that appears (de-tile
+// declined or disarmed) falls through to the FULL derivation (the designed
+// refusal path, correct by construction) and wakes recording on the next
+// frame boundary, restoring the +6.7% replay regime while bands persist.
+// Never dormant under mode-3 verify (its compare population must be whole).
+bool g_tile_dormant = false;
+uint64_t g_tile_frame_rep0 = 0;  // p.repeat at the last frame boundary
 // [NR-TIL] mode 3: compare instead of consume.
 bool g_tile_verify = false;
 // [NR-TILSYS] N-4-2b piece 1: 0 = off, 1 = serve the system constants from the
@@ -1654,6 +1668,7 @@ struct NrTilProbe {
   uint64_t draws = 0;        // draws seen under the latch
   uint64_t base = 0;         // base-band draws (window offset 0)
   uint64_t repeat = 0;       // repeat-band draws
+  uint64_t dormant = 0;      // draws that took the dormant fast path
   uint64_t recorded = 0;     // spans stored
   uint64_t cand = 0;         // repeat-band draws with a record at their ordinal
   uint64_t rep = 0;          // actually replayed
@@ -1941,7 +1956,7 @@ void NrTilReportIfDue() {
                       p.fb_begin + p.fb_heap + p.fb_ctx + p.fb_valve +
                       p.fb_rt + p.fb_sys + p.fb_vf + p.fb_ib + p.fb_texpso;
   REXGPU_INFO(
-      "[nr-til] draws={} base={} repeat={} | rec={} segs {}/{} nomatch={} "
+      "[nr-til] draws={} dorm={} base={} repeat={} | rec={} segs {}/{} nomatch={} "
       "(empty={} none={} draws={} = {:.1f}% of repeat, segcap={} | bias={} "
       "ambig={} absent={}) | "
       "cand={} rep={} ({:.1f}% of repeat) el={:.1f} syssets={} | fb={} "
@@ -1951,7 +1966,7 @@ void NrTilReportIfDue() {
       "arena={} keys={} roots={} pso={} cap={} | ctxwhy pso={} rs={} "
       "topo={} ru2d={} shm={} utd={}/{}/{}/{}/{}/{}/{} first={} | "
       "arena={}KB recs={}",
-      p.draws, p.base, p.repeat, p.recorded, p.segs_rep, p.segs_rec,
+      p.draws, p.dormant, p.base, p.repeat, p.recorded, p.segs_rep, p.segs_rec,
       p.seg_nomatch, p.nm_empty, p.nm_none, p.nm_draws,
       p.repeat ? 100.0 * double(p.nm_draws) / double(p.repeat) : 0.0, p.seg_cap,
       p.nm_bias, p.nm_ambig, p.nm_absent, p.cand, p.rep,
@@ -8932,6 +8947,11 @@ void D3D12CommandProcessor::NrTileBeginDraw(uint32_t win_off, uint32_t prim,
   NrTilProbe& p = g_tile_p;
   ++p.draws;
   if (g_tile_frame != frame_current_) {
+    // [NR-TIL-DORMANT] decide from the frame that just ENDED, before the
+    // reset: no repeat-band draw reached IssueDraw => nothing this frame's
+    // recording could ever have served => the next frame records nothing.
+    g_tile_dormant = !g_tile_verify && p.repeat == g_tile_frame_rep0;
+    g_tile_frame_rep0 = p.repeat;
     // Every recording is same-frame BY RULE: the spans embed per-frame
     // constant-pool GPU addresses, and the three bands of one frame are the
     // only executions that ever share them.
@@ -8942,6 +8962,21 @@ void D3D12CommandProcessor::NrTileBeginDraw(uint32_t win_off, uint32_t prim,
     g_tile_segs.clear();
     g_tile_arena_used = 0;
     g_tile_seg_open = false;
+  }
+  if (g_tile_dormant) {
+    // The dormant fast path: only the wake detector runs. A repeat-band
+    // draw here falls through to the full derivation (mode 0) and its
+    // count wakes recording at the next frame boundary.
+    ++p.dormant;
+    if (win_off == 0) {
+      ++p.base;
+    } else {
+      ++p.repeat;
+    }
+    g_tile_mode = 0;
+    g_tile_rec_open = false;
+    g_tile_cmp_open = false;
+    return;
   }
   if (!g_tile_seg_open || win_off != g_tile_win) {
     g_tile_win = win_off;
