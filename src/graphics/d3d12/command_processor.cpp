@@ -524,6 +524,13 @@ constexpr uint64_t kDrawDumpCap = 12000;
 bool g_inst_probe = false;
 uint64_t g_inst_draw_count = 0;
 bool g_inst_dumped = false;
+// [INST-PROBE] city latch: issued draws this frame (unconditional ++ at the
+// IssueDrawImpl success seam, reset each swap) and the once-latched "a city
+// frame has been seen" flag. The probe capture is one-shot (kDrawDumpCap), so
+// armed at launch it would spend its whole cap on the boot/menu stream; it
+// stays dormant until a frame issues >= 2500 draws.
+uint64_t g_frame_issued = 0;
+bool g_inst_city = false;
 
 // [GPU-INST] Cached gpu_instance enable (refreshed once/frame, cmd-proc thread
 // only). g_instance_dirty tracks whether any register OUTSIDE the vertex
@@ -5182,14 +5189,21 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // gate itself is latched base-side (WorkerThreadMain), not here.
   NrFxReportIfDue();
   // [INST-PROBE] Refresh + reset-on-arm the instancing feasibility probe.
+  // Gated on the city latch (see g_inst_city) so the one-shot capture spends
+  // its cap on city draws, not the menu.
   {
     const bool inst_now = REXCVAR_GET(gpu_instance_probe);
-    if (inst_now && !g_inst_probe) {
+    if (g_frame_issued >= 2500) g_inst_city = true;
+    const bool inst_active = inst_now && g_inst_city;
+    if (inst_active && !g_inst_probe) {
       g_inst_keys.clear();
       g_inst_draw_count = 0;
       g_inst_dumped = false;
+      REXGPU_INFO("[inst-probe] city latch hit - capture armed ({} draws last frame)",
+                  g_frame_issued);
     }
-    g_inst_probe = inst_now;
+    g_inst_probe = inst_active;
+    g_frame_issued = 0;
   }
   // [GPU-INST] Refresh the instancing enable once/frame; report the coalescing
   // ratio per second when it is on. Any open batch from the previous frame is
@@ -7006,6 +7020,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_tile_rec_open) NrTileRecordEnd();
   if (g_tile_cmp_open) NrTileCompareEnd();
   if (g_draw_prof) g_draw_ns[25] += prof_ns_since(_dp_tilr0);
+  // [INST-PROBE] city latch input: issued draws this frame.
+  ++g_frame_issued;
   // [BATCH-CENSUS] the seam: an issued draw that reached emission. Outside
   // every phase bracket; its own cost is bracket 26 (bc) so it cannot muddy
   // rr when both cvars ride one drive.
