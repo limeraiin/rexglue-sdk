@@ -72,6 +72,22 @@ REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU/D3D12",
                     "timed per-draw (cheap, ~a few %). Off by default. Ch.9 cmd-proc triage.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [BATCH-CENSUS] The draw-count question, measured where it matters: of the
+// issued draws in a heavy city frame, how many share a {geometry+shader} batch
+// key with their NEIGHBOUR (mergeable without reordering) and how many repeat
+// ANYWHERE in the frame (poolable with reordering)? The forest answer was
+// 92.6% ([[draw-stream-instanceable]]); the city number decides whether
+// draw-count reduction is the 2x lever. Key = the inst-probe batch key
+// (prim + counts + VS/PS ucode hashes + IB identity + bound-VB hash) - an
+// UPPER BOUND on mergeability (RT/viewport state is not in the key). Runs at
+// the IssueDrawImpl success seam, outside every [gpu-draw] phase bracket;
+// its own cost is bracketed as `bc` on [gpu-draw2]. Logs '[batch-census]' 1 Hz.
+REXCVAR_DEFINE_BOOL(gpu_batch_census, false, "GPU/D3D12",
+                    "Diagnostic: 1 Hz census of issued draws sharing a batch key with a "
+                    "neighbour (adjacent runs) and within the frame (poolable repeats). "
+                    "Off by default; '[batch-census]'.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(gpu_parallel_record, false, "GPU/D3D12",
                     "[GPU-PRECORD] Phase 1a correctness probe (Ch.9 cmd-proc parallel-record "
                     "track): every N draws, force a full command-list state re-emit into the "
@@ -420,7 +436,26 @@ bool g_tile_prof = false;  // [NR-TILP] N-4-2 head stage split
 // printed so the split provably covers the slice.
 // 17..19 = vp sub-brackets (17 = NrNativePipeline lookup + pipeline bind,
 // 18 = viewport cache key build/compare + host viewport info, 19 = scissor).
-uint64_t g_draw_ns[20] = {};
+// 20..26 = `rest` sub-brackets (ISSUEDRAW census follow-up: rest was 62.7 ms/s
+// at the city in naruto_751, the largest single item, and unnamed - exactly
+// the remainder shape [[subtraction-buckets-mislabel]] warns about). 20 = cen
+// (BeginSubmission -> prim: census class, precord segment bookkeeping, rsy
+// setup), 21 = ruse (trans -> pso: the RUF-V2B upgrade verdict + NrRubFind
+// fast-pso probe), 22 = pret (pso -> tex: async-compile check +
+// GetD3D12PipelineByHandle + pipeline-lock release + texture-mask derivation),
+// 23 = rsp (ff+sc -> bind: the NR-BND root-signature predict block), 24 = rply
+// (a tile/span replay-served draw: total from entry to its return - it closes
+// NO phase bracket, so before this it hid whole in rest), 25 = tilr (post-tail
+// NrTileRecordEnd/CompareEnd), 26 = bc (the batch-key census's own per-draw
+// work when gpu_batch_census rides the same drive). rr = rest - sum, printed
+// on [gpu-draw2] so the split provably covers the slice.
+uint64_t g_draw_ns[27] = {};
+// [GPU-DRAW2] early-return classes: a draw that leaves IssueDrawImpl before
+// the tail contributes total but only partial phase brackets; the lost span is
+// rest. Counters name the population: 0=tile-replay 1=span-replay 2=no-vs
+// 3=no-effect (zero surface pitch / no rasterization) 4=zero host vertices
+// 5=async-pso skip.
+uint64_t g_draw_ret[6] = {};
 // [GPU-DRAW] 5-4-4b inc 3: NrUpdateBindings sub-profile (g_draw_prof only,
 // printed as [nr-bndp]). ns: 0=cbuffer composes 1=sampler-params derivation
 // 2=srv-key freshness checks 3=sampler-heap find-or-allocate
@@ -2138,12 +2173,13 @@ std::string inst_decode_mask(const uint64_t mask[4]) {
   return out;
 }
 
-// Per-draw accumulation: compute this draw's batch key, snapshot/diff its used
-// float constants against the first draw seen for that key.
-void InstanceProbeDraw(const RegisterFile& regs, const Shader* vs, const Shader* ps,
-                       uint32_t prim, uint32_t index_count, uint32_t host_vtx,
-                       uint32_t ib_base, int ib_fmt, uint32_t ib_cnt) {
-  if (vs == nullptr) return;
+// The batch key itself, shared by the one-shot inst-probe and the continuous
+// [BATCH-CENSUS]: {prim, counts, VS/PS ucode hashes, IB identity, bound-VB
+// hash}. Draws with equal keys are the same geometry through the same shaders;
+// only constants (the per-instance transform) can differ.
+uint64_t InstBatchKey(const RegisterFile& regs, const Shader* vs, const Shader* ps,
+                      uint32_t prim, uint32_t index_count, uint32_t host_vtx,
+                      uint32_t ib_base, int ib_fmt, uint32_t ib_cnt, uint32_t* vb0_out) {
   const Shader::ConstantRegisterMap& vcm = vs->constant_register_map();
   // Stable hash over the bound vertex buffers (+ a label VB addr).
   uint64_t vbhash = 0;
@@ -2159,6 +2195,7 @@ void InstanceProbeDraw(const RegisterFile& regs, const Shader* vs, const Shader*
       vbhash = inst_mix(vbhash, (uint64_t(addr) << 32) | (uint32_t(vf.size) << 2));
     }
   }
+  if (vb0_out) *vb0_out = vb0;
   const uint64_t vs_hash = vs->ucode_data_hash();
   const uint64_t ps_hash = ps ? ps->ucode_data_hash() : 0;
   uint64_t key = 0;
@@ -2169,6 +2206,21 @@ void InstanceProbeDraw(const RegisterFile& regs, const Shader* vs, const Shader*
   key = inst_mix(key, ps_hash);
   key = inst_mix(key, (uint64_t(ib_base) << 32) ^ (uint64_t(uint32_t(ib_fmt)) << 16) ^ ib_cnt);
   key = inst_mix(key, vbhash);
+  return key;
+}
+
+// Per-draw accumulation: compute this draw's batch key, snapshot/diff its used
+// float constants against the first draw seen for that key.
+void InstanceProbeDraw(const RegisterFile& regs, const Shader* vs, const Shader* ps,
+                       uint32_t prim, uint32_t index_count, uint32_t host_vtx,
+                       uint32_t ib_base, int ib_fmt, uint32_t ib_cnt) {
+  if (vs == nullptr) return;
+  const Shader::ConstantRegisterMap& vcm = vs->constant_register_map();
+  uint32_t vb0 = 0;
+  const uint64_t key = InstBatchKey(regs, vs, ps, prim, index_count, host_vtx, ib_base, ib_fmt,
+                                    ib_cnt, &vb0);
+  const uint64_t vs_hash = vs->ucode_data_hash();
+  const uint64_t ps_hash = ps ? ps->ucode_data_hash() : 0;
 
   auto it = g_inst_keys.find(key);
   if (it == g_inst_keys.end()) {
@@ -2271,6 +2323,89 @@ inline uint64_t prof_ns_since(std::chrono::steady_clock::time_point t0) {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now() - t0)
                       .count());
+}
+
+// [BATCH-CENSUS] Continuous batch-key census at the IssueDrawImpl success
+// seam (see the cvar comment). Two populations per second:
+//  - adjacent: draws whose key equals the previous issued draw's key. A run of
+//    length L contributes L-1 to `adj` and all L draws to `rundraws` - the
+//    "share a key with a neighbour" number, mergeable with NO reordering.
+//  - frame-global: keys seen >=2 times anywhere in the frame. `extra` =
+//    sum(count-1) = draws removable by pooling WITH reordering (upper bound).
+// A resolve or a frame boundary breaks a run (real merging cannot span them).
+// CP-thread only, like every [gpu-draw] counter.
+bool g_batch_census = false;
+uint64_t g_bc_prev_key = 0;
+uint32_t g_bc_run_len = 0;
+uint64_t g_bc_draws = 0, g_bc_adj = 0, g_bc_runs = 0, g_bc_run_draws = 0;
+uint64_t g_bc_maxrun = 0;  // window max, reset at each 1 Hz report
+uint64_t g_bc_breaks = 0;
+std::unordered_map<uint64_t, uint32_t> g_bc_frame_keys;
+constexpr size_t kBcMaxFrameKeys = 32768;
+uint64_t g_bc_frame_ovf = 0;
+uint64_t g_bc_frames = 0, g_bc_keys = 0, g_bc_rep_draws = 0, g_bc_extra = 0;
+uint64_t g_bc_maxkey = 0;  // window max, reset at each 1 Hz report
+
+void BatchCensusRunEnd() {
+  if (g_bc_run_len >= 2) {
+    ++g_bc_runs;
+    g_bc_run_draws += g_bc_run_len;
+    if (g_bc_run_len > g_bc_maxrun) g_bc_maxrun = g_bc_run_len;
+  }
+  g_bc_run_len = 0;
+}
+
+void BatchCensusBreak() {
+  BatchCensusRunEnd();
+  ++g_bc_breaks;
+}
+
+void BatchCensusDraw(uint64_t key) {
+  ++g_bc_draws;
+  if (g_bc_run_len != 0 && key == g_bc_prev_key) {
+    ++g_bc_adj;
+    ++g_bc_run_len;
+  } else {
+    BatchCensusRunEnd();
+    g_bc_run_len = 1;
+  }
+  g_bc_prev_key = key;
+  auto it = g_bc_frame_keys.find(key);
+  if (it != g_bc_frame_keys.end()) {
+    ++it->second;
+  } else if (g_bc_frame_keys.size() < kBcMaxFrameKeys) {
+    g_bc_frame_keys.emplace(key, 1u);
+  } else {
+    ++g_bc_frame_ovf;  // an overflowed key is UNDERcounted, never miscounted
+  }
+}
+
+void BatchCensusFrameEnd() {
+  BatchCensusRunEnd();
+  ++g_bc_frames;
+  g_bc_keys += g_bc_frame_keys.size();
+  uint64_t rep = 0, extra = 0, mx = 0;
+  for (const auto& kv : g_bc_frame_keys) {
+    if (kv.second >= 2) {
+      rep += kv.second;
+      extra += kv.second - 1;
+    }
+    if (kv.second > mx) mx = kv.second;
+  }
+  g_bc_rep_draws += rep;
+  g_bc_extra += extra;
+  if (mx > g_bc_maxkey) g_bc_maxkey = mx;
+  g_bc_frame_keys.clear();
+}
+
+void BatchCensusReset() {
+  g_bc_prev_key = 0;
+  g_bc_run_len = 0;
+  g_bc_draws = g_bc_adj = g_bc_runs = g_bc_run_draws = g_bc_maxrun = 0;
+  g_bc_breaks = 0;
+  g_bc_frame_keys.clear();
+  g_bc_frame_ovf = 0;
+  g_bc_frames = g_bc_keys = g_bc_rep_draws = g_bc_extra = g_bc_maxkey = 0;
 }
 }  // namespace
 
@@ -5114,18 +5249,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   FlushInstancedBatch();
   if (g_draw_prof) {
-    static uint64_t s_last[20] = {}, s_last_cnt = 0;
+    static uint64_t s_last[27] = {}, s_last_cnt = 0;
     static uint64_t s_last_res[5] = {0, 0, 0, 0, 0};
     static uint64_t s_last_bnd[7] = {}, s_last_bndc[8] = {};
+    static uint64_t s_last_ret[6] = {};
     static auto s_last_report = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     if (now - s_last_report >= std::chrono::seconds(1)) {
-      double d[20];
-      for (int i = 0; i < 20; ++i) d[i] = (g_draw_ns[i] - s_last[i]) / 1e6;
+      double d[27];
+      for (int i = 0; i < 27; ++i) d[i] = (g_draw_ns[i] - s_last[i]) / 1e6;
       double b[7];
       for (int i = 0; i < 7; ++i) b[i] = (g_bind_ns[i] - s_last_bnd[i]) / 1e6;
       uint64_t dc = g_draw_count - s_last_cnt;
       double other = d[5] - (d[0] + d[1] + d[2] + d[3] + d[4] + d[6] + d[7] + d[8]);
+      double rest = other - (d[12] + d[13] + d[14] + d[15] + d[16]);
       REXGPU_INFO(
           "[gpu-draw] draws={} total={:.1f}ms | begin={:.1f} prim={:.1f} rt={:.1f} pso={:.1f} "
           "tex={:.1f} ff+sc={:.1f} bind={:.1f} tail={:.1f} other={:.1f}ms "
@@ -5135,10 +5272,19 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           "rearm={} req={} dup={}",
           dc, d[5], d[6], d[0], d[1], d[2], d[3], d[8], d[4], d[7], other,
           d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16],
-          other - (d[12] + d[13] + d[14] + d[15] + d[16]), d[17], d[18], d[19],
+          rest, d[17], d[18], d[19],
           g_draw_res_cnt[0] - s_last_res[0],
           g_draw_res_cnt[1] - s_last_res[1], g_draw_res_cnt[2] - s_last_res[2],
           g_draw_res_cnt[3] - s_last_res[3], g_draw_res_cnt[4] - s_last_res[4]);
+      REXGPU_INFO(
+          "[gpu-draw2] rest: cen={:.1f} ruse={:.1f} pret={:.1f} rsp={:.1f} rply={:.1f} "
+          "tilr={:.1f} bc={:.1f} rr={:.1f}ms | ret/s: tile={} span={} novs={} noeff={} "
+          "novtx={} apso={}",
+          d[20], d[21], d[22], d[23], d[24], d[25], d[26],
+          rest - (d[20] + d[21] + d[22] + d[23] + d[24] + d[25] + d[26]),
+          g_draw_ret[0] - s_last_ret[0], g_draw_ret[1] - s_last_ret[1],
+          g_draw_ret[2] - s_last_ret[2], g_draw_ret[3] - s_last_ret[3],
+          g_draw_ret[4] - s_last_ret[4], g_draw_ret[5] - s_last_ret[5]);
       REXGPU_INFO(
           "[nr-bndp] cb={:.1f} smp={:.1f} key={:.1f} smpidx={:.1f} di={:.1f} root={:.1f}ms "
           "rest={:.1f} reqns={:.1f} | evals={} srvv={} req={} | fires sys={} fv={} fp={} "
@@ -5150,12 +5296,62 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           g_bind_cnt[4] - s_last_bndc[4], g_bind_cnt[5] - s_last_bndc[5],
           g_bind_cnt[6] - s_last_bndc[6], g_bind_cnt[7] - s_last_bndc[7]);
       s_last_report = now;
-      for (int i = 0; i < 20; ++i) s_last[i] = g_draw_ns[i];
+      for (int i = 0; i < 27; ++i) s_last[i] = g_draw_ns[i];
       for (int i = 0; i < 5; ++i) s_last_res[i] = g_draw_res_cnt[i];
       for (int i = 0; i < 7; ++i) s_last_bnd[i] = g_bind_ns[i];
       for (int i = 0; i < 8; ++i) s_last_bndc[i] = g_bind_cnt[i];
+      for (int i = 0; i < 6; ++i) s_last_ret[i] = g_draw_ret[i];
       s_last_cnt = g_draw_count;
     }
+  }
+
+  // [BATCH-CENSUS] fold the frame that just ended (under the OLD arm state,
+  // so a mid-run flag flip cannot fold a half-censused frame), then refresh
+  // the arm for the next frame; reset-on-arm like the inst-probe.
+  {
+    if (g_batch_census) {
+      BatchCensusFrameEnd();
+      static uint64_t s_bc[10] = {};
+      static auto s_bc_last = std::chrono::steady_clock::now();
+      const auto bc_now = std::chrono::steady_clock::now();
+      if (bc_now - s_bc_last >= std::chrono::seconds(1)) {
+        s_bc_last = bc_now;
+        const uint64_t draws = g_bc_draws - s_bc[0];
+        const uint64_t adj = g_bc_adj - s_bc[1];
+        const uint64_t runs = g_bc_runs - s_bc[2];
+        const uint64_t rundraws = g_bc_run_draws - s_bc[3];
+        const uint64_t frames = g_bc_frames - s_bc[4];
+        const uint64_t keys = g_bc_keys - s_bc[5];
+        const uint64_t rep = g_bc_rep_draws - s_bc[6];
+        const uint64_t extra = g_bc_extra - s_bc[7];
+        const uint64_t breaks = g_bc_breaks - s_bc[8];
+        const uint64_t ovf = g_bc_frame_ovf - s_bc[9];
+        const double dd = draws ? double(draws) : 1.0;
+        REXGPU_INFO(
+            "[batch-census] draws={} adj={} ({:.1f}%) runs={} rundraws={} ({:.1f}%) maxrun={} "
+            "| frame: keys/fr={} rep={} ({:.1f}%) extra={} ({:.1f}%) maxkey={} ovf={} "
+            "| fr={} brk={}",
+            draws, adj, 100.0 * double(adj) / dd, runs, rundraws,
+            100.0 * double(rundraws) / dd, g_bc_maxrun,
+            frames ? keys / frames : 0, rep, 100.0 * double(rep) / dd, extra,
+            100.0 * double(extra) / dd, g_bc_maxkey, ovf, frames, breaks);
+        g_bc_maxrun = 0;
+        g_bc_maxkey = 0;
+        s_bc[0] = g_bc_draws;
+        s_bc[1] = g_bc_adj;
+        s_bc[2] = g_bc_runs;
+        s_bc[3] = g_bc_run_draws;
+        s_bc[4] = g_bc_frames;
+        s_bc[5] = g_bc_keys;
+        s_bc[6] = g_bc_rep_draws;
+        s_bc[7] = g_bc_extra;
+        s_bc[8] = g_bc_breaks;
+        s_bc[9] = g_bc_frame_ovf;
+      }
+    }
+    const bool bc_arm = REXCVAR_GET(gpu_batch_census);
+    if (bc_arm && !g_batch_census) BatchCensusReset();
+    g_batch_census = bc_arm;
   }
 
   if (g_draw_prof) g_draw_res_seen.clear();
@@ -5714,6 +5910,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     // bands at exactly these points, and the base band of the next segment
     // is what the next repeat band replays.
     if (g_nr_tile_on) NrTileSegBreak();
+    // [BATCH-CENSUS] a resolve breaks a mergeable run.
+    if (g_batch_census) BatchCensusBreak();
     // [GPU-DRAW] other sub-bracket 16 (copy): the whole resolve path.
     bool _dp_copy_ok = IssueCopy();
     if (g_draw_prof) g_draw_ns[16] += prof_ns_since(_dp_total.t0);
@@ -5747,6 +5945,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       g_tile_pend_valid = false;
     }
     if (NrTileReplayTry()) {
+      // [GPU-DRAW2] rest sub-bracket 24 (rply): a replay-served draw closes
+      // no phase bracket, so its whole time used to hide in rest.
+      if (g_draw_prof) {
+        g_draw_ns[24] += prof_ns_since(_dp_total.t0);
+        ++g_draw_ret[0];
+      }
       return true;
     }
   }
@@ -5757,6 +5961,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // A false return is a fall-through: every head step it took is idempotent
   // on this path.
   if (g_nr_span_consume && g_spr_open && NrSpanReplayTry()) {
+    if (g_draw_prof) {
+      g_draw_ns[24] += prof_ns_since(_dp_total.t0);
+      ++g_draw_ret[1];
+    }
     return true;
   }
 
@@ -5766,6 +5974,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
   if (!vertex_shader) {
     // Always need a vertex shader.
+    if (g_draw_prof) ++g_draw_ret[2];
     return false;
   }
 
@@ -5813,6 +6022,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
+    if (g_draw_prof) ++g_draw_ret[3];
     return true;
   }
   D3D12Shader* pixel_shader = nullptr;
@@ -5833,6 +6043,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      if (g_draw_prof) ++g_draw_ret[3];
       return true;
     }
   }
@@ -5849,6 +6060,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (!_dp_bs_ok) {
     return false;
   }
+  // [GPU-DRAW2] rest sub-bracket 20 (cen): here -> primitive processing
+  // (census class set, precord segment bookkeeping, rsy verify setup).
+  auto _dp_cen0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   // [gpu-census] draw class (per-RT-config when known); no-op when already
   // there (one timestamp per class change, not per draw).
   GpuCensusSetClass(gpu_census_draw_class_);
@@ -5884,6 +6099,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     g_nr_res_ib_seen = false;
   }
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
+  if (g_draw_prof) g_draw_ns[20] += prof_ns_since(_dp_cen0);
   auto _dp_prim0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
   bool _dp_prim_ok = primitive_processor_->Process(primitive_processing_result);
@@ -5939,6 +6155,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
+    if (g_draw_prof) ++g_draw_ret[4];
     return true;
   }
 
@@ -6016,6 +6233,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
   if (g_draw_prof) g_draw_ns[14] += prof_ns_since(_dp_otrans0);
+  // [GPU-DRAW2] rest sub-bracket 21 (ruse): here -> ConfigurePipeline (the
+  // RUF-V2B upgrade verdict + the NrRubFind fast-pso probe).
+  auto _dp_ruse0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
   // [NR-RUF] 5-4-5-2: pipeline identity is a pure function of the draw's
   // inputs (5-1 description determinism + 5-3a description-keyed objects,
   // measured live: pso ne=0 under the bundle gate), and the objects are
@@ -6091,6 +6312,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       }
     }
   }
+  if (g_draw_prof) g_draw_ns[21] += prof_ns_since(_dp_ruse0);
   auto _dp_pso0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
   bool _dp_pso_ok =
@@ -6103,8 +6325,17 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (!_dp_pso_ok) {
     return false;
   }
+  // [GPU-DRAW2] rest sub-bracket 22 (pret): here -> RequestTextures (the
+  // async-compile cvar read + GetD3D12PipelineByHandle lookup + pipeline-lock
+  // release + used-texture-mask derivation).
+  auto _dp_pret0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
+    if (g_draw_prof) {
+      g_draw_ns[22] += prof_ns_since(_dp_pret0);
+      ++g_draw_ret[5];
+    }
     return true;
   }
 
@@ -6119,6 +6350,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  if (g_draw_prof) g_draw_ns[22] += prof_ns_since(_dp_pret0);
   auto _dp_tex0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
   texture_cache_->RequestTextures(used_texture_mask);
@@ -6259,6 +6491,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // from here on is band-INVARIANT and can be memcpyd into the repeat bands.
   if (g_tile_rec_open || g_tile_cmp_open) NrTileRecordAnchor();
   if (g_draw_prof) g_draw_ns[8] += prof_ns_since(_dp_ff0);
+  // [GPU-DRAW2] rest sub-bracket 23 (rsp): here -> UpdateBindings (the NR-BND
+  // root-signature predict block).
+  auto _dp_rsp0 = g_draw_prof ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
 
   // [NR-BND] Phase 5-3b-0: the root-signature selection, ours against the one
   // the pipeline description carries. Bindless (this machine): one of two
@@ -6292,6 +6528,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   }
 
   // Update constant buffers, descriptors and root parameters.
+  if (g_draw_prof) g_draw_ns[23] += prof_ns_since(_dp_rsp0);
   auto _dp_bind0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
   // [NR-SWP] Phase 5-3b swap: assemble the bindings with OUR UpdateBindings
@@ -6763,8 +7000,26 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // all the way to emission -- every earlier `return false` leaves the
   // record valid=0, which is exactly right: the repeat bands must fall
   // through at that ordinal too, and the ordinal itself is already held.
+  // [GPU-DRAW2] rest sub-bracket 25 (tilr): the post-tail record close.
+  auto _dp_tilr0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
   if (g_tile_rec_open) NrTileRecordEnd();
   if (g_tile_cmp_open) NrTileCompareEnd();
+  if (g_draw_prof) g_draw_ns[25] += prof_ns_since(_dp_tilr0);
+  // [BATCH-CENSUS] the seam: an issued draw that reached emission. Outside
+  // every phase bracket; its own cost is bracket 26 (bc) so it cannot muddy
+  // rr when both cvars ride one drive.
+  if (g_batch_census) {
+    auto _dp_bc0 = g_draw_prof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+    BatchCensusDraw(InstBatchKey(
+        regs, vertex_shader, pixel_shader, uint32_t(primitive_type), index_count,
+        primitive_processing_result.host_draw_vertex_count,
+        index_buffer_info ? index_buffer_info->guest_base : 0u,
+        index_buffer_info ? int(index_buffer_info->format) : -1,
+        index_buffer_info ? index_buffer_info->count : 0u, nullptr));
+    if (g_draw_prof) g_draw_ns[26] += prof_ns_since(_dp_bc0);
+  }
   return true;
 }
 

@@ -12,10 +12,13 @@
 #include <algorithm>
 #include <array>
 #include <cfloat>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <memory>
 #include <utility>
+
+#include <rex/cvar.h>
 
 #include <rex/assert.h>
 #include <rex/dbg.h>
@@ -32,6 +35,13 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+// [NR-TEXB] closes the [gpu-draw] tex bracket: the base derivation is split
+// by [nr-texp] (pipeline/texture/cache.cpp); everything else RequestTextures
+// does here is NrTexBarriersOnly. naruto_751 city: tex read 91 ms/s and
+// [nr-texp] named 64 - this brackets the ~27 ms/s remainder instead of
+// leaving it a subtraction bucket. Same DLL as the cvar definition.
+REXCVAR_DECLARE(bool, gpu_draw_profile);
 
 namespace rex::graphics::d3d12 {
 
@@ -704,7 +714,27 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   TextureCache::RequestTextures(used_texture_mask);
+  // [NR-TEXB] the tex-bracket remainder, 1 Hz while gpu_draw_profile is on.
+  const bool texb = REXCVAR_GET(gpu_draw_profile);
+  const auto texb0 = texb ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
   NrTexBarriersOnly(used_texture_mask);
+  if (texb) {
+    static uint64_t s_texb_ns = 0, s_texb_calls = 0;
+    static uint64_t s_texb_ns_last = 0, s_texb_calls_last = 0;
+    const auto texb1 = std::chrono::steady_clock::now();
+    s_texb_ns += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(texb1 - texb0).count());
+    ++s_texb_calls;
+    static auto s_texb_report = texb1;
+    if (texb1 - s_texb_report >= std::chrono::seconds(1)) {
+      s_texb_report = texb1;
+      REXGPU_INFO("[nr-texb] bar={:.1f}ms calls={}", (s_texb_ns - s_texb_ns_last) / 1e6,
+                  s_texb_calls - s_texb_calls_last);
+      s_texb_ns_last = s_texb_ns;
+      s_texb_calls_last = s_texb_calls;
+    }
+  }
 }
 
 // [NR-TILTEX] N-4-2b piece 2: everything a texture request does that is NOT
