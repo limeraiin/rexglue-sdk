@@ -84,16 +84,9 @@ REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU/D3D12",
 // [DRAW-POOL] rung 1b-2 (per-instance pixel-shader constants): a key whose
 // pooled draws differed in PS constants (the `vfy ps` refusal) opens its
 // next batch with the instanced pixel shader variant, and every occurrence
-// appends its PS constants to a second instance block. `gpu_pool_psinst_cycle`
-// N alternates the lever ON/OFF every N seconds in place ('[pool] PHASE'
-// logged); 0 = ON. `gpu_pool_psinst_force` opens EVERY eligible batch
-// PS-instanced (smoke test of the variant). Both go when the drive confirms.
-REXCVAR_DEFINE_UINT32(gpu_pool_psinst_cycle, 0, "GPU/D3D12",
-                      "Seconds per phase of the in-place ON/OFF cycle of the rung 1b-2 "
-                      "per-instance PS constants (0 = always on).");
-REXCVAR_DEFINE_BOOL(gpu_pool_psinst_force, false, "GPU/D3D12",
-                    "Rung 1b-2 smoke test: every eligible pool batch uses the instanced "
-                    "pixel shader variant.");
+// appends its PS constants to a second instance block. Unconditional since
+// 2026-09-02 (naruto_775 RTX: hit 22.9 -> 29.4%, PS refusals -92%; naruto_776
+// Intel: refusals -93%, fps within noise; eye clean; cvars deleted).
 // its own cost is bracketed as `bc` on [gpu-draw2]. Logs '[batch-census]' 1 Hz.
 REXCVAR_DEFINE_BOOL(gpu_batch_census, false, "GPU/D3D12",
                     "Diagnostic: 1 Hz census of issued draws sharing a batch key with a "
@@ -2682,10 +2675,8 @@ struct PoolPred {
 constexpr uint32_t kPoolPredSlots = 1u << 14;
 std::vector<PoolPred> g_pool_pred;
 uint32_t g_pool_frame = 1;
-// Rung 1b-2: the lever (cycler phase), the smoke-test override, and the
-// predictor entry of the draw being issued (set by PoolPredict).
-bool g_pool_psinst = true;
-bool g_pool_psinst_force = false;
+// Rung 1b-2: the predictor entry of the draw being issued (set by
+// PoolPredict); its ps_delta_frame decides PS-instanced opens.
 PoolPred* g_pool_last_pred = nullptr;
 struct PoolStats {
   uint64_t draws = 0, opq = 0, hit = 0, opened = 0, first_in_batch = 0;
@@ -5851,24 +5842,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           double(d(&PoolStats::opened_ps)) / fr, double(d(&PoolStats::hit_ps)) / fr);
       s_pp = c;
     }
-    // Rung 1b-2 cycler: phase 0 = per-instance PS constants ON, phase 1 =
-    // OFF (a PS delta refuses, as before), `cycle` seconds each. 0 = ON.
-    {
-      static auto s_ps_t0 = pp_now;
-      static bool s_ps_on = true;
-      const uint32_t cycle = REXCVAR_GET(gpu_pool_psinst_cycle);
-      bool on = true;
-      if (cycle) {
-        const uint64_t el = uint64_t(std::chrono::duration<double>(pp_now - s_ps_t0).count());
-        on = ((el / cycle) & 1) == 0;
-      }
-      if (on != s_ps_on) {
-        s_ps_on = on;
-        REXGPU_INFO("[pool] PHASE {}", on ? "ON" : "OFF");
-      }
-      g_pool_psinst = on;
-      g_pool_psinst_force = REXCVAR_GET(gpu_pool_psinst_force);
-    }
     // Unconditional since 2026-09-02 (naruto_764/765/766 clean; the cvar and
     // its cycler are gone): the pool is how draws are issued.
     if (!g_pool_on) {
@@ -6886,17 +6859,16 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     }
   }
   // Rung 1b-2: open PS-instanced when the key's pooled draws differed in PS
-  // constants recently (last frame or this one), or under the smoke test.
-  // A geometry shader between the stages (points, rectangles, quads) would
-  // not carry XEINSTANCEID: those draws keep the plain pixel shader.
+  // constants recently (last frame or this one). A geometry shader between
+  // the stages (points, rectangles, quads) would not carry XEINSTANCEID:
+  // those draws keep the plain pixel shader.
   const bool pool_ps_inst =
-      pool_open && g_pool_psinst && pixel_shader &&
+      pool_open && pixel_shader &&
       primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kPointList &&
       primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kRectangleList &&
       primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kQuadList &&
-      pixel_shader->constant_register_map().float_count != 0 &&
-      (g_pool_psinst_force ||
-       (g_pool_last_pred && g_pool_frame - g_pool_last_pred->ps_delta_frame <= 1));
+      pixel_shader->constant_register_map().float_count != 0 && g_pool_last_pred &&
+      g_pool_frame - g_pool_last_pred->ps_delta_frame <= 1;
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
