@@ -478,15 +478,10 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
       static_cast<int>(SDL_GetJoystickType(SDL_GetGamepadJoystick(controller))),
       static_cast<int>(SDL_GetGamepadType(controller)), SDL_GetGamepadVendor(controller),
       SDL_GetGamepadProduct(controller));
+  // The pad's own player-index LED is ignored: a DualSense reported slot 1
+  // while slot 0 was free, which made it player 2 with no profile and no
+  // save. The first pad connected is player 1, always.
   int user_id = -1;
-  // Check if the controller has a player index LED.
-  user_id = SDL_GetGamepadPlayerIndex(controller);
-  // Is that id already taken?
-  if (user_id < 0 || user_id >= static_cast<int>(controllers_.size()) ||
-      controllers_.at(user_id).sdl) {
-    user_id = -1;
-  }
-  // No player index or already taken, just take the first free slot.
   if (user_id < 0) {
     for (size_t i = 0; i < controllers_.size(); i++) {
       if (!controllers_.at(i).sdl) {

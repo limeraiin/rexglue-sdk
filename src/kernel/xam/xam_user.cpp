@@ -44,8 +44,10 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   }
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
+  // The one profile is signed in on EVERY slot: whichever pad the player
+  // picks up owns the save data.
   if (user_index < 4) {
-    if (user_index == 0) {
+    {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
@@ -68,10 +70,8 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
 u32 XamUserGetSigninState_entry(u32 user_index) {
   uint32_t signin_state = 0;
   if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
-    }
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    signin_state = user_profile->signin_state();
   }
   return signin_state;
 }
@@ -92,7 +92,7 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  if (user_index >= 4) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -108,10 +108,6 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
-    return X_E_NO_SUCH_USER;
-  }
-
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   rex::string::util_copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
@@ -121,10 +117,6 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
 u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_len) {
   if (user_index >= 4) {
     return X_E_INVALIDARG;
-  }
-
-  if (user_index) {
-    return X_E_NO_SUCH_USER;
   }
 
   if (!buffer || buffer_len < 16) {
@@ -211,8 +203,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
-  if (!xuids && user_index) {
-    // Only support user 0.
+  if (!xuids && user_index >= 4) {
+    // Every slot is the one profile.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
           REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
@@ -308,8 +300,8 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index) {
-    // Only support user 0.
+  if (user_index >= 4) {
+    // Every slot is the one profile.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
                                                       X_ERROR_NO_SUCH_USER);
@@ -376,10 +368,6 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     if (user_index >= 4) {
       return X_ERROR_INVALID_PARAMETER;
     }
-
-    if (user_index) {
-      return X_ERROR_NO_SUCH_USER;
-    }
   }
 
   // If we deny everything, games should hopefully not try to do stuff.
@@ -388,10 +376,6 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
 }
 
 u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags) {
-  if (user_index) {
-    return X_ERROR_NO_SUCH_USER;
-  }
-
   // No restrictions?
   *out_flags = 0;
   return X_ERROR_SUCCESS;
@@ -399,10 +383,6 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
 
 u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
                                              mapped_u32 out_unk3) {
-  if (user_index) {
-    return X_ERROR_NO_SUCH_USER;
-  }
-
   // Some games have special case paths for 3F that differ from the failure
   // path, so my guess is that's 'don't care'.
   *out_unk2 = 0x3F;
@@ -430,9 +410,6 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   if (user_index >= 4) {
     return X_ERROR_INVALID_PARAMETER;
   }
-  if (user_index) {
-    return X_ERROR_NO_SUCH_USER;
-  }
   return 6 /* 6 appears to be Gold */;
 }
 
@@ -444,18 +421,13 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
   if (user_index >= 4) {
     result = X_ERROR_INVALID_PARAMETER;
   } else {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      if (user_profile->signin_state() == 0) {
-        result = X_ERROR_NOT_LOGGED_ON;
-      } else {
-        // No friends!
-        are_friends = 0;
-        result = X_ERROR_SUCCESS;
-      }
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    if (user_profile->signin_state() == 0) {
+      result = X_ERROR_NOT_LOGGED_ON;
     } else {
-      // Only support user 0.
-      result = X_ERROR_NO_SUCH_USER;  // if user is local -> X_ERROR_NOT_LOGGED_ON
+      // No friends!
+      are_friends = 0;
+      result = X_ERROR_SUCCESS;
     }
   }
 
