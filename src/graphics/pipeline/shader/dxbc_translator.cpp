@@ -133,6 +133,8 @@ void DxbcShaderTranslator::Reset() {
   in_reg_ps_point_coordinates_ = UINT32_MAX;
   in_reg_ps_position_ = UINT32_MAX;
   in_reg_ps_front_face_sample_index_ = UINT32_MAX;
+  out_reg_vs_instance_id_ = UINT32_MAX;
+  in_reg_ps_instance_id_ = UINT32_MAX;
 
   in_domain_location_used_ = 0;
   in_control_point_index_used_ = false;
@@ -441,6 +443,12 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
               dxbc::Src::V1D(kInRegisterVSInstanceID, dxbc::Src::kXXXX),
               dxbc::Src::LU(instanced_float_count));
   }
+  // [DRAW-POOL] rung 1b-2: export SV_InstanceID for the instanced pixel
+  // shader variant (a plain pixel shader simply does not read it).
+  if (out_reg_vs_instance_id_ != UINT32_MAX) {
+    a_.OpMov(dxbc::Dest::O(out_reg_vs_instance_id_, 0b0001),
+             dxbc::Src::V1D(kInRegisterVSInstanceID, dxbc::Src::kXXXX));
+  }
 
   // Remember that x# are only accessible via mov load or store - use a
   // temporary variable if need to do any computations!
@@ -598,6 +606,14 @@ void DxbcShaderTranslator::StartPixelShader() {
   // If not translating anything, we only need the depth.
   if (is_depth_only_pixel_shader_) {
     return;
+  }
+
+  // [DRAW-POOL] rung 1b-2: instance_base.x = instance id * float_count, the
+  // same redirect the instancing vertex shader applies to its constants.
+  if (system_temp_instance_base_ != UINT32_MAX && in_reg_ps_instance_id_ != UINT32_MAX) {
+    a_.OpUMul(dxbc::Dest::Null(), dxbc::Dest::R(system_temp_instance_base_, 0b0001),
+              dxbc::Src::V1D(in_reg_ps_instance_id_, dxbc::Src::kXXXX),
+              dxbc::Src::LU(current_shader().constant_register_map().float_count));
   }
 
   bool uses_register_dynamic_addressing = current_shader().uses_register_dynamic_addressing();
@@ -783,6 +799,11 @@ void DxbcShaderTranslator::StartTranslation() {
       out_reg_vs_point_size_ = out_reg_index;
       ++out_reg_index;
     }
+    // [DRAW-POOL] rung 1b-2: the instance id export, fixed register.
+    if (IsVertexShaderInstanced()) {
+      assert_true(out_reg_index <= kInterstageRegisterInstanceID);
+      out_reg_vs_instance_id_ = kInterstageRegisterInstanceID;
+    }
   } else if (is_pixel_shader()) {
     uint32_t in_reg_index = 0;
     // Interpolators.
@@ -801,6 +822,12 @@ void DxbcShaderTranslator::StartTranslation() {
     // System inputs.
     in_reg_ps_front_face_sample_index_ = in_reg_index;
     ++in_reg_index;
+    // [DRAW-POOL] rung 1b-2: the instance id from the vertex shader, fixed
+    // register (must match the vertex shader's).
+    if (IsPixelShaderInstanced()) {
+      assert_true(in_reg_index <= kInterstageRegisterInstanceID);
+      in_reg_ps_instance_id_ = kInterstageRegisterInstanceID;
+    }
   }
 
   // Allocate global system temporary registers that may also be used in the
@@ -833,6 +860,13 @@ void DxbcShaderTranslator::StartTranslation() {
       if (shader_writes_color_targets & (1 << i)) {
         system_temps_color_[i] = PushSystemTemp(0b1111);
       }
+    }
+    // [DRAW-POOL] rung 1b-2: per-instance base index into the float-constants
+    // cbuffer. Pushed before the memexport temps, so it is the top of the
+    // persistent stack where CompleteShaderCode releases it (after the
+    // memexport pop).
+    if (IsPixelShaderInstanced()) {
+      system_temp_instance_base_ = PushSystemTemp(0b0001);
     }
   }
 
@@ -2660,6 +2694,20 @@ void DxbcShaderTranslator::WriteInputSignature() {
       }
     }
 
+    // [DRAW-POOL] rung 1b-2: XEINSTANCEID from the instancing vertex shader.
+    size_t ps_instance_id_position = SIZE_MAX;
+    if (in_reg_ps_instance_id_ != UINT32_MAX) {
+      ps_instance_id_position = shader_object_.size();
+      shader_object_.resize(shader_object_.size() + kParameterDwords);
+      ++parameter_count;
+      auto& instance_id = *reinterpret_cast<dxbc::SignatureParameter*>(shader_object_.data() +
+                                                                       ps_instance_id_position);
+      instance_id.component_type = dxbc::SignatureRegisterComponentType::kUInt32;
+      instance_id.register_index = in_reg_ps_instance_id_;
+      instance_id.mask = 0b0001;
+      instance_id.always_reads_mask = 0b0001;
+    }
+
     // Semantic names.
     uint32_t semantic_offset = uint32_t((shader_object_.size() - blob_position) * sizeof(uint32_t));
     if (interpolator_count) {
@@ -2695,6 +2743,14 @@ void DxbcShaderTranslator::WriteInputSignature() {
         sample_index.semantic_name_ptr = semantic_offset;
       }
       semantic_offset += dxbc::AppendAlignedString(shader_object_, "SV_SampleIndex");
+    }
+    if (ps_instance_id_position != SIZE_MAX) {
+      {
+        auto& instance_id = *reinterpret_cast<dxbc::SignatureParameter*>(
+            shader_object_.data() + ps_instance_id_position);
+        instance_id.semantic_name_ptr = semantic_offset;
+      }
+      semantic_offset += dxbc::AppendAlignedString(shader_object_, "XEINSTANCEID");
     }
   }
 
@@ -2902,6 +2958,7 @@ void DxbcShaderTranslator::WriteOutputSignature() {
 
     // Point size (XEPSIZE). Always used because reset to -1.
     size_t point_size_position = shader_object_.size();
+    size_t vs_instance_id_position = SIZE_MAX;
     if (out_reg_vs_point_size_ != UINT32_MAX) {
       shader_object_.resize(shader_object_.size() + kParameterDwords);
       ++parameter_count;
@@ -2913,6 +2970,18 @@ void DxbcShaderTranslator::WriteOutputSignature() {
         point_size.mask = 0b0001;
         point_size.never_writes_mask = 0b1110;
       }
+    }
+    // [DRAW-POOL] rung 1b-2: XEINSTANCEID.
+    if (out_reg_vs_instance_id_ != UINT32_MAX) {
+      vs_instance_id_position = shader_object_.size();
+      shader_object_.resize(shader_object_.size() + kParameterDwords);
+      ++parameter_count;
+      auto& instance_id = *reinterpret_cast<dxbc::SignatureParameter*>(shader_object_.data() +
+                                                                       vs_instance_id_position);
+      instance_id.component_type = dxbc::SignatureRegisterComponentType::kUInt32;
+      instance_id.register_index = out_reg_vs_instance_id_;
+      instance_id.mask = 0b0001;
+      instance_id.never_writes_mask = 0b1110;
     }
 
     // Semantic names.
@@ -2961,6 +3030,14 @@ void DxbcShaderTranslator::WriteOutputSignature() {
         point_size.semantic_name_ptr = semantic_offset;
       }
       semantic_offset += dxbc::AppendAlignedString(shader_object_, "XEPSIZE");
+    }
+    if (vs_instance_id_position != SIZE_MAX) {
+      {
+        auto& instance_id = *reinterpret_cast<dxbc::SignatureParameter*>(
+            shader_object_.data() + vs_instance_id_position);
+        instance_id.semantic_name_ptr = semantic_offset;
+      }
+      semantic_offset += dxbc::AppendAlignedString(shader_object_, "XEINSTANCEID");
     }
   } else if (is_pixel_shader()) {
     // [N-10b deletion c] was `if (!edram_rov_used_)`; RTV is the only path.
@@ -3133,7 +3210,7 @@ void DxbcShaderTranslator::WriteShaderCode() {
         constant_register_map.float_dynamic_addressing
             ? dxbc::ConstantBufferAccessPattern::kDynamicIndexed
             : dxbc::ConstantBufferAccessPattern::kImmediateIndexed;
-    if (IsVertexShaderInstanced()) {
+    if (IsVertexShaderInstanced() || IsPixelShaderInstanced()) {
       float_cbuffer_vec4_count = kInstancedFloatConstantsVec4Capacity;
       float_cbuffer_access = dxbc::ConstantBufferAccessPattern::kDynamicIndexed;
     }
@@ -3292,6 +3369,10 @@ void DxbcShaderTranslator::WriteShaderCode() {
     }
     // Position output.
     ao_.OpDclOutputSIV(dxbc::Dest::O(out_reg_vs_position_), dxbc::Name::kPosition);
+    // [DRAW-POOL] rung 1b-2: instance id output.
+    if (out_reg_vs_instance_id_ != UINT32_MAX) {
+      ao_.OpDclOutput(dxbc::Dest::O(out_reg_vs_instance_id_, 0b0001));
+    }
     // Clip and cull distance outputs.
     uint32_t clip_distance_count = shader_modification.GetVertexClipDistanceCount();
     uint32_t cull_distance_count = shader_modification.GetVertexCullDistanceCount();
@@ -3365,6 +3446,11 @@ void DxbcShaderTranslator::WriteShaderCode() {
       ao_.OpDclInputPSSGV(
           dxbc::Dest::V1D(in_reg_ps_front_face_sample_index_, front_face_and_sample_index_mask),
           dxbc::Name::kIsFrontFace);
+    }
+    // [DRAW-POOL] rung 1b-2: the instance id, flat.
+    if (in_reg_ps_instance_id_ != UINT32_MAX) {
+      ao_.OpDclInputPS(dxbc::InterpolationMode::kConstant,
+                       dxbc::Dest::V1D(in_reg_ps_instance_id_, 0b0001));
     }
     // [N-10b deletion c] the ROV VCoverage declaration branch is DELETED.
     if (sample_rate_memexport) {

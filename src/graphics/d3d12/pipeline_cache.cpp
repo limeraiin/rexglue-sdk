@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -3763,6 +3764,45 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     } else {
       REXGPU_ERROR("Failed to create graphics pipeline with VS {:016X}",
                    runtime_description.vertex_shader->shader().ucode_data_hash());
+    }
+    // [PSO-FAIL] diagnostics: the debug layer's stored messages (needs
+    // --d3d12_debug true) and the failing bytecode pair, dumped as
+    // psofail/<n>_<vs>[_<ps>].{vs,ps}.dxbc next to the executable (first 8).
+    {
+      static std::atomic<uint32_t> s_psofail_n{0};
+      const uint32_t n = s_psofail_n.fetch_add(1);
+      ID3D12InfoQueue* iq = nullptr;
+      if (n < 8 && SUCCEEDED(command_processor_.GetD3D12Provider().GetDevice()->QueryInterface(
+                       IID_PPV_ARGS(&iq)))) {
+        const UINT64 count = iq->GetNumStoredMessages();
+        for (UINT64 i = 0; i < count; ++i) {
+          SIZE_T len = 0;
+          if (FAILED(iq->GetMessage(i, nullptr, &len)) || !len) continue;
+          std::vector<uint8_t> buf(len);
+          auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+          if (SUCCEEDED(iq->GetMessage(i, msg, &len)) && msg->pDescription) {
+            REXGPU_ERROR("[psofail] d3d12 debug: {}", msg->pDescription);
+          }
+        }
+        iq->ClearStoredMessages();
+        iq->Release();
+      }
+      if (n < 8) {
+        std::error_code ec;
+        std::filesystem::create_directories("psofail", ec);
+        auto dump = [&](const D3D12Shader::D3D12Translation* t, const char* stage) {
+          if (!t) return;
+          const std::vector<uint8_t>& bin = t->translated_binary();
+          const std::string name =
+              fmt::format("psofail/{}_{:016X}_mod{:016X}.{}.dxbc", n, t->shader().ucode_data_hash(),
+                          t->modification(), stage);
+          std::ofstream f(name, std::ios::binary);
+          f.write(reinterpret_cast<const char*>(bin.data()), std::streamsize(bin.size()));
+          REXGPU_ERROR("[psofail] dumped {} ({} bytes)", name, bin.size());
+        };
+        dump(runtime_description.vertex_shader, "vs");
+        dump(runtime_description.pixel_shader, "ps");
+      }
     }
     return nullptr;
   }

@@ -1274,7 +1274,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12CommandSignature> pool_cmdsig_draw_;
   bool PoolOpenAndDraw(uint64_t key, const RegisterFile& regs, const D3D12Shader* vertex_shader,
                        const D3D12Shader* pixel_shader, uint32_t host_draw_vertex_count,
-                       bool indexed, uint32_t capacity);
+                       bool indexed, uint32_t capacity, bool ps_inst);
 
   // Whether the latest shared memory and EDRAM buffer binding contains the
   // shared memory UAV rather than the SRV.

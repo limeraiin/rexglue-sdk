@@ -186,6 +186,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // [DRAW-POOL] rung 1b-2: the per-instance-constants variant of the
+      // pixel shader. Reads the instance id the instancing vertex shader
+      // exports (XEINSTANCEID, constant interpolation) and redirects every
+      // absolute float-constant load to that instance's block, exactly like
+      // vertex.instanced. Only emitted when the shader has float constants
+      // and does NOT use dynamic float addressing; must be paired with an
+      // instancing vertex shader (the input has to be provided).
+      uint32_t instanced : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -621,6 +629,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
   static constexpr uint32_t kInRegisterVSVertexIndex = 0;
   // [GPU-INST] SV_InstanceID input register for the instancing variant.
   static constexpr uint32_t kInRegisterVSInstanceID = 1;
+  // [DRAW-POOL] rung 1b-2: D3D12 links a user semantic only when it sits in
+  // the SAME hardware register in both stages, so XEINSTANCEID lives in a
+  // fixed register above every layout-dependent one (VS: o31, PS: v31).
+  static constexpr uint32_t kInterstageRegisterInstanceID = 31;
   static constexpr uint32_t kInRegisterDSControlPointIndex = 0;
 
   // [GPU-INST] True when the current translation is the instancing variant of a
@@ -629,6 +641,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // declaration, the per-instance base computation, and the cbuffer redirect.
   bool IsVertexShaderInstanced() {
     return is_vertex_shader() && GetDxbcShaderModification().vertex.instanced &&
+           current_shader().constant_register_map().float_count != 0 &&
+           !current_shader().constant_register_map().float_dynamic_addressing;
+  }
+  // [DRAW-POOL] rung 1b-2: the per-instance-constants pixel shader variant.
+  bool IsPixelShaderInstanced() {
+    return is_pixel_shader() && GetDxbcShaderModification().pixel.instanced &&
            current_shader().constant_register_map().float_count != 0 &&
            !current_shader().constant_register_map().float_dynamic_addressing;
   }
@@ -982,6 +1000,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // user_clip_plane_cull, then one SV_CullDistance if vertex_kill_and is used.
   uint32_t out_reg_vs_clip_cull_distances_;
   uint32_t out_reg_vs_point_size_;
+  // [DRAW-POOL] rung 1b-2: XEINSTANCEID (uint, .x) exported by the instancing
+  // vertex shader variant, read by the instanced pixel shader variant.
+  uint32_t out_reg_vs_instance_id_;
+  uint32_t in_reg_ps_instance_id_;
   uint32_t in_reg_ps_interpolators_;
   uint32_t in_reg_ps_point_coordinates_;
   uint32_t in_reg_ps_position_;

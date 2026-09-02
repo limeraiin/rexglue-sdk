@@ -81,6 +81,19 @@ REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU/D3D12",
 // (prim + counts + VS/PS ucode hashes + IB identity + bound-VB hash) - an
 // UPPER BOUND on mergeability (RT/viewport state is not in the key). Runs at
 // the IssueDrawImpl success seam, outside every [gpu-draw] phase bracket;
+// [DRAW-POOL] rung 1b-2 (per-instance pixel-shader constants): a key whose
+// pooled draws differed in PS constants (the `vfy ps` refusal) opens its
+// next batch with the instanced pixel shader variant, and every occurrence
+// appends its PS constants to a second instance block. `gpu_pool_psinst_cycle`
+// N alternates the lever ON/OFF every N seconds in place ('[pool] PHASE'
+// logged); 0 = ON. `gpu_pool_psinst_force` opens EVERY eligible batch
+// PS-instanced (smoke test of the variant). Both go when the drive confirms.
+REXCVAR_DEFINE_UINT32(gpu_pool_psinst_cycle, 0, "GPU/D3D12",
+                      "Seconds per phase of the in-place ON/OFF cycle of the rung 1b-2 "
+                      "per-instance PS constants (0 = always on).");
+REXCVAR_DEFINE_BOOL(gpu_pool_psinst_force, false, "GPU/D3D12",
+                    "Rung 1b-2 smoke test: every eligible pool batch uses the instanced "
+                    "pixel shader variant.");
 // its own cost is bracketed as `bc` on [gpu-draw2]. Logs '[batch-census]' 1 Hz.
 REXCVAR_DEFINE_BOOL(gpu_batch_census, false, "GPU/D3D12",
                     "Diagnostic: 1 Hz census of issued draws sharing a batch key with a "
@@ -2635,6 +2648,11 @@ struct PoolBatch {
   uint64_t float_bitmap[4];
   uint8_t* inst;        // upload-heap instance block (write only)
   uint32_t* count_ptr;  // InstanceCount inside the argument buffer
+  // Rung 1b-2: the pixel shader's per-instance block (ps_inst batches only).
+  bool ps_inst;
+  uint32_t ps_float_count;
+  uint64_t ps_bitmap[4];
+  uint8_t* ps_block;
   PoolSnap snap;
 };
 std::vector<PoolBatch> g_pool_batches;  // arena, reused per window
@@ -2657,12 +2675,21 @@ struct PoolPred {
   uint64_t key;
   uint32_t frame, win_epoch;
   uint16_t win_count, frame_max, prev_max, pad;
+  // Rung 1b-2: the last frame in which two pooled draws of this key differed
+  // in pixel-shader constants; the key opens PS-instanced while it is fresh.
+  uint32_t ps_delta_frame;
 };
 constexpr uint32_t kPoolPredSlots = 1u << 14;
 std::vector<PoolPred> g_pool_pred;
 uint32_t g_pool_frame = 1;
+// Rung 1b-2: the lever (cycler phase), the smoke-test override, and the
+// predictor entry of the draw being issued (set by PoolPredict).
+bool g_pool_psinst = true;
+bool g_pool_psinst_force = false;
+PoolPred* g_pool_last_pred = nullptr;
 struct PoolStats {
   uint64_t draws = 0, opq = 0, hit = 0, opened = 0, first_in_batch = 0;
+  uint64_t opened_ps = 0, hit_ps = 0;  // rung 1b-2: PS-instanced batches / their hits
   uint64_t ref_pred = 0, ref_cap = 0, ref_vfy_regs = 0, ref_vfy_ps = 0, ref_vfy_bl = 0,
            ref_elig = 0, ref_tile = 0, ref_alloc = 0, ref_psbig = 0, ref_ovf = 0;
   uint64_t close_class = 0, close_pass = 0, close_copy = 0, close_frame = 0, close_submit = 0;
@@ -2738,7 +2765,9 @@ uint32_t PoolPredict(uint64_t key) {
     p.prev_max = 0;
     p.frame_max = 0;
     p.win_epoch = 0;
+    p.ps_delta_frame = 0;
   }
+  g_pool_last_pred = &p;
   if (p.frame != g_pool_frame) {
     // A key absent for a whole frame forgets; one frame back is the model.
     p.prev_max = (p.frame + 1 == g_pool_frame) ? p.frame_max : 0;
@@ -2809,13 +2838,14 @@ bool PoolGather(const RegisterFile& regs, const Shader* ps, PoolSnap& out) {
 
 // The instance block layout is the instanced VS's: the used vertex float
 // constants, packed in bitmap order, float_count vec4s per instance.
-void PoolPackInstance(const RegisterFile& regs, const uint64_t bitmap[4], uint8_t* dst) {
+void PoolPackInstance(const RegisterFile& regs, const uint64_t bitmap[4], uint8_t* dst,
+                      uint32_t base_reg = XE_GPU_REG_SHADER_CONSTANT_000_X) {
   for (uint32_t word = 0; word < 4; ++word) {
     uint64_t entry = bitmap[word];
     uint32_t idx;
     while (rex::bit_scan_forward(entry, &idx)) {
       entry &= ~(uint64_t(1) << idx);
-      std::memcpy(dst, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (word << 8) + (idx << 2)], 16);
+      std::memcpy(dst, &regs[base_reg + (word << 8) + (idx << 2)], 16);
       dst += 16;
     }
   }
@@ -2850,10 +2880,21 @@ bool PoolTryHit(uint64_t key, const RegisterFile& regs, const Shader* ps) {
     return false;
   }
   if (now.ps_n != b.snap.ps_n || std::memcmp(now.ps, b.snap.ps, now.ps_n * 4) != 0) {
-    ++g_pool.ref_vfy_ps;
-    return false;
+    // Rung 1b-2: a PS-constant delta marks the key (its next batch opens
+    // PS-instanced); a plain batch still refuses it.
+    if (g_pool_last_pred) g_pool_last_pred->ps_delta_frame = g_pool_frame;
+    if (!b.ps_inst) {
+      ++g_pool.ref_vfy_ps;
+      return false;
+    }
   }
   PoolPackInstance(regs, b.float_bitmap, b.inst + size_t(b.count) * b.float_count * 16);
+  if (b.ps_inst) {
+    PoolPackInstance(regs, b.ps_bitmap, b.ps_block + size_t(b.count) * b.ps_float_count * 16,
+                     XE_GPU_REG_SHADER_CONSTANT_256_X);
+    g_pool.inst_bytes += size_t(b.ps_float_count) * 16;
+    ++g_pool.hit_ps;
+  }
   ++b.count;
   *b.count_ptr = b.count;
   g_pool.inst_bytes += size_t(b.float_count) * 16;
@@ -5794,7 +5835,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           "[pool] in={}/s out={}/s (-{:.1f}%) dpf {:.0f} -> {:.0f} | opq={:.1f}% hit={:.1f}% "
           "batches/fr={:.1f} sizes 1/2-3/4-9/10-49/50+={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% "
           "| refuse pred1={} cap={} vfy regs/ps/bl={}/{}/{} elig={} tile={} alloc={} psbig={} "
-          "ovf={} | close class/pass/copy/frame/submit={}/{}/{}/{}/{} | inst {:.1f} MB/s",
+          "ovf={} | close class/pass/copy/frame/submit={}/{}/{}/{}/{} | inst {:.1f} MB/s "
+          "| psinst open/fr={:.1f} hit/fr={:.1f}",
           draws, draws - hit, 100.0 * double(hit) / dd, double(draws) / fr,
           double(draws - hit) / fr, 100.0 * double(opq) / dd, 100.0 * double(hit) / dd,
           double(opened) / fr, 100.0 * double(hist[0]) / bb, 100.0 * double(hist[1]) / bb,
@@ -5805,8 +5847,27 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           d(&PoolStats::ref_psbig), d(&PoolStats::ref_ovf), d(&PoolStats::close_class),
           d(&PoolStats::close_pass), d(&PoolStats::close_copy), d(&PoolStats::close_frame),
           d(&PoolStats::close_submit),
-          secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0);
+          secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0,
+          double(d(&PoolStats::opened_ps)) / fr, double(d(&PoolStats::hit_ps)) / fr);
       s_pp = c;
+    }
+    // Rung 1b-2 cycler: phase 0 = per-instance PS constants ON, phase 1 =
+    // OFF (a PS delta refuses, as before), `cycle` seconds each. 0 = ON.
+    {
+      static auto s_ps_t0 = pp_now;
+      static bool s_ps_on = true;
+      const uint32_t cycle = REXCVAR_GET(gpu_pool_psinst_cycle);
+      bool on = true;
+      if (cycle) {
+        const uint64_t el = uint64_t(std::chrono::duration<double>(pp_now - s_ps_t0).count());
+        on = ((el / cycle) & 1) == 0;
+      }
+      if (on != s_ps_on) {
+        s_ps_on = on;
+        REXGPU_INFO("[pool] PHASE {}", on ? "ON" : "OFF");
+      }
+      g_pool_psinst = on;
+      g_pool_psinst_force = REXCVAR_GET(gpu_pool_psinst_force);
     }
     // Unconditional since 2026-09-02 (naruto_764/765/766 clean; the cvar and
     // its cycler are gone): the pool is how draws are issued.
@@ -6824,6 +6885,18 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       pool_open = true;
     }
   }
+  // Rung 1b-2: open PS-instanced when the key's pooled draws differed in PS
+  // constants recently (last frame or this one), or under the smoke test.
+  // A geometry shader between the stages (points, rectangles, quads) would
+  // not carry XEINSTANCEID: those draws keep the plain pixel shader.
+  const bool pool_ps_inst =
+      pool_open && g_pool_psinst && pixel_shader &&
+      primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kPointList &&
+      primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kRectangleList &&
+      primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kQuadList &&
+      pixel_shader->constant_register_map().float_count != 0 &&
+      (g_pool_psinst_force ||
+       (g_pool_last_pred && g_pool_frame - g_pool_last_pred->ps_delta_frame <= 1));
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
@@ -6842,6 +6915,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           ? pipeline_cache_->GetCurrentPixelShaderModification(
                 *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
           : DxbcShaderTranslator::Modification(0);
+  // Rung 1b-2: the per-instance-constants pixel shader, paired with the
+  // instancing vertex shader (pool_open implies it).
+  if (pool_ps_inst) pixel_shader_modification.pixel.instanced = 1;
 
   // Set up the render targets - this may perform dispatches and draws.
   uint32_t normalized_color_mask =
@@ -7522,7 +7598,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     if (pool_open &&
         PoolOpenAndDraw(pool_key, regs, vertex_shader, pixel_shader,
                         primitive_processing_result.host_draw_vertex_count, /*indexed=*/false,
-                        std::min<uint32_t>(pool_pred + 1 + pool_pred / 4, 256))) {
+                        std::min<uint32_t>(pool_pred + 1 + pool_pred / 4, 256), pool_ps_inst)) {
     } else if (start_instanced) {
       StartInstancedBatch(regs, active_vertex_shader(), active_pixel_shader(), primitive_type,
                           index_count, index_buffer_info,
@@ -7606,7 +7682,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     if (pool_open &&
         PoolOpenAndDraw(pool_key, regs, vertex_shader, pixel_shader,
                         primitive_processing_result.host_draw_vertex_count, /*indexed=*/true,
-                        std::min<uint32_t>(pool_pred + 1 + pool_pred / 4, 256))) {
+                        std::min<uint32_t>(pool_pred + 1 + pool_pred / 4, 256), pool_ps_inst)) {
     } else if (start_instanced) {
       StartInstancedBatch(regs, active_vertex_shader(), active_pixel_shader(), primitive_type,
                           index_count, index_buffer_info,
@@ -7912,7 +7988,7 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
                                             const D3D12Shader* vertex_shader,
                                             const D3D12Shader* pixel_shader,
                                             uint32_t host_draw_vertex_count, bool indexed,
-                                            uint32_t capacity) {
+                                            uint32_t capacity, bool ps_inst) {
   auto& sig = indexed ? pool_cmdsig_indexed_ : pool_cmdsig_draw_;
   if (!sig) {
     D3D12_INDIRECT_ARGUMENT_DESC arg = {};
@@ -7930,8 +8006,13 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
   }
   const Shader::ConstantRegisterMap& cm = vertex_shader->constant_register_map();
   const uint32_t float_count = cm.float_count;
+  // Rung 1b-2: the pixel shader's block sizes the batch too.
+  const uint32_t ps_float_count =
+      ps_inst && pixel_shader ? pixel_shader->constant_register_map().float_count : 0;
+  ps_inst = ps_float_count != 0;
   const uint32_t cap_max =
-      std::max(2u, DxbcShaderTranslator::kInstancedFloatConstantsVec4Capacity / float_count);
+      std::max(2u, DxbcShaderTranslator::kInstancedFloatConstantsVec4Capacity /
+                       std::max(float_count, ps_float_count));
   capacity = std::max(2u, std::min(capacity, cap_max));
   if (g_pool_batch_n >= g_pool_batches.size()) {
     if (g_pool_batches.size() >= 4096) {
@@ -7940,7 +8021,11 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
     }
     g_pool_batches.resize(g_pool_batches.size() * 2);
   }
-  const size_t inst_bytes = size_t(capacity) * float_count * 16;
+  // [args (256) | VS instance block, 256-aligned | PS instance block].
+  const size_t vs_bytes = rex::align<size_t>(size_t(capacity) * float_count * 16,
+                                             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+  const size_t ps_bytes = size_t(capacity) * ps_float_count * 16;
+  const size_t inst_bytes = vs_bytes + ps_bytes;
   ID3D12Resource* buffer = nullptr;
   size_t offset = 0;
   D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
@@ -7976,12 +8061,32 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
   b.inst = mapping + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
   b.count_ptr = args + 1;
   PoolPackInstance(regs, b.float_bitmap, b.inst);
+  b.ps_inst = ps_inst;
+  b.ps_float_count = ps_float_count;
+  b.ps_block = nullptr;
+  if (ps_inst) {
+    std::memcpy(b.ps_bitmap, pixel_shader->constant_register_map().float_bitmap,
+                sizeof(b.ps_bitmap));
+    b.ps_block = b.inst + vs_bytes;
+    PoolPackInstance(regs, b.ps_bitmap, b.ps_block, XE_GPU_REG_SHADER_CONSTANT_256_X);
+  }
   slot->batch = g_pool_batch_n++;
   const uint32_t root_parameter_float_constants_vertex =
       bindless_resources_used_ ? kRootParameter_Bindless_FloatConstantsVertex
                                : kRootParameter_Bindful_FloatConstantsVertex;
   deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
       root_parameter_float_constants_vertex, gpu + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+  if (ps_inst) {
+    const uint32_t root_parameter_float_constants_pixel =
+        bindless_resources_used_ ? kRootParameter_Bindless_FloatConstantsPixel
+                                 : kRootParameter_Bindful_FloatConstantsPixel;
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        root_parameter_float_constants_pixel,
+        gpu + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT + vs_bytes);
+    cbuffer_binding_float_pixel_.up_to_date = false;
+    g_pool.inst_bytes += size_t(ps_float_count) * 16;
+    ++g_pool.opened_ps;
+  }
   deferred_command_list_.D3DExecuteIndirect(sig.Get(), 1, buffer, offset);
   // The vertex float CBV now points at the instance block; the next plain
   // draw must re-upload and re-bind its own constants.
