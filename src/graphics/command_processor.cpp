@@ -270,17 +270,10 @@ REXCVAR_DEFINE_BOOL(gpu_nr_apply_cycle, false, "GPU",
 // in the naruto_720 cycle. They buy no fps -- do not re-enable without a
 // reason. ⚠ A probe that measures compose COVERAGE (nr-cmp/nrcap gates)
 // must set this to 0, or its denominator loses every repeat-band stop.
-REXCVAR_DEFINE_INT32(gpu_nr_band_skip, 1, "GPU",
-                     "N-9-6: at a repeat-band draw stop, DROP the deferred "
-                     "ranges instead of composing them. 0 = off, 1 = ALU + "
-                     "bool/loop (DEFAULT, gated), 2 = + fetch, 3 = + state "
-                     "windows (2 and 3 buy nothing and one of them flashes).");
-// One in-place cycler, 10 s per phase: 0 off / 1 / 2 / 3. The visual gate
-// rides it ([[visual-defect-needs-a-visual-bisect]]) -- the phase is logged
-// so the eye and the log agree on what was live.
-REXCVAR_DEFINE_BOOL(gpu_nr_band_cycle, false, "GPU",
-                    "N-9-6: cycle band-skip {off, alu, +fetch, +state} 10 s "
-                    "each in place for the paired fps + visual read.");
+// 2026-09-02 flag sweep: the cvar and its cycler are gone; mode 1 (ALU +
+// bool/loop) is the shipped behaviour, unconditional under de-tile. The
+// mode-2/3 branches inside Nr6DropRange are unreachable and kept only so
+// the class filter reads as it was validated.
 
 // [NR-97] N-9-7 phase A: stop APPLYING a repeat band's register stream.
 //
@@ -569,13 +562,8 @@ REXCVAR_DEFINE_BOOL(gpu_nr_pkt_census, false, "GPU",
 // proven gpu_nr_issue seam); the executor's per-packet framing for the other
 // ~96% of dispatches never runs. Eligibility: D3D12, no precord capture, no
 // open trace, no gpu_nr_issue_from/count bisection window.
-REXCVAR_DEFINE_BOOL(gpu_nr_skip, true, "GPU",
-                    "[nr-skp] Phase 5-4-2: for eligible depth-1 indirect "
-                    "buffers, skip the executor's packet loop and run the "
-                    "lockstep walk as the only decoder (draws + non-stream "
-                    "packets delegated to the executor's own handlers). "
-                    "Implies gpu_nr_issue and gpu_nr_walk_effects. ON by "
-                    "default.");
+// [nr-skp] Phase 5-4-2: the lockstep walk is the only decoder for eligible
+// depth-1 indirect buffers. Unconditional (cvar deleted 2026-09-02).
 
 // [NR-SPP] 5-4-4 step 0b: prices the skip path's halves. Whole-buffer bracket
 // minus the two stop-dispatch brackets = the walk decode + bulk range applies;
@@ -601,13 +589,9 @@ REXCVAR_DEFINE_BOOL(gpu_nr_skip_profile, false, "GPU",
 // gpu_nr_issue seam run unchanged inside it. Any packet shape the direct
 // decode does not cover falls back to the delegated dispatch, so every odd
 // case keeps the proven handler.
-REXCVAR_DEFINE_BOOL(gpu_nr_skip_direct, true, "GPU",
-                    "[nr-skp] Phase 5-4-4a: under gpu_nr_skip, issue draw "
-                    "stops by direct call from the walk instead of the "
-                    "per-draw delegated packet re-parse. Odd packet shapes "
-                    "fall back to delegation. Default ON since the 5-4-4a "
-                    "city validation (naruto_364, pixel-perfect at 13M "
-                    "draws).");
+// [nr-skp] Phase 5-4-4a: draw stops issue by direct call from the walk; odd
+// packet shapes fall back to delegation. Unconditional (cvar deleted
+// 2026-09-02; validated naruto_364).
 
 // [NR-PB] N-2-2 item 0: the widened bulk apply. NrWalkRegRange used to accept
 // only the three pure constant windows; every multi-register write to the
@@ -828,20 +812,10 @@ REXCVAR_DEFINE_INT32(gpu_nr_detile_widen_seg, -1, "GPU",
                      "duplicate. HUD below the band line missing by design "
                      "except at -1.");
 
-REXCVAR_DEFINE_INT32(gpu_nr_detile, 1, "GPU",
-                     "[nr-detile] N-5: render the frame ONCE instead of once "
-                     "per EDRAM tile band - band 1 rasterises and resolves the "
-                     "full frame height and the repeat bands are not executed. "
-                     "Self-arming from the previous frame, with a "
-                     "resolve-destination guard that disarms on violation. "
-                     "0 = off, 1 = on, 2 = cycle 10 s on / 10 s off IN PLACE "
-                     "so one drive reads both halves at matched load. "
-                     "DEFAULT ON since the N-6-5 city gate: correct picture "
-                     "confirmed by drive, 56-61 fps at 2500-3000 band-1 draws "
-                     "per frame against ~43 shipping, and the EDRAM readback "
-                     "reports every sampled row r0..r704 changing every "
-                     "sample. Kept as a cvar for the A/B and the in-place "
-                     "cycle, not as a thing anyone has to set.");
+// [nr-detile] N-5: render the frame ONCE instead of once per EDRAM tile
+// band; self-arming from the previous frame with a resolve-destination
+// guard. Unconditional mode 1 (cvar deleted 2026-09-02; the mode-2 cycler
+// code is unreachable).
 
 // [nr-pb] Plain-register bulk apply (N-2-2 item 0) is UNCONDITIONAL under
 // the skip -- was `gpu_nr_plain_bulk` default ON since the naruto_485/486
@@ -2442,7 +2416,6 @@ bool g_nr5c_cur_sup = false;  // the stop in flight composed a SUPPRESSED record
 
 // [NR-6] N-9-6 repeat-band compose skip (see the cvars).
 int32_t g_nr6_mode = 0;
-bool g_nr6_cycle = false;
 int32_t g_nr6_phase = -1;
 uint64_t g_nr6_stops = 0;      // 0x22 stops the hoisted predicate called a band
 uint64_t g_nr6_groups = 0;     // ...of which had a deferred group to drop
@@ -5535,7 +5508,7 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-SKP] 5-4-2: the skip is the consumer of BOTH the issue seam and the
   // walk-driven effects, so it implies them (and through them the lockstep
   // walk and the running context).
-  const bool kNrSkip = REXCVAR_GET(gpu_nr_skip);
+  const bool kNrSkip = true;
   g_nr_skip = kNrSkip;
   // [NR-TILE] N-4: the tile probe rides the skip (the draw skip sits in the
   // skip loop). Announced, because a run with wrong pixels must never be
@@ -5558,7 +5531,7 @@ void CommandProcessor::WorkerThreadMain() {
   // [NR-DETILE] N-5: rides the skip, because the observe-and-skip seam is the
   // walk's own draw-stop loop. The per-frame value is recomputed at the swap
   // (mode 2 cycles there); this only announces the mode and gates it.
-  g_nr_detile_mode = kNrSkip ? REXCVAR_GET(gpu_nr_detile) : 0;
+  g_nr_detile_mode = kNrSkip ? 1 : 0;
   if (g_nr_detile_mode && REXCVAR_GET(gpu_nr_detile_tap) >= 0) {
     REXGPU_INFO(
         "[nr-detile] TAP BISECT: only band-1 resolve tap {} is extended to "
@@ -5575,7 +5548,7 @@ void CommandProcessor::WorkerThreadMain() {
   const bool kSkpProf = REXCVAR_GET(gpu_nr_skip_profile) && kNrSkip;
   g_skp_prof = kSkpProf;
   // [NR-SKP] 5-4-4a: the direct draw path only exists under the skip.
-  g_nr_skip_direct = REXCVAR_GET(gpu_nr_skip_direct) && kNrSkip;
+  g_nr_skip_direct = kNrSkip;
   // [NR-PB] N-2-2 item 0: the plain bulk apply only exists under the skip
   // (NrWalkRegRange is dead everywhere else). Unconditional there.
   g_nr_plain_bulk = kNrSkip;
@@ -5851,21 +5824,9 @@ void CommandProcessor::WorkerThreadMain() {
                   g_nr5c_skip_mode,
                   g_nr5c_cycle ? " CYCLE off/arena/arena+skip 10 s each" : "");
     }
-    // [NR-6] the repeat-band compose skip. Off unless asked for; the cycler
-    // owns the live mode while armed.
-    {
-      const int32_t m = REXCVAR_GET(gpu_nr_band_skip);
-      g_nr6_mode = m > 0 ? (m > 3 ? 3 : m) : 0;
-      g_nr6_cycle = REXCVAR_GET(gpu_nr_band_cycle);
-      if (g_nr6_mode || g_nr6_cycle) {
-        REXGPU_INFO(
-            "[nr-6] repeat-band compose skip ARMED: mode={}{} -- a band-2/3 "
-            "draw's deferred ranges are DROPPED, not composed. pred_ne must "
-            "stay 0.",
-            g_nr6_mode,
-            g_nr6_cycle ? " CYCLE off/alu/+fetch/+state 10 s each" : "");
-      }
-    }
+    // [NR-6] the repeat-band compose skip: mode 1 (ALU + bool/loop),
+    // unconditional (naruto_722 verdict, cvar deleted 2026-09-02).
+    g_nr6_mode = 1;
     // [NR-97] N-9-7 phase A: the repeat-band walk skip. Rides the skip (the
     // walk is the only decoder there) and de-tile (its predicate IS the band
     // test, so an unarmed or guard-tripped de-tile disarms this outright).
@@ -6061,29 +6022,6 @@ void CommandProcessor::WorkerThreadMain() {
                     phase == 0   ? "OFF (baseline: scratch memcpy, full applies)"
                     : phase == 1 ? "ARENA (apply in place, no memcpy)"
                                  : "ARENA+SKIP (clean record runs skipped)");
-      }
-    }
-
-    // [NR-6] the repeat-band drop cycle: 10 s per class, in place, phase
-    // logged so the eye and the log agree ([[visual-defect-needs-a-visual-
-    // bisect]]). 0 = off (baseline), 1 = ALU + bool/loop dropped, 2 = +
-    // fetch, 3 = + state windows.
-    if (g_nr6_cycle) {
-      static auto nr6_t0 = prof_clock::now();
-      const int32_t phase =
-          int32_t((std::chrono::duration_cast<std::chrono::seconds>(
-                       prof_clock::now() - nr6_t0)
-                       .count() /
-                   10) %
-                  4);
-      if (phase != g_nr6_phase) {
-        g_nr6_phase = phase;
-        g_nr6_mode = phase;
-        REXGPU_INFO("[nr-6] PHASE {} - {}", phase,
-                    phase == 0   ? "OFF (baseline: repeat bands compose)"
-                    : phase == 1 ? "DROP alu+bool (fetch/state still apply)"
-                    : phase == 2 ? "DROP alu+bool+fetch"
-                                 : "DROP alu+bool+fetch+state (everything)");
       }
     }
 

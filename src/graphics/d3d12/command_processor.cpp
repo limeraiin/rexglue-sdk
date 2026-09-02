@@ -81,15 +81,6 @@ REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU/D3D12",
 // (prim + counts + VS/PS ucode hashes + IB identity + bound-VB hash) - an
 // UPPER BOUND on mergeability (RT/viewport state is not in the key). Runs at
 // the IssueDrawImpl success seam, outside every [gpu-draw] phase bracket;
-// [DRAW-POOL] rung 1. `gpu_draw_pool` is the A/B switch for the city gate;
-// `gpu_draw_pool_cycle` N alternates ON/OFF every N seconds in place (the
-// phase is logged as '[pool] PHASE'). When the gate passes the cvars go.
-REXCVAR_DEFINE_BOOL(gpu_draw_pool, true, "GPU/D3D12",
-                    "Pool order-independent repeat draws of a pass into one instanced "
-                    "indirect draw. '[pool]' 1 Hz.");
-REXCVAR_DEFINE_UINT32(gpu_draw_pool_cycle, 0, "GPU/D3D12",
-                      "Seconds per phase of the in-place ON/OFF cycle of gpu_draw_pool "
-                      "(0 = fixed).");
 // its own cost is bracketed as `bc` on [gpu-draw2]. Logs '[batch-census]' 1 Hz.
 REXCVAR_DEFINE_BOOL(gpu_batch_census, false, "GPU/D3D12",
                     "Diagnostic: 1 Hz census of issued draws sharing a batch key with a "
@@ -232,14 +223,8 @@ REXCVAR_DEFINE_BOOL(gpu_nr_bindings, false, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-SYS] Phase 5-3b-1: the system-constants mirror's gate.
-REXCVAR_DEFINE_BOOL(gpu_nr_sysconst, true, "GPU/D3D12",
-                    "[NR-SYS] Phase 5-3b-1 system-constants mirror: re-derive the system "
-                    "constants (UpdateSystemConstantValues) from the draw register file "
-                    "with the native renderer's own transcription and byte-compare the "
-                    "whole struct against the emulated one after every update. Reports "
-                    "'[nr-sys]' once/sec. ON by default: this mirror is what the bindings "
-                    "swap uploads from.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [NR-SYS] Phase 5-3b-1 system-constants mirror: the bindings swap uploads
+// from it. Unconditional (cvar deleted 2026-09-02).
 
 // [NR-DSC] Phase 5-3b-2: the descriptor/sampler mirror's gate.
 REXCVAR_DEFINE_BOOL(gpu_nr_desc, false, "GPU/D3D12",
@@ -253,28 +238,17 @@ REXCVAR_DEFINE_BOOL(gpu_nr_desc, false, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-SWP] Phase 5-3b swap: our own UpdateBindings for eligible draws.
-REXCVAR_DEFINE_BOOL(gpu_nr_bindings_swap, true, "GPU/D3D12",
-                    "[NR-SWP] Phase 5-3b swap: assemble each draw's bindings with the "
-                    "native renderer's own UpdateBindings (system constants from the "
-                    "5-3b-1 mirror, guest cbuffers via the 5-3b-0 packers, samplers via "
-                    "the 5-3b-2 derivation, SRV index values via the 5-3b-3 maps, root "
-                    "parameters transcribed) instead of the emulated one; per-draw "
-                    "fallback, counted. Requires gpu_nr_sysconst and gpu_nr_residency. "
-                    "Reports '[nr-swp]' once/sec. ON by default.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [NR-SWP] Phase 5-3b swap: each draw's bindings are assembled by the native
+// renderer's own UpdateBindings, per-draw fallback counted. Unconditional
+// (cvar deleted 2026-09-02).
 
 // [NR-LEAN] Phase 5-4-4b inc 2b: skip the emulated sysconst derivation.
 // Default ON 2026-08-11 after the city A/B (naruto_380 vs 374: drawstop
 // 1.94 -> 1.81us/draw at ~330k draws/s, user: better, all gates zero); the
 // verify latch already forces it off for gate runs.
-REXCVAR_DEFINE_BOOL(gpu_nr_lean_sysconst, true, "GPU/D3D12",
-                    "[NR-LEAN] 5-4-4b inc 2b: under the bindings swap with verify off, "
-                    "skip the emulated UpdateSystemConstantValues body per draw. The "
-                    "5-3b-1 mirror (the swap's upload source) keeps running and supplies "
-                    "the dirty signal by whole-struct compare; the rare fallback to the "
-                    "emulated UpdateBindings re-syncs the member by one memcpy from the "
-                    "mirror. Counted on '[nr-swp]' as lean=/lazy=. On by default.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [NR-LEAN] 5-4-4b inc 2b: under the swap with verify off, the emulated
+// UpdateSystemConstantValues body is skipped per draw. Unconditional (cvar
+// deleted 2026-09-02).
 
 // [NR-RUB] Phase 5-4-5-1: the replay-reuse bundle gate. For every swapped
 // draw with a reuse-probe identity, the derived binding outputs (the four
@@ -317,15 +291,8 @@ REXCVAR_DEFINE_BOOL(gpu_nr_reuse_v2b, false, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // [NR-RSY] Phase 5-3b-3: the residency + descriptor-allocation mirror's gate.
-REXCVAR_DEFINE_BOOL(gpu_nr_residency, true, "GPU/D3D12",
-                    "[NR-RSY] Phase 5-3b-3 residency mirror: predict every vertex/index "
-                    "buffer shared-memory residency request from the draw register file "
-                    "with the native renderer's own transcription of the sync-state "
-                    "machine, mirror the bindless view-descriptor pool and the "
-                    "per-texture SRV descriptor maps, and compare the texture SRV index "
-                    "values against every emulated descriptor-indices rebuild. Reports "
-                    "'[nr-rsy]' once/sec. ON by default: the bindings swap requires it.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [NR-RSY] Phase 5-3b-3 residency mirror: the bindings swap requires it.
+// Unconditional (cvar deleted 2026-09-02).
 
 // [NR-TILP] N-4-2 outer stamps, defined in graphics/command_processor.cpp
 // (the drawstop-bracket side of the seam). See the definitions for the
@@ -5434,7 +5401,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // its sticky never-derived fields are only knowable by seeding).
   NrSysReportIfDue();
   {
-    const bool nr_sys_now = REXCVAR_GET(gpu_nr_sysconst);
+    const bool nr_sys_now = true;
     if (nr_sys_now && !g_nr_sysconst) {
       g_nr_sys_seeded = false;
     }
@@ -5464,7 +5431,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // it feeds.
   NrResReportIfDue();
   {
-    const bool nr_res_now = REXCVAR_GET(gpu_nr_residency) && bindless_resources_used_;
+    const bool nr_res_now = bindless_resources_used_;
     if (nr_res_now && !g_nr_res) {
       NrResVfetchSeedFromEmulated();
       NrResPoolReseed();
@@ -5486,12 +5453,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // still byte-checked by the sysconst gate every draw) and the 5-3b-3
   // texture-descriptor map (kept warm by the FindOrCreate hook).
   NrSwapReportIfDue();
-  g_nr_swap = REXCVAR_GET(gpu_nr_bindings_swap) && bindless_resources_used_ &&
+  g_nr_swap = bindless_resources_used_ &&
               g_nr_sysconst && g_nr_sys_seeded && g_nr_res;
   // [NR-LEAN] 5-4-4b inc 2b: the lean sysconst path needs the swap (mirror is
   // the upload source) and verify off (the whole-struct memcmp gate reads the
   // member the lean path stops deriving).
-  g_nr_lean_sys = REXCVAR_GET(gpu_nr_lean_sysconst) && g_nr_swap && !g_nr_verify;
+  g_nr_lean_sys = g_nr_swap && !g_nr_verify;
   // [NR-RUB] 5-4-5-1: verdict + latch. Needs the swap (the gate instruments
   // OUR UpdateBindings). On arm, or after a fallback made the staging
   // mirrors stale, force every compose to re-run once so the staged copies
@@ -5830,22 +5797,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0);
       s_pp = c;
     }
-    // The cycler: phase 0 = ON, phase 1 = OFF, `cycle` seconds each.
-    static auto s_pool_t0 = pp_now;
-    static bool s_pool_phase_on = true;
-    const uint32_t cycle = REXCVAR_GET(gpu_draw_pool_cycle);
-    bool phase_on = true;
-    if (cycle) {
-      const uint64_t el = uint64_t(std::chrono::duration<double>(pp_now - s_pool_t0).count());
-      phase_on = ((el / cycle) & 1) == 0;
-      if (phase_on != s_pool_phase_on) {
-        s_pool_phase_on = phase_on;
-        REXGPU_INFO("[pool] PHASE {}", phase_on ? "ON" : "OFF");
-      }
+    // Unconditional since 2026-09-02 (naruto_764/765/766 clean; the cvar and
+    // its cycler are gone): the pool is how draws are issued.
+    if (!g_pool_on) {
+      PoolReset();
+      g_pool_on = true;
     }
-    const bool want = REXCVAR_GET(gpu_draw_pool) && phase_on;
-    if (want && !g_pool_on) PoolReset();
-    g_pool_on = want;
   }
 
   // [BATCH-CENSUS] fold the frame that just ended (under the OLD arm state,
