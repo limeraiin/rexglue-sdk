@@ -2377,9 +2377,12 @@ void BatchCensusRunEnd() {
   g_bc_run_len = 0;
 }
 
+void Bc2PassClose();
+void Bc2FrameEnd();
 void BatchCensusBreak() {
   BatchCensusRunEnd();
   ++g_bc_breaks;
+  Bc2PassClose();
 }
 
 void BatchCensusDraw(uint64_t key) {
@@ -2418,6 +2421,138 @@ void BatchCensusFrameEnd() {
   g_bc_extra += extra;
   if (mx > g_bc_maxkey) g_bc_maxkey = mx;
   g_bc_frame_keys.clear();
+  Bc2FrameEnd();
+}
+
+// [BATCH-CENSUS v2] The pooling question with the erosion steps separated.
+// v1's key (geometry + shaders) is an UPPER BOUND on mergeability: two draws
+// with the same key can still differ in bound textures, blend/depth state,
+// viewport or render-target config, and a mesh drawn in two passes counts as
+// a repeat. v2 folds ONE draw into three scopes with the FULL merge key
+// (v1 + texture fetch constants of every used slot + the raster/blend/depth/
+// viewport state + the pass key):
+//   fr   = frame-global, full key      (v1 minus the texture/state erosion)
+//   pass = within one render-target config, resolve to resolve
+//   win  = within a run of ORDER-INDEPENDENT draws (blend off, z test AND
+//          z write) of one pass; any other draw closes the window, because a
+//          pooled draw is issued at the window's END and may not be
+//          reordered across a blended or z-disabled draw.
+// win extra is the number a host in-pass pooler can actually remove today;
+// fr/pass extra bound what a smarter order treatment could add.
+// One open-addressed table, epoch-tagged per scope: a slot is empty when its
+// frame epoch is stale, so a frame is insert-only and reset is one increment.
+struct Bc2Slot {
+  uint64_t key;
+  uint32_t ep_fr, ep_pass, ep_win;
+  uint32_t n_fr, n_pass, n_win;
+};
+constexpr uint32_t kBc2Slots = 1u << 16;
+constexpr uint32_t kBc2MaxProbe = 64;
+std::vector<Bc2Slot> g_bc2_tab;
+uint32_t g_bc2_ep_fr = 1, g_bc2_ep_pass = 1, g_bc2_ep_win = 1;
+uint64_t g_bc2_pass_key = 0;
+bool g_bc2_pass_open = false;
+uint32_t g_bc2_cur_win_draws = 0;  // opaque draws in the open window
+enum : uint32_t { kBc2Opq = 0, kBc2Zro = 1, kBc2Bld = 2 };
+struct Bc2Counters {
+  uint64_t extra_fr = 0, extra_pass = 0, extra_win = 0;
+  uint64_t passes = 0, wins = 0, win_blk = 0, win_draws = 0, keys_win = 0;
+  uint64_t cls[3] = {0, 0, 0};
+  uint64_t ord[4] = {0, 0, 0, 0};  // pooled draw by ordinal: 2-3 / 4-9 / 10-49 / 50+
+  uint64_t inst_vec4 = 0;          // per-instance vec4s streamed by pooled draws
+  uint64_t ovf = 0;
+};
+Bc2Counters g_bc2;
+uint64_t g_bc2_maxwin = 0;  // window max key count, reset at each report
+
+Bc2Slot* Bc2Lookup(uint64_t key) {
+  uint32_t i = uint32_t(key ^ (key >> 29) ^ (key >> 47)) & (kBc2Slots - 1);
+  for (uint32_t p = 0; p < kBc2MaxProbe; ++p) {
+    Bc2Slot& s = g_bc2_tab[i];
+    if (s.ep_fr != g_bc2_ep_fr) {
+      s.key = key;
+      s.ep_fr = g_bc2_ep_fr;
+      s.ep_pass = s.ep_win = 0;
+      s.n_fr = s.n_pass = s.n_win = 0;
+      return &s;
+    }
+    if (s.key == key) return &s;
+    i = (i + 1) & (kBc2Slots - 1);
+  }
+  return nullptr;
+}
+
+void Bc2WinClose(bool by_draw) {
+  if (g_bc2_cur_win_draws) {
+    ++g_bc2.wins;
+    if (by_draw) ++g_bc2.win_blk;
+  }
+  g_bc2_cur_win_draws = 0;
+  ++g_bc2_ep_win;
+}
+
+void Bc2PassClose() {
+  Bc2WinClose(false);
+  if (g_bc2_pass_open) ++g_bc2.passes;
+  g_bc2_pass_open = false;
+  ++g_bc2_ep_pass;
+}
+
+void Bc2Draw(uint64_t key, uint64_t pass_key, uint32_t cls, uint32_t vs_float_count) {
+  if (!g_bc2_pass_open || pass_key != g_bc2_pass_key) {
+    Bc2PassClose();
+    g_bc2_pass_key = pass_key;
+    g_bc2_pass_open = true;
+  }
+  ++g_bc2.cls[cls];
+  if (cls != kBc2Opq) Bc2WinClose(true);
+  Bc2Slot* s = Bc2Lookup(key);
+  if (!s) {
+    ++g_bc2.ovf;  // undercounted, never miscounted
+    return;
+  }
+  if (++s->n_fr >= 2) ++g_bc2.extra_fr;
+  if (s->ep_pass != g_bc2_ep_pass) {
+    s->ep_pass = g_bc2_ep_pass;
+    s->n_pass = 0;
+  }
+  if (++s->n_pass >= 2) ++g_bc2.extra_pass;
+  if (cls != kBc2Opq) return;
+  if (s->ep_win != g_bc2_ep_win) {
+    s->ep_win = g_bc2_ep_win;
+    s->n_win = 0;
+  }
+  ++g_bc2_cur_win_draws;
+  ++g_bc2.win_draws;
+  const uint32_t n = ++s->n_win;
+  if (n == 1) {
+    ++g_bc2.keys_win;
+    return;
+  }
+  ++g_bc2.extra_win;
+  g_bc2.inst_vec4 += vs_float_count;
+  g_bc2.ord[n < 4 ? 0 : n < 10 ? 1 : n < 50 ? 2 : 3] += 1;
+  if (n > g_bc2_maxwin) g_bc2_maxwin = n;
+}
+
+void Bc2FrameEnd() {
+  Bc2PassClose();
+  ++g_bc2_ep_fr;
+  if (g_bc2_ep_fr == 0) {  // wrap: every slot must read stale
+    for (Bc2Slot& s : g_bc2_tab) s.ep_fr = 0;
+    g_bc2_ep_fr = 1;
+  }
+}
+
+void Bc2Reset() {
+  if (g_bc2_tab.empty()) g_bc2_tab.resize(kBc2Slots);
+  for (Bc2Slot& s : g_bc2_tab) s.ep_fr = 0;
+  g_bc2_ep_fr = g_bc2_ep_pass = g_bc2_ep_win = 1;
+  g_bc2_pass_key = 0;
+  g_bc2_pass_open = false;
+  g_bc2_cur_win_draws = 0;
+  g_bc2 = Bc2Counters{};
+  g_bc2_maxwin = 0;
 }
 
 void BatchCensusReset() {
@@ -2428,6 +2563,7 @@ void BatchCensusReset() {
   g_bc_frame_keys.clear();
   g_bc_frame_ovf = 0;
   g_bc_frames = g_bc_keys = g_bc_rep_draws = g_bc_extra = g_bc_maxkey = 0;
+  Bc2Reset();
 }
 }  // namespace
 
@@ -5364,6 +5500,53 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             100.0 * double(rundraws) / dd, g_bc_maxrun,
             frames ? keys / frames : 0, rep, 100.0 * double(rep) / dd, extra,
             100.0 * double(extra) / dd, g_bc_maxkey, ovf, frames, breaks);
+        // [BATCH-CENSUS v2] the same draws through the full merge key, by
+        // scope. Read `win` as what a host in-pass pooler removes today,
+        // `pass`/`fr` as what order treatment could add; `blk` = windows a
+        // blended/z-off draw closed (the interleave), `after` = projected
+        // draws/frame once win extra is pooled.
+        {
+          static Bc2Counters s_bc2;
+          const Bc2Counters& c = g_bc2;
+          const uint64_t xf = c.extra_fr - s_bc2.extra_fr;
+          const uint64_t xp = c.extra_pass - s_bc2.extra_pass;
+          const uint64_t xw = c.extra_win - s_bc2.extra_win;
+          const uint64_t passes = c.passes - s_bc2.passes;
+          const uint64_t wins = c.wins - s_bc2.wins;
+          const uint64_t blk = c.win_blk - s_bc2.win_blk;
+          const uint64_t wdraws = c.win_draws - s_bc2.win_draws;
+          const uint64_t wkeys = c.keys_win - s_bc2.keys_win;
+          const uint64_t opq = c.cls[0] - s_bc2.cls[0];
+          const uint64_t zro = c.cls[1] - s_bc2.cls[1];
+          const uint64_t bld = c.cls[2] - s_bc2.cls[2];
+          uint64_t ord[4];
+          for (int i = 0; i < 4; ++i) ord[i] = c.ord[i] - s_bc2.ord[i];
+          const uint64_t vec4 = c.inst_vec4 - s_bc2.inst_vec4;
+          const uint64_t ovf2 = c.ovf - s_bc2.ovf;
+          static auto s_bc2_last = bc_now;
+          const double secs = std::chrono::duration<double>(bc_now - s_bc2_last).count();
+          s_bc2_last = bc_now;
+          const double fr = frames ? double(frames) : 1.0;
+          REXGPU_INFO(
+              "[batch-census2] fullkey extra fr={} ({:.1f}%) pass={} ({:.1f}%) "
+              "win={} ({:.1f}%) | passes/fr={:.1f} win/fr={:.1f} blk/fr={:.1f} "
+              "draws/win={:.1f} keys/win={:.1f} maxwin={} | class opq={:.1f}% "
+              "zro={:.1f}% bld={:.1f}% | pooled by ord 2-3/4-9/10-49/50+ = "
+              "{:.1f}/{:.1f}/{:.1f}/{:.1f}% | inst vec4/draw={:.1f} = {:.1f} MB/s "
+              "| dpf {:.0f} -> {:.0f} | ovf={}",
+              xf, 100.0 * double(xf) / dd, xp, 100.0 * double(xp) / dd, xw,
+              100.0 * double(xw) / dd, double(passes) / fr, double(wins) / fr,
+              double(blk) / fr, wins ? double(wdraws) / double(wins) : 0.0,
+              wins ? double(wkeys) / double(wins) : 0.0, g_bc2_maxwin,
+              100.0 * double(opq) / dd, 100.0 * double(zro) / dd,
+              100.0 * double(bld) / dd, 100.0 * double(ord[0]) / dd,
+              100.0 * double(ord[1]) / dd, 100.0 * double(ord[2]) / dd,
+              100.0 * double(ord[3]) / dd, xw ? double(vec4) / double(xw) : 0.0,
+              secs > 0 ? double(vec4) * 16.0 / secs / 1048576.0 : 0.0,
+              double(draws) / fr, double(draws - xw) / fr, ovf2);
+          g_bc2_maxwin = 0;
+          s_bc2 = c;
+        }
         g_bc_maxrun = 0;
         g_bc_maxkey = 0;
         s_bc[0] = g_bc_draws;
@@ -7043,12 +7226,76 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_batch_census) {
     auto _dp_bc0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-    BatchCensusDraw(InstBatchKey(
+    const uint64_t bc_key = InstBatchKey(
         regs, vertex_shader, pixel_shader, uint32_t(primitive_type), index_count,
         primitive_processing_result.host_draw_vertex_count,
         index_buffer_info ? index_buffer_info->guest_base : 0u,
         index_buffer_info ? int(index_buffer_info->format) : -1,
-        index_buffer_info ? index_buffer_info->count : 0u, nullptr));
+        index_buffer_info ? index_buffer_info->count : 0u, nullptr);
+    BatchCensusDraw(bc_key);
+    // [BATCH-CENSUS v2] the pass key = the render-target config this draw
+    // writes; the full key = v1 + every used texture fetch constant + the
+    // blend/depth/mask/stencil/alpha state + viewport/scissor/offset + cull
+    // + the pass key. Order class from the same registers: opaque = no RT
+    // blends AND depth tested AND depth written.
+    {
+      uint64_t pk = 0;
+      pk = inst_mix(pk, regs[XE_GPU_REG_RB_SURFACE_INFO]);
+      pk = inst_mix(pk, regs[XE_GPU_REG_RB_MODECONTROL]);
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if ((normalized_color_mask >> (4 * i)) & 0xF) {
+          pk = inst_mix(pk, (uint64_t(i) << 32) |
+                                regs[reg::RB_COLOR_INFO::rt_register_indices[i]]);
+        }
+      }
+      if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
+        pk = inst_mix(pk, 0x100000000ull | regs[XE_GPU_REG_RB_DEPTH_INFO]);
+      }
+      uint64_t k2 = inst_mix(bc_key, pk);
+      uint32_t tm = used_texture_mask, ti;
+      while (rex::bit_scan_forward(tm, &ti)) {
+        tm &= ~(uint32_t(1) << ti);
+        const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * ti;
+        for (uint32_t j = 0; j < 6; ++j) k2 = inst_mix(k2, regs[base + j]);
+      }
+      bool blends = false;
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if (!((normalized_color_mask >> (4 * i)) & 0xF)) continue;
+        const uint32_t bcv = regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF;
+        k2 = inst_mix(k2, bcv);
+        reg::RB_BLENDCONTROL bc;
+        bc.value = bcv;
+        if (bc.color_srcblend != xenos::BlendFactor::kOne ||
+            bc.color_destblend != xenos::BlendFactor::kZero ||
+            bc.color_comb_fcn != xenos::BlendOp::kAdd ||
+            bc.alpha_srcblend != xenos::BlendFactor::kOne ||
+            bc.alpha_destblend != xenos::BlendFactor::kZero ||
+            bc.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+          blends = true;
+        }
+      }
+      k2 = inst_mix(k2, normalized_color_mask);
+      k2 = inst_mix(k2, normalized_depth_control.value);
+      const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+      k2 = inst_mix(k2, colorcontrol.value & 0x1F);
+      if (colorcontrol.alpha_test_enable) k2 = inst_mix(k2, regs[XE_GPU_REG_RB_ALPHA_REF]);
+      if (normalized_depth_control.stencil_enable) {
+        k2 = inst_mix(k2, regs[XE_GPU_REG_RB_STENCILREFMASK]);
+        k2 = inst_mix(k2, regs[XE_GPU_REG_RB_STENCILREFMASK_BF]);
+      }
+      for (uint32_t j = 0; j < 6; ++j) k2 = inst_mix(k2, regs[XE_GPU_REG_PA_CL_VPORT_XSCALE + j]);
+      k2 = inst_mix(k2, regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL]);
+      k2 = inst_mix(k2, regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR]);
+      k2 = inst_mix(k2, regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET]);
+      k2 = inst_mix(k2, regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL]);
+      k2 = inst_mix(k2, regs[XE_GPU_REG_PA_CL_VTE_CNTL]);
+      const uint32_t cls =
+          blends ? kBc2Bld
+                 : (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable)
+                       ? kBc2Opq
+                       : kBc2Zro;
+      Bc2Draw(k2, pk, cls, vertex_shader->constant_register_map().float_count);
+    }
     if (g_draw_prof) g_draw_ns[26] += prof_ns_since(_dp_bc0);
   }
   return true;
