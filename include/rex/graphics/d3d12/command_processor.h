@@ -1264,6 +1264,18 @@ class D3D12CommandProcessor : public CommandProcessor {
   // [GPU-INST] Emit the open batch (if any) as a single instanced draw.
   void FlushInstancedBatch();
 
+  // [DRAW-POOL] rung 1: in-pass pooling of order-independent repeat draws.
+  // The first occurrence of a key is issued in place as ONE indirect
+  // instanced draw whose argument buffer and instance constant block live in
+  // the upload heap; every later occurrence in the same window appends its
+  // vertex float constants and raises the instance count in that buffer,
+  // skipping its own IssueDraw entirely. Nothing is deferred or replayed.
+  Microsoft::WRL::ComPtr<ID3D12CommandSignature> pool_cmdsig_indexed_;
+  Microsoft::WRL::ComPtr<ID3D12CommandSignature> pool_cmdsig_draw_;
+  bool PoolOpenAndDraw(uint64_t key, const RegisterFile& regs, const D3D12Shader* vertex_shader,
+                       const D3D12Shader* pixel_shader, uint32_t host_draw_vertex_count,
+                       bool indexed, uint32_t capacity);
+
   // Whether the latest shared memory and EDRAM buffer binding contains the
   // shared memory UAV rather than the SRV.
   // Separate descriptor tables for the SRV and the UAV, even though only one is

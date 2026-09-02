@@ -287,6 +287,19 @@ class DeferredCommandList {
     args.start_instance_location = start_instance_location;
   }
 
+  // [DRAW-POOL] one indirect draw whose arguments live in a CPU-writable
+  // (upload heap) buffer, so the instance count can be raised after the
+  // draw was recorded, until the list is executed.
+  void D3DExecuteIndirect(ID3D12CommandSignature* command_signature, UINT max_command_count,
+                          ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset) {
+    auto& args = *reinterpret_cast<D3DExecuteIndirectArguments*>(
+        WriteCommand(Command::kD3DExecuteIndirect, sizeof(D3DExecuteIndirectArguments)));
+    args.command_signature = command_signature;
+    args.max_command_count = max_command_count;
+    args.argument_buffer = argument_buffer;
+    args.argument_buffer_offset = argument_buffer_offset;
+  }
+
   void D3DDrawInstanced(UINT vertex_count_per_instance, UINT instance_count,
                         UINT start_vertex_location, UINT start_instance_location) {
     auto& args = *reinterpret_cast<D3DDrawInstancedArguments*>(
@@ -593,6 +606,7 @@ class DeferredCommandList {
     kD3DDispatch,
     kD3DDrawIndexedInstanced,
     kD3DDrawInstanced,
+    kD3DExecuteIndirect,
     kD3DBeginQuery,
     kD3DEndQuery,
     kD3DResolveQueryData,
@@ -705,6 +719,13 @@ class DeferredCommandList {
     UINT instance_count;
     UINT start_vertex_location;
     UINT start_instance_location;
+  };
+
+  struct D3DExecuteIndirectArguments {
+    ID3D12CommandSignature* command_signature;
+    UINT max_command_count;
+    ID3D12Resource* argument_buffer;
+    UINT64 argument_buffer_offset;
   };
 
   struct D3DQueryArguments {

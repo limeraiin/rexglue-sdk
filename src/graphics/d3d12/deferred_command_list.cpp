@@ -93,6 +93,14 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
                                  args.thread_group_count_z);
         }
       } break;
+      case Command::kD3DExecuteIndirect: {
+        if (current_pipeline_state != nullptr) {
+          auto& args = *reinterpret_cast<const D3DExecuteIndirectArguments*>(stream);
+          command_list->ExecuteIndirect(args.command_signature, args.max_command_count,
+                                        args.argument_buffer, args.argument_buffer_offset, nullptr,
+                                        0);
+        }
+      } break;
       case Command::kD3DDrawIndexedInstanced: {
         if (current_pipeline_state != nullptr) {
           auto& args = *reinterpret_cast<const D3DDrawIndexedInstancedArguments*>(stream);
@@ -306,6 +314,7 @@ void DeferredCommandList::NrBfcScan(size_t start_elements, NrBfcSpanCounts* out)
     switch (header.command) {
       case Command::kD3DDrawIndexedInstanced:
       case Command::kD3DDrawInstanced:
+      case Command::kD3DExecuteIndirect:
         ++out->draw;
         break;
       case Command::kD3DSetPipelineState:
@@ -412,6 +421,7 @@ void DeferredCommandList::NrSprScanSpan(size_t start_elements, NrSprScan* out) c
     switch (header.command) {
       case Command::kD3DDrawIndexedInstanced:
       case Command::kD3DDrawInstanced:
+      case Command::kD3DExecuteIndirect:
         ++out->draw;
         break;
       case Command::kD3DSetPipelineState:

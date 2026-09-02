@@ -81,6 +81,15 @@ REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU/D3D12",
 // (prim + counts + VS/PS ucode hashes + IB identity + bound-VB hash) - an
 // UPPER BOUND on mergeability (RT/viewport state is not in the key). Runs at
 // the IssueDrawImpl success seam, outside every [gpu-draw] phase bracket;
+// [DRAW-POOL] rung 1. `gpu_draw_pool` is the A/B switch for the city gate;
+// `gpu_draw_pool_cycle` N alternates ON/OFF every N seconds in place (the
+// phase is logged as '[pool] PHASE'). When the gate passes the cvars go.
+REXCVAR_DEFINE_BOOL(gpu_draw_pool, true, "GPU/D3D12",
+                    "Pool order-independent repeat draws of a pass into one instanced "
+                    "indirect draw. '[pool]' 1 Hz.");
+REXCVAR_DEFINE_UINT32(gpu_draw_pool_cycle, 0, "GPU/D3D12",
+                      "Seconds per phase of the in-place ON/OFF cycle of gpu_draw_pool "
+                      "(0 = fixed).");
 // its own cost is bracketed as `bc` on [gpu-draw2]. Logs '[batch-census]' 1 Hz.
 REXCVAR_DEFINE_BOOL(gpu_batch_census, false, "GPU/D3D12",
                     "Diagnostic: 1 Hz census of issued draws sharing a batch key with a "
@@ -2602,6 +2611,276 @@ void BatchCensusReset() {
   g_bc_frame_ovf = 0;
   g_bc_frames = g_bc_keys = g_bc_rep_draws = g_bc_extra = g_bc_maxkey = 0;
   Bc2Reset();
+}
+
+// ===================== [DRAW-POOL] rung 1 =====================
+// The city draw stream repeats a full merge key (geometry + shaders + VB/IB +
+// textures + blend/depth state + RT config) for 36% of its draws WITHIN a
+// pass, interleaved, and every one of those repeats is order-independent
+// (naruto_762). The pool turns each such repeat into one appended instance:
+//   key time (before any derivation): compute the key; if a batch is open
+//     for it in the current window and the draw's remaining state matches
+//     the batch's snapshot byte for byte, append the vertex float constants
+//     to the batch's instance block, raise InstanceCount in its argument
+//     buffer, and return. That skips IssueDraw entirely.
+//   emission (first occurrence, eligible, predictor says the key repeats):
+//     one ExecuteIndirect with the instanced VS variant instead of a plain
+//     draw; args + instance block reserved from the upload pool.
+//   window close (any non-opaque draw, RT config change, resolve, frame
+//     end, submission): one epoch increment; nothing to flush.
+// Reordering: an appended instance renders at the FIRST occurrence's
+// position. Legal because the pool class is order-independent by blend
+// arithmetic (color ONE/ZERO, alpha ONE/ZERO or ZERO/ZERO) AND z-tested AND
+// z-written, and no non-opaque draw sits between the two (it would have
+// closed the window).
+// Same-address hazards: a VB/IB/texture rewritten between the two draws at
+// the same address would be a fence violation on real hardware too (the GPU
+// consumes asynchronously), so the key's addresses identify contents.
+bool g_pool_on = false;
+constexpr uint32_t kPoolMaxPsVec4 = 64;
+// Context registers that feed the system constants / fixed-function state
+// and are NOT already in the key: compared byte for byte on a hit.
+constexpr uint32_t kPoolRegRanges[][2] = {
+    {0x2000, 0x2006}, {0x200E, 0x2010}, {0x2080, 0x208C}, {0x2100, 0x2115}, {0x2180, 0x2185},
+    {0x2200, 0x220C}, {0x2280, 0x2295}, {0x2300, 0x2309}, {0x2312, 0x2313}, {0x2380, 0x23A0}};
+constexpr uint32_t kPoolRegCount = 6 + 2 + 12 + 21 + 5 + 12 + 21 + 9 + 1 + 32;
+struct PoolSnap {
+  uint32_t regs[kPoolRegCount];
+  uint32_t bool_loop[8 + 32];
+  uint32_t ps_n;  // dwords of ps[] in use
+  uint32_t ps[kPoolMaxPsVec4 * 4];
+};
+struct PoolBatch {
+  uint64_t key;
+  uint32_t epoch;
+  uint32_t count, capacity, float_count;
+  uint64_t float_bitmap[4];
+  uint8_t* inst;        // upload-heap instance block (write only)
+  uint32_t* count_ptr;  // InstanceCount inside the argument buffer
+  PoolSnap snap;
+};
+std::vector<PoolBatch> g_pool_batches;  // arena, reused per window
+uint32_t g_pool_batch_n = 0;
+struct PoolSlot {
+  uint64_t key;
+  uint32_t epoch;
+  uint32_t batch;
+};
+constexpr uint32_t kPoolSlots = 1u << 13;
+constexpr uint32_t kPoolMaxProbe = 32;
+std::vector<PoolSlot> g_pool_tab;
+uint32_t g_pool_epoch = 1;
+uint64_t g_pool_pass_key = 0;
+bool g_pool_pass_open = false;
+// The repeat predictor: a key's max count within one window of the previous
+// frame decides whether its first occurrence opens a batch (and how big).
+// A key that never repeated draws plainly and costs nothing.
+struct PoolPred {
+  uint64_t key;
+  uint32_t frame, win_epoch;
+  uint16_t win_count, frame_max, prev_max, pad;
+};
+constexpr uint32_t kPoolPredSlots = 1u << 14;
+std::vector<PoolPred> g_pool_pred;
+uint32_t g_pool_frame = 1;
+struct PoolStats {
+  uint64_t draws = 0, opq = 0, hit = 0, opened = 0, first_in_batch = 0;
+  uint64_t ref_pred = 0, ref_cap = 0, ref_vfy_regs = 0, ref_vfy_ps = 0, ref_vfy_bl = 0,
+           ref_elig = 0, ref_tile = 0, ref_alloc = 0, ref_psbig = 0, ref_ovf = 0;
+  uint64_t close_class = 0, close_pass = 0, close_copy = 0, close_frame = 0, close_submit = 0;
+  uint64_t hist[5] = {0, 0, 0, 0, 0};  // closed batch sizes 1 / 2-3 / 4-9 / 10-49 / 50+
+  uint64_t inst_bytes = 0, frames = 0;
+};
+PoolStats g_pool;
+
+enum PoolCloseReason { kPoolCloseClass, kPoolClosePass, kPoolCloseCopy, kPoolCloseFrame,
+                       kPoolCloseSubmit };
+void PoolClose(PoolCloseReason why) {
+  for (uint32_t i = 0; i < g_pool_batch_n; ++i) {
+    const uint32_t n = g_pool_batches[i].count;
+    ++g_pool.hist[n < 2 ? 0 : n < 4 ? 1 : n < 10 ? 2 : n < 50 ? 3 : 4];
+  }
+  if (g_pool_batch_n) {
+    switch (why) {
+      case kPoolCloseClass: ++g_pool.close_class; break;
+      case kPoolClosePass: ++g_pool.close_pass; break;
+      case kPoolCloseCopy: ++g_pool.close_copy; break;
+      case kPoolCloseFrame: ++g_pool.close_frame; break;
+      case kPoolCloseSubmit: ++g_pool.close_submit; break;
+    }
+  }
+  g_pool_batch_n = 0;
+  ++g_pool_epoch;
+  if (g_pool_epoch == 0) {
+    for (PoolSlot& s : g_pool_tab) s.epoch = 0;
+    for (PoolPred& p : g_pool_pred) p.win_epoch = 0;
+    g_pool_epoch = 1;
+  }
+  if (why == kPoolClosePass || why == kPoolCloseCopy || why == kPoolCloseFrame ||
+      why == kPoolCloseSubmit) {
+    g_pool_pass_open = false;
+  }
+}
+
+void PoolReset() {
+  if (g_pool_tab.empty()) g_pool_tab.resize(kPoolSlots);
+  if (g_pool_pred.empty()) g_pool_pred.resize(kPoolPredSlots);
+  if (g_pool_batches.empty()) g_pool_batches.resize(256);
+  for (PoolSlot& s : g_pool_tab) s.epoch = 0;
+  for (PoolPred& p : g_pool_pred) { p.key = 0; p.frame = 0; p.win_epoch = 0; }
+  g_pool_batch_n = 0;
+  g_pool_epoch = 1;
+  g_pool_pass_open = false;
+  g_pool_frame = 1;
+}
+
+PoolSlot* PoolLookup(uint64_t key) {
+  uint32_t i = uint32_t(key ^ (key >> 29) ^ (key >> 47)) & (kPoolSlots - 1);
+  for (uint32_t p = 0; p < kPoolMaxProbe; ++p) {
+    PoolSlot& s = g_pool_tab[i];
+    if (s.epoch != g_pool_epoch) {
+      s.key = key;
+      s.epoch = g_pool_epoch;
+      s.batch = UINT32_MAX;
+      return &s;
+    }
+    if (s.key == key) return &s;
+    i = (i + 1) & (kPoolSlots - 1);
+  }
+  return nullptr;
+}
+
+// Counts this occurrence of the key in the current window/frame and returns
+// the key's max window count from the PREVIOUS frame.
+uint32_t PoolPredict(uint64_t key) {
+  PoolPred& p = g_pool_pred[uint32_t(key ^ (key >> 31)) & (kPoolPredSlots - 1)];
+  if (p.key != key) {
+    p.key = key;
+    p.frame = 0;
+    p.prev_max = 0;
+    p.frame_max = 0;
+    p.win_epoch = 0;
+  }
+  if (p.frame != g_pool_frame) {
+    // A key absent for a whole frame forgets; one frame back is the model.
+    p.prev_max = (p.frame + 1 == g_pool_frame) ? p.frame_max : 0;
+    p.frame_max = 0;
+    p.frame = g_pool_frame;
+    p.win_epoch = 0;
+  }
+  if (p.win_epoch != g_pool_epoch) {
+    p.win_epoch = g_pool_epoch;
+    p.win_count = 0;
+  }
+  if (p.win_count < 0xFFFF) ++p.win_count;
+  if (p.win_count > p.frame_max) p.frame_max = p.win_count;
+  return p.prev_max;
+}
+
+// The pool class: order-independent by blend arithmetic on every written RT
+// AND depth tested AND depth written, in the color+depth EDRAM mode.
+bool PoolClassOpaque(const RegisterFile& regs) {
+  if (regs.Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kColorDepth) return false;
+  const reg::RB_DEPTHCONTROL dc = draw_util::GetNormalizedDepthControl(regs);
+  if (!dc.z_enable || !dc.z_write_enable) return false;
+  const uint32_t mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (!((mask >> (4 * i)) & 0xF)) continue;
+    reg::RB_BLENDCONTROL bc;
+    bc.value = regs[reg::RB_BLENDCONTROL::rt_register_indices[i]];
+    if (bc.color_srcblend != xenos::BlendFactor::kOne ||
+        bc.color_destblend != xenos::BlendFactor::kZero ||
+        bc.color_comb_fcn != xenos::BlendOp::kAdd || bc.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+      return false;
+    }
+    const bool a_replace = bc.alpha_srcblend == xenos::BlendFactor::kOne &&
+                           bc.alpha_destblend == xenos::BlendFactor::kZero;
+    const bool a_const = bc.alpha_srcblend == xenos::BlendFactor::kZero &&
+                         bc.alpha_destblend == xenos::BlendFactor::kZero;
+    if (!a_replace && !a_const) return false;
+  }
+  return true;
+}
+
+// Everything a hit must match beyond the key. False = the pixel shader's
+// constants cannot be snapshotted (dynamic addressing / too many).
+bool PoolGather(const RegisterFile& regs, const Shader* ps, PoolSnap& out) {
+  uint32_t k = 0;
+  for (const auto& r : kPoolRegRanges) {
+    for (uint32_t i = r[0]; i < r[1]; ++i) out.regs[k++] = regs[i];
+  }
+  for (uint32_t i = 0; i < 8; ++i) out.bool_loop[i] = regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i];
+  for (uint32_t i = 0; i < 32; ++i) out.bool_loop[8 + i] = regs[XE_GPU_REG_SHADER_CONSTANT_LOOP_00 + i];
+  out.ps_n = 0;
+  if (!ps) return true;
+  const Shader::ConstantRegisterMap& cm = ps->constant_register_map();
+  if (cm.float_dynamic_addressing || cm.float_count > kPoolMaxPsVec4) return false;
+  uint32_t* dst = out.ps;
+  for (uint32_t word = 0; word < 4; ++word) {
+    uint64_t entry = cm.float_bitmap[word];
+    uint32_t idx;
+    while (rex::bit_scan_forward(entry, &idx)) {
+      entry &= ~(uint64_t(1) << idx);
+      std::memcpy(dst, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (word << 8) + (idx << 2)], 16);
+      dst += 4;
+    }
+  }
+  out.ps_n = uint32_t(dst - out.ps);
+  return true;
+}
+
+// The instance block layout is the instanced VS's: the used vertex float
+// constants, packed in bitmap order, float_count vec4s per instance.
+void PoolPackInstance(const RegisterFile& regs, const uint64_t bitmap[4], uint8_t* dst) {
+  for (uint32_t word = 0; word < 4; ++word) {
+    uint64_t entry = bitmap[word];
+    uint32_t idx;
+    while (rex::bit_scan_forward(entry, &idx)) {
+      entry &= ~(uint64_t(1) << idx);
+      std::memcpy(dst, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (word << 8) + (idx << 2)], 16);
+      dst += 16;
+    }
+  }
+}
+
+// The hit path. True = this draw is now an instance of an open batch.
+bool PoolTryHit(uint64_t key, const RegisterFile& regs, const Shader* ps) {
+  PoolSlot* s = PoolLookup(key);
+  if (!s) {
+    ++g_pool.ref_ovf;
+    return false;
+  }
+  if (s->batch == UINT32_MAX) return false;
+  PoolBatch& b = g_pool_batches[s->batch];
+  if (b.epoch != g_pool_epoch || b.key != key) return false;
+  if (b.count >= b.capacity) {
+    ++g_pool.ref_cap;
+    s->batch = UINT32_MAX;  // the next occurrence opens a fresh batch
+    return false;
+  }
+  PoolSnap now;
+  if (!PoolGather(regs, ps, now)) {
+    ++g_pool.ref_psbig;
+    return false;
+  }
+  if (std::memcmp(now.regs, b.snap.regs, sizeof(now.regs)) != 0) {
+    ++g_pool.ref_vfy_regs;
+    return false;
+  }
+  if (std::memcmp(now.bool_loop, b.snap.bool_loop, sizeof(now.bool_loop)) != 0) {
+    ++g_pool.ref_vfy_bl;
+    return false;
+  }
+  if (now.ps_n != b.snap.ps_n || std::memcmp(now.ps, b.snap.ps, now.ps_n * 4) != 0) {
+    ++g_pool.ref_vfy_ps;
+    return false;
+  }
+  PoolPackInstance(regs, b.float_bitmap, b.inst + size_t(b.count) * b.float_count * 16);
+  ++b.count;
+  *b.count_ptr = b.count;
+  g_pool.inst_bytes += size_t(b.float_count) * 16;
+  ++g_pool.hit;
+  return true;
 }
 }  // namespace
 
@@ -5508,6 +5787,67 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
   }
 
+  // [DRAW-POOL] frame end: close the window, advance the predictor's frame,
+  // report at 1 Hz, latch the cvar / cycler phase for the next frame.
+  {
+    if (g_pool_on) PoolClose(kPoolCloseFrame);
+    ++g_pool_frame;
+    ++g_pool.frames;
+    static PoolStats s_pp;
+    static auto s_pp_last = std::chrono::steady_clock::now();
+    const auto pp_now = std::chrono::steady_clock::now();
+    if (g_pool_on && pp_now - s_pp_last >= std::chrono::seconds(1)) {
+      const double secs = std::chrono::duration<double>(pp_now - s_pp_last).count();
+      s_pp_last = pp_now;
+      const PoolStats& c = g_pool;
+      auto d = [&](uint64_t PoolStats::*f) { return c.*f - s_pp.*f; };
+      const uint64_t draws = d(&PoolStats::draws), hit = d(&PoolStats::hit),
+                     opq = d(&PoolStats::opq), opened = d(&PoolStats::opened),
+                     frames = d(&PoolStats::frames);
+      uint64_t hist[5], batches = 0;
+      for (int i = 0; i < 5; ++i) {
+        hist[i] = c.hist[i] - s_pp.hist[i];
+        batches += hist[i];
+      }
+      const double dd = draws ? double(draws) : 1.0;
+      const double fr = frames ? double(frames) : 1.0;
+      const double bb = batches ? double(batches) : 1.0;
+      REXGPU_INFO(
+          "[pool] in={}/s out={}/s (-{:.1f}%) dpf {:.0f} -> {:.0f} | opq={:.1f}% hit={:.1f}% "
+          "batches/fr={:.1f} sizes 1/2-3/4-9/10-49/50+={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% "
+          "| refuse pred1={} cap={} vfy regs/ps/bl={}/{}/{} elig={} tile={} alloc={} psbig={} "
+          "ovf={} | close class/pass/copy/frame/submit={}/{}/{}/{}/{} | inst {:.1f} MB/s",
+          draws, draws - hit, 100.0 * double(hit) / dd, double(draws) / fr,
+          double(draws - hit) / fr, 100.0 * double(opq) / dd, 100.0 * double(hit) / dd,
+          double(opened) / fr, 100.0 * double(hist[0]) / bb, 100.0 * double(hist[1]) / bb,
+          100.0 * double(hist[2]) / bb, 100.0 * double(hist[3]) / bb,
+          100.0 * double(hist[4]) / bb, d(&PoolStats::ref_pred), d(&PoolStats::ref_cap),
+          d(&PoolStats::ref_vfy_regs), d(&PoolStats::ref_vfy_ps), d(&PoolStats::ref_vfy_bl),
+          d(&PoolStats::ref_elig), d(&PoolStats::ref_tile), d(&PoolStats::ref_alloc),
+          d(&PoolStats::ref_psbig), d(&PoolStats::ref_ovf), d(&PoolStats::close_class),
+          d(&PoolStats::close_pass), d(&PoolStats::close_copy), d(&PoolStats::close_frame),
+          d(&PoolStats::close_submit),
+          secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0);
+      s_pp = c;
+    }
+    // The cycler: phase 0 = ON, phase 1 = OFF, `cycle` seconds each.
+    static auto s_pool_t0 = pp_now;
+    static bool s_pool_phase_on = true;
+    const uint32_t cycle = REXCVAR_GET(gpu_draw_pool_cycle);
+    bool phase_on = true;
+    if (cycle) {
+      const uint64_t el = uint64_t(std::chrono::duration<double>(pp_now - s_pool_t0).count());
+      phase_on = ((el / cycle) & 1) == 0;
+      if (phase_on != s_pool_phase_on) {
+        s_pool_phase_on = phase_on;
+        REXGPU_INFO("[pool] PHASE {}", phase_on ? "ON" : "OFF");
+      }
+    }
+    const bool want = REXCVAR_GET(gpu_draw_pool) && phase_on;
+    if (want && !g_pool_on) PoolReset();
+    g_pool_on = want;
+  }
+
   // [BATCH-CENSUS] fold the frame that just ended (under the OLD arm state,
   // so a mid-run flag flip cannot fold a half-censused frame), then refresh
   // the arm for the next frame; reset-on-arm like the inst-probe.
@@ -6170,6 +6510,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     if (g_nr_tile_on) NrTileSegBreak();
     // [BATCH-CENSUS] a resolve breaks a mergeable run.
     if (g_batch_census) BatchCensusBreak();
+    // [DRAW-POOL] a resolve reads what the pool's instances would still
+    // write: close every batch.
+    if (g_pool_on) PoolClose(kPoolCloseCopy);
     // [GPU-DRAW] other sub-bracket 16 (copy): the whole resolve path.
     bool _dp_copy_ok = IssueCopy();
     if (g_draw_prof) g_draw_ns[16] += prof_ns_since(_dp_total.t0);
@@ -6257,6 +6600,57 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     }
     ++g_inst_flush_site[0];
     FlushInstancedBatch();
+  }
+
+  // [DRAW-POOL] key time. Before any derivation: the key, the window
+  // bookkeeping (a non-opaque draw or an RT config change closes every
+  // batch), the predictor, and the hit path.
+  uint64_t pool_key = 0;
+  bool pool_class_ok = false;
+  uint32_t pool_pred = 0;
+  if (g_pool_on) {
+    ++g_pool.draws;
+    auto* pool_ps = static_cast<D3D12Shader*>(active_pixel_shader());
+    uint64_t pk = 0;
+    pk = inst_mix(pk, regs[XE_GPU_REG_RB_SURFACE_INFO]);
+    pk = inst_mix(pk, regs[XE_GPU_REG_RB_MODECONTROL]);
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      pk = inst_mix(pk, regs[reg::RB_COLOR_INFO::rt_register_indices[i]]);
+    }
+    pk = inst_mix(pk, regs[XE_GPU_REG_RB_DEPTH_INFO]);
+    if (!g_pool_pass_open || pk != g_pool_pass_key) {
+      if (g_pool_pass_open) PoolClose(kPoolClosePass);
+      g_pool_pass_key = pk;
+      g_pool_pass_open = true;
+    }
+    pool_class_ok = PoolClassOpaque(regs);
+    if (!pool_class_ok) {
+      PoolClose(kPoolCloseClass);
+    } else {
+      ++g_pool.opq;
+      pool_key = InstBatchKey(regs, vertex_shader, pool_ps, uint32_t(primitive_type), index_count,
+                              0, index_buffer_info ? index_buffer_info->guest_base : 0u,
+                              index_buffer_info ? int(index_buffer_info->format) : -1,
+                              index_buffer_info ? index_buffer_info->count : 0u, nullptr);
+      pool_key = inst_mix(pool_key, index_buffer_info ? uint32_t(index_buffer_info->endianness) + 1
+                                                      : 0u);
+      pool_key = inst_mix(pool_key, pk);
+      uint32_t tm = vertex_shader->GetUsedTextureMaskAfterTranslation() |
+                    (pool_ps ? pool_ps->GetUsedTextureMaskAfterTranslation() : 0u);
+      uint32_t ti;
+      while (rex::bit_scan_forward(tm, &ti)) {
+        tm &= ~(uint32_t(1) << ti);
+        const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * ti;
+        for (uint32_t j = 0; j < 6; ++j) pool_key = inst_mix(pool_key, regs[base + j]);
+      }
+      pool_pred = PoolPredict(pool_key);
+      if (g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0) {
+        ++g_pool.ref_tile;
+      } else if (PoolTryHit(pool_key, regs, pool_ps)) {
+        ++g_frame_issued;
+        return true;
+      }
+    }
   }
 
   // [GPU-PRECORD] Phase 1b-1c Inc 4 (H1/H2): hold the coarse pipeline lock across the
@@ -6432,6 +6826,35 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       vertex_shader->constant_register_map().float_count != 0 &&
       !vertex_shader->constant_register_map().float_dynamic_addressing;
 
+  // [DRAW-POOL] does this first occurrence open a batch? The class and the
+  // key were decided at key time; the predictor must have seen the key
+  // repeat within a window last frame; the rest is the instanced VS's own
+  // eligibility (the same set the old coalescer used) plus a snapshottable
+  // pixel shader and no tile recording in flight.
+  bool pool_open = false;
+  if (g_pool_on && pool_class_ok && !g_instance) {
+    if (pool_pred < 2) {
+      ++g_pool.ref_pred;
+    } else if (g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0) {
+      ++g_pool.ref_tile;
+    } else if (memexport_used || !is_rasterization_done ||
+               edram_mode != xenos::EdramMode::kColorDepth ||
+               primitive_processing_result.IsTessellated() ||
+               primitive_processing_result.host_vertex_shader_type !=
+                   Shader::HostVertexShaderType::kVertex ||
+               vertex_shader->constant_register_map().float_count == 0 ||
+               vertex_shader->constant_register_map().float_dynamic_addressing ||
+               !submission_open_) {
+      ++g_pool.ref_elig;
+    } else if (pixel_shader &&
+               (pixel_shader->constant_register_map().float_dynamic_addressing ||
+                pixel_shader->constant_register_map().float_count > kPoolMaxPsVec4)) {
+      ++g_pool.ref_psbig;
+    } else {
+      pool_open = true;
+    }
+  }
+
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
@@ -6443,7 +6866,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   DxbcShaderTranslator::Modification vertex_shader_modification =
       pipeline_cache_->GetCurrentVertexShaderModification(
           *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
-          start_instanced);
+          start_instanced || pool_open);
   DxbcShaderTranslator::Modification pixel_shader_modification =
       pixel_shader
           ? pipeline_cache_->GetCurrentPixelShaderModification(
@@ -7125,7 +7548,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
     // [GPU-INST] Defer the draw to coalesce following identical-except-transform
     // draws; the pipeline/bindings/barriers above are recorded once for the run.
-    if (start_instanced) {
+    // [DRAW-POOL] or open a batch: one indirect draw in place, instance 0 = this.
+    if (pool_open &&
+        PoolOpenAndDraw(pool_key, regs, vertex_shader, pixel_shader,
+                        primitive_processing_result.host_draw_vertex_count, /*indexed=*/false,
+                        std::min<uint32_t>(pool_pred + 1 + pool_pred / 4, 256))) {
+    } else if (start_instanced) {
       StartInstancedBatch(regs, active_vertex_shader(), active_pixel_shader(), primitive_type,
                           index_count, index_buffer_info,
                           primitive_processing_result.host_draw_vertex_count, /*indexed=*/false);
@@ -7204,7 +7632,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
     // [GPU-INST] Defer the draw to coalesce the run (memexport draws are never
     // instanced, so scratch_index_buffer is always null on this path).
-    if (start_instanced) {
+    // [DRAW-POOL] or open a batch: one indirect draw in place, instance 0 = this.
+    if (pool_open &&
+        PoolOpenAndDraw(pool_key, regs, vertex_shader, pixel_shader,
+                        primitive_processing_result.host_draw_vertex_count, /*indexed=*/true,
+                        std::min<uint32_t>(pool_pred + 1 + pool_pred / 4, 256))) {
+    } else if (start_instanced) {
       StartInstancedBatch(regs, active_vertex_shader(), active_pixel_shader(), primitive_type,
                           index_count, index_buffer_info,
                           primitive_processing_result.host_draw_vertex_count, /*indexed=*/true);
@@ -7495,6 +7928,95 @@ void D3D12CommandProcessor::FlushInstancedBatch() {
   cbuffer_binding_float_vertex_.up_to_date = false;
   ++g_instance_draws_out;
   b.data.clear();
+}
+
+// [DRAW-POOL] The first occurrence: reserve [args | instance block] from the
+// upload pool, write instance 0, bind the block as the vertex float
+// constants, record ONE ExecuteIndirect, register the batch. False = plain
+// draw instead (the instanced VS variant reads instance 0 from the normal
+// cbuffer identically, so the caller's fallback draw is still correct).
+bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& regs,
+                                            const D3D12Shader* vertex_shader,
+                                            const D3D12Shader* pixel_shader,
+                                            uint32_t host_draw_vertex_count, bool indexed,
+                                            uint32_t capacity) {
+  auto& sig = indexed ? pool_cmdsig_indexed_ : pool_cmdsig_draw_;
+  if (!sig) {
+    D3D12_INDIRECT_ARGUMENT_DESC arg = {};
+    arg.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED
+                       : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC desc = {};
+    desc.ByteStride = indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS);
+    desc.NumArgumentDescs = 1;
+    desc.pArgumentDescs = &arg;
+    if (FAILED(GetD3D12Provider().GetDevice()->CreateCommandSignature(&desc, nullptr,
+                                                                      IID_PPV_ARGS(&sig)))) {
+      ++g_pool.ref_alloc;
+      return false;
+    }
+  }
+  const Shader::ConstantRegisterMap& cm = vertex_shader->constant_register_map();
+  const uint32_t float_count = cm.float_count;
+  const uint32_t cap_max =
+      std::max(2u, DxbcShaderTranslator::kInstancedFloatConstantsVec4Capacity / float_count);
+  capacity = std::max(2u, std::min(capacity, cap_max));
+  if (g_pool_batch_n >= g_pool_batches.size()) {
+    if (g_pool_batches.size() >= 4096) {
+      ++g_pool.ref_alloc;
+      return false;
+    }
+    g_pool_batches.resize(g_pool_batches.size() * 2);
+  }
+  const size_t inst_bytes = size_t(capacity) * float_count * 16;
+  ID3D12Resource* buffer = nullptr;
+  size_t offset = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+  uint8_t* mapping = constant_buffer_pool_->Request(
+      frame_current_, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT + inst_bytes,
+      D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, &buffer, &offset, &gpu);
+  if (!mapping) {
+    ++g_pool.ref_alloc;
+    return false;
+  }
+  PoolSlot* slot = PoolLookup(key);
+  if (!slot) {
+    ++g_pool.ref_ovf;
+    return false;
+  }
+  PoolBatch& b = g_pool_batches[g_pool_batch_n];
+  if (!PoolGather(regs, pixel_shader, b.snap)) {
+    ++g_pool.ref_psbig;
+    return false;
+  }
+  uint32_t* args = reinterpret_cast<uint32_t*>(mapping);
+  args[0] = host_draw_vertex_count;
+  args[1] = 1;
+  args[2] = 0;
+  args[3] = 0;
+  if (indexed) args[4] = 0;
+  b.key = key;
+  b.epoch = g_pool_epoch;
+  b.count = 1;
+  b.capacity = capacity;
+  b.float_count = float_count;
+  std::memcpy(b.float_bitmap, cm.float_bitmap, sizeof(b.float_bitmap));
+  b.inst = mapping + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+  b.count_ptr = args + 1;
+  PoolPackInstance(regs, b.float_bitmap, b.inst);
+  slot->batch = g_pool_batch_n++;
+  const uint32_t root_parameter_float_constants_vertex =
+      bindless_resources_used_ ? kRootParameter_Bindless_FloatConstantsVertex
+                               : kRootParameter_Bindful_FloatConstantsVertex;
+  deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+      root_parameter_float_constants_vertex, gpu + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+  deferred_command_list_.D3DExecuteIndirect(sig.Get(), 1, buffer, offset);
+  // The vertex float CBV now points at the instance block; the next plain
+  // draw must re-upload and re-bind its own constants.
+  cbuffer_binding_float_vertex_.up_to_date = false;
+  g_pool.inst_bytes += size_t(float_count) * 16;
+  ++g_pool.opened;
+  ++g_pool.first_in_batch;
+  return true;
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
@@ -10842,6 +11364,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       deferred_command_list_.ExecuteStream(segment_stream, command_list_, command_list_1_);
     }
     precord_segments_.clear();
+    // [DRAW-POOL] the GPU reads the argument buffers from here on: no batch
+    // recorded in this list may take another instance.
+    if (g_pool_on) PoolClose(kPoolCloseSubmit);
     deferred_command_list_.Execute(command_list_, command_list_1_);
     // [gpu-census] the timestamps are replayed into the real list now, so
     // the resolve can be recorded directly on it.
