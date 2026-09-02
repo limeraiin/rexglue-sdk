@@ -81,6 +81,14 @@ REXCVAR_DEFINE_BOOL(gpu_draw_profile, false, "GPU/D3D12",
 // (prim + counts + VS/PS ucode hashes + IB identity + bound-VB hash) - an
 // UPPER BOUND on mergeability (RT/viewport state is not in the key). Runs at
 // the IssueDrawImpl success seam, outside every [gpu-draw] phase bracket;
+// [DRAW-POOL] rung 1b-1 (PoolPredict from the window): a key's SECOND
+// occurrence in the current window opens a batch even when last frame's
+// predictor never saw it repeat. `gpu_pool_pred2_cycle` N alternates the
+// rule ON/OFF every N seconds in place ('[pool] PHASE' logged); 0 = ON.
+// Deleted the session the drive confirms it.
+REXCVAR_DEFINE_UINT32(gpu_pool_pred2_cycle, 0, "GPU/D3D12",
+                      "Seconds per phase of the in-place ON/OFF cycle of the rung 1b-1 "
+                      "window predictor (0 = always on).");
 // its own cost is bracketed as `bc` on [gpu-draw2]. Logs '[batch-census]' 1 Hz.
 REXCVAR_DEFINE_BOOL(gpu_batch_census, false, "GPU/D3D12",
                     "Diagnostic: 1 Hz census of issued draws sharing a batch key with a "
@@ -2650,8 +2658,12 @@ struct PoolPred {
 constexpr uint32_t kPoolPredSlots = 1u << 14;
 std::vector<PoolPred> g_pool_pred;
 uint32_t g_pool_frame = 1;
+// Rung 1b-1: the window rule (second occurrence opens) and, for the
+// reporter, the last-frame prediction of the draw being issued.
+bool g_pool_pred2 = true;
+uint32_t g_pool_last_prev_max = 0;
 struct PoolStats {
-  uint64_t draws = 0, opq = 0, hit = 0, opened = 0, first_in_batch = 0;
+  uint64_t draws = 0, opq = 0, hit = 0, opened = 0, first_in_batch = 0, opened_win = 0;
   uint64_t ref_pred = 0, ref_cap = 0, ref_vfy_regs = 0, ref_vfy_ps = 0, ref_vfy_bl = 0,
            ref_elig = 0, ref_tile = 0, ref_alloc = 0, ref_psbig = 0, ref_ovf = 0;
   uint64_t close_class = 0, close_pass = 0, close_copy = 0, close_frame = 0, close_submit = 0;
@@ -2741,7 +2753,11 @@ uint32_t PoolPredict(uint64_t key) {
   }
   if (p.win_count < 0xFFFF) ++p.win_count;
   if (p.win_count > p.frame_max) p.frame_max = p.win_count;
-  return p.prev_max;
+  g_pool_last_prev_max = p.prev_max;
+  // Rung 1b-1: a key already seen once in THIS window repeats by definition;
+  // its second occurrence opens (capacity grows with the count as batches
+  // fill and reopen), so a key unseen last frame pools from its third draw.
+  return g_pool_pred2 ? std::max<uint32_t>(p.prev_max, p.win_count) : p.prev_max;
 }
 
 // The pool class: order-independent by blend arithmetic on every written RT
@@ -5783,7 +5799,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           "[pool] in={}/s out={}/s (-{:.1f}%) dpf {:.0f} -> {:.0f} | opq={:.1f}% hit={:.1f}% "
           "batches/fr={:.1f} sizes 1/2-3/4-9/10-49/50+={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% "
           "| refuse pred1={} cap={} vfy regs/ps/bl={}/{}/{} elig={} tile={} alloc={} psbig={} "
-          "ovf={} | close class/pass/copy/frame/submit={}/{}/{}/{}/{} | inst {:.1f} MB/s",
+          "ovf={} | close class/pass/copy/frame/submit={}/{}/{}/{}/{} | inst {:.1f} MB/s "
+          "| open2/fr={:.1f}",
           draws, draws - hit, 100.0 * double(hit) / dd, double(draws) / fr,
           double(draws - hit) / fr, 100.0 * double(opq) / dd, 100.0 * double(hit) / dd,
           double(opened) / fr, 100.0 * double(hist[0]) / bb, 100.0 * double(hist[1]) / bb,
@@ -5794,8 +5811,26 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           d(&PoolStats::ref_psbig), d(&PoolStats::ref_ovf), d(&PoolStats::close_class),
           d(&PoolStats::close_pass), d(&PoolStats::close_copy), d(&PoolStats::close_frame),
           d(&PoolStats::close_submit),
-          secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0);
+          secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0,
+          double(d(&PoolStats::opened_win)) / fr);
       s_pp = c;
+    }
+    // Rung 1b-1 cycler: phase 0 = window rule ON, phase 1 = OFF (last
+    // frame's predictor only), `cycle` seconds each. 0 = ON.
+    {
+      static auto s_p2_t0 = pp_now;
+      static bool s_p2_on = true;
+      const uint32_t cycle = REXCVAR_GET(gpu_pool_pred2_cycle);
+      bool on = true;
+      if (cycle) {
+        const uint64_t el = uint64_t(std::chrono::duration<double>(pp_now - s_p2_t0).count());
+        on = ((el / cycle) & 1) == 0;
+      }
+      if (on != s_p2_on) {
+        s_p2_on = on;
+        REXGPU_INFO("[pool] PHASE {}", on ? "ON" : "OFF");
+      }
+      g_pool_pred2 = on;
     }
     // Unconditional since 2026-09-02 (naruto_764/765/766 clean; the cvar and
     // its cycler are gone): the pool is how draws are issued.
@@ -7972,6 +8007,7 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
   cbuffer_binding_float_vertex_.up_to_date = false;
   g_pool.inst_bytes += size_t(float_count) * 16;
   ++g_pool.opened;
+  if (g_pool_last_prev_max < 2) ++g_pool.opened_win;
   ++g_pool.first_in_batch;
   return true;
 }
