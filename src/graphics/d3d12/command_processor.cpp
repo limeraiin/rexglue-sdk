@@ -2441,29 +2441,39 @@ void BatchCensusFrameEnd() {
 // fr/pass extra bound what a smarter order treatment could add.
 // One open-addressed table, epoch-tagged per scope: a slot is empty when its
 // frame epoch is stale, so a frame is insert-only and reset is one increment.
+// Two windows: `win` (strict: class opq only) and `win2` (opq + bzw, where
+// bzw = blend ON but depth test AND depth write ON = a material the game
+// left alpha blending enabled on; true transparents do not write depth).
+// naruto_761 classified 97% of city draws as blended, which is that habit,
+// not real transparency; win2 is the practical pool under the depth-write
+// argument, win is the provable one.
 struct Bc2Slot {
   uint64_t key;
-  uint32_t ep_fr, ep_pass, ep_win;
-  uint32_t n_fr, n_pass, n_win;
+  uint32_t ep_fr, ep_pass, ep_win[2];
+  uint32_t n_fr, n_pass, n_win[2];
 };
 constexpr uint32_t kBc2Slots = 1u << 16;
 constexpr uint32_t kBc2MaxProbe = 64;
 std::vector<Bc2Slot> g_bc2_tab;
-uint32_t g_bc2_ep_fr = 1, g_bc2_ep_pass = 1, g_bc2_ep_win = 1;
+uint32_t g_bc2_ep_fr = 1, g_bc2_ep_pass = 1, g_bc2_ep_win[2] = {1, 1};
 uint64_t g_bc2_pass_key = 0;
 bool g_bc2_pass_open = false;
-uint32_t g_bc2_cur_win_draws = 0;  // opaque draws in the open window
-enum : uint32_t { kBc2Opq = 0, kBc2Zro = 1, kBc2Bld = 2 };
+uint32_t g_bc2_cur_win_draws[2] = {0, 0};  // poolable draws in the open window
+enum : uint32_t { kBc2Opq = 0, kBc2Bzw = 1, kBc2Zro = 2, kBc2Bld = 3 };
 struct Bc2Counters {
-  uint64_t extra_fr = 0, extra_pass = 0, extra_win = 0;
-  uint64_t passes = 0, wins = 0, win_blk = 0, win_draws = 0, keys_win = 0;
-  uint64_t cls[3] = {0, 0, 0};
-  uint64_t ord[4] = {0, 0, 0, 0};  // pooled draw by ordinal: 2-3 / 4-9 / 10-49 / 50+
-  uint64_t inst_vec4 = 0;          // per-instance vec4s streamed by pooled draws
+  uint64_t extra_fr = 0, extra_pass = 0, extra_win[2] = {0, 0};
+  uint64_t passes = 0, wins[2] = {0, 0}, win_blk[2] = {0, 0}, win_draws[2] = {0, 0},
+           keys_win[2] = {0, 0};
+  uint64_t cls[4] = {0, 0, 0, 0};
+  uint64_t ord[2][4] = {};  // pooled draw by ordinal: 2-3 / 4-9 / 10-49 / 50+
+  uint64_t inst_vec4[2] = {0, 0};  // per-instance vec4s streamed by pooled draws
   uint64_t ovf = 0;
 };
 Bc2Counters g_bc2;
-uint64_t g_bc2_maxwin = 0;  // window max key count, reset at each report
+uint64_t g_bc2_maxwin[2] = {0, 0};  // window max key count, reset at each report
+// What the city actually sets: top RB_BLENDCONTROL0 (masked) and normalized
+// RB_DEPTHCONTROL values by draw count, per report window.
+std::unordered_map<uint32_t, uint64_t> g_bc2_blend_hist, g_bc2_depth_hist;
 
 Bc2Slot* Bc2Lookup(uint64_t key) {
   uint32_t i = uint32_t(key ^ (key >> 29) ^ (key >> 47)) & (kBc2Slots - 1);
@@ -2472,8 +2482,8 @@ Bc2Slot* Bc2Lookup(uint64_t key) {
     if (s.ep_fr != g_bc2_ep_fr) {
       s.key = key;
       s.ep_fr = g_bc2_ep_fr;
-      s.ep_pass = s.ep_win = 0;
-      s.n_fr = s.n_pass = s.n_win = 0;
+      s.ep_pass = s.ep_win[0] = s.ep_win[1] = 0;
+      s.n_fr = s.n_pass = s.n_win[0] = s.n_win[1] = 0;
       return &s;
     }
     if (s.key == key) return &s;
@@ -2482,30 +2492,55 @@ Bc2Slot* Bc2Lookup(uint64_t key) {
   return nullptr;
 }
 
-void Bc2WinClose(bool by_draw) {
-  if (g_bc2_cur_win_draws) {
-    ++g_bc2.wins;
-    if (by_draw) ++g_bc2.win_blk;
+void Bc2WinClose(uint32_t w, bool by_draw) {
+  if (g_bc2_cur_win_draws[w]) {
+    ++g_bc2.wins[w];
+    if (by_draw) ++g_bc2.win_blk[w];
   }
-  g_bc2_cur_win_draws = 0;
-  ++g_bc2_ep_win;
+  g_bc2_cur_win_draws[w] = 0;
+  ++g_bc2_ep_win[w];
 }
 
 void Bc2PassClose() {
-  Bc2WinClose(false);
+  Bc2WinClose(0, false);
+  Bc2WinClose(1, false);
   if (g_bc2_pass_open) ++g_bc2.passes;
   g_bc2_pass_open = false;
   ++g_bc2_ep_pass;
 }
 
-void Bc2Draw(uint64_t key, uint64_t pass_key, uint32_t cls, uint32_t vs_float_count) {
+void Bc2WinFold(Bc2Slot* s, uint32_t w, uint32_t vs_float_count) {
+  if (s->ep_win[w] != g_bc2_ep_win[w]) {
+    s->ep_win[w] = g_bc2_ep_win[w];
+    s->n_win[w] = 0;
+  }
+  ++g_bc2_cur_win_draws[w];
+  ++g_bc2.win_draws[w];
+  const uint32_t n = ++s->n_win[w];
+  if (n == 1) {
+    ++g_bc2.keys_win[w];
+    return;
+  }
+  ++g_bc2.extra_win[w];
+  g_bc2.inst_vec4[w] += vs_float_count;
+  g_bc2.ord[w][n < 4 ? 0 : n < 10 ? 1 : n < 50 ? 2 : 3] += 1;
+  if (n > g_bc2_maxwin[w]) g_bc2_maxwin[w] = n;
+}
+
+void Bc2Draw(uint64_t key, uint64_t pass_key, uint32_t cls, uint32_t vs_float_count,
+             uint32_t blend0, uint32_t depthctl) {
   if (!g_bc2_pass_open || pass_key != g_bc2_pass_key) {
     Bc2PassClose();
     g_bc2_pass_key = pass_key;
     g_bc2_pass_open = true;
   }
   ++g_bc2.cls[cls];
-  if (cls != kBc2Opq) Bc2WinClose(true);
+  if (g_bc2_blend_hist.size() < 256) ++g_bc2_blend_hist[blend0];
+  if (g_bc2_depth_hist.size() < 256) ++g_bc2_depth_hist[depthctl];
+  const bool pool0 = cls == kBc2Opq;
+  const bool pool1 = cls == kBc2Opq || cls == kBc2Bzw;
+  if (!pool0) Bc2WinClose(0, true);
+  if (!pool1) Bc2WinClose(1, true);
   Bc2Slot* s = Bc2Lookup(key);
   if (!s) {
     ++g_bc2.ovf;  // undercounted, never miscounted
@@ -2517,22 +2552,23 @@ void Bc2Draw(uint64_t key, uint64_t pass_key, uint32_t cls, uint32_t vs_float_co
     s->n_pass = 0;
   }
   if (++s->n_pass >= 2) ++g_bc2.extra_pass;
-  if (cls != kBc2Opq) return;
-  if (s->ep_win != g_bc2_ep_win) {
-    s->ep_win = g_bc2_ep_win;
-    s->n_win = 0;
+  if (pool0) Bc2WinFold(s, 0, vs_float_count);
+  if (pool1) Bc2WinFold(s, 1, vs_float_count);
+}
+
+// Top-4 of a value histogram as "v:share%" text, then clear it.
+std::string Bc2HistTop(std::unordered_map<uint32_t, uint64_t>& h, uint64_t total) {
+  std::vector<std::pair<uint32_t, uint64_t>> v(h.begin(), h.end());
+  std::sort(v.begin(), v.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  std::string out;
+  for (size_t i = 0; i < v.size() && i < 4; ++i) {
+    if (i) out += ' ';
+    out += fmt::format("{:08x}:{:.1f}%", v[i].first,
+                       total ? 100.0 * double(v[i].second) / double(total) : 0.0);
   }
-  ++g_bc2_cur_win_draws;
-  ++g_bc2.win_draws;
-  const uint32_t n = ++s->n_win;
-  if (n == 1) {
-    ++g_bc2.keys_win;
-    return;
-  }
-  ++g_bc2.extra_win;
-  g_bc2.inst_vec4 += vs_float_count;
-  g_bc2.ord[n < 4 ? 0 : n < 10 ? 1 : n < 50 ? 2 : 3] += 1;
-  if (n > g_bc2_maxwin) g_bc2_maxwin = n;
+  h.clear();
+  return out.empty() ? "-" : out;
 }
 
 void Bc2FrameEnd() {
@@ -2547,12 +2583,14 @@ void Bc2FrameEnd() {
 void Bc2Reset() {
   if (g_bc2_tab.empty()) g_bc2_tab.resize(kBc2Slots);
   for (Bc2Slot& s : g_bc2_tab) s.ep_fr = 0;
-  g_bc2_ep_fr = g_bc2_ep_pass = g_bc2_ep_win = 1;
+  g_bc2_ep_fr = g_bc2_ep_pass = g_bc2_ep_win[0] = g_bc2_ep_win[1] = 1;
   g_bc2_pass_key = 0;
   g_bc2_pass_open = false;
-  g_bc2_cur_win_draws = 0;
+  g_bc2_cur_win_draws[0] = g_bc2_cur_win_draws[1] = 0;
   g_bc2 = Bc2Counters{};
-  g_bc2_maxwin = 0;
+  g_bc2_maxwin[0] = g_bc2_maxwin[1] = 0;
+  g_bc2_blend_hist.clear();
+  g_bc2_depth_hist.clear();
 }
 
 void BatchCensusReset() {
@@ -5510,41 +5548,49 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           const Bc2Counters& c = g_bc2;
           const uint64_t xf = c.extra_fr - s_bc2.extra_fr;
           const uint64_t xp = c.extra_pass - s_bc2.extra_pass;
-          const uint64_t xw = c.extra_win - s_bc2.extra_win;
           const uint64_t passes = c.passes - s_bc2.passes;
-          const uint64_t wins = c.wins - s_bc2.wins;
-          const uint64_t blk = c.win_blk - s_bc2.win_blk;
-          const uint64_t wdraws = c.win_draws - s_bc2.win_draws;
-          const uint64_t wkeys = c.keys_win - s_bc2.keys_win;
-          const uint64_t opq = c.cls[0] - s_bc2.cls[0];
-          const uint64_t zro = c.cls[1] - s_bc2.cls[1];
-          const uint64_t bld = c.cls[2] - s_bc2.cls[2];
-          uint64_t ord[4];
-          for (int i = 0; i < 4; ++i) ord[i] = c.ord[i] - s_bc2.ord[i];
-          const uint64_t vec4 = c.inst_vec4 - s_bc2.inst_vec4;
+          const uint64_t cls[4] = {c.cls[0] - s_bc2.cls[0], c.cls[1] - s_bc2.cls[1],
+                                   c.cls[2] - s_bc2.cls[2], c.cls[3] - s_bc2.cls[3]};
           const uint64_t ovf2 = c.ovf - s_bc2.ovf;
           static auto s_bc2_last = bc_now;
           const double secs = std::chrono::duration<double>(bc_now - s_bc2_last).count();
           s_bc2_last = bc_now;
           const double fr = frames ? double(frames) : 1.0;
+          const uint64_t total_draws = cls[0] + cls[1] + cls[2] + cls[3];
           REXGPU_INFO(
-              "[batch-census2] fullkey extra fr={} ({:.1f}%) pass={} ({:.1f}%) "
-              "win={} ({:.1f}%) | passes/fr={:.1f} win/fr={:.1f} blk/fr={:.1f} "
-              "draws/win={:.1f} keys/win={:.1f} maxwin={} | class opq={:.1f}% "
-              "zro={:.1f}% bld={:.1f}% | pooled by ord 2-3/4-9/10-49/50+ = "
-              "{:.1f}/{:.1f}/{:.1f}/{:.1f}% | inst vec4/draw={:.1f} = {:.1f} MB/s "
-              "| dpf {:.0f} -> {:.0f} | ovf={}",
-              xf, 100.0 * double(xf) / dd, xp, 100.0 * double(xp) / dd, xw,
-              100.0 * double(xw) / dd, double(passes) / fr, double(wins) / fr,
-              double(blk) / fr, wins ? double(wdraws) / double(wins) : 0.0,
-              wins ? double(wkeys) / double(wins) : 0.0, g_bc2_maxwin,
-              100.0 * double(opq) / dd, 100.0 * double(zro) / dd,
-              100.0 * double(bld) / dd, 100.0 * double(ord[0]) / dd,
-              100.0 * double(ord[1]) / dd, 100.0 * double(ord[2]) / dd,
-              100.0 * double(ord[3]) / dd, xw ? double(vec4) / double(xw) : 0.0,
-              secs > 0 ? double(vec4) * 16.0 / secs / 1048576.0 : 0.0,
-              double(draws) / fr, double(draws - xw) / fr, ovf2);
-          g_bc2_maxwin = 0;
+              "[batch-census2] fullkey extra fr={} ({:.1f}%) pass={} ({:.1f}%) | "
+              "passes/fr={:.1f} | class opq={:.1f}% bzw={:.1f}% zro={:.1f}% bld={:.1f}% "
+              "| blend0 top {} | depthctl top {} | dpf {:.0f} | ovf={}",
+              xf, 100.0 * double(xf) / dd, xp, 100.0 * double(xp) / dd, double(passes) / fr,
+              100.0 * double(cls[0]) / dd, 100.0 * double(cls[1]) / dd,
+              100.0 * double(cls[2]) / dd, 100.0 * double(cls[3]) / dd,
+              Bc2HistTop(g_bc2_blend_hist, total_draws), Bc2HistTop(g_bc2_depth_hist, total_draws),
+              double(draws) / fr, ovf2);
+          // One line per window rule: win = strict (opq only), win2 = opq + bzw.
+          for (uint32_t w = 0; w < 2; ++w) {
+            const uint64_t xw = c.extra_win[w] - s_bc2.extra_win[w];
+            const uint64_t wins = c.wins[w] - s_bc2.wins[w];
+            const uint64_t blk = c.win_blk[w] - s_bc2.win_blk[w];
+            const uint64_t wdraws = c.win_draws[w] - s_bc2.win_draws[w];
+            const uint64_t wkeys = c.keys_win[w] - s_bc2.keys_win[w];
+            uint64_t ord[4];
+            for (int i = 0; i < 4; ++i) ord[i] = c.ord[w][i] - s_bc2.ord[w][i];
+            const uint64_t vec4 = c.inst_vec4[w] - s_bc2.inst_vec4[w];
+            REXGPU_INFO(
+                "[batch-census2] {}: extra={} ({:.1f}%) | win/fr={:.1f} blk/fr={:.1f} "
+                "draws/win={:.1f} keys/win={:.1f} maxwin={} | pooled by ord "
+                "2-3/4-9/10-49/50+ = {:.1f}/{:.1f}/{:.1f}/{:.1f}% | inst vec4/draw={:.1f} "
+                "= {:.1f} MB/s | dpf {:.0f} -> {:.0f}",
+                w ? "win2" : "win", xw, 100.0 * double(xw) / dd, double(wins) / fr,
+                double(blk) / fr, wins ? double(wdraws) / double(wins) : 0.0,
+                wins ? double(wkeys) / double(wins) : 0.0, g_bc2_maxwin[w],
+                100.0 * double(ord[0]) / dd, 100.0 * double(ord[1]) / dd,
+                100.0 * double(ord[2]) / dd, 100.0 * double(ord[3]) / dd,
+                xw ? double(vec4) / double(xw) : 0.0,
+                secs > 0 ? double(vec4) * 16.0 / secs / 1048576.0 : 0.0, double(draws) / fr,
+                double(draws - xw) / fr);
+            g_bc2_maxwin[w] = 0;
+          }
           s_bc2 = c;
         }
         g_bc_maxrun = 0;
@@ -7239,19 +7285,18 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     // + the pass key. Order class from the same registers: opaque = no RT
     // blends AND depth tested AND depth written.
     {
+      // The pass = the BOUND render-target config (raw registers), not what
+      // this draw writes: a depth-only draw into the same buffers is the
+      // same pass (the mask-dependent key split 157 passes/frame, naruto_761).
       uint64_t pk = 0;
       pk = inst_mix(pk, regs[XE_GPU_REG_RB_SURFACE_INFO]);
       pk = inst_mix(pk, regs[XE_GPU_REG_RB_MODECONTROL]);
       for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-        if ((normalized_color_mask >> (4 * i)) & 0xF) {
-          pk = inst_mix(pk, (uint64_t(i) << 32) |
-                                regs[reg::RB_COLOR_INFO::rt_register_indices[i]]);
-        }
+        pk = inst_mix(pk, regs[reg::RB_COLOR_INFO::rt_register_indices[i]]);
       }
-      if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
-        pk = inst_mix(pk, 0x100000000ull | regs[XE_GPU_REG_RB_DEPTH_INFO]);
-      }
+      pk = inst_mix(pk, regs[XE_GPU_REG_RB_DEPTH_INFO]);
       uint64_t k2 = inst_mix(bc_key, pk);
+      const uint32_t blend0_raw = regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF;
       uint32_t tm = used_texture_mask, ti;
       while (rex::bit_scan_forward(tm, &ti)) {
         tm &= ~(uint32_t(1) << ti);
@@ -7289,12 +7334,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       k2 = inst_mix(k2, regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET]);
       k2 = inst_mix(k2, regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL]);
       k2 = inst_mix(k2, regs[XE_GPU_REG_PA_CL_VTE_CNTL]);
-      const uint32_t cls =
-          blends ? kBc2Bld
-                 : (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable)
-                       ? kBc2Opq
-                       : kBc2Zro;
-      Bc2Draw(k2, pk, cls, vertex_shader->constant_register_map().float_count);
+      const bool zw = normalized_depth_control.z_enable && normalized_depth_control.z_write_enable;
+      const uint32_t cls = blends ? (zw ? kBc2Bzw : kBc2Bld) : (zw ? kBc2Opq : kBc2Zro);
+      Bc2Draw(k2, pk, cls, vertex_shader->constant_register_map().float_count, blend0_raw,
+              normalized_depth_control.value);
     }
     if (g_draw_prof) g_draw_ns[26] += prof_ns_since(_dp_bc0);
   }
