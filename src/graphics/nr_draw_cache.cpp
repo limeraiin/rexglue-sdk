@@ -9,6 +9,8 @@
 
 #include "rex/graphics/nr_draw_cache.h"
 
+#include <vector>
+
 // [NR-CACHE] See the header for what this is. Threading model is the
 // registry's, for the registry's reasons: one guest-thread writer at raised
 // IRQL, one command-processor reader, no synchronisation, every output a rate
@@ -393,4 +395,104 @@ extern "C" uint32_t* rex_nr_state_alloc(uint32_t guest_addr, uint32_t body_ndw,
   *out_gen = g_state_gen;
   g_stats.state_dwords += body_ndw;
   return blk + kStateHdrDwords;
+}
+
+// [GKEY] the guest-key side table (see the header).
+namespace rex {
+namespace graphics {
+namespace nr {
+namespace {
+constexpr uint32_t kGkBits = 20;
+constexpr uint32_t kGkSize = 1u << kGkBits;  // 32MB, allocated at init (opt-in)
+struct GkEntry {
+  uint32_t addr;  // masked; 0 = empty; written LAST
+  uint32_t c[kGkWords];
+  uint32_t pad;
+};
+std::vector<GkEntry> g_gk_tab;
+GkTableStats g_gk_stats = {};
+struct GkPair {
+  uint32_t vs, ps;  // 0/0 = empty
+  uint32_t m[kGkMaskWords];
+};
+constexpr uint32_t kGkPairBits = 14;
+std::vector<GkPair> g_gk_pairs;
+inline uint32_t GkPairSlot(uint32_t vs, uint32_t ps) {
+  uint32_t h = (vs >> 4) * 0x9E3779B1u ^ (ps >> 4) * 0x85EBCA77u;
+  h ^= h >> 15;
+  return h & ((1u << kGkPairBits) - 1);
+}
+inline uint32_t GkSlot(uint32_t addr) {
+  uint32_t h = addr >> 2;
+  h ^= h >> 16;
+  h *= 0x7FEB352Du;
+  h ^= h >> 15;
+  return h & (kGkSize - 1);
+}
+}  // namespace
+
+bool LookupGkey(uint32_t phys_addr, uint32_t out[kGkWords]) {
+  const uint32_t addr = phys_addr & kPhysMask;
+  if (!addr || g_gk_tab.empty()) return false;
+  const GkEntry& e = g_gk_tab[GkSlot(addr)];
+  if (e.addr != addr) return false;
+  for (uint32_t i = 0; i < kGkWords; ++i) out[i] = e.c[i];
+  return e.addr == addr;  // re-check after the copy: a torn entry is a miss
+}
+
+const GkTableStats& GetGkTableStats() { return g_gk_stats; }
+
+void SetGkeySlots(uint32_t vs, uint32_t ps, const uint32_t m[kGkMaskWords]) {
+  if (g_gk_pairs.empty()) return;
+  GkPair& e = g_gk_pairs[GkPairSlot(vs, ps)];
+  if (e.vs == vs && e.ps == ps) {
+    bool same = true;
+    for (uint32_t i = 0; i < kGkMaskWords; ++i) same = same && e.m[i] == m[i];
+    if (same) return;
+    ++g_gk_stats.slots_changed;
+  } else {
+    ++g_gk_stats.slots_set;
+  }
+  e.vs = 0;  // invalidate first (the hook reads this unsynchronised)
+  e.ps = ps;
+  for (uint32_t i = 0; i < kGkMaskWords; ++i) e.m[i] = m[i];
+  e.vs = vs;
+}
+
+}  // namespace nr
+}  // namespace graphics
+}  // namespace rex
+
+extern "C" bool rex_nr_gkey_slots(uint32_t vs, uint32_t ps, uint32_t* out_m) {
+  using namespace rex::graphics::nr;
+  if (g_gk_pairs.empty()) return false;
+  const GkPair& e = g_gk_pairs[GkPairSlot(vs, ps)];
+  if (e.vs != vs || e.ps != ps) return false;
+  for (uint32_t i = 0; i < kGkMaskWords; ++i) out_m[i] = e.m[i];
+  return e.vs == vs;
+}
+
+extern "C" void rex_nr_record_gkey(uint32_t guest_addr, const uint32_t* comps) {
+  using namespace rex::graphics::nr;
+  const uint32_t addr = guest_addr & kPhysMask;
+  if (!addr || g_gk_tab.empty()) return;  // init runs at boot, never here
+  GkEntry& e = g_gk_tab[GkSlot(addr)];
+  if (e.addr == addr) {
+    ++g_gk_stats.replaced;
+  } else if (e.addr) {
+    ++g_gk_stats.evictions;
+  }
+  e.addr = 0;  // invalidate before mutating (a racing reader misses)
+  for (uint32_t i = 0; i < kGkWords; ++i) e.c[i] = comps[i];
+  e.addr = addr;
+  ++g_gk_stats.stored;
+}
+
+// Allocates the side table. Called once at boot from the game's cvar latch
+// (host thread, before any guest thread runs): the store path allocates
+// nothing on the guest thread.
+extern "C" void rex_nr_gkey_init() {
+  using namespace rex::graphics::nr;
+  if (g_gk_tab.empty()) g_gk_tab.resize(kGkSize);
+  if (g_gk_pairs.empty()) g_gk_pairs.resize(1u << kGkPairBits);
 }

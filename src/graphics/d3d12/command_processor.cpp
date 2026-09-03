@@ -30,6 +30,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
+#include <rex/graphics/nr_draw_cache.h>  // [GKEY] rung-2 census join
 #include <rex/graphics/nr_descriptors.h>
 #include <rex/graphics/nr_detile.h>
 #include <rex/graphics/nr_residency.h>
@@ -92,6 +93,16 @@ REXCVAR_DEFINE_BOOL(gpu_batch_census, false, "GPU/D3D12",
                     "Diagnostic: 1 Hz census of issued draws sharing a batch key with a "
                     "neighbour (adjacent runs) and within the frame (poolable repeats). "
                     "Off by default; '[batch-census]'.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [GKEY] Rung-2 census (ISSUEDRAW-HANDOFF.md section 4 B, first increment).
+// Pair with the game's nr_gkey_census: the guest recorder hook hashes the
+// draw pool's inputs from the device shadows and publishes them with the
+// record; this side mirrors the hash over the register file at IssueDraw
+// and joins by packet address. Counters only. Logs '[gkey]' 1 Hz.
+REXCVAR_DEFINE_BOOL(gpu_gkey_census, false, "GPU/D3D12",
+                    "Diagnostic: rung-2 census - join the guest hook's shadow-side hash "
+                    "of the draw pool's inputs (game cvar nr_gkey_census) against the "
+                    "register file at IssueDraw. Off by default; '[gkey]'.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(gpu_parallel_record, false, "GPU/D3D12",
@@ -2636,6 +2647,8 @@ struct PoolSnap {
 };
 struct PoolBatch {
   uint64_t key;
+  uint64_t gk;      // [GKEY] the opener's guest hash (0 = none); census only
+  uint32_t gkc[6];  // [GKEY] its six components, for the hit attribution
   uint32_t epoch;
   uint32_t count, capacity, float_count;
   uint64_t float_bitmap[4];
@@ -2689,6 +2702,15 @@ struct PoolStats {
 };
 PoolStats g_pool;
 
+// [GKEY] rung-2 census window table (epoch-tagged like the pool tables;
+// defined with the census below, cleared with them on an epoch wrap).
+struct GkSlot {
+  uint64_t gk;
+  uint64_t hkey;
+  uint32_t epoch;
+};
+std::vector<GkSlot> g_gk_tab;
+
 enum PoolCloseReason { kPoolCloseClass, kPoolClosePass, kPoolCloseCopy, kPoolCloseFrame,
                        kPoolCloseSubmit };
 void PoolClose(PoolCloseReason why) {
@@ -2710,6 +2732,7 @@ void PoolClose(PoolCloseReason why) {
   if (g_pool_epoch == 0) {
     for (PoolSlot& s : g_pool_tab) s.epoch = 0;
     for (PoolPred& p : g_pool_pred) p.win_epoch = 0;
+    for (auto& e : g_gk_tab) e.epoch = 0;  // [GKEY]
     g_pool_epoch = 1;
   }
   if (why == kPoolClosePass || why == kPoolCloseCopy || why == kPoolCloseFrame ||
@@ -2891,6 +2914,246 @@ bool PoolTryHit(uint64_t key, const RegisterFile& regs, const Shader* ps) {
   g_pool.inst_bytes += size_t(b.float_count) * 16;
   ++g_pool.hit;
   return true;
+}
+
+// ── [GKEY] rung-2 census ────────────────────────────────────────────────
+// Joins the guest hook's shadow-side hash of the pool inputs (six 32-bit
+// components, nr_draw_cache.h LookupGkey; game cvar nr_gkey_census) to the
+// draw being issued, and answers with counters:
+//   mirror  the same hash over the REGISTER FILE equals the shadows' (per
+//           component: pkt+shaders, fetch, stA, stB, stC, bool/loop) --
+//           the recorder CAN compute the pool's state from what it sees
+//   shptr   the shader object pointer is a stable ucode identity (a
+//           REHASH = same pointer, different ucode = an in-place patch)
+//   cover   of the pool's hits, how many carry a guest hash equal to the
+//           batch opener's: the hits rung 2 could take from a packet
+//   safety  of the draws whose guest hash equals an earlier draw's in the
+//           same window, how many did the host REFUSE and why; a
+//           non-constant refusal (regs/bl/host-key) is a class the guest
+//           would wrongly emit an append packet for
+bool g_gk_census = false;
+uint64_t g_gk_cur = 0;  // this draw's guest hash (0 = none), copied at open
+uint32_t g_gk_cur_c[6] = {0, 0, 0, 0, 0, 0};
+struct GkStats {
+  uint64_t draws = 0, norec = 0, argsne = 0, badhdr = 0, nogk = 0, joined = 0;
+  uint64_t mir_eq = 0, mir_ne[6] = {0, 0, 0, 0, 0, 0};
+  uint64_t shp_new = 0, shp_rehash = 0;
+  uint64_t hit = 0, hit_eq = 0, hit_ne = 0, hit_none = 0;
+  uint64_t hit_ne_c[6] = {0, 0, 0, 0, 0, 0};  // which component split the hit
+  uint64_t gkeq = 0, gkeq_hkne = 0, gkeq_hit = 0, gkeq_notopen = 0, gkeq_ref_ps = 0,
+           gkeq_ref_regs = 0, gkeq_ref_bl = 0, gkeq_ref_cap = 0, gkeq_ref_other = 0;
+  uint64_t tile = 0, tab_ovf = 0;
+  uint64_t nomask = 0, mask_ne = 0;  // guest hashed the whole window / a stale mask
+};
+GkStats g_gk;
+constexpr uint32_t kGkSlots = 1u << 13;
+struct GkShp {
+  uint32_t ptr;
+  uint64_t hash;
+};
+constexpr uint32_t kGkShpSlots = 1u << 12;
+std::vector<GkShp> g_gk_shp;
+
+inline uint32_t GkFold(uint64_t h) { return uint32_t(h) ^ uint32_t(h >> 32); }
+inline uint64_t GkRegs(uint64_t h, const RegisterFile& regs, uint32_t first, uint32_t n) {
+  for (uint32_t i = 0; i < n; ++i) h = inst_mix(h, regs[first + i]);
+  return h;
+}
+// The host mirror of the game's GkCompute (naruto-recomp src/record_map.cpp):
+// identical inputs in identical order, read from the register file and the
+// packet. Keep the two in lockstep.
+void GkHostHash(const RegisterFile& regs, const uint32_t* pkt, uint32_t pkt_ndw,
+                uint32_t vs_ptr, uint32_t ps_ptr, const uint32_t m[4], uint32_t c[6]) {
+  uint64_t h = 0;
+  for (uint32_t i = 0; i < pkt_ndw; ++i) h = inst_mix(h, pkt[i]);
+  h = inst_mix(h, vs_ptr);
+  h = inst_mix(h, ps_ptr);
+  c[0] = GkFold(h);
+  // c1 walks the fetch window the way the guest did: the used slots of the
+  // mask it stored with the hash, or the whole window when it had none.
+  if (m[0] | m[1] | m[2] | m[3]) {
+    h = 0;
+    for (uint32_t w = 0; w < 3; ++w) {
+      uint32_t bits = m[w];
+      uint32_t j;
+      while (rex::bit_scan_forward(bits, &j)) {
+        bits &= ~(uint32_t(1) << j);
+        h = GkRegs(h, regs, 0x4800 + 2 * (w * 32 + j), 2);
+      }
+    }
+    uint32_t bits = m[3];
+    uint32_t t;
+    while (rex::bit_scan_forward(bits, &t)) {
+      bits &= ~(uint32_t(1) << t);
+      h = GkRegs(h, regs, 0x4800 + 6 * t, 6);
+    }
+    c[1] = GkFold(h);
+  } else {
+    c[1] = GkFold(GkRegs(0, regs, 0x4800, 192));
+  }
+  h = GkRegs(0, regs, 0x2000, 6);
+  h = GkRegs(h, regs, 0x200E, 2);
+  h = GkRegs(h, regs, 0x2100, 21);
+  h = GkRegs(h, regs, 0x2180, 5);
+  c[2] = GkFold(h);
+  h = GkRegs(0, regs, 0x2200, 12);
+  h = GkRegs(h, regs, 0x2280, 21);
+  c[3] = GkFold(h);
+  h = GkRegs(0, regs, 0x2300, 9);
+  h = inst_mix(h, regs[0x2312]);
+  h = GkRegs(h, regs, 0x2380, 8);
+  h = GkRegs(h, regs, 0x2388, 24);
+  c[4] = GkFold(h);
+  c[5] = GkFold(GkRegs(0, regs, 0x4900, 40));
+}
+void GkShaderCheck(uint32_t ptr, uint64_t hash) {
+  if (!ptr || g_gk_shp.empty()) return;
+  GkShp& e = g_gk_shp[((ptr >> 4) * 0x9E3779B1u) >> 20];
+  if (e.ptr == ptr) {
+    if (e.hash != hash) {
+      ++g_gk.shp_rehash;
+      e.hash = hash;
+    }
+    return;
+  }
+  e.ptr = ptr;
+  e.hash = hash;
+  ++g_gk.shp_new;
+}
+GkSlot* GkLookup(uint64_t gk, bool* fresh) {
+  if (g_gk_tab.empty()) return nullptr;
+  uint32_t i = uint32_t(gk ^ (gk >> 29) ^ (gk >> 47)) & (kGkSlots - 1);
+  for (uint32_t p = 0; p < kPoolMaxProbe; ++p) {
+    GkSlot& e = g_gk_tab[i];
+    if (e.epoch != g_pool_epoch) {
+      e.gk = gk;
+      e.epoch = g_pool_epoch;
+      e.hkey = 0;
+      *fresh = true;
+      return &e;
+    }
+    if (e.gk == gk) {
+      *fresh = false;
+      return &e;
+    }
+    i = (i + 1) & (kGkSlots - 1);
+  }
+  return nullptr;
+}
+// Before the hit decision: join, mirror, shader identity. Returns the draw's
+// guest hash (0 = no joinable record).
+uint64_t GkJoin(const RegisterFile& regs, const uint32_t* pkt_raw, uint32_t addr, uint32_t prim,
+                uint32_t index_count, const D3D12Shader* vs, const D3D12Shader* ps) {
+  ++g_gk.draws;
+  nr::DrawRecord rec;
+  if (!addr || !pkt_raw || !nr::LookupDraw(addr, &rec)) {
+    ++g_gk.norec;
+    return 0;
+  }
+  if (rec.rid == 0 || rec.prim != prim || (rec.count != index_count && rec.count <= 65535)) {
+    ++g_gk.argsne;
+    return 0;
+  }
+  uint32_t pkt[8];
+  pkt[0] = rex::byte_swap(pkt_raw[0]);
+  if ((pkt[0] >> 30) != 3 || ((pkt[0] >> 8) & 0x7F) != 0x22) {
+    ++g_gk.badhdr;
+    return 0;
+  }
+  uint32_t ndw = ((pkt[0] >> 16) & 0x3FFF) + 2;
+  if (ndw > 8) ndw = 8;
+  for (uint32_t i = 1; i < ndw; ++i) pkt[i] = rex::byte_swap(pkt_raw[i]);
+  uint32_t gc[nr::kGkWords];
+  if (!nr::LookupGkey(addr, gc)) {
+    ++g_gk.nogk;
+    return 0;
+  }
+  ++g_gk.joined;
+  for (uint32_t i = 0; i < 6; ++i) g_gk_cur_c[i] = gc[i];
+  // Publish this pair's used-slot mask for the hook's next record of it,
+  // and grade the mask the guest hashed with against today's.
+  {
+    const Shader::ConstantRegisterMap& vcm = vs->constant_register_map();
+    uint32_t hm[4] = {vcm.vertex_fetch_bitmap[0], vcm.vertex_fetch_bitmap[1],
+                      vcm.vertex_fetch_bitmap[2],
+                      vs->GetUsedTextureMaskAfterTranslation() |
+                          (ps ? ps->GetUsedTextureMaskAfterTranslation() : 0u)};
+    nr::SetGkeySlots(rec.vs, rec.ps, hm);
+    const uint32_t* gm = gc + 6;
+    if (!(gm[0] | gm[1] | gm[2] | gm[3])) {
+      ++g_gk.nomask;
+    } else if (gm[0] != hm[0] || gm[1] != hm[1] || gm[2] != hm[2] || gm[3] != hm[3]) {
+      ++g_gk.mask_ne;
+    }
+  }
+  uint32_t hc[6];
+  GkHostHash(regs, pkt, ndw, rec.vs, rec.ps, gc + 6, hc);
+  bool all = true;
+  for (uint32_t i = 0; i < 6; ++i) {
+    if (hc[i] != gc[i]) {
+      ++g_gk.mir_ne[i];
+      all = false;
+    }
+  }
+  if (all) ++g_gk.mir_eq;
+  GkShaderCheck(rec.vs, vs->ucode_data_hash());
+  if (ps) GkShaderCheck(rec.ps, ps->ucode_data_hash());
+  uint64_t gk = 0;
+  for (uint32_t i = 0; i < 6; ++i) gk = inst_mix(gk, gc[i]);
+  return gk ? gk : 1;
+}
+// After the hit decision: coverage and the safety class. r[] = the vfy
+// ps/regs/bl and cap refusal counters snapshotted before PoolTryHit.
+void GkAfter(uint64_t gk, uint64_t hkey, bool hit, const uint64_t r[4]) {
+  if (hit) {
+    ++g_gk.hit;
+    if (!gk) {
+      ++g_gk.hit_none;
+    } else {
+      PoolSlot* s = PoolLookup(hkey);
+      const PoolBatch* b = (s && s->batch != UINT32_MAX) ? &g_pool_batches[s->batch] : nullptr;
+      if (b && b->gk == gk) {
+        ++g_gk.hit_eq;
+      } else {
+        ++g_gk.hit_ne;
+        if (b && b->gk) {
+          for (uint32_t i = 0; i < 6; ++i) {
+            if (b->gkc[i] != g_gk_cur_c[i]) ++g_gk.hit_ne_c[i];
+          }
+        }
+      }
+    }
+  }
+  if (!gk) return;
+  bool fresh = false;
+  GkSlot* e = GkLookup(gk, &fresh);
+  if (!e) {
+    ++g_gk.tab_ovf;
+    return;
+  }
+  if (fresh) {
+    e->hkey = hkey;
+    return;
+  }
+  ++g_gk.gkeq;
+  if (e->hkey != hkey) {
+    ++g_gk.gkeq_hkne;
+    return;
+  }
+  if (hit) {
+    ++g_gk.gkeq_hit;
+  } else if (g_pool.ref_vfy_ps != r[0]) {
+    ++g_gk.gkeq_ref_ps;
+  } else if (g_pool.ref_vfy_regs != r[1]) {
+    ++g_gk.gkeq_ref_regs;
+  } else if (g_pool.ref_vfy_bl != r[2]) {
+    ++g_gk.gkeq_ref_bl;
+  } else if (g_pool.ref_cap != r[3]) {
+    ++g_gk.gkeq_ref_cap;
+  } else {
+    PoolSlot* s = PoolLookup(hkey);
+    if (s && s->batch == UINT32_MAX) ++g_gk.gkeq_notopen; else ++g_gk.gkeq_ref_other;
+  }
 }
 }  // namespace
 
@@ -5841,6 +6104,48 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0,
           double(d(&PoolStats::opened_ps)) / fr, double(d(&PoolStats::hit_ps)) / fr);
       s_pp = c;
+      // [GKEY] the rung-2 census join, same window.
+      static GkStats s_gk;
+      if (g_gk_census) {
+        const GkStats& g = g_gk;
+        auto e = [&](uint64_t GkStats::*f) { return g.*f - s_gk.*f; };
+        const uint64_t gd = e(&GkStats::draws), joined = e(&GkStats::joined),
+                       hit = e(&GkStats::hit);
+        uint64_t ne[6], hn[6];
+        for (int i = 0; i < 6; ++i) {
+          ne[i] = g.mir_ne[i] - s_gk.mir_ne[i];
+          hn[i] = g.hit_ne_c[i] - s_gk.hit_ne_c[i];
+        }
+        const nr::GkTableStats& ts = nr::GetGkTableStats();
+        REXGPU_INFO(
+            "[gkey] draws={}/s join={:.1f}% (norec={} argsne={} badhdr={} nogk={}) | mirror "
+            "eq={:.1f}% ne pkt/fetch/stA/stB/stC/bl={}/{}/{}/{}/{}/{} | shp new={} REHASH={} "
+            "| hits={} cover eq={:.1f}% ne={} (pkt/fetch/stA/stB/stC/bl={}/{}/{}/{}/{}/{}) "
+            "none={} | gkeq={} HKNE={} hit={} notopen={} "
+            "ref ps/regs/bl/cap/other={}/{}/{}/{}/{} | tile={} ovf={} | mask none={} NE={} "
+            "pairs set={} changed={} | tbl stored={} evict={}",
+            gd, 100.0 * double(joined) / double(gd ? gd : 1), e(&GkStats::norec),
+            e(&GkStats::argsne), e(&GkStats::badhdr), e(&GkStats::nogk),
+            100.0 * double(e(&GkStats::mir_eq)) / double(joined ? joined : 1), ne[0], ne[1],
+            ne[2], ne[3], ne[4], ne[5], e(&GkStats::shp_new), e(&GkStats::shp_rehash), hit,
+            100.0 * double(e(&GkStats::hit_eq)) / double(hit ? hit : 1), e(&GkStats::hit_ne),
+            hn[0], hn[1], hn[2], hn[3], hn[4], hn[5], e(&GkStats::hit_none), e(&GkStats::gkeq), e(&GkStats::gkeq_hkne),
+            e(&GkStats::gkeq_hit), e(&GkStats::gkeq_notopen), e(&GkStats::gkeq_ref_ps),
+            e(&GkStats::gkeq_ref_regs), e(&GkStats::gkeq_ref_bl), e(&GkStats::gkeq_ref_cap),
+            e(&GkStats::gkeq_ref_other), e(&GkStats::tile), e(&GkStats::tab_ovf),
+            e(&GkStats::nomask), e(&GkStats::mask_ne), ts.slots_set, ts.slots_changed,
+            ts.stored, ts.evictions);
+        s_gk = g;
+      }
+    }
+    // [GKEY] latch the census for the next frame; tables sized on arm.
+    {
+      const bool gk_arm = REXCVAR_GET(gpu_gkey_census);
+      if (gk_arm && g_gk_tab.empty()) {
+        g_gk_tab.resize(kGkSlots);
+        g_gk_shp.resize(kGkShpSlots);
+      }
+      g_gk_census = gk_arm;
     }
     // Unconditional since 2026-09-02 (naruto_764/765/766 clean; the cvar and
     // its cycler are gone): the pool is how draws are issued.
@@ -6614,6 +6919,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   uint32_t pool_pred = 0;
   if (g_pool_on) {
     ++g_pool.draws;
+    g_gk_cur = 0;  // [GKEY]
     auto* pool_ps = static_cast<D3D12Shader*>(active_pixel_shader());
     uint64_t pk = 0;
     pk = inst_mix(pk, regs[XE_GPU_REG_RB_SURFACE_INFO]);
@@ -6648,11 +6954,30 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         for (uint32_t j = 0; j < 6; ++j) pool_key = inst_mix(pool_key, regs[base + j]);
       }
       pool_pred = PoolPredict(pool_key);
+      // [GKEY] rung-2 census: join the guest hash before the hit decision,
+      // classify the outcome after it. nr_tile_draw_addr_ is the skip walk's
+      // stop address of this draw's own packet (the record join key).
+      uint64_t gk = 0;
+      if (g_gk_census) {
+        const uint32_t gk_addr = nr_tile_draw_addr_ & 0x1FFFFFFFu;
+        const uint32_t* gk_pkt =
+            gk_addr ? memory_->TranslatePhysical<const uint32_t*>(gk_addr) : nullptr;
+        gk = GkJoin(regs, gk_pkt, gk_addr, uint32_t(primitive_type), index_count,
+                    vertex_shader, pool_ps);
+        g_gk_cur = gk;
+      }
       if (g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0) {
         ++g_pool.ref_tile;
-      } else if (PoolTryHit(pool_key, regs, pool_ps)) {
-        ++g_frame_issued;
-        return true;
+        if (gk) ++g_gk.tile;
+      } else {
+        const uint64_t gk_r[4] = {g_pool.ref_vfy_ps, g_pool.ref_vfy_regs, g_pool.ref_vfy_bl,
+                                  g_pool.ref_cap};
+        const bool pool_hit = PoolTryHit(pool_key, regs, pool_ps);
+        if (g_gk_census) GkAfter(gk, pool_key, pool_hit, gk_r);
+        if (pool_hit) {
+          ++g_frame_issued;
+          return true;
+        }
       }
     }
   }
@@ -8025,6 +8350,8 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
   args[3] = 0;
   if (indexed) args[4] = 0;
   b.key = key;
+  b.gk = g_gk_cur;  // [GKEY]
+  std::memcpy(b.gkc, g_gk_cur_c, sizeof(b.gkc));
   b.epoch = g_pool_epoch;
   b.count = 1;
   b.capacity = capacity;

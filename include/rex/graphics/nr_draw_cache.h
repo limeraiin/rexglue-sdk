@@ -206,4 +206,42 @@ extern "C" void rex_nr_record_draw_args_state(uint32_t guest_addr, uint32_t rid,
                                               uint32_t state_gen, uint32_t vs,
                                               uint32_t ps);
 
+
+// [GKEY] Rung-2 census: the guest hook's own hash of the draw-pool's inputs,
+// computed from the DEVICE SHADOWS at record time (naruto-recomp
+// src/record_map.cpp GkCompute) and joined by the D3D12 pool at IssueDraw
+// against the same hash over the register file ([gkey] report). Six 32-bit
+// components so a mismatch names its class: 0 = the DRAW_INDX packet dwords
+// + shader object pointers, 1 = the 0x4800 fetch window (32 slots x 6),
+// 2/3/4 = the pool's context-register ranges (A: 0x2000/0x2100/0x2180,
+// B: 0x2200/0x2280, C: 0x2300/0x2380/0x2388), 5 = bool+loop (0x4900, 40).
+// Lives in its own direct-mapped side table (allocated on the first store,
+// so the default build pays nothing); same unsynchronised key-last model as
+// the record table.
+namespace rex {
+namespace graphics {
+namespace nr {
+// Entry = 6 hash components + the 4-word used-fetch mask the hook hashed
+// c1 with (all zero = the whole window): m[0..2] = vertex fetch constants
+// 0..95 (2 dwords each), m[3] = texture fetch slots 0..31 (6 dwords each).
+constexpr uint32_t kGkComps = 6;
+constexpr uint32_t kGkMaskWords = 4;
+constexpr uint32_t kGkWords = kGkComps + kGkMaskWords;
+bool LookupGkey(uint32_t phys_addr, uint32_t out[kGkWords]);
+struct GkTableStats {
+  uint64_t stored, replaced, evictions;
+  uint64_t slots_set, slots_changed;  // the pair -> used-slot mask table
+};
+const GkTableStats& GetGkTableStats();
+// The used-fetch-slot mask of a shader pair (guest object pointers), written
+// by the host at IssueDraw from the translated shaders' fetch maps and read
+// by the hook (rex_nr_gkey_slots) when it hashes the fetch window.
+void SetGkeySlots(uint32_t vs, uint32_t ps, const uint32_t m[kGkMaskWords]);
+}  // namespace nr
+}  // namespace graphics
+}  // namespace rex
+extern "C" void rex_nr_record_gkey(uint32_t guest_addr, const uint32_t* words);
+extern "C" bool rex_nr_gkey_slots(uint32_t vs, uint32_t ps, uint32_t* out_m);
+extern "C" void rex_nr_gkey_init();
+
 #endif  // REX_GRAPHICS_NR_DRAW_CACHE_H_
