@@ -1153,6 +1153,45 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [SKC] rung-2 skip census (gpu_pool_skip_census): would dropping a POOLED
+// HIT's register applies change what a later draw reads? Under the guest
+// append packet the group's type0 writes never reach the register file, so
+// the host holds the PRE-group value of every register the group changed
+// until something rewrites it. Model: every register write clears the
+// register's taint; a value-changing write is listed on the current group;
+// at a pool hit the group's list becomes tainted; a plain draw whose shader
+// pair reads a tainted register is a draw the skip would render wrong.
+// Counters only ('[pool-skip]' next to '[pool]'); the readers are in the
+// D3D12 command processor (SkcHit/SkcPlain).
+bool g_skc_on = false;
+uint8_t g_skc_taint[rex::graphics::RegisterFile::kRegisterCount];
+uint32_t g_skc_seen[rex::graphics::RegisterFile::kRegisterCount];  // == g_skc_gen: listed on this group
+uint32_t g_skc_gen = 1;
+uint32_t g_skc_chg[4096];
+uint32_t g_skc_chg_n = 0;
+bool g_skc_chg_ovf = false;
+uint32_t g_skc_ntaint = 0;
+inline void SkcWrite1(uint32_t idx, uint32_t old_val, uint32_t new_val) {
+  if (g_skc_taint[idx]) {
+    g_skc_taint[idx] = 0;
+    --g_skc_ntaint;
+  }
+  if (old_val != new_val && g_skc_seen[idx] != g_skc_gen) {
+    g_skc_seen[idx] = g_skc_gen;
+    if (g_skc_chg_n < 4096) {
+      g_skc_chg[g_skc_chg_n++] = idx;
+    } else {
+      g_skc_chg_ovf = true;
+    }
+  }
+}
+void SkcWriteBE(uint32_t base, const uint32_t* be, uint32_t n, const uint32_t* rf) {
+  if (base + n > rex::graphics::RegisterFile::kRegisterCount) return;
+  for (uint32_t i = 0; i < n; ++i) {
+    SkcWrite1(base + i, rf[base + i], rex::memory::load_and_swap<uint32_t>(be + i));
+  }
+}
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
@@ -7894,6 +7933,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     return;
   }
 
+  if (g_skc_on) SkcWrite1(index, regs.values[index], value);  // [SKC]
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
   // [NR-5C] overlap tracking: every register-file write dirties its bucket.
@@ -8065,6 +8105,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 // consumer (WAIT_REG_MEM polls from this thread), so the volatile per-dword
 // store buys nothing here.
 void CommandProcessor::WriteRegisterRangePlain(uint32_t base, uint32_t* values_be, uint32_t n) {
+  if (g_skc_on) SkcWriteBE(base, values_be, n, register_file_->values);  // [SKC]
   memory::copy_and_swap(register_file_->values + base, values_be, n);
   NrbStampRange(base, n);  // [NR-5C] overlap tracking
 }
@@ -10249,6 +10290,7 @@ bool CommandProcessor::N8fApplyRange(uint32_t base, uint32_t* be, uint32_t n) {
     ++g_n8f_straddle;
     return false;
   }
+  if (g_skc_on) SkcWriteBE(base, be, n, register_file_->values);  // [SKC]
   memory::copy_and_swap(register_file_->values + base, be, n);
   NrbStampRange(base, n);  // [NR-5C] overlap tracking
   if (g_nr_issue && g_nri_seeded && !g_nri_live) {

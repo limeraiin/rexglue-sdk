@@ -32,6 +32,17 @@
 #include <rex/graphics/nr_bindings.h>
 #include <rex/graphics/nr_draw_cache.h>  // [GKEY] rung-2 census join
 
+// [SKC] the rung-2 skip census tracker lives in command_processor.cpp (global scope).
+extern bool g_skc_on;
+extern uint8_t g_skc_taint[];
+extern uint32_t g_skc_seen[];
+extern uint32_t g_skc_gen;
+extern uint32_t g_skc_chg[];
+extern uint32_t g_skc_chg_n;
+extern bool g_skc_chg_ovf;
+extern uint32_t g_skc_ntaint;
+void SkcWriteBE(uint32_t base, const uint32_t* be, uint32_t n, const uint32_t* rf);
+
 namespace rex::graphics {
 // [GKEY-UC] defined in src/graphics/command_processor.cpp (the walk's shader refs).
 void NrCtxShaderRef(int which, uint32_t* addr, uint32_t* ndw, uint8_t* immediate,
@@ -105,6 +116,13 @@ REXCVAR_DEFINE_BOOL(gpu_batch_census, false, "GPU/D3D12",
 // draw pool's inputs from the device shadows and publishes them with the
 // record; this side mirrors the hash over the register file at IssueDraw
 // and joins by packet address. Counters only. Logs '[gkey]' 1 Hz.
+// [SKC] rung-2 skip census: taint the registers a pooled hit's group changed
+// and count the plain draws that read one. Counters only, '[pool-skip]'.
+REXCVAR_DEFINE_BOOL(gpu_pool_skip_census, false, "GPU/D3D12",
+                    "Diagnostic: rung-2 skip census - would dropping a pooled hit's "
+                    "register applies change what a later draw reads? Off by default; "
+                    "'[pool-skip]'.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_gkey_census, false, "GPU/D3D12",
                     "Diagnostic: rung-2 census - join the guest hook's shadow-side hash "
                     "of the draw pool's inputs (game cvar nr_gkey_census) against the "
@@ -2638,6 +2656,143 @@ void BatchCensusReset() {
 // the same address would be a fence violation on real hardware too (the GPU
 // consumes asynchronously), so the key's addresses identify contents.
 bool g_pool_on = false;
+
+// [SKC] see command_processor.cpp (the tracker). Classes: 0 vs float, 1 ps
+// float, 2 fetch (vb), 3 fetch (tex), 4 bool/loop, 5 state 0x2000-0x23FF,
+// 6 below 0x2000, 7 other.
+struct SkcStats {
+  uint64_t hits = 0, hits_chg0 = 0, hits_ovf = 0, hit_only_alu = 0;
+  uint64_t chg[8] = {};      // changed dwords on hits, per class (2 = any fetch)
+  uint64_t hit_cls[8] = {};  // hits whose group changed the class
+  uint64_t plain = 0, plain_taint = 0, taint_pop = 0;
+  uint64_t rd[8] = {};       // plain draws reading a tainted register, per class
+  uint64_t rd_regs[8] = {};  // tainted registers read, per class
+};
+SkcStats g_skc;
+uint32_t g_skc_ntaint_cls[8] = {};
+// Per-register histogram of tainted registers READ by plain draws (naruto_793:
+// the state class carried 96% of the reading draws; name the registers).
+// Float constants are binned on the vec4's first register. Cleared per window.
+uint32_t g_skc_rd_hist[RegisterFile::kRegisterCount] = {};
+inline int SkcClass(uint32_t idx) {
+  if (idx >= XE_GPU_REG_SHADER_CONSTANT_000_X && idx <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    return idx < XE_GPU_REG_SHADER_CONSTANT_256_X ? 0 : 1;
+  }
+  if (idx >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 && idx <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    return 2;
+  }
+  if (idx >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 && idx <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    return 4;
+  }
+  if (idx < 0x2000) return 6;
+  if (idx < 0x2400) return 5;
+  return 7;
+}
+void SkcGroupReset() {
+  g_skc_chg_n = 0;
+  g_skc_chg_ovf = false;
+  ++g_skc_gen;
+}
+void SkcHit() {
+  ++g_skc.hits;
+  if (!g_skc_chg_n) ++g_skc.hits_chg0;
+  if (g_skc_chg_ovf) ++g_skc.hits_ovf;
+  uint32_t clsmask = 0;
+  for (uint32_t i = 0; i < g_skc_chg_n; ++i) {
+    const uint32_t r = g_skc_chg[i];
+    const int c = SkcClass(r);
+    ++g_skc.chg[c];
+    clsmask |= 1u << c;
+    if (!g_skc_taint[r]) {
+      g_skc_taint[r] = 1;
+      ++g_skc_ntaint;
+    }
+  }
+  for (int c = 0; c < 8; ++c) {
+    if (clsmask & (1u << c)) ++g_skc.hit_cls[c];
+  }
+  if (clsmask && !(clsmask & ~3u)) ++g_skc.hit_only_alu;
+  // Recount the taint population per class (cheap: only on hits).
+  for (int c = 0; c < 8; ++c) g_skc_ntaint_cls[c] = 0;
+  if (g_skc_ntaint) {
+    for (uint32_t r = 0; r < RegisterFile::kRegisterCount; ++r) {
+      if (g_skc_taint[r]) ++g_skc_ntaint_cls[SkcClass(r)];
+    }
+  }
+}
+void SkcPlain(const D3D12Shader* vs, const D3D12Shader* ps) {
+  ++g_skc.plain;
+  g_skc.taint_pop += g_skc_ntaint;
+  if (!g_skc_ntaint || !vs) return;
+  uint32_t rdmask = 0;
+  const Shader::ConstantRegisterMap& vm = vs->constant_register_map();
+  const Shader::ConstantRegisterMap* pm = ps ? &ps->constant_register_map() : nullptr;
+  if (g_skc_ntaint_cls[0] | g_skc_ntaint_cls[1]) {
+    for (uint32_t c = 0; c < 512; ++c) {
+      const uint32_t r = XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * c;
+      if (!(g_skc_taint[r] | g_skc_taint[r + 1] | g_skc_taint[r + 2] | g_skc_taint[r + 3])) continue;
+      bool used;
+      if (c < 256) {
+        used = vm.float_dynamic_addressing || ((vm.float_bitmap[c >> 6] >> (c & 63)) & 1);
+      } else {
+        const uint32_t p = c - 256;
+        used = pm && (pm->float_dynamic_addressing || ((pm->float_bitmap[p >> 6] >> (p & 63)) & 1));
+      }
+      if (used) {
+        rdmask |= 1u << (c < 256 ? 0 : 1);
+        ++g_skc_rd_hist[r];
+        ++g_skc.rd_regs[c < 256 ? 0 : 1];
+      }
+    }
+  }
+  if (g_skc_ntaint_cls[2]) {
+    const uint32_t tm = vs->GetUsedTextureMaskAfterTranslation() |
+                        (ps ? ps->GetUsedTextureMaskAfterTranslation() : 0u);
+    for (uint32_t d = 0; d < 192; ++d) {
+      if (!g_skc_taint[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + d]) continue;
+      const uint32_t vb = d / 2, tex = d / 6;
+      if ((vm.vertex_fetch_bitmap[vb >> 5] >> (vb & 31)) & 1) {
+        rdmask |= 1u << 2;
+        ++g_skc.rd_regs[2];
+        ++g_skc_rd_hist[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + d];
+      }
+      if ((tm >> tex) & 1) {
+        rdmask |= 1u << 3;
+        ++g_skc.rd_regs[3];
+        ++g_skc_rd_hist[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + d];
+      }
+    }
+  }
+  if (g_skc_ntaint_cls[4]) {
+    for (uint32_t r = XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031; r <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31; ++r) {
+      if (g_skc_taint[r]) {
+        rdmask |= 1u << 4;
+        ++g_skc.rd_regs[4];
+      }
+    }
+  }
+  if (g_skc_ntaint_cls[5] | g_skc_ntaint_cls[6]) {
+    for (uint32_t r = 0; r < 0x2400; ++r) {
+      if (g_skc_taint[r]) {
+        rdmask |= 1u << (r < 0x2000 ? 6 : 5);
+        ++g_skc_rd_hist[r];
+        ++g_skc.rd_regs[r < 0x2000 ? 6 : 5];
+      }
+    }
+  }
+  if (g_skc_ntaint_cls[7]) {
+    for (uint32_t r = 0x2400; r < RegisterFile::kRegisterCount; ++r) {
+      if (g_skc_taint[r] && SkcClass(r) == 7) {
+        rdmask |= 1u << 7;
+        ++g_skc.rd_regs[7];
+      }
+    }
+  }
+  if (rdmask) ++g_skc.plain_taint;
+  for (int c = 0; c < 8; ++c) {
+    if (rdmask & (1u << c)) ++g_skc.rd[c];
+  }
+}
 constexpr uint32_t kPoolMaxPsVec4 = 64;
 // Context registers that feed the system constants / fixed-function state
 // and are NOT already in the key: compared byte for byte on a hit.
@@ -5422,6 +5577,7 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   // unchanged range needs no stamp -- but it is stamped here anyway, which
   // is merely conservative for the skip lever.
   NrbStampRange(start_index, num_registers);
+  if (g_skc_on) SkcWriteBE(start_index, base, num_registers, register_file_->values);  // [SKC]
   // [GPU-PRECORD] Phase 1b-0: log the bulk write (raw guest dwords) for replay.
   // See WriteRegister; offset into the segment's frommem_data is stored, not a pointer,
   // so the side buffer may grow without invalidating earlier events. A range that
@@ -6271,6 +6427,50 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0,
           double(d(&PoolStats::opened_ps)) / fr, double(d(&PoolStats::hit_ps)) / fr);
       s_pp = c;
+      // [SKC] the rung-2 skip census, same window.
+      if (g_skc_on) {
+        static SkcStats s_sk;
+        const SkcStats& k = g_skc;
+        uint64_t chg[8], hc[8], rd[8], rr[8];
+        for (int i = 0; i < 8; ++i) {
+          chg[i] = k.chg[i] - s_sk.chg[i];
+          hc[i] = k.hit_cls[i] - s_sk.hit_cls[i];
+          rd[i] = k.rd[i] - s_sk.rd[i];
+          rr[i] = k.rd_regs[i] - s_sk.rd_regs[i];
+        }
+        const uint64_t hits = k.hits - s_sk.hits, plain = k.plain - s_sk.plain,
+                       pt = k.plain_taint - s_sk.plain_taint;
+        REXGPU_INFO(
+            "[pool-skip] hits={} chg0={} ovf={} onlyalu={} | chg dw vsf/psf/fetch/bl/st/lo/oth="
+            "{}/{}/{}/{}/{}/{}/{} | groups touching vsf/psf/fetch/bl/st/lo/oth={}/{}/{}/{}/{}/{}/{} "
+            "| plain={} READ TAINT={} ({:.3f}%) vsf/psf/vb/tex/bl/st/lo/oth={}/{}/{}/{}/{}/{}/{}/{} "
+            "regs={}/{}/{}/{}/{}/{}/{}/{} | taint pop avg={:.1f} now={}",
+            hits, k.hits_chg0 - s_sk.hits_chg0, k.hits_ovf - s_sk.hits_ovf,
+            k.hit_only_alu - s_sk.hit_only_alu, chg[0], chg[1], chg[2], chg[4], chg[5], chg[6],
+            chg[7], hc[0], hc[1], hc[2], hc[4], hc[5], hc[6], hc[7], plain, pt,
+            100.0 * double(pt) / double(plain ? plain : 1), rd[0], rd[1], rd[2], rd[3], rd[4],
+            rd[5], rd[6], rd[7], rr[0], rr[1], rr[2], rr[3], rr[4], rr[5], rr[6], rr[7],
+            double(k.taint_pop - s_sk.taint_pop) / double(plain ? plain : 1), g_skc_ntaint);
+        s_sk = k;
+        // The top tainted-and-read registers of the window.
+        {
+          std::string top;
+          for (int n = 0; n < 12; ++n) {
+            uint32_t best = 0, bi = UINT32_MAX;
+            for (uint32_t r = 0; r < RegisterFile::kRegisterCount; ++r) {
+              if (g_skc_rd_hist[r] > best) {
+                best = g_skc_rd_hist[r];
+                bi = r;
+              }
+            }
+            if (bi == UINT32_MAX) break;
+            top += fmt::format(" {:04X}:{}", bi, best);
+            g_skc_rd_hist[bi] = 0;
+          }
+          std::memset(g_skc_rd_hist, 0, sizeof(g_skc_rd_hist));
+          REXGPU_INFO("[pool-skip2] top read-tainted regs:{}", top.empty() ? " none" : top.c_str());
+        }
+      }
       // [GKEY] the rung-2 census join, same window.
       static GkStats s_gk;
       if (g_gk_census) {
@@ -6323,6 +6523,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         g_gk_shp.resize(kGkShpSlots);
       }
       g_gk_census = gk_arm;
+    }
+    // [SKC] latch; clear the taint state on arm.
+    {
+      const bool sk_arm = REXCVAR_GET(gpu_pool_skip_census);
+      if (sk_arm && !g_skc_on) {
+        std::memset(g_skc_taint, 0, RegisterFile::kRegisterCount);
+        std::memset(g_skc_seen, 0, RegisterFile::kRegisterCount * sizeof(uint32_t));
+        g_skc_ntaint = 0;
+        for (int i = 0; i < 8; ++i) g_skc_ntaint_cls[i] = 0;
+        SkcGroupReset();
+      }
+      g_skc_on = sk_arm;
     }
     // Unconditional since 2026-09-02 (naruto_764/765/766 clean; the cvar and
     // its cycler are gone): the pool is how draws are issued.
@@ -7152,11 +7364,19 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         const bool pool_hit = PoolTryHit(pool_key, regs, pool_ps);
         if (g_gk_census) GkAfter(gk, pool_key, pool_hit, gk_r);
         if (pool_hit) {
+          if (g_skc_on) {  // [SKC] the skipping host would hold the pre-group values
+            SkcHit();
+            SkcGroupReset();
+          }
           ++g_frame_issued;
           return true;
         }
       }
     }
+  }
+  if (g_skc_on) {  // [SKC] a plain draw reads the register file
+    SkcPlain(vertex_shader, static_cast<D3D12Shader*>(active_pixel_shader()));
+    SkcGroupReset();
   }
 
   // [GPU-PRECORD] Phase 1b-1c Inc 4 (H1/H2): hold the coarse pipeline lock across the
