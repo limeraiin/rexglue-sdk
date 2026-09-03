@@ -11940,4 +11940,15 @@ void CommandProcessor::InitializeTrace() {
                                gamma_ramp_rw_component_);
 }
 
+// [GKEY-UC] the skip walk's current shader refs, for the D3D12 census
+// (g_ctx_state has internal linkage). which: 0 = VS, 1 = PS.
+void NrCtxShaderRef(int which, uint32_t* addr, uint32_t* ndw, uint8_t* immediate,
+                    uint8_t* valid) {
+  const nr::ShaderRef& r = which ? g_ctx_state.ps : g_ctx_state.vs;
+  *addr = r.addr;
+  *ndw = r.size_dwords;
+  *immediate = r.immediate;
+  *valid = r.valid;
+}
+
 }  // namespace rex::graphics

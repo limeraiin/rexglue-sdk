@@ -31,6 +31,12 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
 #include <rex/graphics/nr_draw_cache.h>  // [GKEY] rung-2 census join
+
+namespace rex::graphics {
+// [GKEY-UC] defined in src/graphics/command_processor.cpp (the walk's shader refs).
+void NrCtxShaderRef(int which, uint32_t* addr, uint32_t* ndw, uint8_t* immediate,
+                    uint8_t* valid);
+}  // namespace rex::graphics
 #include <rex/graphics/nr_descriptors.h>
 #include <rex/graphics/nr_detile.h>
 #include <rex/graphics/nr_residency.h>
@@ -2708,6 +2714,9 @@ struct GkSlot {
   uint64_t gk;
   uint64_t hkey;
   uint32_t epoch;
+  // [GKEY] HKNE attribution: the first occurrence's host-key inputs.
+  uint64_t vs_hash, ps_hash;
+  uint32_t ib_base, index_count, prim, addr;
 };
 std::vector<GkSlot> g_gk_tab;
 
@@ -2933,6 +2942,10 @@ bool PoolTryHit(uint64_t key, const RegisterFile& regs, const Shader* ps) {
 //           would wrongly emit an append packet for
 bool g_gk_census = false;
 uint64_t g_gk_cur = 0;  // this draw's guest hash (0 = none), copied at open
+// [GKEY] this draw's host-key inputs, for the HKNE sample (set by GkJoin).
+uint64_t g_gk_cur_vs = 0, g_gk_cur_ps = 0;
+uint32_t g_gk_cur_ib = 0, g_gk_cur_cnt = 0, g_gk_cur_prim = 0, g_gk_cur_addr = 0;
+uint32_t g_gk_hkne_samples = 0;
 uint32_t g_gk_cur_c[6] = {0, 0, 0, 0, 0, 0};
 struct GkStats {
   uint64_t draws = 0, norec = 0, argsne = 0, badhdr = 0, nogk = 0, joined = 0;
@@ -2963,11 +2976,14 @@ inline uint64_t GkRegs(uint64_t h, const RegisterFile& regs, uint32_t first, uin
 // identical inputs in identical order, read from the register file and the
 // packet. Keep the two in lockstep.
 void GkHostHash(const RegisterFile& regs, const uint32_t* pkt, uint32_t pkt_ndw,
-                uint32_t vs_ptr, uint32_t ps_ptr, const uint32_t m[4], uint32_t c[6]) {
+                uint32_t vs_addr, uint32_t vs_ndw, uint32_t ps_addr, uint32_t ps_ndw,
+                const uint32_t m[4], uint32_t c[6]) {
   uint64_t h = 0;
   for (uint32_t i = 0; i < pkt_ndw; ++i) h = inst_mix(h, pkt[i]);
-  h = inst_mix(h, vs_ptr);
-  h = inst_mix(h, ps_ptr);
+  h = inst_mix(h, vs_addr);
+  h = inst_mix(h, vs_ndw);
+  h = inst_mix(h, ps_addr);
+  h = inst_mix(h, ps_ndw);
   c[0] = GkFold(h);
   // c1 walks the fetch window the way the guest did: the used slots of the
   // mask it stored with the hash, or the whole window when it had none.
@@ -3006,9 +3022,11 @@ void GkHostHash(const RegisterFile& regs, const uint32_t* pkt, uint32_t pkt_ndw,
   c[4] = GkFold(h);
   c[5] = GkFold(GkRegs(0, regs, 0x4900, 40));
 }
+// Keyed by the ucode's physical address (the IM_LOAD operand): REHASH =
+// the same address carried different bytes = an in-place patch.
 void GkShaderCheck(uint32_t ptr, uint64_t hash) {
   if (!ptr || g_gk_shp.empty()) return;
-  GkShp& e = g_gk_shp[((ptr >> 4) * 0x9E3779B1u) >> 20];
+  GkShp& e = g_gk_shp[((ptr >> 2) * 0x9E3779B1u) >> 20];
   if (e.ptr == ptr) {
     if (e.hash != hash) {
       ++g_gk.shp_rehash;
@@ -3040,10 +3058,126 @@ GkSlot* GkLookup(uint64_t gk, bool* fresh) {
   }
   return nullptr;
 }
+// [GKEY-UC] one-shot layout probe: where does the guest shader OBJECT keep
+// its ucode? Scans the object for the ucode inline (dword offsets 0..2047)
+// and for an embedded guest pointer whose target starts with the ucode, and
+// for a dword equal to the ucode's dword/byte count. Logs the first 8 VS
+// and 8 PS samples; the rung-2 hook needs the offsets to hash the ucode
+// (drive 782: the object pointer is re-patched, REHASH 44.6%, HKNE 12).
+uint32_t g_gk_ucprobe_n[2] = {0, 0};
+void GkUcodeProbe(rex::memory::Memory* mem, uint32_t obj, const Shader* sh, const Shader* other,
+                  int which) {
+  if (!obj || !sh || g_gk_ucprobe_n[which] >= 8) return;
+  ++g_gk_ucprobe_n[which];
+  const uint32_t* uc = sh->ucode_dwords();
+  const uint32_t ucn = uint32_t(sh->ucode_dword_count());
+  if (!uc || ucn < 8) return;
+  // naruto_785: the object's block holds the OTHER stage's ucode (the
+  // device's +12684/+12688 are pixel/vertex, not vertex/pixel). Match both.
+  const uint32_t* uo = other ? other->ucode_dwords() : nullptr;
+  const uint32_t uon = other ? uint32_t(other->ucode_dword_count()) : 0;
+  const uint32_t* o = mem->TranslateVirtual<const uint32_t*>(obj);
+  if (!o) return;
+  auto match_at = [&](const uint32_t* q) {
+    for (uint32_t k = 0; k < 8; ++k) {
+      if (rex::byte_swap(q[k]) != uc[k]) return false;
+    }
+    return true;
+  };
+  auto match_other = [&](const uint32_t* q) {
+    if (!uo || uon < 8) return false;
+    for (uint32_t k = 0; k < 8; ++k) {
+      if (rex::byte_swap(q[k]) != uo[k]) return false;
+    }
+    return true;
+  };
+  // Is the host page behind a guest address committed? (a virtual-heap
+  // pointer in the object may point at freed pages; the physical views are
+  // always mapped.)
+  auto readable = [&](const uint32_t* q, size_t bytes) {
+    MEMORY_BASIC_INFORMATION mbi;
+    const uint8_t* a = reinterpret_cast<const uint8_t*>(q);
+    const uint8_t* e = a + bytes;
+    while (a < e) {
+      if (!VirtualQuery(a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+          (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        return false;
+      }
+      a = reinterpret_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+  };
+  // The walk's own shader ref for this draw: where the executed ucode lives
+  // (immediate = a copy inside the buffer) and how long it is.
+  uint32_t ref_addr = 0, ref_ndw = 0;
+  uint8_t ref_imm = 0, ref_valid = 0;
+  NrCtxShaderRef(which, &ref_addr, &ref_ndw, &ref_imm, &ref_valid);
+  int ref_off = -1;    // object dword whose masked value == the ref address
+  int blk_delta = -1;  // ucode found relative to the object's physical block
+  int blk_delta_other = -1;  // the OTHER stage's ucode, same block
+  int ndw_off_other = -1, nbytes_off_other = -1;
+  uint32_t blk_base = 0;
+  {
+    const uint32_t bidx = which ? 8 : 6;
+    const uint32_t bv = rex::byte_swap(o[bidx]);
+    if (bv >= 0xA0000000u) {
+      blk_base = bv;
+      const uint32_t* t = mem->TranslateVirtual<const uint32_t*>(bv);
+      if (t && readable(t - 8192, 16384 * 4 + 32)) {
+        for (int k = -8192; k < 8192; ++k) {
+          if (blk_delta < 0 && match_at(t + k)) blk_delta = k * 4;
+          if (blk_delta_other < 0 && match_other(t + k)) blk_delta_other = k * 4;
+          if (blk_delta >= 0 && blk_delta_other >= 0) break;
+        }
+      }
+    }
+  }
+  for (uint32_t i = 0; i < 256 && uon; ++i) {
+    const uint32_t v = rex::byte_swap(o[i]);
+    if (v == uon && ndw_off_other < 0) ndw_off_other = int(i * 4);
+    if (v == uon * 4 && nbytes_off_other < 0) nbytes_off_other = int(i * 4);
+  }
+  int inline_off = -1, ptr_off = -1, ptr_delta = -1, ndw_off = -1, nbytes_off = -1;
+  uint32_t ptr_val = 0;
+  for (uint32_t i = 0; i < 2048 && inline_off < 0; ++i) {
+    if (match_at(o + i)) inline_off = int(i * 4);
+  }
+  for (uint32_t i = 0; i < 256 && ptr_off < 0; ++i) {
+    const uint32_t v = rex::byte_swap(o[i]);
+    if (v == ucn && ndw_off < 0) ndw_off = int(i * 4);
+    if (v == ucn * 4 && nbytes_off < 0) nbytes_off = int(i * 4);
+    if (ref_addr && (v & 0x1FFFFFFFu) == ref_addr && v >= 0x40000000u && ref_off < 0) {
+      ref_off = int(i * 4);
+    }
+    if (v < 0x40000000u || (v & 3) != 0 || v == 0xFFFF0000u) continue;
+    const uint32_t* t = mem->TranslateVirtual<const uint32_t*>(v);
+    if (!t || !readable(t, 4096 * 4 + 32)) continue;
+    for (uint32_t k = 0; k < 4096; ++k) {
+      if (match_at(t + k)) {
+        ptr_off = int(i * 4);
+        ptr_val = v;
+        ptr_delta = int(k * 4);
+        break;
+      }
+    }
+  }
+  std::string hdr;
+  for (uint32_t i = 0; i < 32; ++i) hdr += fmt::format("{:08X} ", rex::byte_swap(o[i]));
+  REXGPU_INFO("[gkey-uc] {} obj={:08X} ucode ndw={} hash={:016X} | walk ref addr={:08X} "
+              "ndw={} imm={} valid={} ref_off={} | blk {:08X} delta={} OTHER delta={} "
+              "(other ndw={} ndw_off={} nbytes_off={}) | inline_off={} "
+              "ptr_off={} (-> {:08X} +{}) ndw_off={} nbytes_off={} | o[0..31]={}",
+              which ? "PS" : "VS", obj, ucn, sh->ucode_data_hash(), ref_addr, ref_ndw,
+              ref_imm, ref_valid, ref_off, blk_base, blk_delta, blk_delta_other, uon,
+              ndw_off_other, nbytes_off_other, inline_off, ptr_off, ptr_val, ptr_delta,
+              ndw_off, nbytes_off, hdr);
+}
+
 // Before the hit decision: join, mirror, shader identity. Returns the draw's
 // guest hash (0 = no joinable record).
-uint64_t GkJoin(const RegisterFile& regs, const uint32_t* pkt_raw, uint32_t addr, uint32_t prim,
-                uint32_t index_count, const D3D12Shader* vs, const D3D12Shader* ps) {
+uint64_t GkJoin(rex::memory::Memory* mem, const RegisterFile& regs, const uint32_t* pkt_raw,
+                uint32_t addr, uint32_t prim, uint32_t index_count, const D3D12Shader* vs,
+                const D3D12Shader* ps) {
   ++g_gk.draws;
   nr::DrawRecord rec;
   if (!addr || !pkt_raw || !nr::LookupDraw(addr, &rec)) {
@@ -3070,6 +3204,20 @@ uint64_t GkJoin(const RegisterFile& regs, const uint32_t* pkt_raw, uint32_t addr
   }
   ++g_gk.joined;
   for (uint32_t i = 0; i < 6; ++i) g_gk_cur_c[i] = gc[i];
+  // The walk's shader refs = the group's IM_LOAD operands = the identity
+  // the hook hashed (naruto_785/786: the object pointers are not one).
+  uint32_t vs_addr = 0, vs_ndw = 0, ps_addr = 0, ps_ndw = 0;
+  uint8_t vs_imm = 0, vs_valid = 0, ps_imm = 0, ps_valid = 0;
+  NrCtxShaderRef(0, &vs_addr, &vs_ndw, &vs_imm, &vs_valid);
+  NrCtxShaderRef(1, &ps_addr, &ps_ndw, &ps_imm, &ps_valid);
+  if (!vs_valid) vs_addr = vs_ndw = 0;
+  if (!ps_valid) ps_addr = ps_ndw = 0;
+  g_gk_cur_vs = vs->ucode_data_hash();
+  g_gk_cur_ps = ps ? ps->ucode_data_hash() : 0;
+  g_gk_cur_ib = (ndw >= 5) ? pkt[3] : 0;
+  g_gk_cur_cnt = index_count;
+  g_gk_cur_prim = prim;
+  g_gk_cur_addr = addr;
   // Publish this pair's used-slot mask for the hook's next record of it,
   // and grade the mask the guest hashed with against today's.
   {
@@ -3078,7 +3226,7 @@ uint64_t GkJoin(const RegisterFile& regs, const uint32_t* pkt_raw, uint32_t addr
                       vcm.vertex_fetch_bitmap[2],
                       vs->GetUsedTextureMaskAfterTranslation() |
                           (ps ? ps->GetUsedTextureMaskAfterTranslation() : 0u)};
-    nr::SetGkeySlots(rec.vs, rec.ps, hm);
+    nr::SetGkeySlots(vs_addr, ps_addr, hm);
     const uint32_t* gm = gc + 6;
     if (!(gm[0] | gm[1] | gm[2] | gm[3])) {
       ++g_gk.nomask;
@@ -3087,7 +3235,7 @@ uint64_t GkJoin(const RegisterFile& regs, const uint32_t* pkt_raw, uint32_t addr
     }
   }
   uint32_t hc[6];
-  GkHostHash(regs, pkt, ndw, rec.vs, rec.ps, gc + 6, hc);
+  GkHostHash(regs, pkt, ndw, vs_addr, vs_ndw, ps_addr, ps_ndw, gc + 6, hc);
   bool all = true;
   for (uint32_t i = 0; i < 6; ++i) {
     if (hc[i] != gc[i]) {
@@ -3096,8 +3244,12 @@ uint64_t GkJoin(const RegisterFile& regs, const uint32_t* pkt_raw, uint32_t addr
     }
   }
   if (all) ++g_gk.mir_eq;
-  GkShaderCheck(rec.vs, vs->ucode_data_hash());
-  if (ps) GkShaderCheck(rec.ps, ps->ucode_data_hash());
+  // naruto_785: the record's "vs" object (dev+12684) carries the PIXEL
+  // ucode and "ps" (dev+12688) the vertex ucode; pair the identities so.
+  GkShaderCheck(vs_addr, vs->ucode_data_hash());
+  if (ps) GkShaderCheck(ps_addr, ps->ucode_data_hash());
+  GkUcodeProbe(mem, rec.vs, vs, ps, 0);
+  if (ps) GkUcodeProbe(mem, rec.ps, ps, vs, 1);
   uint64_t gk = 0;
   for (uint32_t i = 0; i < 6; ++i) gk = inst_mix(gk, gc[i]);
   return gk ? gk : 1;
@@ -3133,11 +3285,26 @@ void GkAfter(uint64_t gk, uint64_t hkey, bool hit, const uint64_t r[4]) {
   }
   if (fresh) {
     e->hkey = hkey;
+    e->vs_hash = g_gk_cur_vs;
+    e->ps_hash = g_gk_cur_ps;
+    e->ib_base = g_gk_cur_ib;
+    e->index_count = g_gk_cur_cnt;
+    e->prim = g_gk_cur_prim;
+    e->addr = g_gk_cur_addr;
     return;
   }
   ++g_gk.gkeq;
   if (e->hkey != hkey) {
     ++g_gk.gkeq_hkne;
+    if (g_gk_hkne_samples < 8) {
+      ++g_gk_hkne_samples;
+      REXGPU_INFO("[gkey] HKNE sample: first addr={:08X} vs={:016X} ps={:016X} ib={:08X} "
+                  "cnt={} prim={} | this addr={:08X} vs={:016X} ps={:016X} ib={:08X} cnt={} "
+                  "prim={} | gk={:016X}",
+                  e->addr, e->vs_hash, e->ps_hash, e->ib_base, e->index_count, e->prim,
+                  g_gk_cur_addr, g_gk_cur_vs, g_gk_cur_ps, g_gk_cur_ib, g_gk_cur_cnt,
+                  g_gk_cur_prim, gk);
+    }
     return;
   }
   if (hit) {
@@ -6962,7 +7129,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         const uint32_t gk_addr = nr_tile_draw_addr_ & 0x1FFFFFFFu;
         const uint32_t* gk_pkt =
             gk_addr ? memory_->TranslatePhysical<const uint32_t*>(gk_addr) : nullptr;
-        gk = GkJoin(regs, gk_pkt, gk_addr, uint32_t(primitive_type), index_count,
+        gk = GkJoin(memory_, regs, gk_pkt, gk_addr, uint32_t(primitive_type), index_count,
                     vertex_shader, pool_ps);
         g_gk_cur = gk;
       }
