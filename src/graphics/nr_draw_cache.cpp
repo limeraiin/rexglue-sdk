@@ -411,6 +411,7 @@ struct GkEntry {
 };
 std::vector<GkEntry> g_gk_tab;
 GkTableStats g_gk_stats = {};
+const uint64_t* g_gk_hook_stats = nullptr;
 struct GkPair {
   uint32_t vs, ps;  // 0/0 = empty
   uint32_t m[kGkMaskWords];
@@ -441,6 +442,7 @@ bool LookupGkey(uint32_t phys_addr, uint32_t out[kGkWords]) {
 }
 
 const GkTableStats& GetGkTableStats() { return g_gk_stats; }
+const uint64_t* GetGkHookStats() { return g_gk_hook_stats; }
 
 void SetGkeySlots(uint32_t vs, uint32_t ps, const uint32_t m[kGkMaskWords]) {
   if (g_gk_pairs.empty()) return;
@@ -491,6 +493,10 @@ extern "C" void rex_nr_record_gkey(uint32_t guest_addr, const uint32_t* comps) {
 // Allocates the side table. Called once at boot from the game's cvar latch
 // (host thread, before any guest thread runs): the store path allocates
 // nothing on the guest thread.
+extern "C" void rex_nr_gkey_hook_stats(const uint64_t* p) {
+  rex::graphics::nr::g_gk_hook_stats = p;
+}
+
 extern "C" void rex_nr_gkey_init() {
   using namespace rex::graphics::nr;
   if (g_gk_tab.empty()) g_gk_tab.resize(kGkSize);

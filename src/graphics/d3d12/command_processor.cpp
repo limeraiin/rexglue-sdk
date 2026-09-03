@@ -6284,13 +6284,23 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           hn[i] = g.hit_ne_c[i] - s_gk.hit_ne_c[i];
         }
         const nr::GkTableStats& ts = nr::GetGkTableStats();
+        // The game hook's emitter-memo counters (window deltas).
+        static uint64_t s_hk[8] = {};
+        uint64_t hd[8] = {};
+        if (const uint64_t* hk = nr::GetGkHookStats()) {
+          for (int i = 0; i < 8; ++i) {
+            hd[i] = hk[i] - s_hk[i];
+            s_hk[i] = hk[i];
+          }
+        }
         REXGPU_INFO(
             "[gkey] draws={}/s join={:.1f}% (norec={} argsne={} badhdr={} nogk={}) | mirror "
             "eq={:.1f}% ne pkt/fetch/stA/stB/stC/bl={}/{}/{}/{}/{}/{} | shp new={} REHASH={} "
             "| hits={} cover eq={:.1f}% ne={} (pkt/fetch/stA/stB/stC/bl={}/{}/{}/{}/{}/{}) "
             "none={} | gkeq={} HKNE={} hit={} notopen={} "
             "ref ps/regs/bl/cap/other={}/{}/{}/{}/{} | tile={} ovf={} | mask none={} NE={} "
-            "pairs set={} changed={} | tbl stored={} evict={}",
+            "pairs set={} changed={} | tbl stored={} evict={} | hook emit={} im={} skip={} "
+            "scan={} memo_ne={} inh={} inh0={}",
             gd, 100.0 * double(joined) / double(gd ? gd : 1), e(&GkStats::norec),
             e(&GkStats::argsne), e(&GkStats::badhdr), e(&GkStats::nogk),
             100.0 * double(e(&GkStats::mir_eq)) / double(joined ? joined : 1), ne[0], ne[1],
@@ -6301,7 +6311,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             e(&GkStats::gkeq_ref_regs), e(&GkStats::gkeq_ref_bl), e(&GkStats::gkeq_ref_cap),
             e(&GkStats::gkeq_ref_other), e(&GkStats::tile), e(&GkStats::tab_ovf),
             e(&GkStats::nomask), e(&GkStats::mask_ne), ts.slots_set, ts.slots_changed,
-            ts.stored, ts.evictions);
+            ts.stored, ts.evictions, hd[0], hd[1], hd[2], hd[3], hd[4], hd[5], hd[6]);
         s_gk = g;
       }
     }

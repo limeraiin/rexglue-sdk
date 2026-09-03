@@ -233,6 +233,10 @@ struct GkTableStats {
   uint64_t slots_set, slots_changed;  // the pair -> used-slot mask table
 };
 const GkTableStats& GetGkTableStats();
+// [GKEY] the game hook's own counters (record_map.cpp g_gk_hook[8]),
+// registered once at the cvar latch via rex_nr_gkey_hook_stats; nullptr
+// until then. Printed as the "hook" tail of the [gkey] line.
+const uint64_t* GetGkHookStats();
 // The used-fetch-slot mask of a shader pair (guest object pointers), written
 // by the host at IssueDraw from the translated shaders' fetch maps and read
 // by the hook (rex_nr_gkey_slots) when it hashes the fetch window.
