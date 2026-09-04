@@ -1262,14 +1262,20 @@ class D3D12CommandProcessor : public CommandProcessor {
       hiz_verdict_readback_;
   const uint32_t* hiz_verdict_mapping_ = nullptr;
   bool hiz_available_ = false;
-  uint32_t hiz_phase_ = 0, hiz_k_ = 300, hiz_rebuild_ = 300;  // latched at frame end
+  uint32_t hiz_phase_ = 0, hiz_k_ = 300, hiz_rebuild_ = 800;  // latched at frame end
   uint32_t hiz_slot_next_ = 0, hiz_sub_first_slot_ = 0, hiz_frame_slots_ = 0;
   // The last Hi-Z build: its depth target, the transfer epoch it saw and the
   // received-draw count at that point; a checkpoint within hiz_rebuild_
   // draws of it on the same target reuses the buffer (test only).
   ID3D12Resource* hiz_build_resource_ = nullptr;
   uint64_t hiz_build_epoch_ = 0, hiz_build_draws_ = 0, hiz_draws_seen_ = 0;
-  bool hiz_last_close_benign_ = false;
+  bool hiz_valid_ = false;  // the buffer holds a conservative Hi-Z of the target
+  std::vector<uint32_t> hiz_slot_idx_;  // per slot: the draw's host index count
+  struct HizPending {
+    uint64_t submission;
+    uint32_t first, count;
+  };
+  std::deque<HizPending> hiz_pending_;
   struct HizWindow {
     bool open = false;
     uint64_t submission = 0, transfer_epoch = 0;

@@ -28,7 +28,7 @@ cbuffer HizConstants : register(b0) {
   uint hiz_tiles_y;   // Hi-Z height in tiles
   uint hiz_depth_w;   // depth buffer width in pixels
   uint hiz_depth_h;   // depth buffer height in pixels
-  uint hiz_mode;      // 1 verify (InstanceCount kept), 2 skip (0 when hidden)
+  uint hiz_mode;      // 0 Hi-Z invalid (nothing hidden), 1 verify (InstanceCount kept), 2 skip
   uint hiz_pad0;
   uint hiz_pad1;
   uint hiz_pad2;
@@ -114,7 +114,7 @@ void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   ty0 = max(ty0, 0);
   tx1 = min(tx1, int(hiz_tiles_x) - 1);
   ty1 = min(ty1, int(hiz_tiles_y) - 1);
-  bool hidden = tx0 <= tx1 && ty0 <= ty1;
+  bool hidden = hiz_mode != 0u && tx0 <= tx1 && ty0 <= ty1;
   if (hidden) {
     bool reversed = (flags & 1u) != 0u;
     [loop]
