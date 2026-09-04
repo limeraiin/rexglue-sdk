@@ -2869,8 +2869,20 @@ struct PoolStats {
   uint64_t close_class = 0, close_pass = 0, close_copy = 0, close_frame = 0, close_submit = 0;
   uint64_t hist[5] = {0, 0, 0, 0, 0};  // closed batch sizes 1 / 2-3 / 4-9 / 10-49 / 50+
   uint64_t inst_bytes = 0, frames = 0;
+  // [GEO] the iGPU's work unit is geometry, not draws (drive 766 reread +
+  // tools/mdi-bench.cpp): host vertex/index counts issued per frame, plain
+  // draws vs pooled hits, and received draws bucketed by index count
+  // (<=16 / <=64 / <=256 / <=1k / <=4k / 4k+) with the index share per bucket.
+  uint64_t geo_idx_plain = 0, geo_idx_hit = 0;
+  uint64_t geo_hist[6] = {0, 0, 0, 0, 0, 0}, geo_hist_idx[6] = {0, 0, 0, 0, 0, 0};
 };
 PoolStats g_pool;
+inline void GeoCount(uint32_t n, bool hit) {
+  (hit ? g_pool.geo_idx_hit : g_pool.geo_idx_plain) += n;
+  const int b = n <= 16 ? 0 : n <= 64 ? 1 : n <= 256 ? 2 : n <= 1024 ? 3 : n <= 4096 ? 4 : 5;
+  ++g_pool.geo_hist[b];
+  g_pool.geo_hist_idx[b] += n;
+}
 
 // [GKEY] rung-2 census window table (epoch-tagged like the pool tables;
 // defined with the census below, cleared with them on an epoch wrap).
@@ -6435,6 +6447,28 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           d(&PoolStats::close_submit),
           secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0,
           double(d(&PoolStats::opened_ps)) / fr, double(d(&PoolStats::hit_ps)) / fr);
+      {
+        const uint64_t gp = d(&PoolStats::geo_idx_plain), gh = d(&PoolStats::geo_idx_hit);
+        uint64_t gd[6], gi[6], gds = 0, gis = 0;
+        for (int i = 0; i < 6; ++i) {
+          gd[i] = c.geo_hist[i] - s_pp.geo_hist[i];
+          gi[i] = c.geo_hist_idx[i] - s_pp.geo_hist_idx[i];
+          gds += gd[i];
+          gis += gi[i];
+        }
+        const double gdd = gds ? double(gds) : 1.0, gii = gis ? double(gis) : 1.0;
+        REXGPU_INFO(
+            "[geo] idx/fr plain={:.0f}k hit={:.0f}k total={:.0f}k | per draw plain={:.0f} "
+            "hit={:.0f} | draws by idx <=16/64/256/1k/4k/4k+ = {:.0f}/{:.0f}/{:.0f}/{:.0f}/"
+            "{:.0f}/{:.0f}% | idx share = {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}%",
+            double(gp) / fr / 1000.0, double(gh) / fr / 1000.0, double(gp + gh) / fr / 1000.0,
+            (draws - hit) ? double(gp) / double(draws - hit) : 0.0,
+            hit ? double(gh) / double(hit) : 0.0, 100.0 * double(gd[0]) / gdd,
+            100.0 * double(gd[1]) / gdd, 100.0 * double(gd[2]) / gdd, 100.0 * double(gd[3]) / gdd,
+            100.0 * double(gd[4]) / gdd, 100.0 * double(gd[5]) / gdd, 100.0 * double(gi[0]) / gii,
+            100.0 * double(gi[1]) / gii, 100.0 * double(gi[2]) / gii, 100.0 * double(gi[3]) / gii,
+            100.0 * double(gi[4]) / gii, 100.0 * double(gi[5]) / gii);
+      }
       s_pp = c;
       // [SKC] the rung-2 skip census, same window.
       if (g_skc_on) {
@@ -7392,6 +7426,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
             SkcHit();
             SkcGroupReset();
           }
+          GeoCount(index_count, true);
           ++g_frame_issued;
           return true;
         }
@@ -8310,6 +8345,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    GeoCount(primitive_processing_result.host_draw_vertex_count, false);
     // [GPU-INST] Defer the draw to coalesce following identical-except-transform
     // draws; the pipeline/bindings/barriers above are recorded once for the run.
     // [DRAW-POOL] or open a batch: one indirect draw in place, instance 0 = this.
@@ -8394,6 +8430,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    GeoCount(primitive_processing_result.host_draw_vertex_count, false);
     // [GPU-INST] Defer the draw to coalesce the run (memexport draws are never
     // instanced, so scratch_index_buffer is always null on this path).
     // [DRAW-POOL] or open a batch: one indirect draw in place, instance 0 = this.
