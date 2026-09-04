@@ -370,7 +370,7 @@ extern uint64_t g_tile_n_opost;
 // clipper count), 2 skip, 3 cycle off / skip / verify 10 s each. Drive 805
 // verified skip (0 visible samples in 107767 out verdicts): default 2.
 REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
-                     "[cull] bounds frustum culling: 0 off, 1 verify, 2 skip, 3 cycle.");
+                     "[cull] bounds frustum culling: 0 off (kill switch), 1 verify, 2 skip.");
 // [hiz] increment 3: the Hi-Z cull. Every cull-eligible plain draw in the
 // frustum becomes an ExecuteIndirect whose arguments a checkpoint compute
 // pass writes: the checkpoint reads the bound depth buffer into a per-tile
@@ -6500,18 +6500,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // [DRAW-POOL] frame end: close the window, advance the predictor's frame,
   // report at 1 Hz, latch the cvar / cycler phase for the next frame.
   {
-    // [cull] phase latch: cvar 3 cycles off / skip / verify 10 s each.
+    // [cull] phase latch (the cycle mode is deleted: the skip is shipped).
     {
-      static auto s_cull_t0 = std::chrono::steady_clock::now();
       const int32_t cv = REXCVAR_GET(gpu_cull);
-      if (cv == 3) {
-        const auto el = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_cull_t0)
-                            .count();
-        const uint32_t slot = uint32_t(el / 10.0) % 3;
-        cull_phase_ = slot == 0 ? 0 : slot == 1 ? 2 : 1;
-      } else {
-        cull_phase_ = cv < 0 || cv > 2 ? 0 : uint32_t(cv);
-      }
+      cull_phase_ = cv < 0 || cv > 2 ? 0 : uint32_t(cv);
       // [hiz] the same latch shape; a phase change closes the open window
       // (its checkpoint carried the old mode).
       const int32_t hv = hiz_available_ ? REXCVAR_GET(gpu_hiz) : 0;
@@ -6519,6 +6511,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       // Drive 815: rebuild 250 / 400 / 800 = 13.9 / 14.2 / 14.8 fps at the
       // heavy city (a build is ~1.3 ms, hidden 30.8 / 29.7 / 28.4%): 800.
       const uint32_t hrb = uint32_t(std::max<int32_t>(REXCVAR_GET(gpu_hiz_rebuild), 0));
+      // Drive 827 (RTX 1440p --no-vsync, GPU-bound at ~20 ms/frame): skip
+      // 47.5 / plain draws issued directly 47.8 / off 49.3 fps: the per-draw
+      // ExecuteIndirect costs nothing, the Hi-Z is neutral on the RTX (its
+      // win is the Intel's); the decomposition cycler is deleted.
       const uint32_t hp = hv < 0 || hv > 2 ? 0 : uint32_t(hv);
       if (hp != hiz_phase_ || k1 != hiz_k_ || hrb != hiz_rebuild_) {
         if (hiz_window_.open) HizWindowClose(5);
@@ -7942,7 +7938,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // eligibility (the same set the old coalescer used) plus a snapshottable
   // pixel shader and no tile recording in flight.
   bool pool_open = false;
-  if (g_pool_on && pool_class_ok && !g_instance && !hiz_draw_.valid) {
+  // [hiz-pool] an eligible opener opens (the per-instance form); drive 821
+  // found the bypass's other half still here: batches/frame 485 -> 58.
+  if (g_pool_on && pool_class_ok && !g_instance) {
     if (pool_pred < 2) {
       ++g_pool.ref_pred;
     } else if (g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0) {
@@ -9190,7 +9188,7 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
       hiz_frame_slots_ + capacity <= kHizMaxPerFrame) {
     ID3D12CommandSignature* hsig = HizCommandSignature(indexed);
     const uint8_t open_dir = hiz_draw_.valid ? hiz_draw_.dir : hiz_draw_.dir_hint;
-    if (hsig && HizWindowEnsure(open_dir)) {
+    if (hsig && HizWindowEnsure(open_dir) && hiz_window_.run_count < kHizMaxRuns) {
       const HizDrawPending d = hiz_draw_;
       hiz_draw_.valid = false;
       // The run must not wrap the ring (the elements are read contiguously).
@@ -9208,13 +9206,22 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
       b.hiz_base = base;
       b.hiz_serial = hiz_window_.serial;
       b.hiz_dir = open_dir;
-      args[0] = 1;  // the element count, raised by every hit
-      b.count_ptr = args;
+      // The run entry: the CPU keeps its count (every hit raises it, as the
+      // old InstanceCount); the test CS zeroes the tail [count, capacity).
+      uint32_t* run = reinterpret_cast<uint32_t*>(hiz_window_.runs +
+                                                  size_t(hiz_window_.run_count) * kHizRunBytes);
+      run[0] = base;
+      run[1] = capacity;
+      run[2] = 1;
+      run[3] = 0;
+      b.count_ptr = run + 2;
+      ++hiz_window_.run_count;
+      hiz_window_.header[1] = hiz_window_.run_count;  // read by the test CS at GPU time
       ++hiz_acc_.pool_open;
       OccDrawBegin();  // [occ] the batch = one query; its count lands at close
       occ_draw_hiz_ = base + 1;
       deferred_command_list_.D3DExecuteIndirect(hsig, capacity, hiz_args_.Get(),
-                                                uint64_t(base) * kHizArgsStride, buffer, offset);
+                                                uint64_t(base) * kHizArgsStride);
       b.occ_tag = OccDrawEnd(host_draw_vertex_count, 1);
       occ_draw_hiz_ = 0;
       inst_base_dirty_ = true;
@@ -16373,7 +16380,8 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
   size_t table_offset = 0;
   D3D12_GPU_VIRTUAL_ADDRESS table_gpu = 0;
   uint8_t* mapping = constant_buffer_pool_->Request(
-      frame_current_, kHizHeaderBytes + size_t(cap) * kHizEntryBytes,
+      frame_current_,
+      kHizHeaderBytes + size_t(cap) * kHizEntryBytes + size_t(kHizMaxRuns) * kHizRunBytes,
       D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, &table_buffer, &table_offset, &table_gpu);
   if (!mapping) {
     return false;
@@ -16418,8 +16426,8 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   SubmitBarriers();
   struct {
-    uint32_t tiles_x, tiles_y, depth_w, depth_h, mode, pad[3];
-  } constants = {tiles_x, tiles_y, w, h, (rebuild || hiz_valid_) ? hiz_phase_ : 0u, {0, 0, 0}};
+    uint32_t tiles_x, tiles_y, depth_w, depth_h, mode, entry_cap, pad[2];
+  } constants = {tiles_x, tiles_y, w, h, (rebuild || hiz_valid_) ? hiz_phase_ : 0u, cap, {0, 0}};
   deferred_command_list_.D3DSetComputeRootSignature(hiz_root_signature_.Get());
   deferred_command_list_.D3DSetComputeRoot32BitConstants(0, 8, &constants, 0);
   deferred_command_list_.D3DSetComputeRootDescriptorTable(1, depth_descriptor.second);
@@ -16439,7 +16447,7 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
     GpuCensusSetClass(kGpuCensusHizTest);
   }
   SetExternalPipeline(hiz_test_pipeline_.Get());
-  deferred_command_list_.D3DDispatch((cap + 63) / 64, 1, 1);
+  deferred_command_list_.D3DDispatch((cap + kHizMaxRuns + 63) / 64, 1, 1);
   PushTransitionBarrier(hiz_args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
   SubmitBarriers();
@@ -16466,6 +16474,8 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
   hiz_window_.dir = dir;
   hiz_window_.header = reinterpret_cast<uint32_t*>(mapping);
   hiz_window_.entries = mapping + kHizHeaderBytes;
+  hiz_window_.runs = hiz_window_.entries + size_t(cap) * kHizEntryBytes;  // [hiz-pool]
+  hiz_window_.run_count = 0;
   hiz_window_.depth_resource = depth;
   return true;
 }

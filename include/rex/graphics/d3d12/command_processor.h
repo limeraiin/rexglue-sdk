@@ -1276,6 +1276,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   static constexpr uint32_t kHizRing = 1u << 16;  // argument / verdict slots
   static constexpr uint32_t kHizMaxPerFrame = kHizRing / 2;
   static constexpr uint32_t kHizEntryBytes = 48, kHizHeaderBytes = 16, kHizArgsStride = 32;
+  // [hiz-pool] a run per per-instance batch of the window: {base slot,
+  // capacity, count (CPU-maintained, final by GPU time)}; the test CS zeroes
+  // the run's unused tail so the batch executes with a fixed MaxCommandCount
+  // and no GPU-side count read (drive 823: NVIDIA stalls ~12 us per
+  // count-buffer ExecuteIndirect).
+  static constexpr uint32_t kHizRunBytes = 16, kHizMaxRuns = 1024;
   static constexpr uint32_t kHizMaxK = 1024;
   static constexpr uint32_t kHizMaxRectTiles = 64;  // per axis
   static constexpr uint32_t kHizBufferBytes = 2u << 20;  // 512x512 tiles of float2
@@ -1308,6 +1314,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint8_t dir = 0;  // 1 reversed (GEQUAL/GREATER), 2 normal (LESS/LEQUAL)
     uint32_t* header = nullptr;
     uint8_t* entries = nullptr;
+    uint8_t* runs = nullptr;  // [hiz-pool] after the entries
+    uint32_t run_count = 0;
     ID3D12Resource* depth_resource = nullptr;
   } hiz_window_;
   // The draw being issued: filled by the [cull] block, consumed by the

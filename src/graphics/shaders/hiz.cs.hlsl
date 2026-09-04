@@ -29,7 +29,7 @@ cbuffer HizConstants : register(b0) {
   uint hiz_depth_w;   // depth buffer width in pixels
   uint hiz_depth_h;   // depth buffer height in pixels
   uint hiz_mode;      // 0 Hi-Z invalid (nothing hidden), 1 verify (InstanceCount kept), 2 skip
-  uint hiz_pad0;
+  uint hiz_entry_cap; // entries the table holds; runs follow them (threads >= cap)
   uint hiz_pad1;
   uint hiz_pad2;
 };
@@ -82,7 +82,11 @@ void hiz_build(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID,
   }
 }
 
-// Table layout: dword 0 = entry count; entries at byte 16, 48 bytes each:
+// Table layout: dword 0 = entry count, dword 1 = run count; entries at byte
+// 16, 48 bytes each; runs at 16 + entry_cap * 48, 16 bytes each: {base slot,
+// capacity, count, pad} = a per-instance pool batch whose elements
+// [count, capacity) the thread zeroes (the batch executes capacity elements
+// with no GPU-side count read).
 //   float4 rect (x0, y0, x1, y1) in depth-buffer pixels
 //   float  z_near        the draw's nearest host depth over the bounds
 //   uint   flags         bit 0: reversed (GEQUAL/GREATER: hidden when
@@ -100,6 +104,23 @@ void hiz_build(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID,
 void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   uint i = dispatch_id.x;
   uint count = hiz_table.Load(0);
+  if (i >= hiz_entry_cap) {
+    uint r = i - hiz_entry_cap;
+    if (r >= hiz_table.Load(4u)) {
+      return;
+    }
+    uint rb = 16u + hiz_entry_cap * 48u + r * 16u;
+    uint run_base = hiz_table.Load(rb);
+    uint run_cap = hiz_table.Load(rb + 4u);
+    uint run_count = hiz_table.Load(rb + 8u);
+    [loop]
+    for (uint s = run_count; s < run_cap; ++s) {
+      uint sb = (run_base + s) * 32u;
+      hiz_args.Store4(sb, uint4(0u, 0u, 0u, 0u));
+      hiz_args.Store2(sb + 16u, uint2(0u, 0u));
+    }
+    return;
+  }
   if (i >= count) {
     return;
   }
