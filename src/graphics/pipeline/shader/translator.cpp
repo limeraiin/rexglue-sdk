@@ -50,6 +50,10 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
   if (is_ucode_analyzed_) {
     return;
   }
+  // [occ-pos] the position-path tracker rides the same walk.
+  delete pos_tracker_;
+  pos_tracker_ = type() == xenos::ShaderType::kVertex ? new PosPathTracker() : nullptr;
+  pos_exec_conditional_ = false;
 
   // Control flow instructions come paired in blocks of 3 dwords and all are
   // listed at the top of the ucode.
@@ -113,6 +117,7 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
         case ControlFlowOpcode::kExecEnd: {
           ParsedExecInstruction instr;
           ParseControlFlowExec(cf.exec, cf_index, instr);
+          pos_exec_conditional_ = false;  // [occ-pos]
           GatherExecInformation(instr, previous_vfetch_full, unique_texture_bindings,
                                 ucode_disasm_buffer);
         } break;
@@ -123,6 +128,7 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
           bool_constant_index = cf.cond_exec.bool_address();
           ParsedExecInstruction instr;
           ParseControlFlowCondExec(cf.cond_exec, cf_index, instr);
+          pos_exec_conditional_ = true;  // [occ-pos]
           GatherExecInformation(instr, previous_vfetch_full, unique_texture_bindings,
                                 ucode_disasm_buffer);
         } break;
@@ -130,10 +136,12 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
         case ControlFlowOpcode::kCondExecPredEnd: {
           ParsedExecInstruction instr;
           ParseControlFlowCondExecPred(cf.cond_exec_pred, cf_index, instr);
+          pos_exec_conditional_ = true;  // [occ-pos]
           GatherExecInformation(instr, previous_vfetch_full, unique_texture_bindings,
                                 ucode_disasm_buffer);
         } break;
         case ControlFlowOpcode::kLoopStart: {
+          if (pos_tracker_) pos_tracker_->MarkControlFlowUnsafe();  // [occ-pos]
           ParsedLoopStartInstruction instr;
           ParseControlFlowLoopStart(cf.loop_start, cf_index, instr);
           instr.Disassemble(&ucode_disasm_buffer);
@@ -146,6 +154,7 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
           constant_register_map_.loop_bitmap |= uint32_t(1) << instr.loop_constant_index;
         } break;
         case ControlFlowOpcode::kCondCall: {
+          if (pos_tracker_) pos_tracker_->MarkControlFlowUnsafe();  // [occ-pos]
           ParsedCallInstruction instr;
           ParseControlFlowCondCall(cf.cond_call, cf_index, instr);
           instr.Disassemble(&ucode_disasm_buffer);
@@ -154,11 +163,13 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
           }
         } break;
         case ControlFlowOpcode::kReturn: {
+          if (pos_tracker_) pos_tracker_->MarkControlFlowUnsafe();  // [occ-pos]
           ParsedReturnInstruction instr;
           ParseControlFlowReturn(cf.ret, cf_index, instr);
           instr.Disassemble(&ucode_disasm_buffer);
         } break;
         case ControlFlowOpcode::kCondJmp: {
+          if (pos_tracker_) pos_tracker_->MarkControlFlowUnsafe();  // [occ-pos]
           ParsedJumpInstruction instr;
           ParseControlFlowCondJmp(cf.cond_jmp, cf_index, instr);
           instr.Disassemble(&ucode_disasm_buffer);
@@ -310,6 +321,12 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
     }
   }
 
+  // [occ-pos] close the position-path analysis.
+  if (pos_tracker_) {
+    pos_tracker_->Finish(pos_path_);
+    delete pos_tracker_;
+    pos_tracker_ = nullptr;
+  }
   is_ucode_analyzed_ = true;
 
   // An empty shader can be created internally by shader translators as a dummy,
@@ -375,6 +392,7 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
     previous_vfetch_full = op;
   }
   fetch_instr.Disassemble(&ucode_disasm_buffer);
+  if (pos_tracker_) pos_tracker_->OnVertexFetch(fetch_instr, pos_exec_conditional_);  // [occ-pos]
 
   GatherFetchResultInformation(fetch_instr.result);
 
@@ -472,6 +490,7 @@ void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t 
   ParsedAluInstruction instr;
   ParseAluInstruction(op, type(), instr);
   instr.Disassemble(&ucode_disasm_buffer);
+  if (pos_tracker_) pos_tracker_->OnAlu(instr, pos_exec_conditional_);  // [occ-pos]
 
   kills_pixels_ = kills_pixels_ ||
                   (ucode::GetAluVectorOpcodeInfo(op.vector_opcode()).changed_state &

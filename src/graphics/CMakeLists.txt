@@ -47,6 +47,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     pipeline/texture/conversion.cpp
     pipeline/shader/interpreter.cpp
     pipeline/shader/translator.cpp
+    pipeline/shader/pos_path.cpp
     pipeline/shader/translator_disasm.cpp
 )
 

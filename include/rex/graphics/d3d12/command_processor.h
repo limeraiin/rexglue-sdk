@@ -56,7 +56,9 @@ struct OccCensusTag {
   uint8_t kind;   // 0 plain, 1 pool batch
   uint8_t cls;    // gpu-census draw class at issue
   uint8_t smp;    // 1 = the occlusion half was recorded
-  uint8_t pad;
+  // [occ-pos] bit0 shader position path eligible, bit1 z-test ok, bits 2-4
+  // the PosPath reason, bits 5-6 the position format class.
+  uint8_t elig;
 };
 
 class D3D12CommandProcessor : public CommandProcessor {
@@ -740,6 +742,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OccBeginSubmission();
   void OccDrawBegin();
   uint32_t OccDrawEnd(uint32_t idx, uint8_t kind);  // returns the tag index
+  void OccSetElig(const D3D12Shader* vertex_shader, const RegisterFile& regs);
   void OccResolveSubmission();
   void OccConsumeCompleted();
   void OccReport1Hz();
@@ -1195,6 +1198,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   const uint64_t* occ_smp_mapping_ = nullptr;
   bool occ_available_ = false, occ_sub_active_ = false, occ_draw_open_ = false,
        occ_draw_smp_ = false;
+  uint8_t occ_draw_elig_ = 0;  // [occ-pos] the draw being issued
   uint32_t occ_ring_next_ = 0, occ_sub_start_ = 0, occ_sub_count_ = 0;
   std::deque<OccPending> occ_pending_;
   uint64_t occ_trunc_ = 0, occ_dropped_ = 0;
@@ -1207,6 +1211,10 @@ class D3D12CommandProcessor : public CommandProcessor {
              cls_smp[kGpuCensusTotalClasses] = {}, cls_q[kGpuCensusTotalClasses] = {},
              cls_hidden_prim[kGpuCensusTotalClasses] = {},
              cls_vs[kGpuCensusTotalClasses] = {};
+    // [occ-pos] eligibility: pe = shader path eligible, pz = pe and z-test ok.
+    uint64_t pe_q = 0, pe_prim = 0, pe_hidden_prim = 0, pz_q = 0, pz_prim = 0,
+             pz_hidden_prim = 0, pz_clipped_prim = 0;
+    uint64_t reason_prim[8] = {}, fmt_prim[4] = {};
   };
   OccAcc occ_acc_;
 

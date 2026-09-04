@@ -8363,6 +8363,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
     GeoCount(primitive_processing_result.host_draw_vertex_count, false);
+    OccSetElig(vertex_shader, regs);  // [occ-pos]
     // [GPU-INST] Defer the draw to coalesce following identical-except-transform
     // draws; the pipeline/bindings/barriers above are recorded once for the run.
     // [DRAW-POOL] or open a batch: one indirect draw in place, instance 0 = this.
@@ -8450,6 +8451,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
     GeoCount(primitive_processing_result.host_draw_vertex_count, false);
+    OccSetElig(vertex_shader, regs);  // [occ-pos]
     // [GPU-INST] Defer the draw to coalesce the run (memexport draws are never
     // instanced, so scratch_index_buffer is always null on this path).
     // [DRAW-POOL] or open a batch: one indirect draw in place, instance 0 = this.
@@ -15351,6 +15353,43 @@ void D3D12CommandProcessor::ShutdownOccCensusResources() {
   g_occ_sub_tags.clear();
 }
 
+// [occ-pos] the draw's cull eligibility, for the census tag (called at the
+// issue sites, after the pipeline cache analyzed the shader).
+void D3D12CommandProcessor::OccSetElig(const D3D12Shader* vertex_shader,
+                                       const RegisterFile& regs) {
+  if (!occ_available_) {
+    return;
+  }
+  const PosPath& pp = vertex_shader->pos_path();
+  const reg::RB_DEPTHCONTROL odc = draw_util::GetNormalizedDepthControl(regs);
+  const bool zok = odc.z_enable && !odc.stencil_enable &&
+                   (odc.zfunc == xenos::CompareFunction::kLess ||
+                    odc.zfunc == xenos::CompareFunction::kLessEqual);
+  uint8_t fmt = 3;
+  if (pp.format == xenos::VertexFormat::k_32_32_32_FLOAT) {
+    fmt = 0;
+  } else if (pp.format == xenos::VertexFormat::k_32_32_32_32_FLOAT) {
+    fmt = 1;
+  } else if (pp.format == xenos::VertexFormat::k_16_16_16_16) {
+    fmt = 2;
+  }
+  occ_draw_elig_ = uint8_t((pp.eligible ? 1 : 0) | (zok ? 2 : 0) |
+                           ((uint8_t(pp.reason) & 7) << 2) | (fmt << 5));
+  static std::unordered_set<uint64_t> s_occ_logged;
+  if (s_occ_logged.size() < 96 &&
+      s_occ_logged.insert(vertex_shader->ucode_data_hash()).second) {
+    char desc[512];
+    pp.Describe(desc, sizeof(desc));
+    REXGPU_INFO(
+        "[occ-pos] vs {:016X} elig={} reason={} fetch={} fmt={} off={} stride={} basis={:x} "
+        "idxreg={} signed={} int={} | {}",
+        vertex_shader->ucode_data_hash(), pp.eligible ? 1 : 0, uint32_t(pp.reason),
+        pp.fetch_constant, uint32_t(pp.format), pp.offset_dwords, pp.stride_dwords,
+        pp.used_basis_mask, pp.index_register, pp.is_signed ? 1 : 0, pp.is_integer ? 1 : 0,
+        desc);
+  }
+}
+
 void D3D12CommandProcessor::OccBeginSubmission() {
   if (!occ_available_) {
     return;
@@ -15414,7 +15453,7 @@ uint32_t D3D12CommandProcessor::OccDrawEnd(uint32_t idx, uint8_t kind) {
   t.kind = kind;
   t.cls = gpu_census_draw_class_;
   t.smp = occ_draw_smp_ ? 1 : 0;
-  t.pad = 0;
+  t.elig = occ_draw_elig_;
   occ_draw_open_ = false;
   return occ_sub_count_++;
 }
@@ -15464,6 +15503,22 @@ void D3D12CommandProcessor::OccConsumeCompleted() {
       a.cls_ps[cls] += st.PSInvocations;
       a.cls_smp[cls] += smp;
       a.cls_vs[cls] += st.VSInvocations;
+      {  // [occ-pos]
+        const bool pe = (t.elig & 1) != 0, pz = pe && (t.elig & 2) != 0;
+        a.reason_prim[(t.elig >> 2) & 7] += st.IAPrimitives;
+        if (pe) {
+          ++a.pe_q;
+          a.pe_prim += st.IAPrimitives;
+          a.fmt_prim[(t.elig >> 5) & 3] += st.IAPrimitives;
+          if (t.smp && smp == 0) a.pe_hidden_prim += st.IAPrimitives;
+        }
+        if (pz) {
+          ++a.pz_q;
+          a.pz_prim += st.IAPrimitives;
+          if (t.smp && smp == 0) a.pz_hidden_prim += st.IAPrimitives;
+          if (t.smp && st.CPrimitives == 0) a.pz_clipped_prim += st.IAPrimitives;
+        }
+      }
       if (t.kind == 1) {
         ++a.batches;
         a.batch_inst += t.inst;
@@ -15539,6 +15594,25 @@ void D3D12CommandProcessor::OccReport1Hz() {
       100.0 * double(a.cls_prim[main_cls]) / prim,
       100.0 * double(a.cls_hidden_prim[main_cls]) / mp, double(a.cls_vs[main_cls]) / fr / 1000.0,
       double(a.cls_ps[main_cls]) / fr / 1000.0, double(a.cls_smp[main_cls]) / fr / 1000.0);
+  {  // [occ-pos] the reachable share of the ceiling.
+    const double pep = a.pe_prim ? double(a.pe_prim) : 1.0;
+    const double pzp = a.pz_prim ? double(a.pz_prim) : 1.0;
+    REXGPU_INFO(
+        "[occ-pos] path-elig draws {:.1f}% prim {:.1f}% (hidden {:.1f}% of them) | +ztest "
+        "draws {:.1f}% prim {:.1f}% (hidden {:.1f}% clipped {:.1f}% of them) = {:.1f}% of all "
+        "prims hidden and cullable | ineligible prim by reason nv/nw/na/mf/nf/cf = "
+        "{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}% | elig fmt f32x3/f32x4/s16x4/other = "
+        "{:.0f}/{:.0f}/{:.0f}/{:.0f}%",
+        100.0 * double(a.pe_q) / q, 100.0 * double(a.pe_prim) / prim,
+        100.0 * double(a.pe_hidden_prim) / pep, 100.0 * double(a.pz_q) / q,
+        100.0 * double(a.pz_prim) / prim, 100.0 * double(a.pz_hidden_prim) / pzp,
+        100.0 * double(a.pz_clipped_prim) / pzp, 100.0 * double(a.pz_hidden_prim) / prim,
+        100.0 * double(a.reason_prim[1]) / prim, 100.0 * double(a.reason_prim[2]) / prim,
+        100.0 * double(a.reason_prim[3]) / prim, 100.0 * double(a.reason_prim[4]) / prim,
+        100.0 * double(a.reason_prim[5]) / prim, 100.0 * double(a.reason_prim[6]) / prim,
+        100.0 * double(a.fmt_prim[0]) / pep, 100.0 * double(a.fmt_prim[1]) / pep,
+        100.0 * double(a.fmt_prim[2]) / pep, 100.0 * double(a.fmt_prim[3]) / pep);
+  }
   occ_acc_ = OccAcc{};
   occ_trunc_ = 0;
   occ_dropped_ = 0;

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <rex/graphics/format/ucode.h>
+#include <rex/graphics/pipeline/shader/pos_path.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/math.h>
@@ -895,6 +896,10 @@ class Shader {
   // register_static_address_bound.
   bool uses_register_dynamic_addressing() const { return uses_register_dynamic_addressing_; }
 
+  // [occ-pos] the vertex shader's position path (vertex shaders only; the
+  // reason field says why a shader is not eligible for bounds culling).
+  const PosPath& pos_path() const { return pos_path_; }
+
   // For building shader modification bits (and also for normalization of them),
   // returns the amount of temporary registers that need to be allocated
   // explicitly - if not using register dynamic addressing, the shader
@@ -1016,6 +1021,10 @@ class Shader {
   bool kills_pixels_ = false;
   bool uses_texture_fetch_instruction_results_ = false;
   bool writes_depth_ = false;
+  // [occ-pos] filled by AnalyzeUcode through the tracker.
+  PosPath pos_path_;
+  PosPathTracker* pos_tracker_ = nullptr;
+  bool pos_exec_conditional_ = false;
 
   // Memory export eM write info for each control flow instruction, if there are
   // any eM writes in the shader.
