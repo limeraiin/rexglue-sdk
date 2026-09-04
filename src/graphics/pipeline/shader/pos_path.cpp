@@ -181,6 +181,7 @@ struct PosPathTracker::Impl {
   bool pos_written[4] = {false, false, false, false};
   struct Fetch {
     uint32_t fetch_constant, index_register;
+    bool index_ok;  // indexed by r0.x, untouched so far
     ParsedVertexFetchInstruction::Attributes attributes;
   };
   Fetch fetches[kMaxFetches];
@@ -188,6 +189,7 @@ struct PosPathTracker::Impl {
   bool have_full = false;
   Fetch last_full{};
   bool cf_unsafe = false;
+  bool r0x_written = false;
 
   Impl() {
     for (auto& r : reg) {
@@ -256,6 +258,7 @@ struct PosPathTracker::Impl {
         }
       }
       if (res.storage_target == InstructionStorageTarget::kRegister) {
+        if (res.storage_index == 0 && i == 0) r0x_written = true;
         reg[res.storage_index][i] = f;
       } else {
         pos[i] = f;
@@ -278,6 +281,12 @@ void PosPathTracker::OnVertexFetch(const ParsedVertexFetchInstruction& instr, bo
                             ? instr.operands[0].storage_index
                             : UINT32_MAX;
     fe.fetch_constant = instr.operands[1].storage_index;
+    const InstructionOperand& io = instr.operands[0];
+    fe.index_ok = io.storage_source == InstructionStorageSource::kRegister &&
+                  io.storage_index == 0 &&
+                  io.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute &&
+                  io.GetComponent(0) == SwizzleSource::kX && !io.is_negated &&
+                  !io.is_absolute_value && !im.r0x_written;
     fe.attributes = instr.attributes;
     im.last_full = fe;
     im.have_full = true;
@@ -383,6 +392,10 @@ void PosPathTracker::Finish(PosPath& out) {
   }
   if (fetch < 0) {
     out.reason = PosPath::kNoFetch;
+    return;
+  }
+  if (!im.fetches[fetch].index_ok) {
+    out.reason = PosPath::kIndexReg;
     return;
   }
   for (uint32_t i = 0; i < 4; ++i) {

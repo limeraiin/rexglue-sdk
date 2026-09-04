@@ -60,6 +60,8 @@ struct OccCensusTag {
   // [occ-pos] bit0 shader position path eligible, bit1 z-test ok, bits 2-4
   // the PosPath reason, bits 5-6 the position format class.
   uint8_t elig;
+  uint16_t vs_slot;  // [occ-pos] vertex shader slot (0 = none)
+  uint16_t dbg;      // [cull] verify debug ring id + 1 (0 = none)
 };
 
 class D3D12CommandProcessor : public CommandProcessor {
@@ -1201,6 +1203,20 @@ class D3D12CommandProcessor : public CommandProcessor {
        occ_draw_smp_ = false;
   uint8_t occ_draw_elig_ = 0;  // [occ-pos] the draw being issued
   uint8_t occ_draw_cull_ = 0;  // [cull] verify: 1 = the frustum test said out
+  uint16_t occ_draw_vs_slot_ = 0, occ_draw_dbg_ = 0;
+  std::vector<uint64_t> occ_vs_hashes_;  // slot -> ucode hash (slot 0 unused)
+  std::unordered_map<uint64_t, uint16_t> occ_vs_slots_;
+  // [cull] verify debug ring: what the frustum test saw for an out verdict.
+  struct CullDbg {
+    uint32_t seq;
+    uint64_t hash;
+    float mn[4], mx[4], m[4][5];
+    uint32_t index_count, fetch0, fetch1, base_vertex, ib_base, stride, offset;
+    uint8_t indexed;
+  };
+  static constexpr uint32_t kCullDbgRing = 4096;
+  std::vector<CullDbg> cull_dbg_;
+  uint32_t cull_dbg_next_ = 0, cull_dbg_logged_ = 0;
   // [cull] increment 2: bounds culling. Phase 0 off, 1 verify (draw with the
   // query, tag the verdict), 2 skip.
   NrCull nr_cull_;
@@ -1230,7 +1246,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     // [cull] verify: draws the frustum test called out, and how many the
     // clipper (cprim > 0) or the depth test (samples > 0) contradicted.
     uint64_t cull_vfy = 0, cull_vfy_prim = 0, cull_wrong = 0, cull_wrong_prim = 0,
-             cull_wrong_smp = 0;
+             cull_wrong_smp = 0, cull_vfy_batch = 0, cull_wrong_batch = 0;
+    uint32_t cull_vfy_vs[4096] = {}, cull_wrong_vs[4096] = {};
   };
   OccAcc occ_acc_;
 

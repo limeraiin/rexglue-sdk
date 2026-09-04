@@ -44,6 +44,7 @@ struct PosPath {
     kMultiFetch,     // clip depends on more than one vertex fetch
     kNoFetch,        // clip is a constant (no vertex dependence)
     kControlFlow,    // loops / calls / jumps in the shader
+    kIndexReg,       // the position fetch is not indexed by an untouched r0.x
     kReasonCount
   };
 

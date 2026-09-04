@@ -6507,7 +6507,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             100.0 * double(gi[1]) / gii, 100.0 * double(gi[2]) / gii, 100.0 * double(gi[3]) / gii,
             100.0 * double(gi[4]) / gii, 100.0 * double(gi[5]) / gii);
       }
-      s_pp = c;
       {  // [cull] the same 1 Hz window.
         const CullAcc& k = cull_acc_;
         const double tt = k.tested ? double(k.tested) : 1.0;
@@ -6536,6 +6535,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         cull_acc_ = CullAcc{};
         cull_stats_ = CullStats{};
       }
+      s_pp = c;
       // [SKC] the rung-2 skip census, same window.
       if (g_skc_on) {
         static SkcStats s_sk;
@@ -7428,6 +7428,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // class; a skipped draw leaves IssueDraw here (nothing below it has a side
   // effect the guest observes; memexport draws are refused).
   occ_draw_cull_ = 0;
+  occ_draw_dbg_ = 0;
   if (cull_phase_ != 0 && !(g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0)) {
     ++cull_acc_.tested;
     const PosPath& cpp = vertex_shader->pos_path();
@@ -7487,6 +7488,23 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
             return true;
           }
           occ_draw_cull_ = 1;
+          if (cull_dbg_.empty()) cull_dbg_.resize(kCullDbgRing);
+          CullDbg& dg = cull_dbg_[cull_dbg_next_ % kCullDbgRing];
+          dg.seq = cull_dbg_next_;
+          dg.hash = vertex_shader->ucode_data_hash();
+          std::memcpy(dg.mn, cb->mn, sizeof(dg.mn));
+          std::memcpy(dg.mx, cb->mx, sizeof(dg.mx));
+          std::memcpy(dg.m, cm, sizeof(dg.m));
+          dg.index_count = index_count;
+          dg.fetch0 = cd.fetch.dword_0;
+          dg.fetch1 = cd.fetch.dword_1;
+          dg.base_vertex = cd.base_vertex;
+          dg.ib_base = cd.ib_guest_base;
+          dg.stride = cpp.stride_dwords;
+          dg.offset = uint32_t(cpp.offset_dwords);
+          dg.indexed = cd.indexed ? 1 : 0;
+          occ_draw_dbg_ = uint16_t((cull_dbg_next_ % kCullDbgRing) + 1);
+          ++cull_dbg_next_;
         }
       }
     }
@@ -15479,6 +15497,20 @@ void D3D12CommandProcessor::OccSetElig(const D3D12Shader* vertex_shader,
     return;
   }
   const PosPath& pp = vertex_shader->pos_path();
+  {
+    const uint64_t vh = vertex_shader->ucode_data_hash();
+    auto sit = occ_vs_slots_.find(vh);
+    if (sit != occ_vs_slots_.end()) {
+      occ_draw_vs_slot_ = sit->second;
+    } else if (occ_vs_hashes_.size() < 4096) {
+      if (occ_vs_hashes_.empty()) occ_vs_hashes_.push_back(0);
+      occ_draw_vs_slot_ = uint16_t(occ_vs_hashes_.size());
+      occ_vs_hashes_.push_back(vh);
+      occ_vs_slots_.emplace(vh, occ_draw_vs_slot_);
+    } else {
+      occ_draw_vs_slot_ = 0;
+    }
+  }
   const reg::RB_DEPTHCONTROL odc = draw_util::GetNormalizedDepthControl(regs);
   // Drive 801: the city's depth state is z-test GREATER_EQUAL with z-write
   // (0x00708766, 63% of draws): both directions qualify. Stencil qualifies
@@ -15583,6 +15615,8 @@ uint32_t D3D12CommandProcessor::OccDrawEnd(uint32_t idx, uint8_t kind) {
   t.cls = gpu_census_draw_class_;
   t.smp = occ_draw_smp_ ? 1 : 0;
   t.elig = occ_draw_elig_;
+  t.vs_slot = occ_draw_vs_slot_;
+  t.dbg = occ_draw_dbg_;
   occ_draw_open_ = false;
   return occ_sub_count_++;
 }
@@ -15642,13 +15676,40 @@ void D3D12CommandProcessor::OccConsumeCompleted() {
           if (t.smp && smp == 0) a.pe_hidden_prim += st.IAPrimitives;
         }
         if (t.elig & 0x80) {  // [cull] verify
-          ++a.cull_vfy;
-          a.cull_vfy_prim += st.IAPrimitives;
-          if (st.CPrimitives) {
-            ++a.cull_wrong;
-            a.cull_wrong_prim += st.IAPrimitives;
+          if (t.kind == 1) {
+            // A batch query covers every instance; only the opener was judged.
+            ++a.cull_vfy_batch;
+            if (st.CPrimitives) ++a.cull_wrong_batch;
+          } else {
+            ++a.cull_vfy;
+            a.cull_vfy_prim += st.IAPrimitives;
+            ++a.cull_vfy_vs[t.vs_slot & 4095];
+            if (st.CPrimitives) {
+              ++a.cull_wrong;
+              a.cull_wrong_prim += st.IAPrimitives;
+              ++a.cull_wrong_vs[t.vs_slot & 4095];
+              if (t.smp && smp) ++a.cull_wrong_smp;
+              if (t.dbg && cull_dbg_logged_ < 24 && !cull_dbg_.empty()) {
+                const CullDbg& dg = cull_dbg_[(t.dbg - 1) % kCullDbgRing];
+                if (dg.seq % kCullDbgRing == uint32_t(t.dbg - 1)) {
+                  ++cull_dbg_logged_;
+                  REXGPU_INFO(
+                      "[cull-wrong] vs {:016X} idx={} indexed={} ib={:08X} base={} fetch={:08X}/{:08X} "
+                      "stride={} off={} | ia={} cprim={} vsinv={} smp={} | mn=({:.3f},{:.3f},{:.3f}) "
+                      "mx=({:.3f},{:.3f},{:.3f}) | m0=({:.4g},{:.4g},{:.4g},{:.4g},{:.4g}) "
+                      "m1=({:.4g},{:.4g},{:.4g},{:.4g},{:.4g}) m2=({:.4g},{:.4g},{:.4g},{:.4g},{:.4g}) "
+                      "m3=({:.4g},{:.4g},{:.4g},{:.4g},{:.4g})",
+                      dg.hash, dg.index_count, dg.indexed, dg.ib_base, dg.base_vertex, dg.fetch0,
+                      dg.fetch1, dg.stride, dg.offset, st.IAPrimitives, st.CPrimitives,
+                      st.VSInvocations, smp, dg.mn[0], dg.mn[1], dg.mn[2], dg.mx[0], dg.mx[1],
+                      dg.mx[2], dg.m[0][0], dg.m[0][1], dg.m[0][2], dg.m[0][3], dg.m[0][4],
+                      dg.m[1][0], dg.m[1][1], dg.m[1][2], dg.m[1][3], dg.m[1][4], dg.m[2][0],
+                      dg.m[2][1], dg.m[2][2], dg.m[2][3], dg.m[2][4], dg.m[3][0], dg.m[3][1],
+                      dg.m[3][2], dg.m[3][3], dg.m[3][4]);
+                }
+              }
+            }
           }
-          if (t.smp && smp) ++a.cull_wrong_smp;
         }
         if (pz) {
           ++a.pz_q;
@@ -15750,12 +15811,24 @@ void D3D12CommandProcessor::OccReport1Hz() {
         100.0 * double(a.reason_prim[5]) / prim, 100.0 * double(a.reason_prim[6]) / prim,
         100.0 * double(a.fmt_prim[0]) / pep, 100.0 * double(a.fmt_prim[1]) / pep,
         100.0 * double(a.fmt_prim[2]) / pep, 100.0 * double(a.fmt_prim[3]) / pep);
-    if (a.cull_vfy) {
-      REXGPU_INFO("[cull-vfy] out-verdict draws={} prim={} | WRONG cprim>0 draws={} ({:.3f}%) "
-                  "prim={} | samples>0 draws={}",
+    if (a.cull_vfy || a.cull_vfy_batch) {
+      std::string top;
+      for (uint32_t n = 0; n < 5; ++n) {
+        uint32_t best = 0;
+        for (uint32_t s = 1; s < 4096; ++s) {
+          if (a.cull_wrong_vs[s] > a.cull_wrong_vs[best]) best = s;
+        }
+        if (!best || !a.cull_wrong_vs[best]) break;
+        top += fmt::format("{:016X}:{}/{} ", best < occ_vs_hashes_.size() ? occ_vs_hashes_[best] : 0,
+                           a.cull_wrong_vs[best], a.cull_vfy_vs[best]);
+        const_cast<OccAcc&>(a).cull_wrong_vs[best] = 0;
+      }
+      REXGPU_INFO("[cull-vfy] plain out-verdict draws={} prim={} | WRONG cprim>0 draws={} "
+                  "({:.3f}%) prim={} samples>0={} | batch out-verdict={} cprim>0={} | top vs "
+                  "wrong/vfy: {}",
                   a.cull_vfy, a.cull_vfy_prim, a.cull_wrong,
-                  100.0 * double(a.cull_wrong) / double(a.cull_vfy), a.cull_wrong_prim,
-                  a.cull_wrong_smp);
+                  100.0 * double(a.cull_wrong) / double(a.cull_vfy ? a.cull_vfy : 1),
+                  a.cull_wrong_prim, a.cull_wrong_smp, a.cull_vfy_batch, a.cull_wrong_batch, top);
     }
   }
   occ_acc_ = OccAcc{};
