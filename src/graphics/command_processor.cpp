@@ -2840,6 +2840,9 @@ bool g_skp_prof = false;
 uint64_t g_spp_buf_ns = 0;    // whole NrSkipExecuteBuffer
 uint64_t g_spp_draw_ns = 0;   // ExecutePacket at draw stops (incl. IssueDraw)
 uint64_t g_spp_deleg_ns = 0;  // ExecutePacket at delegated stops
+// [NR-SPP2] the walker's apply bracket (range_fn + reg_fn, rdtsc), the split
+// of the skip line's walk+bulk remainder into walk and apply.
+nr::CtxApplyProf g_spp_apply = {};
 // [NR-5C-ATTR] the draw-stop dispatch bracket split by the record the stop
 // composed from ([0] packet-sourced, [1] suppressed). Filled only while the
 // compose bracket is armed; the sum stays == g_spp_draw_ns.
@@ -6172,6 +6175,21 @@ void CommandProcessor::WorkerThreadMain() {
         // go through ExecutePacketType0 any more -- it is the walk -- which is
         // why the split line's type0 bucket reads 0 and this line is the one
         // that prices state decoding.
+        // [NR-SPP2] rdtsc -> ns, calibrated across this window (first
+        // window prints 0).
+        static uint64_t spp2_cal_tsc = 0;
+        static std::chrono::steady_clock::time_point spp2_cal_t;
+        const uint64_t spp2_now_tsc = __rdtsc();
+        const auto spp2_now_t = std::chrono::steady_clock::now();
+        const double spp2_ns_per_tick =
+            (spp2_cal_tsc && spp2_now_tsc > spp2_cal_tsc)
+                ? double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             spp2_now_t - spp2_cal_t)
+                             .count()) /
+                      double(spp2_now_tsc - spp2_cal_tsc)
+                : 0.0;
+        spp2_cal_tsc = spp2_now_tsc;
+        spp2_cal_t = spp2_now_t;
         if (g_skp_prof && g_spp_buf_ns) {
           const double b_ms = g_spp_buf_ns / 1e6;
           const double d_ms = g_spp_draw_ns / 1e6;
@@ -6186,6 +6204,29 @@ void CommandProcessor::WorkerThreadMain() {
               "[n7] skip buf={:.1f}ms drawstop={:.1f}ms delegstop={:.1f}ms "
               "walk+bulk={:.1f}ms (wall={:.0f}ms, exec={:.1f}ms)",
               b_ms, d_ms, g_ms, b_ms - d_ms - g_ms - c_ms, wall_ms, exec_ms);
+          // [NR-SPP2] the remainder split: apply = the walker's range_fn +
+          // reg_fn brackets; walk = remainder - apply = header decode + the
+          // walker's own dispatch. Per RECEIVED draw beside it (the [n7]
+          // window's draws), which is the unit the rung-2 packet is priced
+          // in. Self-cost: 2 rdtsc per call (~15 ns), half in each side.
+          {
+            const nr::CtxApplyProf& ap = g_spp_apply;
+            const double ar_ms = double(ap.tsc_rng) * spp2_ns_per_tick / 1e6;
+            const double ap_ms = double(ap.tsc_reg) * spp2_ns_per_tick / 1e6;
+            const double a_ms = ar_ms + ap_ms;
+            const double wb_ms = b_ms - d_ms - g_ms - c_ms;
+            const double dd = draws ? double(draws) : 1.0;
+            REXGPU_INFO(
+                "[n7] skip2 apply={:.1f}ms (rng {:.1f}ms n={} dw={} {:.0f}ns/rng | "
+                "pdw {:.1f}ms n={} {:.0f}ns/pdw) walk={:.1f}ms | per received draw: "
+                "walk={:.2f}us apply={:.2f}us drawstop={:.2f}us delegstop={:.2f}us "
+                "rng/draw={:.1f} pdw/draw={:.1f} draws={}",
+                a_ms, ar_ms, ap.rng, ap.rng_dw,
+                ap.rng ? ar_ms * 1e6 / double(ap.rng) : 0.0, ap_ms, ap.reg,
+                ap.reg ? ap_ms * 1e6 / double(ap.reg) : 0.0, wb_ms - a_ms,
+                (wb_ms - a_ms) * 1e3 / dd, a_ms * 1e3 / dd, d_ms * 1e3 / dd,
+                g_ms * 1e3 / dd, double(ap.rng) / dd, double(ap.reg) / dd, draws);
+          }
           if (g_nr5c_prof) {
             REXGPU_INFO(
                 "[n7] skip   compose={:.1f}ms sup={:.1f}ms({} calls, "
@@ -6204,6 +6245,7 @@ void CommandProcessor::WorkerThreadMain() {
           }
         }
         g_spp_buf_ns = g_spp_draw_ns = g_spp_deleg_ns = 0;
+        g_spp_apply = {};  // [NR-SPP2]
         g_spp_draw_bin_ns[0] = g_spp_draw_bin_ns[1] = 0;
         g_spp_draw_bin_n[0] = g_spp_draw_bin_n[1] = 0;
         g_n7_cmp_ns[0] = g_n7_cmp_ns[1] = 0;
@@ -8534,6 +8576,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
           // mode keeps the walker's per-dword path bit-identically.
           g_ctx_walker.range_fn = NrWalkRegRange;
           g_ctx_walker.range_user = this;
+          g_ctx_walker.prof = g_skp_prof ? &g_spp_apply : nullptr;  // [NR-SPP2]
           if (g_nr_tile_bufskip) {
             ++g_tile_bufs_skipped;
             g_ctx_walker.reg_fn = NrTileRegWrite;

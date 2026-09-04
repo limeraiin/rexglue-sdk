@@ -34,6 +34,8 @@
 
 // [SKC] the rung-2 skip census tracker lives in command_processor.cpp (global scope).
 extern bool g_skc_on;
+static bool g_skc_disarmed = false;         // [SKC] gpu_pool_skip_census_secs elapsed
+static uint32_t g_skc_city_windows = 0;     // [SKC] armed windows at city scale
 extern uint8_t g_skc_taint[];
 extern uint32_t g_skc_seen[];
 extern uint32_t g_skc_gen;
@@ -122,6 +124,12 @@ REXCVAR_DEFINE_BOOL(gpu_pool_skip_census, false, "GPU/D3D12",
                     "Diagnostic: rung-2 skip census - would dropping a pooled hit's "
                     "register applies change what a later draw reads? Off by default; "
                     "'[pool-skip]'.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(gpu_pool_skip_census_secs, 0, "GPU/D3D12",
+                     "Diagnostic: keep gpu_pool_skip_census armed for this many CITY "
+                     "windows (>= 100k received draws/s), then disarm for the rest of "
+                     "the run so the same drive can price the apply path clean. 0 = "
+                     "never disarm.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_gkey_census, false, "GPU/D3D12",
                     "Diagnostic: rung-2 census - join the guest hook's shadow-side hash "
@@ -6470,6 +6478,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           std::memset(g_skc_rd_hist, 0, sizeof(g_skc_rd_hist));
           REXGPU_INFO("[pool-skip2] top read-tainted regs:{}", top.empty() ? " none" : top.c_str());
         }
+        // [SKC] timed disarm: after N city windows the census stands down so
+        // the rest of the drive prices the apply path without its hooks.
+        {
+          const int32_t sk_secs = REXCVAR_GET(gpu_pool_skip_census_secs);
+          if (sk_secs > 0 && !g_skc_disarmed) {
+            if (draws >= 100000) ++g_skc_city_windows;
+            if (g_skc_city_windows >= uint32_t(sk_secs)) {
+              g_skc_disarmed = true;
+              REXGPU_INFO("[pool-skip] DISARMED after {} city windows "
+                          "(gpu_pool_skip_census_secs); apply path clean from here",
+                          g_skc_city_windows);
+            }
+          }
+        }
       }
       // [GKEY] the rung-2 census join, same window.
       static GkStats s_gk;
@@ -6526,7 +6548,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     // [SKC] latch; clear the taint state on arm.
     {
-      const bool sk_arm = REXCVAR_GET(gpu_pool_skip_census);
+      const bool sk_arm = REXCVAR_GET(gpu_pool_skip_census) && !g_skc_disarmed;
       if (sk_arm && !g_skc_on) {
         std::memset(g_skc_taint, 0, RegisterFile::kRegisterCount);
         std::memset(g_skc_seen, 0, RegisterFile::kRegisterCount * sizeof(uint32_t));

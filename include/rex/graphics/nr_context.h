@@ -545,6 +545,16 @@ struct CtxMemoStats {
 };
 
 // Decoder state. Zero-initialize through CtxWalkBegin, never by hand.
+// [NR-SPP2] the apply-cost bracket: rdtsc around every range_fn / reg_fn
+// call the walk makes, so the skip path's "walk+bulk" remainder splits into
+// walk (header decode + dispatch) and apply (the consumers). Installed per
+// buffer by the skip loop when gpu_nr_skip_profile is on; null = one
+// pointer test per call.
+struct CtxApplyProf {
+  uint64_t tsc_rng, rng, rng_dw;  // range_fn calls (accepted or refused)
+  uint64_t tsc_reg, reg;          // reg_fn calls (the per-dword path)
+};
+
 struct CtxWalker {
   const uint8_t* raw;
   uint32_t dwords;
@@ -572,6 +582,7 @@ struct CtxWalker {
   // the caller sets both fields afterwards when it wants ranges as ranges.
   CtxRegRangeFn range_fn;
   void* range_user;
+  CtxApplyProf* prof;  // [NR-SPP2] null when off
 
   CtxBinState bin;
   uint32_t cursor;   // next dword to decode

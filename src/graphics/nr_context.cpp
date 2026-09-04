@@ -10,6 +10,7 @@
 #include "rex/graphics/nr_context.h"
 
 #include <cstring>
+#include <intrin.h>
 #include <unordered_map>
 
 // [NR-CTX] See the header. Decode rules mirror the executor exactly
@@ -194,9 +195,31 @@ namespace {
 
 // Every decoded write reaches reg_fn, mirrored or not: the resource census is
 // interested in precisely the registers the mirror ignores.
+// [NR-SPP2] every range_fn call goes through here so one bracket prices the
+// range consumer whatever installer put it there (skip / N97 / tile).
+inline bool CtxRangeApply(CtxWalker* w, uint32_t base, const uint32_t* be,
+                          uint32_t n, uint32_t phys, bool from_memory) {
+  if (!w->prof) return w->range_fn(w->range_user, base, be, n, phys, from_memory);
+  const uint64_t t0 = __rdtsc();
+  const bool r = w->range_fn(w->range_user, base, be, n, phys, from_memory);
+  w->prof->tsc_rng += __rdtsc() - t0;
+  ++w->prof->rng;
+  w->prof->rng_dw += n;
+  return r;
+}
+
 void CtxWriteReg(CtxWalker* w, uint32_t reg, uint32_t value,
                  bool from_memory = false) {
-  if (w->reg_fn) w->reg_fn(w->reg_user, reg, value, from_memory);
+  if (w->reg_fn) {
+    if (w->prof) {  // [NR-SPP2]
+      const uint64_t t0 = __rdtsc();
+      w->reg_fn(w->reg_user, reg, value, from_memory);
+      w->prof->tsc_reg += __rdtsc() - t0;
+      ++w->prof->reg;
+    } else {
+      w->reg_fn(w->reg_user, reg, value, from_memory);
+    }
+  }
   const int32_t s = CtxSlot(reg);
   if (s < 0) return;
   w->ctx->values[s] = value;
@@ -336,7 +359,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     // bulk store cannot express) and a truncated packet keeps the per-dword
     // path's exact partial-apply behavior, so neither is offered.
     if (!one_reg && j + 1 + cnt <= dwords && CtxRangeOfferable(w, base, cnt) &&
-        w->range_fn(w->range_user, base,
+        CtxRangeApply(w, base,
                     (const uint32_t*)(raw + (j + 1) * 4), cnt,
                     w->buffer_phys + (j + 1) * 4, /*from_memory=*/false)) {
       if (w->rec) w->rec->push_back({kCtxMemoRange, 0, uint16_t(base), cnt, j + 1, j});
@@ -485,7 +508,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     if (base != kCtxNoBase) {
       // [NR-SKP] 5-4-3: full-fit constant payload as one range.
       if (j + 1 + cnt <= dwords && CtxRangeOfferable(w, base, cnt - 1) &&
-          w->range_fn(w->range_user, base,
+          CtxRangeApply(w, base,
                       (const uint32_t*)(raw + (j + 2) * 4), cnt - 1,
                       w->buffer_phys + (j + 2) * 4, /*from_memory=*/false)) {
         if (w->rec) w->rec->push_back({kCtxMemoRange, 0, uint16_t(base), cnt - 1, j + 2, j});
@@ -511,7 +534,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
     ++w->stats->set_const2;
     // [NR-SKP] 5-4-3: same range shape as SET_CONSTANT, raw register base.
     if (j + 1 + cnt <= dwords && CtxRangeOfferable(w, base, cnt - 1) &&
-        w->range_fn(w->range_user, base,
+        CtxRangeApply(w, base,
                     (const uint32_t*)(raw + (j + 2) * 4), cnt - 1,
                     w->buffer_phys + (j + 2) * 4, /*from_memory=*/false)) {
       if (w->rec) w->rec->push_back({kCtxMemoRange, 0, uint16_t(base), cnt - 1, j + 2, j});
@@ -533,7 +556,7 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
       // reads guest memory at `address` itself. Only offered when a memory
       // reader exists, so the no-reader poison semantics stay untouched.
       if (w->mem_read && CtxRangeOfferable(w, base, size_dwords) &&
-          w->range_fn(w->range_user, base, nullptr, size_dwords, address,
+          CtxRangeApply(w, base, nullptr, size_dwords, address,
                       /*from_memory=*/true)) {
         if (w->rec) w->rec->push_back({kCtxMemoRangeMem, 0, uint16_t(base), size_dwords, address, j});
         w->stats->mem_loads += size_dwords;
@@ -664,7 +687,7 @@ bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
     switch (op.kind) {
       case kCtxMemoRange:
         if (w->range_fn &&
-            w->range_fn(w->range_user, op.reg,
+            CtxRangeApply(w, op.reg,
                         (const uint32_t*)(w->raw + size_t(op.a) * 4), op.n,
                         w->buffer_phys + op.a * 4, /*from_memory=*/false)) {
           w->cursor = pkt_end;
@@ -680,7 +703,7 @@ bool CtxMemoNext(CtxWalker* w, CtxDrawStop* stop) {
         // By-ref values are re-read from guest memory at replay, exactly as
         // the parsed walk re-reads them ([[bindings-inline-constants-byref]]).
         if (w->mem_read && w->range_fn &&
-            w->range_fn(w->range_user, op.reg, nullptr, op.n, op.a,
+            CtxRangeApply(w, op.reg, nullptr, op.n, op.a,
                         /*from_memory=*/true)) {
           w->stats->mem_loads += op.n;
           w->cursor = pkt_end;
@@ -826,7 +849,7 @@ bool CtxPlanNext(CtxWalker* w, CtxDrawStop* stop) {
         // declined offer costs exactly the reg_fn calls and nothing else --
         // the same equivalence CtxRangeOfferable rests on.
         if (w->range_fn && op.n &&
-            w->range_fn(w->range_user, op.reg,
+            CtxRangeApply(w, op.reg,
                         (const uint32_t*)(raw + size_t(payload) * 4), op.n,
                         w->buffer_phys + payload * 4, /*from_memory=*/false)) {
           break;
@@ -865,7 +888,7 @@ bool CtxPlanNext(CtxWalker* w, CtxDrawStop* stop) {
         // guarded; type and size are guarded and compiled.
         const uint32_t address = BE32(raw, at + 1) & 0x1FFFFFFF;
         if (w->mem_read && w->range_fn && op.n &&
-            w->range_fn(w->range_user, op.reg, nullptr, op.n, address,
+            CtxRangeApply(w, op.reg, nullptr, op.n, address,
                         /*from_memory=*/true)) {
           w->stats->mem_loads += op.n;
           break;
