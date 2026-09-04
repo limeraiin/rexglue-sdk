@@ -113,7 +113,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     kGpuCensusTexUp,        // texture-cache load-shader dispatches
     kGpuCensusMemUp,        // shared-memory upload copies
     kGpuCensusSwap,         // IssueSwap gamma/present pass
-    kGpuCensusHiz,          // [hiz] checkpoints: depth -> Hi-Z build + the test CS
+    kGpuCensusHiz,          // [hiz] the Hi-Z build CS
+    kGpuCensusHizTest,      // [hiz] the test CS + the argument-buffer barriers
+    kGpuCensusHizDepth,     // [hiz] the depth target's transitions (the decompress)
     kGpuCensusOther,        // submission setup / untagged
     kGpuCensusClassCount
   };
@@ -405,6 +407,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     // (as SRV and as UAV, either may be null if not used), and, if ROV is used
     // for EDRAM, EDRAM R32_UINT UAV.
     kRootParameter_Bindful_SharedMemoryAndEdram,  // +1 = 9 in all.
+    // [hiz-pool] the instancing vertex shader's instance base (one root
+    // constant, set per element by the per-instance pool batch).
+    kRootParameter_Bindful_InstanceBase,  // +1 = 10 in VS.
 
     kRootParameter_Bindful_Count_Base,
 
@@ -435,6 +440,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     kRootParameter_Bindless_SamplerHeap,  // +1 = 12 in all.
     // Unbounded SRV/UAV descriptor table - never changed.
     kRootParameter_Bindless_ViewHeap,  // +1 = 13 in all.
+    // [hiz-pool] the instancing vertex shader's instance base (one root
+    // constant, set per element by the per-instance pool batch).
+    kRootParameter_Bindless_InstanceBase,  // +1 = 14 in VS.
 
     kRootParameter_Bindless_Count,
   };
@@ -1244,13 +1252,29 @@ class D3D12CommandProcessor : public CommandProcessor {
   void HizWindowClose(uint32_t reason);
   bool HizCheckpoint(uint8_t dir);
   bool HizDraw(bool indexed, uint32_t host_draw_vertex_count);
+  // [hiz-pool] the per-instance pool batch: one ExecuteIndirect element per
+  // instance (InstanceCount 1, the instance index as a root constant), every
+  // element a table entry of the opener's window, so the checkpoint hides
+  // single instances. A batch takes hits only while its window is open.
+  struct HizDrawPending;
+  bool HizWindowValidate(uint8_t dir);  // closes a window that no longer holds
+  bool HizWindowEnsure(uint8_t dir);    // validate, then open one when needed
+  void HizAppend(uint32_t slot, const HizDrawPending* d, uint32_t inst, uint32_t host_count);
+  bool HizPoolAppend(uint32_t base, uint32_t serial, uint32_t inst, uint8_t dir,
+                     uint32_t idx_count);
+  ID3D12CommandSignature* HizCommandSignature(bool indexed);  // [constant, draw]
+  void HizInstanceBaseReset();  // root constant 0 before a plain instanced draw
+  uint32_t hiz_window_serial_ = 0;
+  bool inst_base_dirty_ = true;
+  std::unordered_map<ID3D12RootSignature*, Microsoft::WRL::ComPtr<ID3D12CommandSignature>>
+      hiz_cmdsig_[2];
   void HizRefuse(uint32_t reason, uint32_t idx) {
     ++hiz_acc_.refuse[reason];
     hiz_acc_.refuse_idx[reason] += idx;
   }
   ID3D12CommandSignature* DrawCommandSignature(bool indexed);
   static constexpr uint32_t kHizRing = 1u << 16;  // argument / verdict slots
-  static constexpr uint32_t kHizMaxPerFrame = kHizRing / 4;
+  static constexpr uint32_t kHizMaxPerFrame = kHizRing / 2;
   static constexpr uint32_t kHizEntryBytes = 48, kHizHeaderBytes = 16, kHizArgsStride = 32;
   static constexpr uint32_t kHizMaxK = 1024;
   static constexpr uint32_t kHizMaxRectTiles = 64;  // per axis
@@ -1278,6 +1302,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::deque<HizPending> hiz_pending_;
   struct HizWindow {
     bool open = false;
+    uint32_t serial = 0;  // [hiz-pool] a batch appends only to its own window
     uint64_t submission = 0, transfer_epoch = 0;
     uint32_t count = 0, cap = 0;
     uint8_t dir = 0;  // 1 reversed (GEQUAL/GREATER), 2 normal (LESS/LEQUAL)
@@ -1291,6 +1316,11 @@ class D3D12CommandProcessor : public CommandProcessor {
     bool valid = false;
     float rect[4] = {}, z_near = 0.0f;
     uint8_t dir = 0;
+    // [hiz-pool] the test direction of a draw refused only for its rect (a
+    // corner behind the camera, oversize): its batch still opens in the
+    // per-instance form so the hits get tested; the draw itself is never
+    // hidden.
+    uint8_t dir_hint = 0;
     uint32_t index_count = 0;
   } hiz_draw_;
   uint32_t occ_draw_hiz_ = 0;  // tag: verdict slot + 1
@@ -1298,6 +1328,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t elig = 0, elig_idx = 0, refuse[12] = {}, refuse_idx[12] = {}, tested = 0,
              tested_idx = 0, checkpoints = 0, builds = 0, close[8] = {}, hidden = 0, hidden_idx = 0, vfy = 0,
              vfy_idx = 0, wrong = 0, wrong_idx = 0, wrong_smp = 0, wrong_vs[4096] = {};
+    // [hiz-pool] per-instance batches opened, instances appended (tested
+    // ones among them), hits refused because the batch's window had closed.
+    uint64_t pool_open = 0, pool_inst = 0, pool_inst_tested = 0, pool_miss = 0;
   } hiz_acc_;
   uint32_t occ_ring_next_ = 0, occ_sub_start_ = 0, occ_sub_count_ = 0;
   std::deque<OccPending> occ_pending_;

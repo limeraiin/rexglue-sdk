@@ -97,8 +97,8 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
         if (current_pipeline_state != nullptr) {
           auto& args = *reinterpret_cast<const D3DExecuteIndirectArguments*>(stream);
           command_list->ExecuteIndirect(args.command_signature, args.max_command_count,
-                                        args.argument_buffer, args.argument_buffer_offset, nullptr,
-                                        0);
+                                        args.argument_buffer, args.argument_buffer_offset,
+                                        args.count_buffer, args.count_buffer_offset);
         }
       } break;
       case Command::kD3DDrawIndexedInstanced: {

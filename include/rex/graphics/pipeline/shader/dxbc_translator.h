@@ -216,6 +216,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kBoolLoopConstants,
     kFetchConstants,
     kDescriptorIndices,
+    // [hiz-pool] a root constant (uint, .x) the instancing vertex shader adds
+    // to SV_InstanceID: an ExecuteIndirect element per instance (InstanceCount
+    // 1, the constant = the instance index) lets a checkpoint hide single
+    // instances of a pooled batch. 0 for a plain instanced draw.
+    kInstanceBase,
   };
 
   // Some are referenced in xenos_draw.hlsli - check it too when updating!
@@ -981,6 +986,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t cbuffer_index_bool_loop_constants_;
   uint32_t cbuffer_index_fetch_constants_;
   uint32_t cbuffer_index_descriptor_indices_;
+  uint32_t cbuffer_index_instance_base_;  // [hiz-pool] instancing VS only
 
   struct SystemConstantRdef {
     const char* name;

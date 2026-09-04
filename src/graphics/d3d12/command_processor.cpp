@@ -384,7 +384,7 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
-REXCVAR_DEFINE_INT32(gpu_hiz_k, 300, "GPU/D3D12",
+REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
                      "[hiz] received draws after the last build or invalidation before the Hi-Z "
@@ -2866,6 +2866,12 @@ struct PoolBatch {
   uint8_t* ps_block;
   PoolSnap snap;
   uint32_t occ_tag;  // [occ] this batch's census tag in the open submission
+  // [hiz-pool] the per-instance form: hiz_base = the first argument slot of
+  // the batch's capacity-long run (UINT32_MAX = the single-element form),
+  // hiz_serial = the window the batch belongs to, idx_count = the host index
+  // (vertex) count every element draws, hiz_dir = the depth test direction.
+  uint32_t hiz_base, hiz_serial, idx_count;
+  uint8_t hiz_dir;
 };
 std::vector<PoolBatch> g_pool_batches;  // arena, reused per window
 // [occ] the open submission's tags (a pool batch writes its final instance
@@ -3094,32 +3100,38 @@ void PoolPackInstance(const RegisterFile& regs, const uint64_t bitmap[4], uint8_
 }
 
 // The hit path. True = this draw is now an instance of an open batch.
-bool PoolTryHit(uint64_t key, const RegisterFile& regs, const Shader* ps) {
+// The hit decision without the commit: the batch this draw would join, or
+// null. [hiz-pool] the caller appends the instance's Hi-Z entry first (a
+// per-instance batch whose window closed refuses; slot_out lets it reopen).
+PoolBatch* PoolMatch(uint64_t key, const RegisterFile& regs, const Shader* ps,
+                     PoolSlot** slot_out) {
+  *slot_out = nullptr;
   PoolSlot* s = PoolLookup(key);
   if (!s) {
     ++g_pool.ref_ovf;
-    return false;
+    return nullptr;
   }
-  if (s->batch == UINT32_MAX) return false;
+  *slot_out = s;
+  if (s->batch == UINT32_MAX) return nullptr;
   PoolBatch& b = g_pool_batches[s->batch];
-  if (b.epoch != g_pool_epoch || b.key != key) return false;
+  if (b.epoch != g_pool_epoch || b.key != key) return nullptr;
   if (b.count >= b.capacity) {
     ++g_pool.ref_cap;
     s->batch = UINT32_MAX;  // the next occurrence opens a fresh batch
-    return false;
+    return nullptr;
   }
   PoolSnap now;
   if (!PoolGather(regs, ps, now)) {
     ++g_pool.ref_psbig;
-    return false;
+    return nullptr;
   }
   if (std::memcmp(now.regs, b.snap.regs, sizeof(now.regs)) != 0) {
     ++g_pool.ref_vfy_regs;
-    return false;
+    return nullptr;
   }
   if (std::memcmp(now.bool_loop, b.snap.bool_loop, sizeof(now.bool_loop)) != 0) {
     ++g_pool.ref_vfy_bl;
-    return false;
+    return nullptr;
   }
   if (now.ps_n != b.snap.ps_n || std::memcmp(now.ps, b.snap.ps, now.ps_n * 4) != 0) {
     // Rung 1b-2: a PS-constant delta marks the key (its next batch opens
@@ -3127,9 +3139,15 @@ bool PoolTryHit(uint64_t key, const RegisterFile& regs, const Shader* ps) {
     if (g_pool_last_pred) g_pool_last_pred->ps_delta_frame = g_pool_frame;
     if (!b.ps_inst) {
       ++g_pool.ref_vfy_ps;
-      return false;
+      return nullptr;
     }
   }
+  return &b;
+}
+
+// The commit of a hit: this draw's constants become the batch's next
+// instance and the count in the argument buffer grows.
+void PoolCommit(PoolBatch& b, const RegisterFile& regs) {
   PoolPackInstance(regs, b.float_bitmap, b.inst + size_t(b.count) * b.float_count * 16);
   if (b.ps_inst) {
     PoolPackInstance(regs, b.ps_bitmap, b.ps_block + size_t(b.count) * b.ps_float_count * 16,
@@ -3141,7 +3159,6 @@ bool PoolTryHit(uint64_t key, const RegisterFile& regs, const Shader* ps) {
   *b.count_ptr = b.count;
   g_pool.inst_bytes += size_t(b.float_count) * 16;
   ++g_pool.hit;
-  return true;
 }
 
 // ── [GKEY] rung-2 census ────────────────────────────────────────────────
@@ -3906,6 +3923,17 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
     parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   }
 
+  // [hiz-pool] Instance base root constant (instancing vertex shaders).
+  {
+    auto& parameter = parameters[kRootParameter_Bindful_InstanceBase];
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants.ShaderRegister =
+        uint32_t(DxbcShaderTranslator::CbufferRegister::kInstanceBase);
+    parameter.Constants.RegisterSpace = 0;
+    parameter.Constants.Num32BitValues = 1;
+    parameter.ShaderVisibility = vertex_visibility;
+  }
+
   // Shared memory and, if ROVs are used, EDRAM.
   D3D12_DESCRIPTOR_RANGE shared_memory_and_edram_ranges[3];
   {
@@ -4502,6 +4530,7 @@ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
 void D3D12CommandProcessor::SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature) {
   if (current_graphics_root_signature_ != root_signature) {
     current_graphics_root_signature_ = root_signature;
+    inst_base_dirty_ = true;  // [hiz-pool]
     deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
   }
   // Force-invalidate because setting a non-guest root signature.
@@ -4884,6 +4913,16 @@ bool D3D12CommandProcessor::SetupContext() {
         range.RegisterSpace = UINT(DxbcShaderTranslator::SRVSpace::kBindlessTexturesCube);
         range.OffsetInDescriptorsFromTableStart = UINT(SystemBindlessView::kUnboundedSRVsStart);
       }
+    }
+    // [hiz-pool] Instance base root constant (instancing vertex shaders).
+    {
+      auto& parameter = root_parameters_bindless[kRootParameter_Bindless_InstanceBase];
+      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      parameter.Constants.ShaderRegister =
+          uint32_t(DxbcShaderTranslator::CbufferRegister::kInstanceBase);
+      parameter.Constants.RegisterSpace = 0;
+      parameter.Constants.Num32BitValues = 1;
+      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     }
     root_signature_bindless_vs_ =
         ui::d3d12::util::CreateRootSignature(provider, root_signature_bindless_desc);
@@ -6593,7 +6632,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               "{:.0f}/{:.0f}k) | tested/fr {:.0f} idx {:.0f}k ({:.1f}% of frame idx) | HIDDEN/fr "
               "{:.0f} idx {:.0f}k ({:.1f}% of frame idx) | vfy {} idx {:.0f}k WRONG {} idx {:.0f}k "
               "smp {} worst vs {:016X} x{} | close cap/pass/copy/zw/dir/sub/xfer/rt={}/{}/{}/{}/{}/"
-              "{}/{}/{}",
+              "{}/{}/{} | pool open/fr {:.1f} inst/fr {:.1f} tested/fr {:.1f} miss/fr {:.1f}",
               kPhase[hiz_phase_ < 3 ? hiz_phase_ : 0], hiz_k_, hiz_rebuild_,
               double(h.checkpoints) / fr, double(h.builds) / fr, double(h.elig) / fr, double(h.elig_idx) / fr / 1000.0,
               100.0 * double(h.refuse[1]) / el, 100.0 * double(h.refuse[2]) / el,
@@ -6612,7 +6651,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               double(h.vfy_idx) / 1000.0, h.wrong, double(h.wrong_idx) / 1000.0, h.wrong_smp,
               worst_vs < occ_vs_hashes_.size() ? occ_vs_hashes_[worst_vs] : 0ull,
               h.wrong_vs[worst_vs], h.close[0], h.close[1], h.close[2], h.close[3], h.close[4],
-              h.close[5], h.close[6], h.close[7]);
+              h.close[5], h.close[6], h.close[7], double(h.pool_open) / fr,
+              double(h.pool_inst) / fr, double(h.pool_inst_tested) / fr, double(h.pool_miss) / fr);
           hiz_acc_ = HizAcc{};
         }
       }
@@ -7515,6 +7555,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // change (another depth target) or a depth write whose function admits a
   // farther value closes it; the next eligible draw opens a new checkpoint.
   hiz_draw_.valid = false;
+  hiz_draw_.dir_hint = 0;
   if (hiz_phase_ != 0) {
     ++hiz_draws_seen_;
     if (hiz_window_.open) {
@@ -7677,11 +7718,28 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       } else {
         const uint64_t gk_r[4] = {g_pool.ref_vfy_ps, g_pool.ref_vfy_regs, g_pool.ref_vfy_bl,
                                   g_pool.ref_cap};
-        // [hiz] a draw the Hi-Z will test stays plain (its batch, if open,
-        // keeps taking the other draws): drive 813, hidden 11.6% -> 27.2% of
-        // the frame's indices. On the RTX this costs the pool's CP saving
-        // for those draws; the MDI per-instance pool is the next form.
-        const bool pool_hit = !hiz_draw_.valid && PoolTryHit(pool_key, regs, pool_ps);
+        // [hiz-pool] drive 817 (RTX 1440p): the pool bypass of tested draws
+        // dropped the hit share 29% -> 6% and the city to a 50 fps CP wall.
+        // Now a tested draw joins its batch as an element of the per-instance
+        // form (its own Hi-Z entry, hidden alone); a batch whose window
+        // closed refuses the hit and the draw reopens a fresh one.
+        PoolSlot* pool_slot = nullptr;
+        PoolBatch* pool_batch = PoolMatch(pool_key, regs, pool_ps, &pool_slot);
+        bool pool_hit = false;
+        if (pool_batch) {
+          if (pool_batch->hiz_base != UINT32_MAX) {
+            if (HizPoolAppend(pool_batch->hiz_base, pool_batch->hiz_serial, pool_batch->count,
+                              pool_batch->hiz_dir, pool_batch->idx_count)) {
+              pool_hit = true;
+            } else {
+              ++hiz_acc_.pool_miss;
+              if (pool_slot) pool_slot->batch = UINT32_MAX;
+            }
+          } else {
+            pool_hit = true;
+          }
+          if (pool_hit) PoolCommit(*pool_batch, regs);
+        }
         if (g_gk_census) GkAfter(gk, pool_key, pool_hit, gk_r);
         if (pool_hit) {
           g_spp_stop_kind = 1;  // [NR-SPP3]
@@ -8617,6 +8675,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     // [GPU-INST] Defer the draw to coalesce following identical-except-transform
     // draws; the pipeline/bindings/barriers above are recorded once for the run.
     // [DRAW-POOL] or open a batch: one indirect draw in place, instance 0 = this.
+    if (inst_base_dirty_ && (pool_open || start_instanced)) HizInstanceBaseReset();  // [hiz-pool]
     if (pool_open &&
         PoolOpenAndDraw(pool_key, regs, vertex_shader, pixel_shader,
                         primitive_processing_result.host_draw_vertex_count, /*indexed=*/false,
@@ -8710,6 +8769,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     // [GPU-INST] Defer the draw to coalesce the run (memexport draws are never
     // instanced, so scratch_index_buffer is always null on this path).
     // [DRAW-POOL] or open a batch: one indirect draw in place, instance 0 = this.
+    if (inst_base_dirty_ && (pool_open || start_instanced)) HizInstanceBaseReset();  // [hiz-pool]
     if (pool_open &&
         PoolOpenAndDraw(pool_key, regs, vertex_shader, pixel_shader,
                         primitive_processing_result.host_draw_vertex_count, /*indexed=*/true,
@@ -9087,6 +9147,10 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
   b.count = 1;
   b.capacity = capacity;
   b.float_count = float_count;
+  b.hiz_base = UINT32_MAX;  // [hiz-pool] decided below
+  b.hiz_serial = 0;
+  b.hiz_dir = 0;
+  b.idx_count = host_draw_vertex_count;
   std::memcpy(b.float_bitmap, cm.float_bitmap, sizeof(b.float_bitmap));
   b.inst = mapping + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
   b.count_ptr = args + 1;
@@ -9117,9 +9181,51 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
     g_pool.inst_bytes += size_t(ps_float_count) * 16;
     ++g_pool.opened_ps;
   }
-  OccDrawBegin();  // [occ] the batch = one query; its count lands at close
-  deferred_command_list_.D3DExecuteIndirect(sig, 1, buffer, offset);
-  b.occ_tag = OccDrawEnd(host_draw_vertex_count, 1);
+  // [hiz-pool] The per-instance form when the opener is Hi-Z eligible: a
+  // capacity-long run of argument slots (one element per instance, executed
+  // up to the CPU-written count at args[0]), the opener as entry 0 of the
+  // window open now; hits append their own entries while that window lives.
+  bool per_instance = false;
+  if (hiz_available_ && hiz_phase_ != 0 && (hiz_draw_.valid || hiz_draw_.dir_hint) &&
+      hiz_frame_slots_ + capacity <= kHizMaxPerFrame) {
+    ID3D12CommandSignature* hsig = HizCommandSignature(indexed);
+    const uint8_t open_dir = hiz_draw_.valid ? hiz_draw_.dir : hiz_draw_.dir_hint;
+    if (hsig && HizWindowEnsure(open_dir)) {
+      const HizDrawPending d = hiz_draw_;
+      hiz_draw_.valid = false;
+      // The run must not wrap the ring (the elements are read contiguously).
+      if ((hiz_slot_next_ & (kHizRing - 1)) + capacity > kHizRing) {
+        for (uint32_t i = hiz_slot_next_ & (kHizRing - 1); i < kHizRing; ++i) {
+          hiz_slot_idx_[i] = 0;  // skipped slots: stale verdict words, idx 0
+        }
+        hiz_slot_next_ += kHizRing - (hiz_slot_next_ & (kHizRing - 1));
+      }
+      const uint32_t base = hiz_slot_next_ & (kHizRing - 1);
+      hiz_slot_next_ += capacity;
+      hiz_frame_slots_ += capacity;
+      for (uint32_t i = 0; i < capacity; ++i) hiz_slot_idx_[base + i] = 0;
+      HizAppend(base, d.valid ? &d : nullptr, 0, host_draw_vertex_count);
+      b.hiz_base = base;
+      b.hiz_serial = hiz_window_.serial;
+      b.hiz_dir = open_dir;
+      args[0] = 1;  // the element count, raised by every hit
+      b.count_ptr = args;
+      ++hiz_acc_.pool_open;
+      OccDrawBegin();  // [occ] the batch = one query; its count lands at close
+      occ_draw_hiz_ = base + 1;
+      deferred_command_list_.D3DExecuteIndirect(hsig, capacity, hiz_args_.Get(),
+                                                uint64_t(base) * kHizArgsStride, buffer, offset);
+      b.occ_tag = OccDrawEnd(host_draw_vertex_count, 1);
+      occ_draw_hiz_ = 0;
+      inst_base_dirty_ = true;
+      per_instance = true;
+    }
+  }
+  if (!per_instance) {
+    OccDrawBegin();  // [occ] the batch = one query; its count lands at close
+    deferred_command_list_.D3DExecuteIndirect(sig, 1, buffer, offset);
+    b.occ_tag = OccDrawEnd(host_draw_vertex_count, 1);
+  }
   // The vertex float CBV now points at the instance block; the next plain
   // draw must re-upload and re-bind its own constants.
   cbuffer_binding_float_vertex_.up_to_date = false;
@@ -13299,6 +13405,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
     // Changing the root signature invalidates all bindings.
     current_graphics_root_up_to_date_ = 0;
+    inst_base_dirty_ = true;  // [hiz-pool]
     deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
   }
 
@@ -14575,6 +14682,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_signature_ = root_signature;
     // Changing the root signature invalidates all bindings.
     current_graphics_root_up_to_date_ = 0;
+    inst_base_dirty_ = true;  // [hiz-pool]
     deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
   }
 
@@ -15847,13 +15955,19 @@ void D3D12CommandProcessor::OccConsumeCompleted() {
       }
       if (t.hiz && hiz_verdict_mapping_) {  // [hiz] the GPU's verdict for this draw
         HizAcc& h = hiz_acc_;
-        const uint32_t verdict = hiz_verdict_mapping_[(t.hiz - 1) & (kHizRing - 1)];
+        // [hiz-pool] a per-instance batch (kind 1) is one query over its
+        // run: WRONG only when every element was hidden and samples passed.
+        const uint32_t n = t.kind == 1 ? std::max<uint32_t>(t.inst, 1) : 1;
+        bool verdict = true;
+        for (uint32_t k = 0; k < n && verdict; ++k) {
+          verdict = hiz_verdict_mapping_[(t.hiz - 1 + k) & (kHizRing - 1)] != 0;
+        }
         if (t.hiz_mode == 1 && t.smp) {  // verify: the draw ran with the query
           ++h.vfy;
-          h.vfy_idx += t.idx;
+          h.vfy_idx += uint64_t(t.idx) * n;
           if (verdict && smp) {
             ++h.wrong;
-            h.wrong_idx += t.idx;
+            h.wrong_idx += uint64_t(t.idx) * n;
             h.wrong_smp += smp;
             ++h.wrong_vs[t.vs_slot & 4095];
           }
@@ -16060,6 +16174,8 @@ void D3D12CommandProcessor::ShutdownHizResources() {
   hiz_test_pipeline_.Reset();
   for (auto& p : hiz_build_pipelines_) p.Reset();
   hiz_root_signature_.Reset();
+  hiz_cmdsig_[0].clear();
+  hiz_cmdsig_[1].clear();
 }
 
 void D3D12CommandProcessor::HizBeginSubmission() {
@@ -16071,7 +16187,8 @@ void D3D12CommandProcessor::HizBeginSubmission() {
     if (hiz_verdict_mapping_) {
       for (uint32_t i = 0; i < p.count; ++i) {
         const uint32_t slot = (p.first + i) & (kHizRing - 1);
-        if (hiz_verdict_mapping_[slot]) {
+        // [hiz-pool] a reserved, never appended slot has idx 0 and a stale word.
+        if (hiz_verdict_mapping_[slot] && hiz_slot_idx_[slot]) {
           ++hiz_acc_.hidden;
           hiz_acc_.hidden_idx += hiz_slot_idx_[slot];
         }
@@ -16171,6 +16288,7 @@ void D3D12CommandProcessor::HizPrepare(const CullBounds& b, const float m[4][5],
     HizRefuse(2, index_count);
     return;
   }
+  hiz_draw_.dir_hint = dir;  // [hiz-pool] the depth class holds from here on
   draw_util::ViewportInfo vp;
   draw_util::GetHostViewportInfo(
       regs, texture_cache_->draw_resolution_scale_x(), texture_cache_->draw_resolution_scale_y(),
@@ -16282,13 +16400,19 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
   const bool rebuild = hiz_draws_seen_ - hiz_build_draws_ >= uint64_t(hiz_rebuild_);
   ++hiz_acc_.checkpoints;
   if (rebuild) ++hiz_acc_.builds;
-  GpuCensusScope census(*this, kGpuCensusHiz);
+  // Priced as three classes: the depth target's transitions (hizd: the
+  // driver's decompress), the build CS (hiz), the test CS with the
+  // argument-buffer barriers (hizt), so a drive names which one the ~1.3 ms
+  // per build on the Intel is before a cheaper build is designed.
+  GpuCensusScope census(*this, rebuild ? kGpuCensusHizDepth : kGpuCensusHizTest);
   ID3D12PipelineState* saved_external = current_external_pipeline_;
   void* saved_guest = current_guest_pipeline_;
 
   if (rebuild) {
     render_target_cache_->TransitionBoundDepthForHiz(
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    SubmitBarriers();
+    GpuCensusSetClass(kGpuCensusHiz);
   }
   PushTransitionBarrier(hiz_args_.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -16312,15 +16436,18 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
     SubmitBarriers();
     hiz_build_draws_ = hiz_draws_seen_;
     hiz_valid_ = true;
+    GpuCensusSetClass(kGpuCensusHizTest);
   }
   SetExternalPipeline(hiz_test_pipeline_.Get());
   deferred_command_list_.D3DDispatch((cap + 63) / 64, 1, 1);
   PushTransitionBarrier(hiz_args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-  if (rebuild) {
-    render_target_cache_->TransitionBoundDepthForHiz(D3D12_RESOURCE_STATE_DEPTH_WRITE);
-  }
   SubmitBarriers();
+  if (rebuild) {
+    GpuCensusSetClass(kGpuCensusHizDepth);
+    render_target_cache_->TransitionBoundDepthForHiz(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    SubmitBarriers();
+  }
   // The draw's pipeline back (the compute passes replaced it).
   if (saved_external) {
     SetExternalPipeline(saved_external);
@@ -16331,6 +16458,7 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
   }
 
   hiz_window_.open = true;
+  hiz_window_.serial = ++hiz_window_serial_;  // [hiz-pool]
   hiz_window_.submission = submission_current_;
   hiz_window_.transfer_epoch = epoch;
   hiz_window_.count = 0;
@@ -16345,13 +16473,143 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
 // The plain-draw site: append the pending entry to the window (opening a
 // checkpoint first when none is open or the open one no longer holds) and
 // issue the draw as ExecuteIndirect from its argument slot.
+bool D3D12CommandProcessor::HizWindowValidate(uint8_t dir) {
+  if (!hiz_window_.open) {
+    return false;
+  }
+  if (hiz_window_.submission != submission_current_) {
+    HizWindowClose(5);
+  } else if (hiz_window_.transfer_epoch != render_target_cache_->transfer_epoch()) {
+    HizWindowClose(6);
+  } else if (hiz_window_.dir != dir) {
+    HizWindowClose(4);
+  } else if (hiz_window_.count >= hiz_window_.cap) {
+    HizWindowClose(0);
+  } else {
+    uint32_t w, h, samples;
+    D3D12_CPU_DESCRIPTOR_HANDLE srv;
+    if (render_target_cache_->GetBoundDepthForHiz(w, h, samples, srv) !=
+        hiz_window_.depth_resource) {
+      HizWindowClose(7);
+    }
+  }
+  return hiz_window_.open;
+}
+
+bool D3D12CommandProcessor::HizWindowEnsure(uint8_t dir) {
+  if (!hiz_available_ || hiz_phase_ == 0) {
+    return false;
+  }
+  if (HizWindowValidate(dir)) {
+    return true;
+  }
+  return HizCheckpoint(dir);
+}
+
+// One table entry of the open window: the slot's arguments (dword 0 = the
+// instance base root constant, then the draw arguments) and, when d is set,
+// the rect and depth to test; otherwise never hidden (flags bit 1).
+void D3D12CommandProcessor::HizAppend(uint32_t slot, const HizDrawPending* d, uint32_t inst,
+                                      uint32_t host_count) {
+  hiz_slot_idx_[slot] = host_count;
+  uint32_t* e = reinterpret_cast<uint32_t*>(hiz_window_.entries +
+                                            size_t(hiz_window_.count) * kHizEntryBytes);
+  if (d) {
+    std::memcpy(e, d->rect, 4 * sizeof(float));
+    std::memcpy(e + 4, &d->z_near, sizeof(float));
+    e[5] = (d->dir == 1 ? 1u : 0u) | (inst << 8);
+    ++hiz_acc_.tested;
+    hiz_acc_.tested_idx += host_count;
+  } else {
+    std::memset(e, 0, 5 * sizeof(uint32_t));
+    e[5] = 2u | (inst << 8);
+  }
+  e[6] = slot;
+  e[7] = 0;  // argument dword 4: base vertex (indexed) / start instance
+  e[8] = host_count;
+  e[9] = 1;   // instances
+  e[10] = 0;  // start index / start vertex
+  e[11] = 0;  // base vertex (indexed) / start instance (non-indexed)
+  ++hiz_window_.count;
+  hiz_window_.header[0] = hiz_window_.count;  // read by the test CS at GPU time
+}
+
+// A pool hit into a per-instance batch: its element (base + inst) gets an
+// entry of the batch's window. False when that window is gone (the hit is
+// refused and the draw reopens a fresh batch).
+bool D3D12CommandProcessor::HizPoolAppend(uint32_t base, uint32_t serial, uint32_t inst,
+                                          uint8_t dir, uint32_t idx_count) {
+  if (!hiz_available_ || hiz_phase_ == 0) {
+    return false;
+  }
+  if (!HizWindowValidate(dir) || hiz_window_.serial != serial) {
+    return false;
+  }
+  const HizDrawPending d = hiz_draw_;
+  hiz_draw_.valid = false;
+  const uint32_t slot = (base + inst) & (kHizRing - 1);
+  const bool tested = d.valid && d.dir == dir;
+  HizAppend(slot, tested ? &d : nullptr, inst, idx_count);
+  ++hiz_acc_.pool_inst;
+  if (tested) ++hiz_acc_.pool_inst_tested;
+  return true;
+}
+
+// The command signature of the Hi-Z argument slot: the instance base root
+// constant, then the draw. Created against the bound guest root signature.
+ID3D12CommandSignature* D3D12CommandProcessor::HizCommandSignature(bool indexed) {
+  ID3D12RootSignature* rs = current_graphics_root_signature_;
+  if (!rs) {
+    return nullptr;
+  }
+  auto& cache = hiz_cmdsig_[indexed ? 1 : 0];
+  auto it = cache.find(rs);
+  if (it != cache.end()) {
+    return it->second.Get();
+  }
+  D3D12_INDIRECT_ARGUMENT_DESC args[2] = {};
+  args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+  args[0].Constant.RootParameterIndex = bindless_resources_used_
+                                            ? kRootParameter_Bindless_InstanceBase
+                                            : kRootParameter_Bindful_InstanceBase;
+  args[0].Constant.DestOffsetIn32BitValues = 0;
+  args[0].Constant.Num32BitValuesToSet = 1;
+  args[1].Type =
+      indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+  D3D12_COMMAND_SIGNATURE_DESC desc = {};
+  desc.ByteStride = kHizArgsStride;
+  desc.NumArgumentDescs = 2;
+  desc.pArgumentDescs = args;
+  Microsoft::WRL::ComPtr<ID3D12CommandSignature> sig;
+  if (FAILED(GetD3D12Provider().GetDevice()->CreateCommandSignature(&desc, rs,
+                                                                    IID_PPV_ARGS(&sig)))) {
+    REXGPU_WARN("[hiz] command signature with the instance base constant failed");
+    cache.emplace(rs, nullptr);
+    return nullptr;
+  }
+  cache.emplace(rs, sig);
+  return sig.Get();
+}
+
+void D3D12CommandProcessor::HizInstanceBaseReset() {
+  const uint32_t zero = 0;
+  deferred_command_list_.D3DSetGraphicsRoot32BitConstants(
+      bindless_resources_used_ ? kRootParameter_Bindless_InstanceBase
+                               : kRootParameter_Bindful_InstanceBase,
+      1, &zero, 0);
+  inst_base_dirty_ = false;
+}
+
+// The plain-draw site: append the pending entry to the window (opening a
+// checkpoint first when none is open or the open one no longer holds) and
+// issue the draw as ExecuteIndirect from its argument slot.
 bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_count) {
   const HizDrawPending d = hiz_draw_;
   hiz_draw_.valid = false;
   if (!hiz_available_ || !d.valid || hiz_phase_ == 0) {
     return false;
   }
-  ID3D12CommandSignature* sig = DrawCommandSignature(indexed);
+  ID3D12CommandSignature* sig = HizCommandSignature(indexed);
   if (!sig) {
     HizRefuse(8, d.index_count);
     return false;
@@ -16360,53 +16618,21 @@ bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_coun
     HizRefuse(7, d.index_count);
     return false;
   }
-  if (hiz_window_.open) {
-    if (hiz_window_.submission != submission_current_) {
-      HizWindowClose(5);
-    } else if (hiz_window_.transfer_epoch != render_target_cache_->transfer_epoch()) {
-      HizWindowClose(6);
-    } else if (hiz_window_.dir != d.dir) {
-      HizWindowClose(4);
-    } else if (hiz_window_.count >= hiz_window_.cap) {
-      HizWindowClose(0);
-    } else {
-      uint32_t w, h, samples;
-      D3D12_CPU_DESCRIPTOR_HANDLE srv;
-      if (render_target_cache_->GetBoundDepthForHiz(w, h, samples, srv) !=
-          hiz_window_.depth_resource) {
-        HizWindowClose(7);
-      }
-    }
-  }
-  if (!hiz_window_.open && !HizCheckpoint(d.dir)) {
+  if (!HizWindowEnsure(d.dir)) {
     HizRefuse(6, d.index_count);
     return false;
   }
   const uint32_t slot = hiz_slot_next_ & (kHizRing - 1);
   ++hiz_slot_next_;
   ++hiz_frame_slots_;
-  hiz_slot_idx_[slot] = host_draw_vertex_count;
-  uint32_t* e = reinterpret_cast<uint32_t*>(hiz_window_.entries +
-                                            size_t(hiz_window_.count) * kHizEntryBytes);
-  std::memcpy(e, d.rect, 4 * sizeof(float));
-  std::memcpy(e + 4, &d.z_near, sizeof(float));
-  e[5] = d.dir == 1 ? 1u : 0u;
-  e[6] = slot;
-  e[7] = 0;  // argument dword 4: base vertex (indexed) / start instance
-  e[8] = host_draw_vertex_count;
-  e[9] = 1;   // instances
-  e[10] = 0;  // start index / start vertex
-  e[11] = 0;  // base vertex (indexed) / start instance (non-indexed)
-  ++hiz_window_.count;
-  hiz_window_.header[0] = hiz_window_.count;  // read by the test CS at GPU time
-  ++hiz_acc_.tested;
-  hiz_acc_.tested_idx += host_draw_vertex_count;
+  HizAppend(slot, &d, 0, host_draw_vertex_count);
   OccDrawBegin();  // [occ]
   occ_draw_hiz_ = slot + 1;
   deferred_command_list_.D3DExecuteIndirect(sig, 1, hiz_args_.Get(),
                                             uint64_t(slot) * kHizArgsStride);
   OccDrawEnd(host_draw_vertex_count, 0);
   occ_draw_hiz_ = 0;
+  inst_base_dirty_ = true;  // the element set the root constant
   return true;
 }
 
@@ -16563,8 +16789,8 @@ void D3D12CommandProcessor::GpuCensusReport1Hz() {
   const double to_ms = gpu_census_ticks_to_ms_;
   REXGPU_INFO(
       "[gpu-census] gpu {:.1f}ms/s | draw {:.1f}/{} xfer {:.1f}/{} resolve {:.1f}/{} "
-      "texup {:.1f}/{} memup {:.1f}/{} swap {:.1f}/{} hiz {:.1f}/{} other {:.1f}/{} | trunc {} "
-      "drop {}",
+      "texup {:.1f}/{} memup {:.1f}/{} swap {:.1f}/{} hiz {:.1f}/{} hizt {:.1f}/{} hizd "
+      "{:.1f}/{} other {:.1f}/{} | trunc {} drop {}",
       double(total_ticks) * to_ms, double(draw_ticks) * to_ms, draw_spans,
       double(gpu_census_class_ticks_[kGpuCensusXfer]) * to_ms,
       gpu_census_class_spans_[kGpuCensusXfer],
@@ -16578,6 +16804,10 @@ void D3D12CommandProcessor::GpuCensusReport1Hz() {
       gpu_census_class_spans_[kGpuCensusSwap],
       double(gpu_census_class_ticks_[kGpuCensusHiz]) * to_ms,
       gpu_census_class_spans_[kGpuCensusHiz],
+      double(gpu_census_class_ticks_[kGpuCensusHizTest]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusHizTest],
+      double(gpu_census_class_ticks_[kGpuCensusHizDepth]) * to_ms,
+      gpu_census_class_spans_[kGpuCensusHizDepth],
       double(gpu_census_class_ticks_[kGpuCensusOther]) * to_ms,
       gpu_census_class_spans_[kGpuCensusOther], gpu_census_trunc_, gpu_census_dropped_);
   // [gpu-census-draw] sub-split: top RT configs by GPU ms this second.

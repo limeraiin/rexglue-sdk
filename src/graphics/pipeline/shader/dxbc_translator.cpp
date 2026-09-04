@@ -122,6 +122,7 @@ void DxbcShaderTranslator::Reset() {
   cbuffer_index_bool_loop_constants_ = kBindingIndexUnallocated;
   cbuffer_index_fetch_constants_ = kBindingIndexUnallocated;
   cbuffer_index_descriptor_indices_ = kBindingIndexUnallocated;
+  cbuffer_index_instance_base_ = kBindingIndexUnallocated;
 
   system_constants_used_ = 0;
 
@@ -437,17 +438,25 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
   // [GPU-INST] Compute the per-instance base index into the float-constants
   // cbuffer: instance_base.x = SV_InstanceID * float_count. Every absolute
   // float-constant load is then redirected to cb[instance_base.x + index].
+  // [hiz-pool] The instance index is SV_InstanceID plus the xe_instance_base
+  // root constant (an ExecuteIndirect element per instance sets it; 0 for a
+  // plain instanced draw), so a checkpoint can hide single instances.
   if (system_temp_instance_base_ != UINT32_MAX) {
     uint32_t instanced_float_count = current_shader().constant_register_map().float_count;
-    a_.OpUMul(dxbc::Dest::Null(), dxbc::Dest::R(system_temp_instance_base_, 0b0001),
+    assert_true(cbuffer_index_instance_base_ != kBindingIndexUnallocated);
+    a_.OpIAdd(dxbc::Dest::R(system_temp_instance_base_, 0b0001),
               dxbc::Src::V1D(kInRegisterVSInstanceID, dxbc::Src::kXXXX),
+              dxbc::Src::CB(cbuffer_index_instance_base_,
+                            uint32_t(CbufferRegister::kInstanceBase), 0, dxbc::Src::kXXXX));
+    // [DRAW-POOL] rung 1b-2: export the instance index for the instanced
+    // pixel shader variant (a plain pixel shader simply does not read it).
+    if (out_reg_vs_instance_id_ != UINT32_MAX) {
+      a_.OpMov(dxbc::Dest::O(out_reg_vs_instance_id_, 0b0001),
+               dxbc::Src::R(system_temp_instance_base_, dxbc::Src::kXXXX));
+    }
+    a_.OpUMul(dxbc::Dest::Null(), dxbc::Dest::R(system_temp_instance_base_, 0b0001),
+              dxbc::Src::R(system_temp_instance_base_, dxbc::Src::kXXXX),
               dxbc::Src::LU(instanced_float_count));
-  }
-  // [DRAW-POOL] rung 1b-2: export SV_InstanceID for the instanced pixel
-  // shader variant (a plain pixel shader simply does not read it).
-  if (out_reg_vs_instance_id_ != UINT32_MAX) {
-    a_.OpMov(dxbc::Dest::O(out_reg_vs_instance_id_, 0b0001),
-             dxbc::Src::V1D(kInRegisterVSInstanceID, dxbc::Src::kXXXX));
   }
 
   // Remember that x# are only accessible via mov load or store - use a
@@ -846,6 +855,7 @@ void DxbcShaderTranslator::StartTranslation() {
     // Allocated just above point_size; released in CompleteShaderCode.
     if (IsVertexShaderInstanced()) {
       system_temp_instance_base_ = PushSystemTemp(0b0001);
+      cbuffer_index_instance_base_ = cbuffer_count_++;  // [hiz-pool]
     }
   } else if (is_pixel_shader()) {
     if (IsDepthStencilSystemTempUsed()) {
@@ -2090,6 +2100,10 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
     name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_descriptor_indices");
   }
+  uint32_t constant_name_ptr_instance_base = name_ptr;
+  if (cbuffer_index_instance_base_ != kBindingIndexUnallocated) {
+    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_instance_base");
+  }
 
   // System constants.
   uint32_t constant_position_dwords_system = uint32_t(shader_object_.size());
@@ -2201,6 +2215,22 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
     constant_descriptor_indices.start_sampler = UINT32_MAX;
   }
 
+  // [hiz-pool] Instance base (root constant, one uint).
+  uint32_t constant_position_dwords_instance_base = uint32_t(shader_object_.size());
+  if (cbuffer_index_instance_base_ != kBindingIndexUnallocated) {
+    shader_object_.resize(constant_position_dwords_instance_base +
+                          sizeof(dxbc::RdefVariable) / sizeof(uint32_t));
+    auto& constant_instance_base = *reinterpret_cast<dxbc::RdefVariable*>(
+        shader_object_.data() + constant_position_dwords_instance_base);
+    constant_instance_base.name_ptr = constant_name_ptr_instance_base;
+    constant_instance_base.size_bytes = sizeof(uint32_t);
+    constant_instance_base.flags = dxbc::kRdefVariableFlagUsed;
+    constant_instance_base.type_ptr =
+        types_ptr + sizeof(dxbc::RdefType) * uint32_t(ShaderRdefTypeIndex::kUint);
+    constant_instance_base.start_texture = UINT32_MAX;
+    constant_instance_base.start_sampler = UINT32_MAX;
+  }
+
   // ***************************************************************************
   // Constant buffers
   // ***************************************************************************
@@ -2226,6 +2256,10 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   uint32_t cbuffer_name_ptr_descriptor_indices = name_ptr;
   if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
     name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_descriptor_indices_cbuffer");
+  }
+  uint32_t cbuffer_name_ptr_instance_base = name_ptr;
+  if (cbuffer_index_instance_base_ != kBindingIndexUnallocated) {
+    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_instance_base_cbuffer");
   }
 
   // All the constant buffers, sorted by their binding index.
@@ -2272,6 +2306,12 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
             (constant_position_dwords_descriptor_indices - blob_position_dwords) * sizeof(uint32_t);
         cbuffer.size_vector_aligned_bytes =
             sizeof(uint32_t) * rex::align(GetBindlessResourceCount(), uint32_t(4));
+      } else if (i == cbuffer_index_instance_base_) {
+        cbuffer.name_ptr = cbuffer_name_ptr_instance_base;
+        cbuffer.variable_count = 1;
+        cbuffer.variables_ptr =
+            (constant_position_dwords_instance_base - blob_position_dwords) * sizeof(uint32_t);
+        cbuffer.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
       } else {
         assert_unhandled_case(i);
       }
@@ -2488,6 +2528,9 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
       } else if (i == cbuffer_index_descriptor_indices_) {
         cbuffer.name_ptr = cbuffer_name_ptr_descriptor_indices;
         cbuffer.bind_point = uint32_t(CbufferRegister::kDescriptorIndices);
+      } else if (i == cbuffer_index_instance_base_) {
+        cbuffer.name_ptr = cbuffer_name_ptr_instance_base;
+        cbuffer.bind_point = uint32_t(CbufferRegister::kInstanceBase);
       } else {
         assert_unhandled_case(i);
       }
@@ -3237,6 +3280,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
                                           uint32_t(CbufferRegister::kDescriptorIndices),
                                           uint32_t(CbufferRegister::kDescriptorIndices)),
                             (GetBindlessResourceCount() + 3) >> 2);
+  }
+  if (cbuffer_index_instance_base_ != kBindingIndexUnallocated) {  // [hiz-pool]
+    ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_instance_base_,
+                                          uint32_t(CbufferRegister::kInstanceBase),
+                                          uint32_t(CbufferRegister::kInstanceBase)),
+                            1);
   }
   if (cbuffer_index_bool_loop_constants_ != kBindingIndexUnallocated) {
     ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_bool_loop_constants_,

@@ -87,10 +87,15 @@ void hiz_build(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID,
 //   float  z_near        the draw's nearest host depth over the bounds
 //   uint   flags         bit 0: reversed (GEQUAL/GREATER: hidden when
 //                        z_near < tile min); else LESS/LEQUAL (hidden when
-//                        z_near > tile max)
+//                        z_near > tile max); bit 1: never hidden (an
+//                        untestable instance of a per-instance pool batch);
+//                        bits 8..31: the instance index written as the
+//                        slot's root constant (argument dword 0)
 //   uint   slot          indirect-argument / verdict slot
 //   uint   args4         argument dword 4 (the base vertex of indexed draws)
 //   uint4  args0         DrawIndexed/Draw argument dwords 0..3
+// Slot layout (32 B): dword 0 = the instance base root constant, dwords
+// 1..5 = the draw arguments (the command signature is [constant, draw]).
 [numthreads(64, 1, 1)]
 void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   uint i = dispatch_id.x;
@@ -114,7 +119,7 @@ void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   ty0 = max(ty0, 0);
   tx1 = min(tx1, int(hiz_tiles_x) - 1);
   ty1 = min(ty1, int(hiz_tiles_y) - 1);
-  bool hidden = hiz_mode != 0u && tx0 <= tx1 && ty0 <= ty1;
+  bool hidden = hiz_mode != 0u && (flags & 2u) == 0u && tx0 <= tx1 && ty0 <= ty1;
   if (hidden) {
     bool reversed = (flags & 1u) != 0u;
     [loop]
@@ -131,7 +136,8 @@ void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   }
   uint instances = (hidden && hiz_mode == 2u) ? 0u : args0.y;
   uint ab = slot * 32u;
-  hiz_args.Store4(ab, uint4(args0.x, instances, args0.z, args0.w));
-  hiz_args.Store(ab + 16u, args4);
+  hiz_args.Store(ab, flags >> 8u);  // the instance base root constant
+  hiz_args.Store4(ab + 4u, uint4(args0.x, instances, args0.z, args0.w));
+  hiz_args.Store(ab + 20u, args4);
   hiz_verdict.Store(slot * 4u, hidden ? 1u : 0u);
 }
