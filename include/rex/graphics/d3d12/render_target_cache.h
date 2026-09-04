@@ -101,6 +101,21 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     return GetPath() == Path::kHostRenderTargets && !REXCVAR_GET(snorm16_render_target_full_range);
   }
 
+  // [hiz] bumps whenever PerformTransfersAndResolveClears records a transfer
+  // or a resolve clear (a render target written by something other than
+  // rasterization): the command processor's Hi-Z window closes on a change.
+  uint64_t transfer_epoch() const { return transfer_epoch_; }
+
+  // [hiz] the depth render target the last Update bound: resource, size in
+  // pixels, sample count and its non-shader-visible depth SRV. Null when no
+  // depth target is bound.
+  ID3D12Resource* GetBoundDepthForHiz(uint32_t& width_out, uint32_t& height_out,
+                                      uint32_t& samples_out,
+                                      D3D12_CPU_DESCRIPTOR_HANDLE& srv_out);
+  // [hiz] pushes the bound depth target's transition through the command
+  // processor's barrier list (the checkpoint reads it, then draws resume).
+  void TransitionBoundDepthForHiz(D3D12_RESOURCE_STATES state);
+
   bool depth_float24_round() const { return depth_float24_round_; }
   bool depth_float24_convert_in_pixel_shader() const {
     return depth_float24_convert_in_pixel_shader_;
@@ -766,6 +781,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // ownership-transfer shapes the game actually hits - in particular whether
   // the self-referential host-depth path (the last shipping-path EDRAM
   // dependency outside the resolve fallback) ever fires.
+  uint64_t transfer_epoch_ = 0;  // [hiz]
   uint64_t xfer_census_passes_ = 0;
   uint64_t xfer_census_modes_[8] = {};  // TransferMode order
   uint64_t xfer_census_stencil_bit_ = 0;

@@ -2188,6 +2188,39 @@ DXGI_FORMAT D3D12RenderTargetCache::GetDepthSRVStencilDXGIFormat(
   }
 }
 
+ID3D12Resource* D3D12RenderTargetCache::GetBoundDepthForHiz(uint32_t& width_out,
+                                                            uint32_t& height_out,
+                                                            uint32_t& samples_out,
+                                                            D3D12_CPU_DESCRIPTOR_HANDLE& srv_out) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return nullptr;
+  }
+  RenderTarget* rt = last_update_accumulated_render_targets()[0];
+  if (!rt) {
+    return nullptr;
+  }
+  auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(rt);
+  if (!d3d12_rt.resource() || !d3d12_rt.descriptor_srv().IsValid()) {
+    return nullptr;
+  }
+  const D3D12_RESOURCE_DESC desc = d3d12_rt.resource()->GetDesc();
+  width_out = uint32_t(desc.Width);
+  height_out = desc.Height;
+  samples_out = desc.SampleDesc.Count;
+  srv_out = d3d12_rt.descriptor_srv().GetHandle();
+  return d3d12_rt.resource();
+}
+
+void D3D12RenderTargetCache::TransitionBoundDepthForHiz(D3D12_RESOURCE_STATES state) {
+  RenderTarget* rt = last_update_accumulated_render_targets()[0];
+  if (!rt) {
+    return;
+  }
+  auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(rt);
+  command_processor_.PushTransitionBarrier(d3d12_rt.resource(), d3d12_rt.SetResourceState(state),
+                                           state);
+}
+
 RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
 
@@ -4560,6 +4593,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         break;
       }
     }
+  }
+  // [hiz] anything that writes a render target other than rasterization
+  // invalidates an open Hi-Z window (the checkpoint's depth may have moved).
+  if (gpu_census_work) {
+    ++transfer_epoch_;
   }
   std::optional<D3D12CommandProcessor::GpuCensusScope> gpu_census_scope;
   if (gpu_census_work) {

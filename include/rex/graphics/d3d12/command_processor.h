@@ -62,6 +62,8 @@ struct OccCensusTag {
   uint8_t elig;
   uint16_t vs_slot;  // [occ-pos] vertex shader slot (0 = none)
   uint16_t dbg;      // [cull] verify debug ring id + 1 (0 = none)
+  uint32_t hiz;      // [hiz] verdict slot + 1 (0 = not Hi-Z tested)
+  uint8_t hiz_mode;  // [hiz] 1 verify (drawn), 2 skip (InstanceCount 0 when hidden)
 };
 
 class D3D12CommandProcessor : public CommandProcessor {
@@ -111,6 +113,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     kGpuCensusTexUp,        // texture-cache load-shader dispatches
     kGpuCensusMemUp,        // shared-memory upload copies
     kGpuCensusSwap,         // IssueSwap gamma/present pass
+    kGpuCensusHiz,          // [hiz] checkpoints: depth -> Hi-Z build + the test CS
     kGpuCensusOther,        // submission setup / untagged
     kGpuCensusClassCount
   };
@@ -1227,6 +1230,69 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   CullAcc cull_acc_;
   uint32_t cull_phase_ = 0;
+
+  // [hiz] ISSUEDRAW increment 3: the Hi-Z cull. See "[hiz]" in
+  // command_processor.cpp. Phase 0 off, 1 verify (every draw issued, the
+  // GPU verdict read back and judged against the [occ] query), 2 skip
+  // (a hidden draw's InstanceCount is zeroed by the checkpoint's test CS).
+  bool InitializeHizResources();
+  void ShutdownHizResources();
+  void HizBeginSubmission();
+  void HizResolveSubmission();  // verdict ring -> readback, on the real list
+  void HizPrepare(const CullBounds& b, const float m[4][5], const RegisterFile& regs,
+                  uint32_t index_count);
+  void HizWindowClose(uint32_t reason);
+  bool HizCheckpoint(uint8_t dir);
+  bool HizDraw(bool indexed, uint32_t host_draw_vertex_count);
+  void HizRefuse(uint32_t reason, uint32_t idx) {
+    ++hiz_acc_.refuse[reason];
+    hiz_acc_.refuse_idx[reason] += idx;
+  }
+  ID3D12CommandSignature* DrawCommandSignature(bool indexed);
+  static constexpr uint32_t kHizRing = 1u << 16;  // argument / verdict slots
+  static constexpr uint32_t kHizMaxPerFrame = kHizRing / 4;
+  static constexpr uint32_t kHizEntryBytes = 48, kHizHeaderBytes = 16, kHizArgsStride = 32;
+  static constexpr uint32_t kHizMaxK = 1024;
+  static constexpr uint32_t kHizMaxRectTiles = 64;  // per axis
+  static constexpr uint32_t kHizBufferBytes = 2u << 20;  // 512x512 tiles of float2
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> hiz_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> hiz_build_pipelines_[3];  // 1x, 2x, 4x
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> hiz_test_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> hiz_buffer_, hiz_args_, hiz_verdict_,
+      hiz_verdict_readback_;
+  const uint32_t* hiz_verdict_mapping_ = nullptr;
+  bool hiz_available_ = false;
+  uint32_t hiz_phase_ = 0, hiz_k_ = 300, hiz_rebuild_ = 300;  // latched at frame end
+  uint32_t hiz_slot_next_ = 0, hiz_sub_first_slot_ = 0, hiz_frame_slots_ = 0;
+  // The last Hi-Z build: its depth target, the transfer epoch it saw and the
+  // received-draw count at that point; a checkpoint within hiz_rebuild_
+  // draws of it on the same target reuses the buffer (test only).
+  ID3D12Resource* hiz_build_resource_ = nullptr;
+  uint64_t hiz_build_epoch_ = 0, hiz_build_draws_ = 0, hiz_draws_seen_ = 0;
+  bool hiz_last_close_benign_ = false;
+  struct HizWindow {
+    bool open = false;
+    uint64_t submission = 0, transfer_epoch = 0;
+    uint32_t count = 0, cap = 0;
+    uint8_t dir = 0;  // 1 reversed (GEQUAL/GREATER), 2 normal (LESS/LEQUAL)
+    uint32_t* header = nullptr;
+    uint8_t* entries = nullptr;
+    ID3D12Resource* depth_resource = nullptr;
+  } hiz_window_;
+  // The draw being issued: filled by the [cull] block, consumed by the
+  // plain-draw site (an ExecuteIndirect instead of a direct draw).
+  struct HizDrawPending {
+    bool valid = false;
+    float rect[4] = {}, z_near = 0.0f;
+    uint8_t dir = 0;
+    uint32_t index_count = 0;
+  } hiz_draw_;
+  uint32_t occ_draw_hiz_ = 0;  // tag: verdict slot + 1
+  struct HizAcc {
+    uint64_t elig = 0, elig_idx = 0, refuse[12] = {}, refuse_idx[12] = {}, tested = 0,
+             tested_idx = 0, checkpoints = 0, builds = 0, close[8] = {}, hidden = 0, hidden_idx = 0, vfy = 0,
+             vfy_idx = 0, wrong = 0, wrong_idx = 0, wrong_smp = 0, wrong_vs[4096] = {};
+  } hiz_acc_;
   uint32_t occ_ring_next_ = 0, occ_sub_start_ = 0, occ_sub_count_ = 0;
   std::deque<OccPending> occ_pending_;
   uint64_t occ_trunc_ = 0, occ_dropped_ = 0;
