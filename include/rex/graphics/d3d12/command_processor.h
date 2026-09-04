@@ -48,6 +48,17 @@
 
 namespace rex::graphics::d3d12 {
 
+// [occ] one census tag per issued draw (file-scope in the .cpp so the draw
+// pool can write a batch's final instance count into it at close).
+struct OccCensusTag {
+  uint32_t idx;   // host index (or vertex) count per instance
+  uint32_t inst;  // instances (pool batches: written at close)
+  uint8_t kind;   // 0 plain, 1 pool batch
+  uint8_t cls;    // gpu-census draw class at issue
+  uint8_t smp;    // 1 = the occlusion half was recorded
+  uint8_t pad;
+};
+
 class D3D12CommandProcessor : public CommandProcessor {
  public:
   explicit D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
@@ -718,6 +729,21 @@ class D3D12CommandProcessor : public CommandProcessor {
   void GpuCensusConsumeCompleted();
   void GpuCensusReport1Hz();
 
+  // [occ] the occlusion census (drive 796 read: the city is ~6.5M indices /
+  // ~2.2M triangles per frame; the iGPU prices triangles on screen). Every
+  // issued draw (plain draw, pool ExecuteIndirect) sits inside a
+  // pipeline-statistics query and an occlusion query; the tags carry the
+  // draw's index count, instance count and gpu-census draw class. Same
+  // ring/pending shape as the gpu-census, consumed on the same fences.
+  bool InitializeOccCensusResources();
+  void ShutdownOccCensusResources();
+  void OccBeginSubmission();
+  void OccDrawBegin();
+  uint32_t OccDrawEnd(uint32_t idx, uint8_t kind);  // returns the tag index
+  void OccResolveSubmission();
+  void OccConsumeCompleted();
+  void OccReport1Hz();
+
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
   bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
@@ -1152,6 +1178,37 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t gpu_census_draw_config_count_ = 0;
   uint32_t gpu_census_last_rt_keys_[5] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
                                           UINT32_MAX};
+
+  // [occ] census state: two query heaps (pipeline statistics + occlusion)
+  // indexed by the same ring slot, one slot per issued draw.
+  static constexpr uint32_t kOccPoolSize = 32768;
+  static constexpr uint32_t kOccMaxPerSubmission = 4096;
+  using OccTag = OccCensusTag;
+  struct OccPending {
+    uint64_t submission;
+    uint32_t start, count;
+    std::vector<OccTag> tags;
+  };
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> occ_stats_heap_, occ_smp_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> occ_stats_readback_, occ_smp_readback_;
+  const D3D12_QUERY_DATA_PIPELINE_STATISTICS* occ_stats_mapping_ = nullptr;
+  const uint64_t* occ_smp_mapping_ = nullptr;
+  bool occ_available_ = false, occ_sub_active_ = false, occ_draw_open_ = false,
+       occ_draw_smp_ = false;
+  uint32_t occ_ring_next_ = 0, occ_sub_start_ = 0, occ_sub_count_ = 0;
+  std::deque<OccPending> occ_pending_;
+  uint64_t occ_trunc_ = 0, occ_dropped_ = 0;
+  struct OccAcc {
+    uint64_t q = 0, batches = 0, batch_inst = 0, nosmp = 0;
+    uint64_t ia_prim = 0, vs_inv = 0, c_inv = 0, c_prim = 0, ps_inv = 0, smp = 0;
+    uint64_t hidden_n = 0, hidden_prim = 0, clipped_n = 0, clipped_prim = 0;
+    uint64_t hist_n[5] = {}, hist_prim[5] = {}, hist_ps[5] = {};
+    uint64_t cls_prim[kGpuCensusTotalClasses] = {}, cls_ps[kGpuCensusTotalClasses] = {},
+             cls_smp[kGpuCensusTotalClasses] = {}, cls_q[kGpuCensusTotalClasses] = {},
+             cls_hidden_prim[kGpuCensusTotalClasses] = {},
+             cls_vs[kGpuCensusTotalClasses] = {};
+  };
+  OccAcc occ_acc_;
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;

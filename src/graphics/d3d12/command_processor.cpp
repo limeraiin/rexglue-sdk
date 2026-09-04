@@ -358,6 +358,13 @@ extern uint64_t g_tile_ns_opost;
 extern uint64_t g_tile_n_opost;
 }  // namespace rex::graphics
 
+// [occ] the occlusion census: every issued draw inside a pipeline-statistics
+// query and an occlusion query (1 Hz beside [pool]/[geo]). Names the share
+// of the city's primitives that reach zero visible samples at draw time (the
+// occlusion lever's lower-bound ceiling), the clipper's frustum share, the
+// VS invocation count (prices the vertex-fetch path) and the fill volume.
+REXCVAR_DEFINE_BOOL(gpu_occ_census, true, "GPU/D3D12",
+                    "[occ] per-draw pipeline-statistics + occlusion query census.");
 // [gpu-census] N-10c: the naruto_636 iGPU drive proved the Intel city wall
 // is the GPU (700-775 ms/s submission-fence blocking); this names what the
 // GPU second is spent on before anything is designed against it.
@@ -2830,8 +2837,13 @@ struct PoolBatch {
   uint64_t ps_bitmap[4];
   uint8_t* ps_block;
   PoolSnap snap;
+  uint32_t occ_tag;  // [occ] this batch's census tag in the open submission
 };
 std::vector<PoolBatch> g_pool_batches;  // arena, reused per window
+// [occ] the open submission's tags (a pool batch writes its final instance
+// count into its tag at close, which always precedes the submission's
+// resolve: kPoolCloseSubmit runs before the deferred list executes).
+std::vector<OccCensusTag> g_occ_sub_tags;
 uint32_t g_pool_batch_n = 0;
 struct PoolSlot {
   uint64_t key;
@@ -2902,6 +2914,9 @@ void PoolClose(PoolCloseReason why) {
   for (uint32_t i = 0; i < g_pool_batch_n; ++i) {
     const uint32_t n = g_pool_batches[i].count;
     ++g_pool.hist[n < 2 ? 0 : n < 4 ? 1 : n < 10 ? 2 : n < 50 ? 3 : 4];
+    // [occ] the batch's final instance count into its census tag.
+    const uint32_t t = g_pool_batches[i].occ_tag;
+    if (t < g_occ_sub_tags.size()) g_occ_sub_tags[t].inst = n;
   }
   if (g_pool_batch_n) {
     switch (why) {
@@ -5302,6 +5317,7 @@ bool D3D12CommandProcessor::SetupContext() {
   pix_capturing_ = false;
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
   InitializeGpuCensusResources();
+  InitializeOccCensusResources();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -5320,6 +5336,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
   ShutdownGpuCensusResources();
+  ShutdownOccCensusResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -8358,8 +8375,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                           index_count, index_buffer_info,
                           primitive_processing_result.host_draw_vertex_count, /*indexed=*/false);
     } else {
+      OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0);
+      OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
@@ -8443,8 +8462,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                           index_count, index_buffer_info,
                           primitive_processing_result.host_draw_vertex_count, /*indexed=*/true);
     } else {
+      OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawIndexedInstanced(
           primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+      OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
@@ -8844,7 +8865,9 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
     g_pool.inst_bytes += size_t(ps_float_count) * 16;
     ++g_pool.opened_ps;
   }
+  OccDrawBegin();  // [occ] the batch = one query; its count lands at close
   deferred_command_list_.D3DExecuteIndirect(sig.Get(), 1, buffer, offset);
+  b.occ_tag = OccDrawEnd(host_draw_vertex_count, 1);
   // The vertex float CBV now points at the instance block; the next plain
   // draw must re-upload and re-bind its own constants.
   cbuffer_binding_float_vertex_.up_to_date = false;
@@ -12041,6 +12064,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       GpuCensusConsumeCompleted();
       GpuCensusBeginSubmission();
     }
+    // [occ] same fences: harvest completed draws, claim this submission's slots.
+    if (occ_available_) {
+      OccConsumeCompleted();
+      OccBeginSubmission();
+    }
     // [GPU-PRECORD] Phase 1a: count draws per submission (segment boundaries);
     // clear any segment streams (defensive — EndSubmission already drains them).
     parallel_record_counter_ = 0;
@@ -12206,6 +12234,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // [gpu-census] the timestamps are replayed into the real list now, so
     // the resolve can be recorded directly on it.
     GpuCensusResolveSubmission();
+    OccResolveSubmission();  // [occ] both heaps -> readback, on the real list
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
@@ -12285,6 +12314,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         }
         // [gpu-census] same 1 Hz window: what the GPU spent the second on.
         GpuCensusReport1Hz();
+        OccReport1Hz();  // [occ]
       }
     }
 
@@ -15219,6 +15249,299 @@ void D3D12CommandProcessor::GpuCensusConsumeCompleted() {
     }
     gpu_census_pending_.pop_front();
   }
+}
+
+// [occ] the occlusion census. Per issued draw: one PIPELINE_STATISTICS query
+// (IA primitives, VS invocations, clipper in/out, PS invocations) and one
+// OCCLUSION query (samples that passed depth/stencil at draw time). The
+// occlusion half is skipped while a guest occlusion query is open (two
+// queries of one type may not overlap on a command list). Report format:
+//   [occ] q/fr trunc drop | /fr prim vsinv clipout(%) psinv(x720p) smp |
+//   hidden(smp0) draws% prim% | clipped(cprim0) draws% prim% |
+//   by smp 0/<=64/<=1k/<=16k/16k+ draws% prim% ps% | main [cfg] ...
+bool D3D12CommandProcessor::InitializeOccCensusResources() {
+  occ_available_ = false;
+  occ_sub_active_ = false;
+  occ_draw_open_ = false;
+  occ_pending_.clear();
+  occ_ring_next_ = 0;
+  occ_trunc_ = 0;
+  occ_dropped_ = 0;
+  occ_acc_ = OccAcc{};
+  occ_stats_heap_.Reset();
+  occ_smp_heap_.Reset();
+  occ_stats_readback_.Reset();
+  occ_smp_readback_.Reset();
+  occ_stats_mapping_ = nullptr;
+  occ_smp_mapping_ = nullptr;
+  if (!REXCVAR_GET(gpu_occ_census)) {
+    return false;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  if (!device) {
+    return false;
+  }
+  D3D12_QUERY_HEAP_DESC heap_desc;
+  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+  heap_desc.Count = kOccPoolSize;
+  heap_desc.NodeMask = 0;
+  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&occ_stats_heap_)))) {
+    REXGPU_WARN("[occ] pipeline-statistics query heap creation failed - census off");
+    return false;
+  }
+  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&occ_smp_heap_)))) {
+    REXGPU_WARN("[occ] occlusion query heap creation failed - census off");
+    occ_stats_heap_.Reset();
+    return false;
+  }
+  auto make_readback = [&](uint64_t bytes, Microsoft::WRL::ComPtr<ID3D12Resource>& out,
+                           const void** mapping_out) {
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, bytes, D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback,
+            GetD3D12Provider().GetHeapFlagCreateNotZeroed(), &buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&out)))) {
+      return false;
+    }
+    D3D12_RANGE read_range = {0, bytes};
+    void* mapping = nullptr;
+    if (FAILED(out->Map(0, &read_range, &mapping))) {
+      out.Reset();
+      return false;
+    }
+    *mapping_out = mapping;
+    return true;
+  };
+  const void* stats_map = nullptr;
+  const void* smp_map = nullptr;
+  if (!make_readback(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) * kOccPoolSize,
+                     occ_stats_readback_, &stats_map) ||
+      !make_readback(sizeof(uint64_t) * kOccPoolSize, occ_smp_readback_, &smp_map)) {
+    REXGPU_WARN("[occ] readback buffer allocation failed - census off");
+    if (occ_stats_readback_ && stats_map) occ_stats_readback_->Unmap(0, nullptr);
+    occ_stats_readback_.Reset();
+    occ_smp_readback_.Reset();
+    occ_stats_heap_.Reset();
+    occ_smp_heap_.Reset();
+    return false;
+  }
+  occ_stats_mapping_ = reinterpret_cast<const D3D12_QUERY_DATA_PIPELINE_STATISTICS*>(stats_map);
+  occ_smp_mapping_ = reinterpret_cast<const uint64_t*>(smp_map);
+  g_occ_sub_tags.assign(kOccMaxPerSubmission, OccCensusTag{});
+  occ_available_ = true;
+  REXGPU_INFO("[occ] on: {} slots, {} per submission", kOccPoolSize, kOccMaxPerSubmission);
+  return true;
+}
+
+void D3D12CommandProcessor::ShutdownOccCensusResources() {
+  occ_available_ = false;
+  occ_sub_active_ = false;
+  occ_draw_open_ = false;
+  occ_pending_.clear();
+  if (occ_stats_readback_ && occ_stats_mapping_) occ_stats_readback_->Unmap(0, nullptr);
+  if (occ_smp_readback_ && occ_smp_mapping_) occ_smp_readback_->Unmap(0, nullptr);
+  occ_stats_mapping_ = nullptr;
+  occ_smp_mapping_ = nullptr;
+  occ_stats_readback_.Reset();
+  occ_smp_readback_.Reset();
+  occ_stats_heap_.Reset();
+  occ_smp_heap_.Reset();
+  g_occ_sub_tags.clear();
+}
+
+void D3D12CommandProcessor::OccBeginSubmission() {
+  if (!occ_available_) {
+    return;
+  }
+  uint32_t start = occ_ring_next_;
+  if (start + kOccMaxPerSubmission > kOccPoolSize) {
+    start = 0;
+  }
+  bool overlap = occ_pending_.size() >= 24;
+  if (!overlap) {
+    const uint32_t region_end = start + kOccMaxPerSubmission;
+    for (const OccPending& pending : occ_pending_) {
+      const uint32_t pending_end = pending.start + pending.count;
+      if (start < pending_end && pending.start < region_end) {
+        overlap = true;
+        break;
+      }
+    }
+  }
+  if (overlap) {
+    ++occ_dropped_;
+    return;
+  }
+  occ_sub_start_ = start;
+  occ_sub_count_ = 0;
+  occ_draw_open_ = false;
+  occ_sub_active_ = true;
+}
+
+void D3D12CommandProcessor::OccDrawBegin() {
+  if (!occ_sub_active_ || occ_draw_open_) {
+    return;
+  }
+  if (occ_sub_count_ >= kOccMaxPerSubmission) {
+    ++occ_trunc_;
+    return;
+  }
+  const uint32_t slot = occ_sub_start_ + occ_sub_count_;
+  deferred_command_list_.D3DBeginQuery(occ_stats_heap_.Get(),
+                                       D3D12_QUERY_TYPE_PIPELINE_STATISTICS, slot);
+  occ_draw_smp_ = !active_occlusion_query_.valid;
+  if (occ_draw_smp_) {
+    deferred_command_list_.D3DBeginQuery(occ_smp_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot);
+  }
+  occ_draw_open_ = true;
+}
+
+uint32_t D3D12CommandProcessor::OccDrawEnd(uint32_t idx, uint8_t kind) {
+  if (!occ_draw_open_) {
+    return UINT32_MAX;
+  }
+  const uint32_t slot = occ_sub_start_ + occ_sub_count_;
+  deferred_command_list_.D3DEndQuery(occ_stats_heap_.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+                                     slot);
+  if (occ_draw_smp_) {
+    deferred_command_list_.D3DEndQuery(occ_smp_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot);
+  }
+  OccCensusTag& t = g_occ_sub_tags[occ_sub_count_];
+  t.idx = idx;
+  t.inst = 1;
+  t.kind = kind;
+  t.cls = gpu_census_draw_class_;
+  t.smp = occ_draw_smp_ ? 1 : 0;
+  t.pad = 0;
+  occ_draw_open_ = false;
+  return occ_sub_count_++;
+}
+
+void D3D12CommandProcessor::OccResolveSubmission() {
+  if (!occ_sub_active_) {
+    return;
+  }
+  occ_sub_active_ = false;
+  occ_draw_open_ = false;
+  if (!occ_sub_count_) {
+    return;
+  }
+  command_list_->ResolveQueryData(
+      occ_stats_heap_.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, occ_sub_start_,
+      occ_sub_count_, occ_stats_readback_.Get(),
+      uint64_t(occ_sub_start_) * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
+  command_list_->ResolveQueryData(occ_smp_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, occ_sub_start_,
+                                  occ_sub_count_, occ_smp_readback_.Get(),
+                                  uint64_t(occ_sub_start_) * sizeof(uint64_t));
+  OccPending& pending = occ_pending_.emplace_back();
+  pending.submission = submission_current_;
+  pending.start = occ_sub_start_;
+  pending.count = occ_sub_count_;
+  pending.tags.assign(g_occ_sub_tags.begin(), g_occ_sub_tags.begin() + occ_sub_count_);
+  occ_ring_next_ = occ_sub_start_ + occ_sub_count_;
+}
+
+void D3D12CommandProcessor::OccConsumeCompleted() {
+  while (!occ_pending_.empty() && occ_pending_.front().submission <= submission_completed_) {
+    const OccPending& pending = occ_pending_.front();
+    OccAcc& a = occ_acc_;
+    for (uint32_t i = 0; i < pending.count; ++i) {
+      const D3D12_QUERY_DATA_PIPELINE_STATISTICS& st = occ_stats_mapping_[pending.start + i];
+      const OccCensusTag& t = pending.tags[i];
+      const uint64_t smp = t.smp ? occ_smp_mapping_[pending.start + i] : 0;
+      const uint8_t cls = t.cls < kGpuCensusTotalClasses ? t.cls : uint8_t(kGpuCensusDraw);
+      ++a.q;
+      a.ia_prim += st.IAPrimitives;
+      a.vs_inv += st.VSInvocations;
+      a.c_inv += st.CInvocations;
+      a.c_prim += st.CPrimitives;
+      a.ps_inv += st.PSInvocations;
+      a.smp += smp;
+      ++a.cls_q[cls];
+      a.cls_prim[cls] += st.IAPrimitives;
+      a.cls_ps[cls] += st.PSInvocations;
+      a.cls_smp[cls] += smp;
+      a.cls_vs[cls] += st.VSInvocations;
+      if (t.kind == 1) {
+        ++a.batches;
+        a.batch_inst += t.inst;
+      }
+      if (!t.smp) {
+        ++a.nosmp;
+        continue;  // no visibility verdict for this draw
+      }
+      if (st.CPrimitives == 0) {
+        ++a.clipped_n;
+        a.clipped_prim += st.IAPrimitives;
+      }
+      if (smp == 0) {
+        ++a.hidden_n;
+        a.hidden_prim += st.IAPrimitives;
+        a.cls_hidden_prim[cls] += st.IAPrimitives;
+      }
+      const int b = smp == 0 ? 0 : smp <= 64 ? 1 : smp <= 1024 ? 2 : smp <= 16384 ? 3 : 4;
+      ++a.hist_n[b];
+      a.hist_prim[b] += st.IAPrimitives;
+      a.hist_ps[b] += st.PSInvocations;
+    }
+    occ_pending_.pop_front();
+  }
+}
+
+void D3D12CommandProcessor::OccReport1Hz() {
+  if (!occ_available_) {
+    return;
+  }
+  static uint64_t s_frames = 0;
+  const uint64_t frames_now = g_pool.frames;
+  const double fr = frames_now > s_frames ? double(frames_now - s_frames) : 1.0;
+  s_frames = frames_now;
+  const OccAcc& a = occ_acc_;
+  if (!a.q) {
+    return;
+  }
+  const double q = double(a.q), prim = a.ia_prim ? double(a.ia_prim) : 1.0;
+  const double ps = a.ps_inv ? double(a.ps_inv) : 1.0;
+  const double vis = double(a.q - a.nosmp) > 0 ? double(a.q - a.nosmp) : 1.0;
+  uint32_t main_cls = kGpuCensusDraw;
+  for (uint32_t c = 0; c < kGpuCensusTotalClasses; ++c) {
+    if (a.cls_prim[c] > a.cls_prim[main_cls]) main_cls = c;
+  }
+  const char* main_desc = main_cls >= kGpuCensusClassCount
+                              ? gpu_census_draw_configs_[main_cls - kGpuCensusClassCount].desc
+                              : "draw";
+  const double mp = a.cls_prim[main_cls] ? double(a.cls_prim[main_cls]) : 1.0;
+  REXGPU_INFO(
+      "[occ] q/fr={:.0f} batches/fr={:.0f} inst/fr={:.0f} nosmp={} trunc={} drop={} | /fr prim "
+      "{:.0f}k vsinv {:.0f}k ({:.2f}/prim) clipout {:.0f}k ({:.1f}%) psinv {:.0f}k ({:.1f}x 720p) "
+      "smp {:.0f}k | hidden(smp0) draws {:.1f}% prim {:.1f}% | clipped(cprim0) draws {:.1f}% "
+      "prim {:.1f}% | by smp 0/<=64/<=1k/<=16k/16k+ draws {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% "
+      "prim {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% ps {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% | main "
+      "[{}] q/fr {:.0f} prim {:.0f}k ({:.0f}%) hidden prim {:.1f}% vsinv {:.0f}k psinv {:.0f}k "
+      "smp {:.0f}k",
+      q / fr, double(a.batches) / fr, double(a.batch_inst) / fr, a.nosmp, occ_trunc_,
+      occ_dropped_, double(a.ia_prim) / fr / 1000.0, double(a.vs_inv) / fr / 1000.0,
+      double(a.vs_inv) / prim, double(a.c_prim) / fr / 1000.0, 100.0 * double(a.c_prim) / prim,
+      double(a.ps_inv) / fr / 1000.0, double(a.ps_inv) / fr / 921600.0,
+      double(a.smp) / fr / 1000.0, 100.0 * double(a.hidden_n) / vis,
+      100.0 * double(a.hidden_prim) / prim, 100.0 * double(a.clipped_n) / vis,
+      100.0 * double(a.clipped_prim) / prim, 100.0 * double(a.hist_n[0]) / vis,
+      100.0 * double(a.hist_n[1]) / vis, 100.0 * double(a.hist_n[2]) / vis,
+      100.0 * double(a.hist_n[3]) / vis, 100.0 * double(a.hist_n[4]) / vis,
+      100.0 * double(a.hist_prim[0]) / prim, 100.0 * double(a.hist_prim[1]) / prim,
+      100.0 * double(a.hist_prim[2]) / prim, 100.0 * double(a.hist_prim[3]) / prim,
+      100.0 * double(a.hist_prim[4]) / prim, 100.0 * double(a.hist_ps[0]) / ps,
+      100.0 * double(a.hist_ps[1]) / ps, 100.0 * double(a.hist_ps[2]) / ps,
+      100.0 * double(a.hist_ps[3]) / ps, 100.0 * double(a.hist_ps[4]) / ps, main_desc,
+      double(a.cls_q[main_cls]) / fr, double(a.cls_prim[main_cls]) / fr / 1000.0,
+      100.0 * double(a.cls_prim[main_cls]) / prim,
+      100.0 * double(a.cls_hidden_prim[main_cls]) / mp, double(a.cls_vs[main_cls]) / fr / 1000.0,
+      double(a.cls_ps[main_cls]) / fr / 1000.0, double(a.cls_smp[main_cls]) / fr / 1000.0);
+  occ_acc_ = OccAcc{};
+  occ_trunc_ = 0;
+  occ_dropped_ = 0;
 }
 
 // [gpu-census] draw sub-split: map the bound RT config to a stable dynamic
