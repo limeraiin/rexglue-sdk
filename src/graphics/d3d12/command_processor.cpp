@@ -34,6 +34,7 @@
 
 // [SKC] the rung-2 skip census tracker lives in command_processor.cpp (global scope).
 extern bool g_skc_on;
+extern uint8_t g_spp_stop_kind;  // [NR-SPP3] 1 = this stop was a pool hit
 static bool g_skc_disarmed = false;         // [SKC] gpu_pool_skip_census_secs elapsed
 static uint32_t g_skc_city_windows = 0;     // [SKC] armed windows at city scale
 extern uint8_t g_skc_taint[];
@@ -7386,6 +7387,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         const bool pool_hit = PoolTryHit(pool_key, regs, pool_ps);
         if (g_gk_census) GkAfter(gk, pool_key, pool_hit, gk_r);
         if (pool_hit) {
+          g_spp_stop_kind = 1;  // [NR-SPP3]
           if (g_skc_on) {  // [SKC] the skipping host would hold the pre-group values
             SkcHit();
             SkcGroupReset();

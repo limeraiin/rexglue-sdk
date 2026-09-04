@@ -1164,6 +1164,7 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 // Counters only ('[pool-skip]' next to '[pool]'); the readers are in the
 // D3D12 command processor (SkcHit/SkcPlain).
 bool g_skc_on = false;
+uint8_t g_spp_stop_kind = 0;  // [NR-SPP3] global scope: the d3d12 TU sets it on a pool hit
 uint8_t g_skc_taint[rex::graphics::RegisterFile::kRegisterCount];
 uint32_t g_skc_seen[rex::graphics::RegisterFile::kRegisterCount];  // == g_skc_gen: listed on this group
 uint32_t g_skc_gen = 1;
@@ -2843,6 +2844,10 @@ uint64_t g_spp_deleg_ns = 0;  // ExecutePacket at delegated stops
 // [NR-SPP2] the walker's apply bracket (range_fn + reg_fn, rdtsc), the split
 // of the skip line's walk+bulk remainder into walk and apply.
 nr::CtxApplyProf g_spp_apply = {};
+// [NR-SPP3] the drawstop bracket binned by the pool's outcome: kind 0 = a
+// plain draw (issued, or dropped inside IssueDraw), 1 = a pool HIT (the d3d12
+// IssueDraw sets it on its hit return). Reset per stop by the skip loop.
+uint64_t g_spp_kind_ns[2] = {}, g_spp_kind_n[2] = {};
 // [NR-5C-ATTR] the draw-stop dispatch bracket split by the record the stop
 // composed from ([0] packet-sourced, [1] suppressed). Filled only while the
 // compose bracket is armed; the sum stays == g_spp_draw_ns.
@@ -6226,6 +6231,15 @@ void CommandProcessor::WorkerThreadMain() {
                 ap.reg ? ap_ms * 1e6 / double(ap.reg) : 0.0, wb_ms - a_ms,
                 (wb_ms - a_ms) * 1e3 / dd, a_ms * 1e3 / dd, d_ms * 1e3 / dd,
                 g_ms * 1e3 / dd, double(ap.rng) / dd, double(ap.reg) / dd, draws);
+            // [NR-SPP3] what a pooled hit pays at its stop against a plain
+            // draw (per stop of each kind; the sum of the two is drawstop).
+            REXGPU_INFO(
+                "[n7] skip3 drawstop by pool outcome: hit={:.1f}ms n={} {:.2f}us/hit | "
+                "plain={:.1f}ms n={} {:.2f}us/plain",
+                double(g_spp_kind_ns[1]) / 1e6, g_spp_kind_n[1],
+                g_spp_kind_n[1] ? double(g_spp_kind_ns[1]) / 1e3 / double(g_spp_kind_n[1]) : 0.0,
+                double(g_spp_kind_ns[0]) / 1e6, g_spp_kind_n[0],
+                g_spp_kind_n[0] ? double(g_spp_kind_ns[0]) / 1e3 / double(g_spp_kind_n[0]) : 0.0);
           }
           if (g_nr5c_prof) {
             REXGPU_INFO(
@@ -6246,6 +6260,8 @@ void CommandProcessor::WorkerThreadMain() {
         }
         g_spp_buf_ns = g_spp_draw_ns = g_spp_deleg_ns = 0;
         g_spp_apply = {};  // [NR-SPP2]
+        g_spp_kind_ns[0] = g_spp_kind_ns[1] = 0;  // [NR-SPP3]
+        g_spp_kind_n[0] = g_spp_kind_n[1] = 0;
         g_spp_draw_bin_ns[0] = g_spp_draw_bin_ns[1] = 0;
         g_spp_draw_bin_n[0] = g_spp_draw_bin_n[1] = 0;
         g_n7_cmp_ns[0] = g_n7_cmp_ns[1] = 0;
@@ -9581,6 +9597,7 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
     // reaches the compose (nothing deferred, delegate, 0x36) must not inherit
     // the previous stop's tag when the drawstop bracket bins below.
     g_nr5c_cur_sup = false;
+    g_spp_stop_kind = 0;  // [NR-SPP3]
     // [NR-6] N-9-6: is this stop a draw de-tile is about to throw away? The
     // test is HOISTED above the compose, which is legal because every register
     // it reads (window offset, both scissors, surface/color/depth info) is
@@ -9912,6 +9929,8 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
                     std::chrono::steady_clock::now() - spp_direct_t0)
                     .count();
             g_spp_draw_ns += d;
+            g_spp_kind_ns[g_spp_stop_kind & 1] += d;  // [NR-SPP3]
+            ++g_spp_kind_n[g_spp_stop_kind & 1];
             // [NR-5C-ATTR] same bin as the compose that fed this stop.
             if (g_nr5c_prof) {
               g_spp_draw_bin_ns[g_nr5c_cur_sup ? 1 : 0] += d;
@@ -10077,6 +10096,10 @@ void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
                              std::chrono::steady_clock::now() - spp_stop_t0)
                              .count();
       (stop.delegate ? g_spp_deleg_ns : g_spp_draw_ns) += d;
+      if (!stop.delegate) {  // [NR-SPP3]
+        g_spp_kind_ns[g_spp_stop_kind & 1] += d;
+        ++g_spp_kind_n[g_spp_stop_kind & 1];
+      }
       // [NR-5C-ATTR] the delegated draw-stop path, binned by the record the
       // compose used (delegates never compose and stay in the pkt bin).
       if (g_nr5c_prof && !stop.delegate) {
