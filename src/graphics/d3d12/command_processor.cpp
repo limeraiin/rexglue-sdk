@@ -390,9 +390,6 @@ REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
                      "[hiz] received draws after the last build or invalidation before the Hi-Z "
                      "is (re)built; until then checkpoints test against the stale Hi-Z (still "
                      "conservative) or, when invalid, hide nothing.");
-REXCVAR_DEFINE_STRING(gpu_hiz_rebuild_cycle, "", "GPU/D3D12",
-                      "[hiz] the tuning cycler: a comma list of rebuild distances cycled 10 s "
-                      "each (e.g. \"250,400,800\"); empty = gpu_hiz_rebuild fixed.");
 REXCVAR_DEFINE_INT32(gpu_occ_census, 2, "GPU/D3D12",
                      "[occ] per-draw pipeline-statistics + occlusion query census: 0 off, 1 "
                      "always (halves the Intel fps), 2 only in a verify phase of [cull]/[hiz].");
@@ -6480,31 +6477,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       // (its checkpoint carried the old mode).
       const int32_t hv = hiz_available_ ? REXCVAR_GET(gpu_hiz) : 0;
       const uint32_t k1 = uint32_t(std::clamp<int32_t>(REXCVAR_GET(gpu_hiz_k), 1, kHizMaxK));
-      uint32_t hrb = uint32_t(std::max<int32_t>(REXCVAR_GET(gpu_hiz_rebuild), 0));
+      // Drive 815: rebuild 250 / 400 / 800 = 13.9 / 14.2 / 14.8 fps at the
+      // heavy city (a build is ~1.3 ms, hidden 30.8 / 29.7 / 28.4%): 800.
+      const uint32_t hrb = uint32_t(std::max<int32_t>(REXCVAR_GET(gpu_hiz_rebuild), 0));
       const uint32_t hp = hv < 0 || hv > 2 ? 0 : uint32_t(hv);
-      {  // the tuning cycler: rebuild distances, 10 s each
-        static std::vector<uint32_t> s_cycle;
-        static std::string s_cycle_src;
-        const std::string src = REXCVAR_GET(gpu_hiz_rebuild_cycle);
-        if (src != s_cycle_src) {
-          s_cycle_src = src;
-          s_cycle.clear();
-          size_t pos = 0;
-          while (pos < src.size()) {
-            const size_t comma = src.find(',', pos);
-            const std::string tok = src.substr(pos, comma == std::string::npos ? std::string::npos
-                                                                               : comma - pos);
-            if (!tok.empty()) s_cycle.push_back(uint32_t(std::max(0, std::atoi(tok.c_str()))));
-            if (comma == std::string::npos) break;
-            pos = comma + 1;
-          }
-        }
-        if (!s_cycle.empty()) {
-          const auto el = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_cull_t0)
-                              .count();
-          hrb = s_cycle[uint32_t(el / 10.0) % s_cycle.size()];
-        }
-      }
       if (hp != hiz_phase_ || k1 != hiz_k_ || hrb != hiz_rebuild_) {
         if (hiz_window_.open) HizWindowClose(5);
         hiz_phase_ = hp;
