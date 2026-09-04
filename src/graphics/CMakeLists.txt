@@ -20,6 +20,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     command_processor.cpp
     nr_draw_registry.cpp
     nr_draw_cache.cpp
+    nr_cull.cpp
     nr_buffer_cache.cpp
     nr_state_walk.cpp
     nr_context.cpp

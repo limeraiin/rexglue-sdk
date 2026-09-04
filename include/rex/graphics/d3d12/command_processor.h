@@ -34,6 +34,7 @@
 #include <rex/graphics/d3d12/primitive_processor.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+#include <rex/graphics/nr_cull.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
@@ -1199,6 +1200,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool occ_available_ = false, occ_sub_active_ = false, occ_draw_open_ = false,
        occ_draw_smp_ = false;
   uint8_t occ_draw_elig_ = 0;  // [occ-pos] the draw being issued
+  uint8_t occ_draw_cull_ = 0;  // [cull] verify: 1 = the frustum test said out
+  // [cull] increment 2: bounds culling. Phase 0 off, 1 verify (draw with the
+  // query, tag the verdict), 2 skip.
+  NrCull nr_cull_;
+  CullStats cull_stats_;
+  struct CullAcc {
+    uint64_t tested = 0, refuse[8] = {}, refuse_idx[8] = {}, bounded = 0, bounded_idx = 0,
+             out = 0, out_idx = 0, skipped = 0, skipped_idx = 0;
+  };
+  CullAcc cull_acc_;
+  uint32_t cull_phase_ = 0;
   uint32_t occ_ring_next_ = 0, occ_sub_start_ = 0, occ_sub_count_ = 0;
   std::deque<OccPending> occ_pending_;
   uint64_t occ_trunc_ = 0, occ_dropped_ = 0;
@@ -1215,6 +1227,10 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t pe_q = 0, pe_prim = 0, pe_hidden_prim = 0, pz_q = 0, pz_prim = 0,
              pz_hidden_prim = 0, pz_clipped_prim = 0;
     uint64_t reason_prim[8] = {}, fmt_prim[4] = {};
+    // [cull] verify: draws the frustum test called out, and how many the
+    // clipper (cprim > 0) or the depth test (samples > 0) contradicted.
+    uint64_t cull_vfy = 0, cull_vfy_prim = 0, cull_wrong = 0, cull_wrong_prim = 0,
+             cull_wrong_smp = 0;
   };
   OccAcc occ_acc_;
 

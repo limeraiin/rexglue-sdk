@@ -363,6 +363,12 @@ extern uint64_t g_tile_n_opost;
 // of the city's primitives that reach zero visible samples at draw time (the
 // occlusion lever's lower-bound ceiling), the clipper's frustum share, the
 // VS invocation count (prices the vertex-fetch path) and the fill volume.
+// [cull] increment 2: frustum refusal from object-space bounds carried by the
+// shader's own clip transform (nr_cull.h). 0 off, 1 verify (every draw still
+// issued, the verdict tagged into the [occ] query and contradicted by the
+// clipper count), 2 skip, 3 cycle off / skip / verify 10 s each.
+REXCVAR_DEFINE_INT32(gpu_cull, 3, "GPU/D3D12",
+                     "[cull] bounds frustum culling: 0 off, 1 verify, 2 skip, 3 cycle.");
 REXCVAR_DEFINE_BOOL(gpu_occ_census, true, "GPU/D3D12",
                     "[occ] per-draw pipeline-statistics + occlusion query census.");
 // [gpu-census] N-10c: the naruto_636 iGPU drive proved the Intel city wall
@@ -5318,6 +5324,7 @@ bool D3D12CommandProcessor::SetupContext() {
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
   InitializeGpuCensusResources();
   InitializeOccCensusResources();
+  nr_cull_.Initialize(memory_, shared_memory_.get());  // [cull]
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -5337,6 +5344,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   ShutdownOcclusionQueryResources();
   ShutdownGpuCensusResources();
   ShutdownOccCensusResources();
+  nr_cull_.Shutdown();  // [cull]
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -6424,6 +6432,19 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // [DRAW-POOL] frame end: close the window, advance the predictor's frame,
   // report at 1 Hz, latch the cvar / cycler phase for the next frame.
   {
+    // [cull] phase latch: cvar 3 cycles off / skip / verify 10 s each.
+    {
+      static auto s_cull_t0 = std::chrono::steady_clock::now();
+      const int32_t cv = REXCVAR_GET(gpu_cull);
+      if (cv == 3) {
+        const auto el = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_cull_t0)
+                            .count();
+        const uint32_t slot = uint32_t(el / 10.0) % 3;
+        cull_phase_ = slot == 0 ? 0 : slot == 1 ? 2 : 1;
+      } else {
+        cull_phase_ = cv < 0 || cv > 2 ? 0 : uint32_t(cv);
+      }
+    }
     if (g_pool_on) PoolClose(kPoolCloseFrame);
     ++g_pool_frame;
     ++g_pool.frames;
@@ -6487,6 +6508,34 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             100.0 * double(gi[4]) / gii, 100.0 * double(gi[5]) / gii);
       }
       s_pp = c;
+      {  // [cull] the same 1 Hz window.
+        const CullAcc& k = cull_acc_;
+        const double tt = k.tested ? double(k.tested) : 1.0;
+        const double bd = k.bounded ? double(k.bounded) : 1.0;
+        const double fidx = double(d(&PoolStats::geo_idx_plain) + d(&PoolStats::geo_idx_hit) + k.skipped_idx);
+        static const char* kPhase[3] = {"off", "verify", "skip"};
+        REXGPU_INFO(
+            "[cull] phase={} tested/fr={:.0f} refuse path/memx/prim/vte/fmt/bounds="
+            "{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}% (idx {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}k)"
+            " | bounded/fr {:.0f} idx {:.0f}k | OUT draws/fr {:.0f} ({:.1f}% of bounded) idx "
+            "{:.0f}k ({:.1f}% of frame idx) | skipped/fr {:.0f} idx {:.0f}k | bounds new={} unb={} "
+            "inval={} full={} scan {:.2f} ms/s entries={}",
+            kPhase[cull_phase_ < 3 ? cull_phase_ : 0], double(k.tested) / fr,
+            100.0 * double(k.refuse[1]) / tt, 100.0 * double(k.refuse[2]) / tt,
+            100.0 * double(k.refuse[3]) / tt, 100.0 * double(k.refuse[4]) / tt,
+            100.0 * double(k.refuse[5]) / tt, 100.0 * double(k.refuse[6]) / tt,
+            double(k.refuse_idx[1]) / fr / 1000.0, double(k.refuse_idx[2]) / fr / 1000.0,
+            double(k.refuse_idx[3]) / fr / 1000.0, double(k.refuse_idx[4]) / fr / 1000.0,
+            double(k.refuse_idx[5]) / fr / 1000.0, double(k.refuse_idx[6]) / fr / 1000.0,
+            double(k.bounded) / fr, double(k.bounded_idx) / fr / 1000.0, double(k.out) / fr,
+            100.0 * double(k.out) / bd, double(k.out_idx) / fr / 1000.0,
+            fidx > 0 ? 100.0 * double(k.out_idx) / fidx : 0.0, double(k.skipped) / fr,
+            double(k.skipped_idx) / fr / 1000.0, cull_stats_.bounds_new,
+            cull_stats_.bounds_unbounded, cull_stats_.bounds_invalidated, cull_stats_.bounds_full,
+            secs > 0 ? double(cull_stats_.bounds_ns) / 1e6 / secs : 0.0, nr_cull_.entries());
+        cull_acc_ = CullAcc{};
+        cull_stats_ = CullStats{};
+      }
       // [SKC] the rung-2 skip census, same window.
       if (g_skc_on) {
         static SkcStats s_sk;
@@ -7372,6 +7421,75 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     }
     ++g_inst_flush_site[0];
     FlushInstancedBatch();
+  }
+
+  // [cull] increment 2: the frustum verdict from the draw's object-space
+  // bounds and the shader's own clip transform. Refusals are counted by
+  // class; a skipped draw leaves IssueDraw here (nothing below it has a side
+  // effect the guest observes; memexport draws are refused).
+  occ_draw_cull_ = 0;
+  if (cull_phase_ != 0 && !(g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0)) {
+    ++cull_acc_.tested;
+    const PosPath& cpp = vertex_shader->pos_path();
+    uint32_t refuse = 0;
+    if (!cpp.eligible) {
+      refuse = 1;
+    } else if (vertex_shader->memexport_eM_written() ||
+               (active_pixel_shader() && active_pixel_shader()->memexport_eM_written())) {
+      refuse = 2;
+    } else if (primitive_type != xenos::PrimitiveType::kTriangleList &&
+               primitive_type != xenos::PrimitiveType::kTriangleStrip &&
+               primitive_type != xenos::PrimitiveType::kTriangleFan &&
+               primitive_type != xenos::PrimitiveType::kLineList &&
+               primitive_type != xenos::PrimitiveType::kLineStrip) {
+      refuse = 3;
+    } else {
+      const auto ccl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+      const auto cvte = regs.Get<reg::PA_CL_VTE_CNTL>();
+      if (ccl.clip_disable || cvte.vtx_xy_fmt || !cvte.vport_x_scale_ena ||
+          !cvte.vport_y_scale_ena) {
+        refuse = 4;
+      } else if ((cpp.format != xenos::VertexFormat::k_32_32_32_FLOAT &&
+                  cpp.format != xenos::VertexFormat::k_32_32_32_32_FLOAT) ||
+                 ((cpp.used_basis_mask & 8) &&
+                  cpp.format != xenos::VertexFormat::k_32_32_32_32_FLOAT)) {
+        refuse = 5;
+      }
+    }
+    if (refuse) {
+      ++cull_acc_.refuse[refuse];
+      cull_acc_.refuse_idx[refuse] += index_count;
+    } else {
+      NrCull::DrawDesc cd;
+      cd.path = &cpp;
+      cd.fetch = regs.GetVertexFetch(cpp.fetch_constant);
+      cd.base_vertex = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+      cd.indexed = index_buffer_info != nullptr;
+      cd.index_count = index_count;
+      cd.ib_guest_base = index_buffer_info ? index_buffer_info->guest_base : 0u;
+      cd.ib_format = index_buffer_info ? index_buffer_info->format : xenos::IndexFormat::kInt16;
+      cd.ib_endian = index_buffer_info ? index_buffer_info->endianness : xenos::Endian::kNone;
+      const CullBounds* cb = nr_cull_.GetBounds(cd, cull_stats_);
+      if (!cb || cb->unbounded) {
+        ++cull_acc_.refuse[6];
+        cull_acc_.refuse_idx[6] += index_count;
+      } else {
+        ++cull_acc_.bounded;
+        cull_acc_.bounded_idx += index_count;
+        float cm[4][5];
+        cpp.Evaluate(reinterpret_cast<const float*>(&regs[XE_GPU_REG_SHADER_CONSTANT_000_X]), cm);
+        if (NrCull::FrustumOutside(*cb, cm)) {
+          ++cull_acc_.out;
+          cull_acc_.out_idx += index_count;
+          if (cull_phase_ == 2) {
+            ++cull_acc_.skipped;
+            cull_acc_.skipped_idx += index_count;
+            return true;
+          }
+          occ_draw_cull_ = 1;
+        }
+      }
+    }
   }
 
   // [DRAW-POOL] key time. Before any derivation: the key, the window
@@ -15362,9 +15480,19 @@ void D3D12CommandProcessor::OccSetElig(const D3D12Shader* vertex_shader,
   }
   const PosPath& pp = vertex_shader->pos_path();
   const reg::RB_DEPTHCONTROL odc = draw_util::GetNormalizedDepthControl(regs);
-  const bool zok = odc.z_enable && !odc.stencil_enable &&
-                   (odc.zfunc == xenos::CompareFunction::kLess ||
-                    odc.zfunc == xenos::CompareFunction::kLessEqual);
+  // Drive 801: the city's depth state is z-test GREATER_EQUAL with z-write
+  // (0x00708766, 63% of draws): both directions qualify. Stencil qualifies
+  // when its fail and z-fail ops keep (a hidden draw then writes nothing).
+  const bool zdir = odc.zfunc == xenos::CompareFunction::kLess ||
+                    odc.zfunc == xenos::CompareFunction::kLessEqual ||
+                    odc.zfunc == xenos::CompareFunction::kGreater ||
+                    odc.zfunc == xenos::CompareFunction::kGreaterEqual;
+  const bool stok = !odc.stencil_enable ||
+                    (odc.stencilfail == xenos::StencilOp::kKeep &&
+                     odc.stencilzfail == xenos::StencilOp::kKeep &&
+                     (!odc.backface_enable || (odc.stencilfail_bf == xenos::StencilOp::kKeep &&
+                                               odc.stencilzfail_bf == xenos::StencilOp::kKeep)));
+  const bool zok = odc.z_enable && zdir && stok;
   uint8_t fmt = 3;
   if (pp.format == xenos::VertexFormat::k_32_32_32_FLOAT) {
     fmt = 0;
@@ -15374,7 +15502,8 @@ void D3D12CommandProcessor::OccSetElig(const D3D12Shader* vertex_shader,
     fmt = 2;
   }
   occ_draw_elig_ = uint8_t((pp.eligible ? 1 : 0) | (zok ? 2 : 0) |
-                           ((uint8_t(pp.reason) & 7) << 2) | (fmt << 5));
+                           ((uint8_t(pp.reason) & 7) << 2) | (fmt << 5) |
+                           (occ_draw_cull_ ? 0x80 : 0));
   static std::unordered_set<uint64_t> s_occ_logged;
   if (s_occ_logged.size() < 96 &&
       s_occ_logged.insert(vertex_shader->ucode_data_hash()).second) {
@@ -15512,6 +15641,15 @@ void D3D12CommandProcessor::OccConsumeCompleted() {
           a.fmt_prim[(t.elig >> 5) & 3] += st.IAPrimitives;
           if (t.smp && smp == 0) a.pe_hidden_prim += st.IAPrimitives;
         }
+        if (t.elig & 0x80) {  // [cull] verify
+          ++a.cull_vfy;
+          a.cull_vfy_prim += st.IAPrimitives;
+          if (st.CPrimitives) {
+            ++a.cull_wrong;
+            a.cull_wrong_prim += st.IAPrimitives;
+          }
+          if (t.smp && smp) ++a.cull_wrong_smp;
+        }
         if (pz) {
           ++a.pz_q;
           a.pz_prim += st.IAPrimitives;
@@ -15612,6 +15750,13 @@ void D3D12CommandProcessor::OccReport1Hz() {
         100.0 * double(a.reason_prim[5]) / prim, 100.0 * double(a.reason_prim[6]) / prim,
         100.0 * double(a.fmt_prim[0]) / pep, 100.0 * double(a.fmt_prim[1]) / pep,
         100.0 * double(a.fmt_prim[2]) / pep, 100.0 * double(a.fmt_prim[3]) / pep);
+    if (a.cull_vfy) {
+      REXGPU_INFO("[cull-vfy] out-verdict draws={} prim={} | WRONG cprim>0 draws={} ({:.3f}%) "
+                  "prim={} | samples>0 draws={}",
+                  a.cull_vfy, a.cull_vfy_prim, a.cull_wrong,
+                  100.0 * double(a.cull_wrong) / double(a.cull_vfy), a.cull_wrong_prim,
+                  a.cull_wrong_smp);
+    }
   }
   occ_acc_ = OccAcc{};
   occ_trunc_ = 0;
