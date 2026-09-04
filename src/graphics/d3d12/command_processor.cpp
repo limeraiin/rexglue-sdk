@@ -366,8 +366,9 @@ extern uint64_t g_tile_n_opost;
 // [cull] increment 2: frustum refusal from object-space bounds carried by the
 // shader's own clip transform (nr_cull.h). 0 off, 1 verify (every draw still
 // issued, the verdict tagged into the [occ] query and contradicted by the
-// clipper count), 2 skip, 3 cycle off / skip / verify 10 s each.
-REXCVAR_DEFINE_INT32(gpu_cull, 3, "GPU/D3D12",
+// clipper count), 2 skip, 3 cycle off / skip / verify 10 s each. Drive 805
+// verified skip (0 visible samples in 107767 out verdicts): default 2.
+REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
                      "[cull] bounds frustum culling: 0 off, 1 verify, 2 skip, 3 cycle.");
 REXCVAR_DEFINE_BOOL(gpu_occ_census, true, "GPU/D3D12",
                     "[occ] per-draw pipeline-statistics + occlusion query census.");
