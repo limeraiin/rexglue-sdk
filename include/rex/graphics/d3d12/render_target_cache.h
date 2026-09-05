@@ -21,6 +21,8 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -817,8 +819,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     uint32_t cls;
     bool written;
     bool from_cleared;  // the source range still held a resolve clear
+    RenderTargetKey source;
+    uint32_t src_clear_start, src_clear_end;  // a cleared range of the source at add (diag)
   };
   std::vector<XferUseRecord> xfer_use_records_;
+  // [xfer-live] (dest.key << 32 | source.key) pairs whose transfer was read
+  // before any write (a real data dependency, not the aliasing emulation):
+  // learned from the census, executed from then on. Drive 838: the expanded
+  // map's 1x depth Z2880t/p16/m0 read its skipped d2d transfer.
+  std::unordered_set<uint64_t> xfer_live_pairs_;
   // Ranges a resolve clear filled and no draw has touched since, per key.
   struct XferClearedRange {
     RenderTargetKey key;
@@ -861,6 +870,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   uint64_t xfer_use_forwarded_last_[kXferUseClassCount] = {};
   void XferUseNoteResolveRead(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles);
   void XferUseReport();
+  static std::string XferKeyStr(RenderTargetKey key);
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> transfer_vertex_buffer_pool_;
 

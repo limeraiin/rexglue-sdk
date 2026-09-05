@@ -384,15 +384,6 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
-// [hiz-sig] Intel drive 835: the draw class 41 -> 87 ms/frame since the
-// Hi-Z argument slots gained the instance-base root constant (every tested
-// draw and every pooled batch is an ExecuteIndirect whose signature carries a
-// non-draw argument; the exact-count patch changed nothing). Seconds per
-// phase: shipped / plainonly (a draw-only signature and element layout for
-// the plain draws; the pooled batches keep [constant, draw]). 0 = off.
-REXCVAR_DEFINE_INT32(gpu_hiz_sig_probe, 0, "GPU/D3D12",
-                     "[hiz-sig] A/B of the ExecuteIndirect signature shape, seconds per phase "
-                     "(0 = off).");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
@@ -16667,35 +16658,12 @@ ID3D12CommandSignature* D3D12CommandProcessor::HizCommandSignaturePlain(bool ind
   // A draw-only signature needs no root signature.
   if (FAILED(GetD3D12Provider().GetDevice()->CreateCommandSignature(&desc, nullptr,
                                                                     IID_PPV_ARGS(&sig)))) {
-    REXGPU_WARN("[hiz-sig] draw-only command signature failed");
+    REXGPU_WARN("[hiz] draw-only command signature failed");
     cache.emplace(rs, nullptr);
     return nullptr;
   }
   cache.emplace(rs, sig);
   return sig.Get();
-}
-
-void D3D12CommandProcessor::HizSigProbeTick() {
-  const int32_t seconds = REXCVAR_GET(gpu_hiz_sig_probe);
-  const auto now = std::chrono::steady_clock::now();
-  if (seconds <= 0) {
-    if (hiz_sig_phase_) {
-      hiz_sig_phase_ = 0;
-      REXGPU_INFO("[hiz-sig] phase=shipped (probe off)");
-    }
-    return;
-  }
-  if (hiz_sig_phase_start_ == std::chrono::steady_clock::time_point{}) {
-    hiz_sig_phase_start_ = now;
-  } else if (now - hiz_sig_phase_start_ >= std::chrono::seconds(seconds)) {
-    hiz_sig_phase_start_ = now;
-    hiz_sig_phase_ = (hiz_sig_phase_ + 1) % 2;
-  }
-  if (now - hiz_sig_last_report_ >= std::chrono::seconds(1)) {
-    hiz_sig_last_report_ = now;
-    static const char* const kNames[2] = {"shipped", "plainonly"};
-    REXGPU_INFO("[hiz-sig] phase={}", kNames[hiz_sig_phase_]);
-  }
 }
 
 void D3D12CommandProcessor::HizInstanceBaseReset() {
@@ -16716,10 +16684,11 @@ bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_coun
   if (!hiz_available_ || !d.valid || hiz_phase_ == 0) {
     return false;
   }
-  HizSigProbeTick();
-  const bool plain_sig = hiz_sig_phase_ != 0;  // [hiz-sig]
-  ID3D12CommandSignature* sig =
-      plain_sig ? HizCommandSignaturePlain(indexed) : HizCommandSignature(indexed);
+  // Drive 838 (Intel 720p): a draw-only signature for the plain draws took
+  // the draw class 81 -> 60 ms/frame (the root-constant element is the
+  // Intel driver's slow path per call); the pooled batches keep [constant,
+  // draw] until their instance index has another carrier.
+  ID3D12CommandSignature* sig = HizCommandSignaturePlain(indexed);
   if (!sig) {
     HizRefuse(8, d.index_count);
     return false;
@@ -16735,14 +16704,13 @@ bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_coun
   const uint32_t slot = hiz_slot_next_ & (kHizRing - 1);
   ++hiz_slot_next_;
   ++hiz_frame_slots_;
-  HizAppend(slot, &d, 0, host_draw_vertex_count, plain_sig);
+  HizAppend(slot, &d, 0, host_draw_vertex_count, true);
   OccDrawBegin();  // [occ]
   occ_draw_hiz_ = slot + 1;
   deferred_command_list_.D3DExecuteIndirect(sig, 1, hiz_args_.Get(),
                                             uint64_t(slot) * kHizArgsStride);
   OccDrawEnd(host_draw_vertex_count, 0);
   occ_draw_hiz_ = 0;
-  if (!plain_sig) inst_base_dirty_ = true;  // the element set the root constant
   return true;
 }
 

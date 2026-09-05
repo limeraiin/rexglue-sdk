@@ -1277,23 +1277,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool inst_base_dirty_ = true;
   std::unordered_map<ID3D12RootSignature*, Microsoft::WRL::ComPtr<ID3D12CommandSignature>>
       hiz_cmdsig_[2];
-  // [hiz-sig] the probe of the signature SHAPE (gpu_hiz_sig_probe): a
-  // draw-only command signature over the same argument slots, reading each
-  // element's draw arguments at +4 (the instance base dword is skipped, the
-  // root constant is not touched). Phase 0 = shipped ([constant, draw]
-  // everywhere), 1 = draw-only everywhere (pooled instances all render as
-  // instance 0: a PRICE phase, visually wrong), 2 = draw-only for plain
-  // draws, [constant, draw] for the pooled batches (renders correctly).
-  // (The draw-only-everywhere phase was dropped: a 4-byte argument offset
-  // removed the device in smoke 836; the plain slots use a second element
-  // layout instead, the draw arguments at dword 0, flag bit 4 to the CS.)
+  // The plain draws' signature: draw-only (no root signature), the draw
+  // arguments at dword 0 of the slot (flag bit 4 to the test CS selects that
+  // element layout). Intel prices a root-constant element per call (drive
+  // 838); a 4-byte argument offset is not allowed (smoke 836).
   ID3D12CommandSignature* HizCommandSignaturePlain(bool indexed);
   std::unordered_map<ID3D12RootSignature*, Microsoft::WRL::ComPtr<ID3D12CommandSignature>>
       hiz_cmdsig_plain_[2];
-  uint32_t hiz_sig_phase_ = 0;
-  std::chrono::steady_clock::time_point hiz_sig_phase_start_{};
-  std::chrono::steady_clock::time_point hiz_sig_last_report_{};
-  void HizSigProbeTick();
   void HizRefuse(uint32_t reason, uint32_t idx) {
     ++hiz_acc_.refuse[reason];
     hiz_acc_.refuse_idx[reason] += idx;

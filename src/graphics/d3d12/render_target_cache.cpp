@@ -4579,6 +4579,11 @@ D3D12RenderTargetCache::GetOrCreateNativeHostDepthScratch(D3D12RenderTarget& des
 // per transfer landed and not yet finalized), so linear scans are fine.
 static constexpr size_t kXferUseRecordCap = 1024;
 
+std::string D3D12RenderTargetCache::XferKeyStr(RenderTargetKey key) {
+  return fmt::format("{}{}t/p{}/m{}", key.is_depth ? "Z" : "C", uint32_t(key.base_tiles),
+                     uint32_t(key.pitch_tiles_at_32bpp), uint32_t(key.msaa_samples));
+}
+
 void D3D12RenderTargetCache::XferUseFinalize(RenderTargetKey key, uint32_t start_tiles,
                                              uint32_t end_tiles, XferUseOutcome pending_outcome,
                                              XferUseOutcome written_outcome) {
@@ -4587,6 +4592,18 @@ void D3D12RenderTargetCache::XferUseFinalize(RenderTargetKey key, uint32_t start
     if (r.dest == key && r.start_tiles < end_tiles && start_tiles < r.end_tiles) {
       const XferUseOutcome outcome = r.written ? written_outcome : pending_outcome;
       ++xfer_use_counts_[r.cls][outcome];
+      if (outcome == kXferUseReadDraw || outcome == kXferUseReadResolve) {
+        // [xfer-live] a skipped transfer that was read: learn the pair.
+        const uint64_t pair = (uint64_t(r.dest.key) << 32) | r.source.key;
+        if (xfer_live_pairs_.insert(pair).second) {
+          REXGPU_WARN(
+              "[xfer-live] LEARN dest={} src={} tiles {}-{} outcome={} fromcleared={} "
+              "srcclr={}-{}: executed from now on",
+              XferKeyStr(r.dest), XferKeyStr(r.source), r.start_tiles, r.end_tiles,
+              outcome == kXferUseReadDraw ? "rd" : "rres", r.from_cleared ? 1 : 0,
+              r.src_clear_start, r.src_clear_end);
+        }
+      }
       auto& by_key = xfer_use_by_key_[r.dest.key];
       ++by_key[outcome];
       if (r.from_cleared) {
@@ -4620,6 +4637,15 @@ void D3D12RenderTargetCache::XferUseAdd(RenderTargetKey dest, const Transfer& tr
   r.cls = (dest.is_depth ? 2u : 0u) | (source.is_depth ? 1u : 0u);
   r.written = false;
   r.from_cleared = false;
+  r.source = source;
+  r.src_clear_start = r.src_clear_end = 0;
+  for (const XferClearedRange& c : xfer_cleared_ranges_) {
+    if (c.key == source) {
+      r.src_clear_start = c.start_tiles;
+      r.src_clear_end = c.end_tiles;
+      break;
+    }
+  }
   if (XferFindCleared(source, transfer.start_tiles, transfer.end_tiles)) {
     r.from_cleared = true;
     ++xfer_use_const_[r.cls];
@@ -4893,6 +4919,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     D3D12_RECT rects[Transfer::kMaxRectanglesWithCutout];
   };
   std::vector<XferForward> xfer_forwards;
+  // [xfer-live] the transfers kept (executed) in the skip phase: learned pairs.
+  std::vector<Transfer> xfer_kept[1 + xenos::kMaxColorRenderTargets];
   {
     const int32_t cycle_seconds = REXCVAR_GET(gpu_xfer_cycle);
     const auto now = std::chrono::steady_clock::now();
@@ -4917,12 +4945,20 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         for (const Transfer& transfer : render_target_transfers[i]) {
           XferUseAdd(dest_key, transfer);
           if (xfer_cycle_phase_) {
-            ++xfer_use_skipped_;
             // The forwarded clear (see XferFindCleared).
             const RenderTargetKey source_key =
                 transfer.source ? transfer.source->key() : RenderTargetKey();
             const XferClearedRange* cleared =
                 XferFindCleared(source_key, transfer.start_tiles, transfer.end_tiles);
+            if (!cleared &&
+                xfer_live_pairs_.count((uint64_t(dest_key.key) << 32) | source_key.key)) {
+              // [xfer-live] a learned data dependency: perform it.
+              assert_true(i < 1 + xenos::kMaxColorRenderTargets);
+              xfer_kept[i].push_back(transfer);
+              ++xfer_use_executed_;
+              continue;
+            }
+            ++xfer_use_skipped_;
             if (cleared) {
               XferForward f;
               f.dest = i;
@@ -4953,9 +4989,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
       if (xfer_cycle_phase_) {
-        static const std::vector<Transfer> kNoTransfers[1 + xenos::kMaxColorRenderTargets];
         assert_true(render_target_count <= 1 + xenos::kMaxColorRenderTargets);
-        render_target_transfers = kNoTransfers;
+        render_target_transfers = xfer_kept;  // empty but for the learned live pairs
       }
     }
     if (render_target_resolve_clear_values && resolve_clear_rectangle) {
