@@ -1291,7 +1291,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12CommandSignature* DrawCommandSignature(bool indexed);
   static constexpr uint32_t kHizRing = 1u << 16;  // argument / verdict slots
   static constexpr uint32_t kHizMaxPerFrame = kHizRing / 2;
-  static constexpr uint32_t kHizEntryBytes = 208, kHizHeaderBytes = 16, kHizArgsStride = 32;
+  static constexpr uint32_t kHizEntryBytes = 48, kHizHeaderBytes = 16, kHizArgsStride = 32;
   // [hiz-pool] a run per per-instance batch of the window: {base slot,
   // capacity, count (CPU-maintained, final by GPU time)}; the test CS zeroes
   // the run's unused tail so the batch executes with a fixed MaxCommandCount
@@ -1346,16 +1346,11 @@ class D3D12CommandProcessor : public CommandProcessor {
     // hidden.
     uint8_t dir_hint = 0;
     uint32_t index_count = 0;
-    // [hiz-sub] entry dwords 12..50: the 4x5 clip matrix, the object-space
-    // box (min xyz, pos w; max xyz) and the viewport, for the GPU sub-box test.
-    bool sub_valid = false;
-    float sub[39] = {};
   } hiz_draw_;
   uint32_t occ_draw_hiz_ = 0;  // tag: verdict slot + 1
   struct HizAcc {
     uint64_t elig = 0, elig_idx = 0, refuse[12] = {}, refuse_idx[12] = {}, tested = 0,
-             tested_idx = 0, checkpoints = 0, builds = 0, close[8] = {}, hidden = 0, hidden_idx = 0,
-             hidden_sub = 0, hidden_sub_idx = 0, vfy = 0,
+             tested_idx = 0, checkpoints = 0, builds = 0, close[8] = {}, hidden = 0, hidden_idx = 0, vfy = 0,
              vfy_idx = 0, wrong = 0, wrong_idx = 0, wrong_smp = 0, wrong_vs[4096] = {};
     // [hiz-pool] per-instance batches opened, instances appended (tested
     // ones among them), hits refused because the batch's window had closed.

@@ -6661,8 +6661,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               "{:.0f}/{:.0f}k) | tested/fr {:.0f} idx {:.0f}k ({:.1f}% of frame idx) | HIDDEN/fr "
               "{:.0f} idx {:.0f}k ({:.1f}% of frame idx) | vfy {} idx {:.0f}k WRONG {} idx {:.0f}k "
               "smp {} worst vs {:016X} x{} | close cap/pass/copy/zw/dir/sub/xfer/rt={}/{}/{}/{}/{}/"
-              "{}/{}/{} | pool open/fr {:.1f} inst/fr {:.1f} tested/fr {:.1f} miss/fr {:.1f}"
-              " | sub/fr {:.1f} idx {:.0f}k",
+              "{}/{}/{} | pool open/fr {:.1f} inst/fr {:.1f} tested/fr {:.1f} miss/fr {:.1f}",
               kPhase[hiz_phase_ < 3 ? hiz_phase_ : 0], hiz_k_, hiz_rebuild_,
               double(h.checkpoints) / fr, double(h.builds) / fr, double(h.elig) / fr, double(h.elig_idx) / fr / 1000.0,
               100.0 * double(h.refuse[1]) / el, 100.0 * double(h.refuse[2]) / el,
@@ -6682,8 +6681,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               worst_vs < occ_vs_hashes_.size() ? occ_vs_hashes_[worst_vs] : 0ull,
               h.wrong_vs[worst_vs], h.close[0], h.close[1], h.close[2], h.close[3], h.close[4],
               h.close[5], h.close[6], h.close[7], double(h.pool_open) / fr,
-              double(h.pool_inst) / fr, double(h.pool_inst_tested) / fr, double(h.pool_miss) / fr,
-              double(h.hidden_sub) / fr, double(h.hidden_sub_idx) / fr / 1000.0);
+              double(h.pool_inst) / fr, double(h.pool_inst_tested) / fr, double(h.pool_miss) / fr);
           hiz_acc_ = HizAcc{};
         }
       }
@@ -16248,10 +16246,6 @@ void D3D12CommandProcessor::HizBeginSubmission() {
         if (hiz_verdict_mapping_[slot] && hiz_slot_idx_[slot]) {
           ++hiz_acc_.hidden;
           hiz_acc_.hidden_idx += hiz_slot_idx_[slot];
-          if (hiz_verdict_mapping_[slot] == 2) {  // [hiz-sub]
-            ++hiz_acc_.hidden_sub;
-            hiz_acc_.hidden_sub_idx += hiz_slot_idx_[slot];
-          }
         }
       }
     }
@@ -16413,32 +16407,6 @@ void D3D12CommandProcessor::HizPrepare(const CullBounds& b, const float m[4][5],
   hiz_draw_.z_near = zn;
   hiz_draw_.dir = dir;
   hiz_draw_.index_count = index_count;
-  {  // [hiz-sub] what the GPU needs to project the 8 sub-boxes itself.
-    float* sd = hiz_draw_.sub;
-    for (uint32_t i = 0; i < 4; ++i) {
-      for (uint32_t j = 0; j < 5; ++j) sd[i * 5 + j] = m[i][j];
-    }
-    sd[20] = b.mn[0];
-    sd[21] = b.mn[1];
-    sd[22] = b.mn[2];
-    sd[23] = b.mn[3];
-    sd[24] = b.mx[0];
-    sd[25] = b.mx[1];
-    sd[26] = b.mx[2];
-    sd[27] = vp.ndc_scale[0];
-    sd[28] = vp.ndc_scale[1];
-    sd[29] = vp.ndc_scale[2];
-    sd[30] = vp.ndc_offset[0];
-    sd[31] = vp.ndc_offset[1];
-    sd[32] = vp.ndc_offset[2];
-    sd[33] = float(vp.xy_offset[0]);
-    sd[34] = float(vp.xy_offset[1]);
-    sd[35] = float(vp.xy_extent[0]);
-    sd[36] = float(vp.xy_extent[1]);
-    sd[37] = vp.z_min;
-    sd[38] = vp.z_max;
-    hiz_draw_.sub_valid = true;
-  }
 }
 
 // Records the checkpoint for a new window: Hi-Z build from the bound depth
@@ -16607,9 +16575,7 @@ void D3D12CommandProcessor::HizAppend(uint32_t slot, const HizDrawPending* d, ui
   if (d) {
     std::memcpy(e, d->rect, 4 * sizeof(float));
     std::memcpy(e + 4, &d->z_near, sizeof(float));
-    e[5] = (d->dir == 1 ? 1u : 0u) | (plain_layout ? 16u : 0u) | (d->sub_valid ? 32u : 0u) |
-           (inst << 8);
-    if (d->sub_valid) std::memcpy(e + 12, d->sub, sizeof(d->sub));  // [hiz-sub]
+    e[5] = (d->dir == 1 ? 1u : 0u) | (plain_layout ? 16u : 0u) | (inst << 8);
     ++hiz_acc_.tested;
     hiz_acc_.tested_idx += host_count;
   } else {
