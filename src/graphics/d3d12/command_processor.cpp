@@ -384,6 +384,18 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
+// [dcache] The per-draw IDENTITY cache of derived state (NEXT-AGENT.md, the
+// design pass after drive 853). A draw whose identity (everything the
+// derivation reads except the float constants) was seen before takes its
+// pipeline, prim result, texture bindings, samplers and descriptor packs
+// from an entry; only the float constants are composed. Content-keyed,
+// cross-frame. 1 = verify (derive as usual, compare every restored piece,
+// count ne), 2 = consume.
+REXCVAR_DEFINE_INT32(gpu_dcache, 2, "GPU/D3D12",
+                     "[dcache] per-draw identity cache of derived state: 0 off, 1 verify "
+                     "(derive and compare), 2 consume (default).");
+REXCVAR_DEFINE_INT32(gpu_dcache_cycle, 0, "GPU/D3D12",
+                     "[dcache] A/B: seconds per phase, consume / off (0 = shipped, none).");
 // [sort] Drive 845 (Intel 720p heavy city): a PSO switch on 2380 of 3460
 // draws per frame, 2030 of them inside windows of the provable reorder
 // class (48 windows/fr, 57 draws and 12.5 distinct PSOs each); a sort by
@@ -2967,6 +2979,270 @@ inline void GeoCount(uint32_t n, bool hit) {
   const int b = n <= 16 ? 0 : n <= 64 ? 1 : n <= 256 ? 2 : n <= 1024 ? 3 : n <= 4096 ? 4 : 5;
   ++g_pool.geo_hist[b];
   g_pool.geo_hist_idx[b] += n;
+}
+
+// ── [dcache] the per-draw identity cache of derived state ─────────────────
+// Design: NEXT-AGENT.md "THE DESIGN PASS (2026-09-05 night)". The identity is
+// a 128-bit XXH3 over one byte vector: draw args, IB facts, VS/PS ucode
+// hashes, every used VB and texture fetch constant, the pass registers, the
+// pool snapshot ranges (kPoolRegRanges) and the bool/loop constants, plus the
+// pool-open variant bit. NOT in it: the float constants (composed per draw)
+// and anything below 0x2000. An entry holds the derived state that is a pure
+// function of the identity AND persistent on the host: the pipeline handle,
+// root signature and native PSO object (never evicted), the prim result
+// (frame-scoped converted index buffers refuse), the texture snaps (the
+// tile replay's NrTexSnap), sampler params + heap indices, the two
+// descriptor-indices packs. What stays live on a hit: the RT cache update,
+// the system constants, the float/fetch/bool-loop uploads, VB/IB residency,
+// cull, Hi-Z, the pool and the emission tail.
+constexpr uint32_t kDcTexMax = 6;
+constexpr uint32_t kDcSmpMax = 8;
+constexpr uint32_t kDcDiMax = 32;
+constexpr uint32_t kDcDiCur = 64;
+constexpr uint32_t kDcSlotBits = 16;
+constexpr uint32_t kDcProbe = 8;
+constexpr uint32_t kDcEntries = 24576;
+struct DcEntry {
+  uint64_t h1 = 0, h2 = 0;
+  uint32_t frame = 0;    // last hit or record (g_dc_frame)
+  uint32_t tex_gen = 0;  // texture cache destroy generation at capture
+  uint8_t valid = 0, pool_open = 0, ps_inst = 0, ib_dma = 0, tex_count = 0;
+  uint8_t smp_n_v = 0, smp_n_p = 0, di_n_v = 0, di_n_p = 0;
+  void* pso = nullptr;
+  ID3D12RootSignature* rootsig = nullptr;
+  ID3D12PipelineState* npso = nullptr;
+  const D3D12Shader* vs = nullptr;
+  const D3D12Shader* ps = nullptr;
+  PrimitiveProcessor::ProcessingResult prim = {};
+  draw_util::ViewportInfo viewport = {};
+  uint32_t ib_req_base = 0, ib_req_size = 0;
+  uint32_t tex_mask = 0;
+  uint64_t smp_heap = 0, view_heap = 0;
+  size_t smp_uid_v = 0, smp_uid_p = 0, tex_uid_v = 0, tex_uid_p = 0;
+  uint32_t smp_v[kDcSmpMax] = {}, smp_p[kDcSmpMax] = {};
+  uint32_t si_v[kDcSmpMax] = {}, si_p[kDcSmpMax] = {};
+  uint32_t di_v[kDcDiMax] = {}, di_p[kDcDiMax] = {};
+  TextureCache::NrTexSnap tex[kDcTexMax] = {};
+};
+struct DcSlot {
+  uint64_t h1 = 0;
+  uint32_t idx = UINT32_MAX;  // UINT32_MAX = empty
+  uint32_t frame = 0;         // LRU stamp
+};
+struct DcId {
+  uint64_t h1 = 0, h2 = 0;
+};
+std::vector<DcSlot> g_dc_slots;
+std::vector<DcEntry> g_dc_entries;
+uint32_t g_dc_entries_used = 0;
+uint32_t g_dc_frame = 1;
+int32_t g_dc_mode = 0;        // per-frame latch of gpu_dcache: 0 off, 1 verify, 2 consume
+bool g_dc_cycle_off = false;  // gpu_dcache_cycle: the off phase
+// The bindings half talks to NrUpdateBindings through these (set around the
+// call by IssueDrawImpl): the entry to restore from (consume), the entry to
+// compare against (verify).
+const DcEntry* g_dc_bind = nullptr;
+const DcEntry* g_dc_bind_verify = nullptr;
+bool g_dc_bind_ne = false;  // verify: the bindings half found a mismatch
+// The descriptor-indices packs as currently bound (bytes + dword count;
+// UINT32_MAX = unknown, e.g. after the emulated fallback composed its own).
+// Both the derive path and the restore path keep these, so a hit can tell
+// whether the entry's pack is already the bound one.
+uint32_t g_dc_di_cur_v[kDcDiCur], g_dc_di_cur_p[kDcDiCur];
+uint32_t g_dc_di_cur_n_v = UINT32_MAX, g_dc_di_cur_n_p = UINT32_MAX;
+struct DcStats {
+  uint64_t draws = 0, elig = 0, hit = 0, verify = 0, miss_new = 0, miss_evict = 0;
+  uint64_t rec = 0, refresh = 0;
+  uint64_t ref_class = 0, ref_conv = 0, ref_tex = 0, ref_di = 0, ref_smp = 0, ref_variant = 0,
+           ref_gen = 0, ref_heap = 0, ref_texref = 0, ref_ps = 0, ref_ibreq = 0, ref_bind = 0,
+           ref_full = 0;
+  uint64_t ne_prim = 0, ne_pso = 0, ne_npso = 0, ne_tex = 0, ne_smp = 0, ne_di = 0, ne_vp = 0;
+};
+DcStats g_dc;
+
+// The identity vector, hashed. ps_active = the active pixel shader object
+// before the PS-needed rule (the rule is a function of the same registers,
+// so the derived null-PS case is consistent by construction; the entry's
+// ps is checked on a hit).
+DcId DcIdentity(const RegisterFile& regs, const D3D12Shader* vs, const D3D12Shader* ps_active,
+                uint32_t prim, uint32_t index_count, bool major_mode_explicit, bool has_ib,
+                uint32_t ib_base, uint32_t ib_fmt, uint32_t ib_count, uint32_t ib_endian,
+                bool pool_open_pred) {
+  uint32_t buf[16 + 96 * 2 + 32 * 6 + 8 + kPoolRegCount + 40];
+  uint32_t n = 0;
+  buf[n++] = prim;
+  buf[n++] = index_count;
+  buf[n++] = major_mode_explicit ? 1u : 0u;
+  buf[n++] = has_ib ? 1u : 0u;
+  buf[n++] = ib_base;
+  buf[n++] = ib_fmt;
+  buf[n++] = ib_count;
+  buf[n++] = ib_endian;
+  const uint64_t vh = vs->ucode_data_hash();
+  buf[n++] = uint32_t(vh);
+  buf[n++] = uint32_t(vh >> 32);
+  const uint64_t ph = ps_active ? ps_active->ucode_data_hash() : 0;
+  buf[n++] = uint32_t(ph);
+  buf[n++] = uint32_t(ph >> 32);
+  buf[n++] = pool_open_pred ? 1u : 0u;
+  buf[n++] = ps_active ? 1u : 0u;
+  const Shader::ConstantRegisterMap& vcm = vs->constant_register_map();
+  for (uint32_t i = 0; i < rex::countof(vcm.vertex_fetch_bitmap); ++i) {
+    uint32_t bits = vcm.vertex_fetch_bitmap[i], j;
+    while (rex::bit_scan_forward(bits, &j)) {
+      bits &= ~(uint32_t(1) << j);
+      const uint32_t r = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (i * 32 + j) * 2;
+      buf[n++] = regs[r];
+      buf[n++] = regs[r + 1];
+    }
+  }
+  uint32_t tm = vs->GetUsedTextureMaskAfterTranslation() |
+                (ps_active ? ps_active->GetUsedTextureMaskAfterTranslation() : 0u);
+  uint32_t ti;
+  while (rex::bit_scan_forward(tm, &ti)) {
+    tm &= ~(uint32_t(1) << ti);
+    const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * ti;
+    for (uint32_t j = 0; j < 6; ++j) buf[n++] = regs[base + j];
+  }
+  buf[n++] = regs[XE_GPU_REG_RB_SURFACE_INFO];
+  buf[n++] = regs[XE_GPU_REG_RB_MODECONTROL];
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    buf[n++] = regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
+  }
+  buf[n++] = regs[XE_GPU_REG_RB_DEPTH_INFO];
+  for (const auto& r : kPoolRegRanges) {
+    for (uint32_t i = r[0]; i < r[1]; ++i) buf[n++] = regs[i];
+  }
+  for (uint32_t i = 0; i < 8; ++i) buf[n++] = regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i];
+  for (uint32_t i = 0; i < 32; ++i) buf[n++] = regs[XE_GPU_REG_SHADER_CONSTANT_LOOP_00 + i];
+  const XXH128_hash_t h = XXH3_128bits(buf, size_t(n) * sizeof(uint32_t));
+  DcId id;
+  id.h1 = h.low64;
+  id.h2 = h.high64;
+  return id;
+}
+
+inline uint32_t DcHome(uint64_t h1) {
+  return uint32_t(h1 ^ (h1 >> 29) ^ (h1 >> 47)) & ((1u << kDcSlotBits) - 1);
+}
+
+// The entry for this identity, or null. A found entry may be invalid (its
+// record refused, or a generation moved): the caller re-records into it.
+DcEntry* DcLookup(const DcId& id) {
+  if (g_dc_slots.empty()) {
+    g_dc_slots.resize(size_t(1) << kDcSlotBits);
+    g_dc_entries.resize(kDcEntries);
+  }
+  uint32_t i = DcHome(id.h1);
+  for (uint32_t p = 0; p < kDcProbe; ++p) {
+    DcSlot& s = g_dc_slots[i];
+    if (s.idx == UINT32_MAX) return nullptr;
+    if (s.h1 == id.h1) {
+      DcEntry& e = g_dc_entries[s.idx];
+      if (e.h2 == id.h2) {
+        s.frame = g_dc_frame;
+        return &e;
+      }
+    }
+    i = (i + 1) & ((1u << kDcSlotBits) - 1);
+  }
+  return nullptr;
+}
+
+// A fresh entry for a new identity: an empty slot of the probe run when the
+// pool has room, else the run's least recently hit slot is evicted and its
+// entry reused. Null when the run is all empty and the pool is full (never
+// in practice: the pool is smaller than the table).
+DcEntry* DcInsert(const DcId& id) {
+  const uint32_t mask = (1u << kDcSlotBits) - 1;
+  uint32_t i = DcHome(id.h1);
+  uint32_t empty = UINT32_MAX, oldest = UINT32_MAX, oldest_frame = UINT32_MAX;
+  for (uint32_t p = 0; p < kDcProbe; ++p) {
+    DcSlot& s = g_dc_slots[i];
+    if (s.idx == UINT32_MAX) {
+      if (empty == UINT32_MAX) empty = i;
+    } else if (s.frame < oldest_frame) {
+      oldest_frame = s.frame;
+      oldest = i;
+    }
+    i = (i + 1) & mask;
+  }
+  uint32_t idx, slot;
+  if (empty != UINT32_MAX && g_dc_entries_used < kDcEntries) {
+    idx = g_dc_entries_used++;
+    slot = empty;
+    ++g_dc.miss_new;
+  } else if (oldest != UINT32_MAX) {
+    idx = g_dc_slots[oldest].idx;
+    slot = oldest;
+    ++g_dc.miss_evict;
+  } else {
+    ++g_dc.ref_full;
+    return nullptr;
+  }
+  DcSlot& s = g_dc_slots[slot];
+  s.h1 = id.h1;
+  s.idx = idx;
+  s.frame = g_dc_frame;
+  DcEntry& e = g_dc_entries[idx];
+  e = DcEntry{};
+  e.h1 = id.h1;
+  e.h2 = id.h2;
+  e.frame = g_dc_frame;
+  return &e;
+}
+
+bool DcPrimEq(const PrimitiveProcessor::ProcessingResult& a,
+              const PrimitiveProcessor::ProcessingResult& b) {
+  return a.guest_primitive_type == b.guest_primitive_type &&
+         a.host_primitive_type == b.host_primitive_type &&
+         a.host_vertex_shader_type == b.host_vertex_shader_type &&
+         a.tessellation_mode == b.tessellation_mode &&
+         a.guest_draw_vertex_count == b.guest_draw_vertex_count &&
+         a.host_draw_vertex_count == b.host_draw_vertex_count &&
+         a.line_loop_closing_index == b.line_loop_closing_index &&
+         a.index_buffer_type == b.index_buffer_type && a.guest_index_base == b.guest_index_base &&
+         a.host_index_format == b.host_index_format &&
+         a.host_shader_index_endian == b.host_shader_index_endian &&
+         a.host_primitive_reset_enabled == b.host_primitive_reset_enabled &&
+         a.host_index_buffer_handle == b.host_index_buffer_handle;
+}
+
+bool DcTexSnapEq(const TextureCache::NrTexSnap& a, const TextureCache::NrTexSnap& b) {
+  return a.slot == b.slot && std::memcmp(a.fetch, b.fetch, sizeof(a.fetch)) == 0 &&
+         !(a.binding.key != b.binding.key) && a.binding.host_swizzle == b.binding.host_swizzle &&
+         a.binding.swizzled_signs == b.binding.swizzled_signs &&
+         a.binding.texture == b.binding.texture &&
+         a.binding.texture_signed == b.binding.texture_signed &&
+         a.descriptor_index == b.descriptor_index &&
+         a.descriptor_index_signed == b.descriptor_index_signed;
+}
+
+void DcReport(double secs) {
+  static DcStats s_last;
+  const DcStats& c = g_dc;
+  auto d = [&](uint64_t DcStats::*f) { return c.*f - s_last.*f; };
+  const double draws = double(std::max<uint64_t>(d(&DcStats::draws), 1));
+  const double elig = double(std::max<uint64_t>(d(&DcStats::elig), 1));
+  const double recs = double(d(&DcStats::rec) + d(&DcStats::refresh));
+  const char* phase = g_dc_mode == 0 ? "off" : g_dc_mode == 1 ? "verify"
+                                              : g_dc_cycle_off ? "off" : "consume";
+  REXGPU_INFO(
+      "[dcache] phase={} draws/s={:.0f} elig={:.1f}% hit={:.1f}% | miss new={} evict={} | refuse "
+      "class={} conv={} tex={} di={} smp={} variant={} gen={} heap={} texref={} ps={} ibreq={} "
+      "bind={} full={} | rec/s={:.0f} refresh/s={:.0f} hits/rec={:.1f} | ne prim={} pso={} "
+      "npso={} tex={} smp={} di={} vp={} | entries {}/{}",
+      phase, draws / secs, 100.0 * elig / draws, 100.0 * double(d(&DcStats::hit)) / elig,
+      d(&DcStats::miss_new), d(&DcStats::miss_evict), d(&DcStats::ref_class),
+      d(&DcStats::ref_conv), d(&DcStats::ref_tex), d(&DcStats::ref_di), d(&DcStats::ref_smp),
+      d(&DcStats::ref_variant), d(&DcStats::ref_gen), d(&DcStats::ref_heap),
+      d(&DcStats::ref_texref), d(&DcStats::ref_ps), d(&DcStats::ref_ibreq),
+      d(&DcStats::ref_bind), d(&DcStats::ref_full), d(&DcStats::rec) / secs,
+      d(&DcStats::refresh) / secs, recs > 0 ? double(d(&DcStats::hit)) / recs : 0.0,
+      d(&DcStats::ne_prim), d(&DcStats::ne_pso), d(&DcStats::ne_npso), d(&DcStats::ne_tex),
+      d(&DcStats::ne_smp), d(&DcStats::ne_di), d(&DcStats::ne_vp), g_dc_entries_used,
+      kDcEntries);
+  s_last = c;
 }
 
 // [GKEY] rung-2 census window table (epoch-tagged like the pool tables;
@@ -6694,6 +6970,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     if (g_pool_on) PoolClose(kPoolCloseFrame);
     ++g_pool_frame;
+    ++g_dc_frame;  // [dcache]
+    {  // [dcache] per-frame latch: the mode and the A/B cycler phase.
+      const int32_t dm = REXCVAR_GET(gpu_dcache);
+      g_dc_mode = (dm >= 0 && dm <= 2) ? dm : 0;
+      const int32_t dcyc = REXCVAR_GET(gpu_dcache_cycle);
+      if (dcyc > 0 && g_dc_mode == 2) {
+        static const auto s_dc_t0 = std::chrono::steady_clock::now();
+        const double dc_el =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_dc_t0).count();
+        g_dc_cycle_off = (uint64_t(dc_el / double(dcyc)) & 1) != 0;
+      } else {
+        g_dc_cycle_off = false;
+      }
+    }
     ++g_pool.frames;
     static PoolStats s_pp;
     static auto s_pp_last = std::chrono::steady_clock::now();
@@ -6703,6 +6993,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       s_pp_last = pp_now;
       const PoolStats& c = g_pool;
       auto d = [&](uint64_t PoolStats::*f) { return c.*f - s_pp.*f; };
+      DcReport(secs);  // [dcache]
       {  // [cmd] the per-frame command census (state changes per draw).
         using Cmd = DeferredCommandList::Command;
         static uint64_t s_cmd_last[64] = {};
@@ -7992,6 +8283,59 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       }
     }
   }
+  // [dcache] key time. Hash everything the derivation reads except the
+  // float constants and look the identity up. consume: every derive stage
+  // below takes its result from the entry and the same live tail runs.
+  // verify: derive as usual, compare each piece, count ne. A miss (or an
+  // invalid / mismatching entry) records at the tail.
+  DcEntry* dc = nullptr;
+  bool dc_consume = false, dc_verify = false, dc_record = false, dc_bind_ok = false;
+  DcId dc_id;
+  if (g_dc_mode != 0 && !g_dc_cycle_off) {
+    ++g_dc.draws;
+    if (g_nr_swap && bindless_resources_used_ && !g_instance && !g_nr_tile_on &&
+        !(g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0) && !g_nr_span_consume) {
+      ++g_dc.elig;
+      const bool dc_pool_pred =
+          g_pool_on && pool_class_ok && pool_pred >= 2 && !g_pool_intel_off;
+      dc_id = DcIdentity(regs, vertex_shader, static_cast<D3D12Shader*>(active_pixel_shader()),
+                         uint32_t(primitive_type), index_count, major_mode_explicit,
+                         index_buffer_info != nullptr,
+                         index_buffer_info ? index_buffer_info->guest_base : 0u,
+                         index_buffer_info ? uint32_t(index_buffer_info->format) : 0u,
+                         index_buffer_info ? index_buffer_info->count : 0u,
+                         index_buffer_info ? uint32_t(index_buffer_info->endianness) : 0u,
+                         dc_pool_pred);
+      dc = DcLookup(dc_id);
+      bool dc_hit = dc && dc->valid;
+      if (dc_hit && (dc->smp_heap != sampler_bindless_heap_gpu_start_.ptr ||
+                     dc->view_heap != view_bindless_heap_gpu_start_.ptr)) {
+        ++g_dc.ref_heap;
+        dc_hit = false;
+      }
+      if (dc_hit && dc->tex_gen != texture_cache_->nr_texture_destroy_generation()) {
+        ++g_dc.ref_gen;
+        dc_hit = false;
+      }
+      if (dc_hit && dc->vs != vertex_shader) {
+        ++g_dc.ref_ps;
+        dc_hit = false;
+      }
+      if (dc_hit) {
+        ++g_dc.hit;
+        if (g_dc_mode == 2) {
+          dc_consume = true;
+        } else {
+          dc_verify = true;
+          ++g_dc.verify;
+        }
+      } else {
+        dc_record = true;
+      }
+    } else {
+      ++g_dc.ref_class;
+    }
+  }
   if (g_skc_on) {  // [SKC] a plain draw reads the register file
     SkcPlain(vertex_shader, static_cast<D3D12Shader*>(active_pixel_shader()));
     SkcGroupReset();
@@ -8045,6 +8389,14 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+  // [dcache] the PS-needed rule is a function of the identity; a differing
+  // object is a stale entry (re-record).
+  if ((dc_consume || dc_verify) && dc->ps != pixel_shader) {
+    ++g_dc.ref_ps;
+    dc_consume = false;
+    dc_verify = false;
+    dc_record = true;
+  }
 
   // [GPU-DRAW] other sub-bracket 12 (head): entry -> here. g_draw_prof is
   // launch-only, so it matched _dp_total.on when t0 was taken.
@@ -8099,11 +8451,23 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   auto _dp_prim0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
   const uint64_t _st_prim0 = CpStallNow();  // [stall]
-  bool _dp_prim_ok = primitive_processor_->Process(primitive_processing_result);
+  bool _dp_prim_ok;
+  if (dc_consume) {
+    // [dcache] the prim result is the entry's; the index residency is live.
+    primitive_processing_result = dc->prim;
+    _dp_prim_ok = !dc->ib_dma || shared_memory_->RequestRange(dc->ib_req_base, dc->ib_req_size);
+    if (!_dp_prim_ok) ++g_dc.ref_ibreq;
+  } else {
+    _dp_prim_ok = primitive_processor_->Process(primitive_processing_result);
+  }
   g_cp_stall.prim += CpStallNow() - _st_prim0;
   if (g_draw_prof) g_draw_ns[0] += prof_ns_since(_dp_prim0);
   if (!_dp_prim_ok) {
     return false;
+  }
+  if (dc_verify && !DcPrimEq(dc->prim, primitive_processing_result)) {
+    ++g_dc.ne_prim;
+    dc_record = true;
   }
   // [GPU-DRAW] other sub-bracket 13 (mods): here -> rt-update.
   auto _dp_omods0 = g_draw_prof ? std::chrono::steady_clock::now()
@@ -8213,6 +8577,21 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kQuadList &&
       pixel_shader->constant_register_map().float_count != 0 && g_pool_last_pred &&
       g_pool_frame - g_pool_last_pred->ps_delta_frame <= 1;
+  // [dcache] the entry was recorded under another pool variant (the
+  // instanced VS / PS-instanced PS are other pipelines; the PS-instanced
+  // choice is a per-key runtime fact outside the identity): derive this draw
+  // and re-record. The prim result was the entry's, so it is re-derived
+  // (Process is idempotent).
+  if ((dc_consume || dc_verify) &&
+      ((dc->pool_open != 0) != pool_open || (dc->ps_inst != 0) != pool_ps_inst)) {
+    ++g_dc.ref_variant;
+    if (dc_consume && !primitive_processor_->Process(primitive_processing_result)) {
+      return false;
+    }
+    dc_consume = false;
+    dc_verify = false;
+    dc_record = true;
+  }
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
@@ -8257,13 +8636,16 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
   // obtain the used textures.
-  D3D12Shader::D3D12Translation* vertex_shader_translation =
-      static_cast<D3D12Shader::D3D12Translation*>(
-          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-  D3D12Shader::D3D12Translation* pixel_shader_translation =
-      pixel_shader ? static_cast<D3D12Shader::D3D12Translation*>(
-                         pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
-                   : nullptr;
+  D3D12Shader::D3D12Translation* vertex_shader_translation = nullptr;
+  D3D12Shader::D3D12Translation* pixel_shader_translation = nullptr;
+  if (!dc_consume) {  // [dcache] a hit binds the entry's pipeline: no translation lookups
+    vertex_shader_translation = static_cast<D3D12Shader::D3D12Translation*>(
+        vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+    pixel_shader_translation =
+        pixel_shader ? static_cast<D3D12Shader::D3D12Translation*>(
+                           pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+                     : nullptr;
+  }
   uint32_t bound_depth_and_color_render_target_bits;
   uint32_t bound_depth_and_color_render_target_formats[1 + xenos::kMaxColorRenderTargets];
   bool host_render_targets_used =
@@ -8360,22 +8742,36 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_draw_prof) g_draw_ns[21] += prof_ns_since(_dp_ruse0);
   auto _dp_pso0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
-  bool _dp_pso_ok =
-      nr_ruf_pso ||
-      pipeline_cache_->ConfigurePipeline(
-          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
-          normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature);
+  bool _dp_pso_ok;
+  if (dc_consume) {
+    // [dcache] pipeline identity is a pure function of the identity and the
+    // objects are persistent (the 5-4-5 finding: pso ne=0 under its gate).
+    pipeline_handle = dc->pso;
+    root_signature = dc->rootsig;
+    _dp_pso_ok = pipeline_handle != nullptr && root_signature != nullptr;
+  } else {
+    _dp_pso_ok =
+        nr_ruf_pso ||
+        pipeline_cache_->ConfigurePipeline(
+            vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+            normalized_depth_control, normalized_color_mask,
+            bound_depth_and_color_render_target_bits, bound_depth_and_color_render_target_formats,
+            &pipeline_handle, &root_signature);
+  }
   if (g_draw_prof) g_draw_ns[2] += prof_ns_since(_dp_pso0);
   if (!_dp_pso_ok) {
     return false;
+  }
+  if (dc_verify && (dc->pso != pipeline_handle || dc->rootsig != root_signature)) {
+    ++g_dc.ne_pso;
+    dc_record = true;
   }
   // [GPU-DRAW2] rest sub-bracket 22 (pret): here -> RequestTextures (the
   // async-compile cvar read + GetD3D12PipelineByHandle lookup + pipeline-lock
   // release + used-texture-mask derivation).
   auto _dp_pret0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-  if (REXCVAR_GET(async_shader_compilation) &&
+  if (!dc_consume && REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     if (g_draw_prof) {
       g_draw_ns[22] += prof_ns_since(_dp_pret0);
@@ -8399,8 +8795,40 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   auto _dp_tex0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
   const uint64_t _st_tex0 = CpStallNow();  // [stall]
-  texture_cache_->RequestTextures(used_texture_mask);
+  bool dc_tex_restored = false;
+  if (dc_consume) {
+    // [dcache] restore the derived bindings (refused while a texture watch
+    // is pending or a fetch constant differs: the full request runs), reload
+    // any restored texture whose memory was written since the capture, then
+    // the usage marking and the transitions. The destroy generation is
+    // re-read here: BeginSubmission ran after the lookup and can evict.
+    if (dc->tex_gen != texture_cache_->nr_texture_destroy_generation()) {
+      ++g_dc.ref_gen;
+      dc_record = true;
+    } else if (dc->tex_count == 0 || texture_cache_->NrTexRestore(dc->tex, dc->tex_count)) {
+      if (used_texture_mask) {
+        texture_cache_->NrTexEnsureLoaded(used_texture_mask);
+        texture_cache_->NrTexBarriersOnly(used_texture_mask);
+      }
+      dc_tex_restored = true;
+    } else {
+      ++g_dc.ref_texref;
+    }
+  }
+  if (!dc_tex_restored) {
+    texture_cache_->RequestTextures(used_texture_mask);
+  }
   g_cp_stall.tex += CpStallNow() - _st_tex0;
+  if (dc_verify && used_texture_mask) {
+    TextureCache::NrTexSnap dc_vs[kDcTexMax];
+    const uint32_t dc_vn = texture_cache_->NrTexCapture(used_texture_mask, dc_vs, kDcTexMax);
+    bool dc_teq = dc_vn != UINT32_MAX && dc_vn == dc->tex_count;
+    for (uint32_t i = 0; dc_teq && i < dc_vn; ++i) dc_teq = DcTexSnapEq(dc_vs[i], dc->tex[i]);
+    if (!dc_teq) {
+      ++g_dc.ne_tex;
+      dc_record = true;
+    }
+  }
   // [NR-TIL] N-4-1: open the pipeline piece (texture loads and their
   // barriers are behind us; the pipeline set is the only thing ahead of the
   // viewport).
@@ -8420,11 +8848,20 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   auto _dp_npso0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
   ID3D12PipelineState* nr_native_pipeline = nullptr;
-  if (g_nr_native_pso) {
+  if (dc_consume) {
+    nr_native_pipeline = dc->npso;  // [dcache]
+    if (g_nr_native_pso_bind) {
+      nr::NrNpsoCountBind(nr_native_pipeline != nullptr);
+    }
+  } else if (g_nr_native_pso) {
     nr_native_pipeline = pipeline_cache_->NrNativePipeline(pipeline_handle, root_signature);
     if (g_nr_native_pso_bind) {
       nr::NrNpsoCountBind(nr_native_pipeline != nullptr);
     }
+  }
+  if (dc_verify && dc->npso != nr_native_pipeline) {
+    ++g_dc.ne_npso;
+    dc_record = true;
   }
 
   // [sort] the segment opens here: everything from the bind to the draw.
@@ -8498,8 +8935,15 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   viewport_key.flags = (uint32_t(convert_z_to_float24) << 0) |
                        (uint32_t(host_render_targets_used) << 1) | (uint32_t(ps_writes_depth) << 2);
 
-  draw_util::ViewportInfo viewport_info;
-  if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
+  draw_util::ViewportInfo viewport_info = {};
+  if (dc_consume) {
+    // [dcache] the entry's; the key cache is kept coherent for the next
+    // derived draw.
+    viewport_info = dc->viewport;
+    previous_viewport_key_ = viewport_key;
+    previous_viewport_info_ = viewport_info;
+    viewport_cache_valid_ = true;
+  } else if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
     viewport_info = previous_viewport_info_;
   } else {
     draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x, draw_resolution_scale_y, true,
@@ -8509,6 +8953,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     previous_viewport_key_ = viewport_key;
     previous_viewport_info_ = viewport_info;
     viewport_cache_valid_ = true;
+  }
+  if (dc_verify && std::memcmp(&viewport_info, &dc->viewport, sizeof(viewport_info)) != 0) {
+    ++g_dc.ne_vp;
+    dc_record = true;
   }
   if (g_draw_prof) g_draw_ns[18] += prof_ns_since(_dp_vpk0);
 
@@ -8591,10 +9039,23 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   bool _dp_bind_ok;
   if (g_nr_swap) {
     bool nr_swp_refused = false;
+    // [dcache] the bindings half: restore from the entry (consume) or
+    // compare against it (verify) inside NrUpdateBindings.
+    g_dc_bind = dc_consume ? dc : nullptr;
+    g_dc_bind_verify = dc_verify ? dc : nullptr;
+    g_dc_bind_ne = false;
     _dp_bind_ok =
         NrUpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used,
                          &nr_swp_refused);
+    g_dc_bind = nullptr;
+    g_dc_bind_verify = nullptr;
+    dc_bind_ok = !nr_swp_refused;
+    if (g_dc_bind_ne) dc_record = true;
     if (nr_swp_refused) {
+      // [dcache] the emulated retry composes its own packs: the bound-pack
+      // bytes are unknown from here.
+      g_dc_di_cur_n_v = UINT32_MAX;
+      g_dc_di_cur_n_p = UINT32_MAX;
       ++g_nr_swap_probe.fallback;
       // [NR-RUB] the emulated retry recomposes into its own pools; the
       // staging mirrors no longer match the effective packs. The per-frame
@@ -9045,6 +9506,104 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     }
   }
   SortSegEnd();  // [sort]
+
+  // [dcache] the record: a miss, an invalid entry or a verify mismatch of an
+  // eligible draw that reached emission stores its derived state.
+  if (dc_record && g_dc_mode != 0 && !g_dc_cycle_off) {
+    const uint32_t dc_smp_v = uint32_t(vertex_shader->GetSamplerBindingsAfterTranslation().size());
+    const uint32_t dc_smp_p =
+        pixel_shader ? uint32_t(pixel_shader->GetSamplerBindingsAfterTranslation().size()) : 0u;
+    bool dc_ok = true;
+    if (!dc_bind_ok) {
+      ++g_dc.ref_bind;
+      dc_ok = false;
+    } else if (memexport_used || start_instanced || primitive_processing_result.IsTessellated() ||
+               primitive_processing_result.host_vertex_shader_type !=
+                   Shader::HostVertexShaderType::kVertex) {
+      ++g_dc.ref_class;
+      dc_ok = false;
+    } else if (primitive_processing_result.index_buffer_type ==
+               PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted) {
+      ++g_dc.ref_conv;
+      dc_ok = false;
+    } else if (uint32_t(rex::bit_count(used_texture_mask)) > kDcTexMax) {
+      ++g_dc.ref_tex;
+      dc_ok = false;
+    } else if (g_dc_di_cur_n_v == UINT32_MAX || g_dc_di_cur_n_v > kDcDiMax ||
+               g_dc_di_cur_n_p == UINT32_MAX || g_dc_di_cur_n_p > kDcDiMax) {
+      ++g_dc.ref_di;
+      dc_ok = false;
+    } else if (dc_smp_v > kDcSmpMax || dc_smp_p > kDcSmpMax ||
+               current_samplers_vertex_.size() < dc_smp_v ||
+               current_samplers_pixel_.size() < dc_smp_p ||
+               current_sampler_bindless_indices_vertex_.size() < dc_smp_v ||
+               current_sampler_bindless_indices_pixel_.size() < dc_smp_p) {
+      ++g_dc.ref_smp;
+      dc_ok = false;
+    }
+    if (dc_ok) {
+      const bool dc_refresh = dc != nullptr;
+      DcEntry* e = dc ? dc : DcInsert(dc_id);
+      if (e) {
+        e->valid = 0;
+        e->frame = g_dc_frame;
+        e->pool_open = pool_open ? 1 : 0;
+        e->ps_inst = pool_ps_inst ? 1 : 0;
+        e->pso = pipeline_handle;
+        e->rootsig = root_signature;
+        e->npso = nr_native_pipeline;
+        e->vs = vertex_shader;
+        e->ps = pixel_shader;
+        e->prim = primitive_processing_result;
+        e->viewport = viewport_info;
+        e->ib_dma = primitive_processing_result.index_buffer_type ==
+                            PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA
+                        ? 1
+                        : 0;
+        e->ib_req_base = primitive_processing_result.guest_index_base;
+        e->ib_req_size =
+            primitive_processing_result.host_draw_vertex_count *
+            (primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2u
+                                                                                          : 4u);
+        e->tex_mask = used_texture_mask;
+        e->tex_gen = texture_cache_->nr_texture_destroy_generation();
+        e->smp_heap = sampler_bindless_heap_gpu_start_.ptr;
+        e->view_heap = view_bindless_heap_gpu_start_.ptr;
+        const uint32_t dc_tn =
+            used_texture_mask ? texture_cache_->NrTexCapture(used_texture_mask, e->tex, kDcTexMax)
+                              : 0u;
+        if (dc_tn == UINT32_MAX) {
+          ++g_dc.ref_tex;
+        } else {
+          e->tex_count = uint8_t(dc_tn);
+          e->smp_n_v = uint8_t(dc_smp_v);
+          e->smp_n_p = uint8_t(dc_smp_p);
+          for (uint32_t i = 0; i < dc_smp_v; ++i) {
+            e->smp_v[i] = current_samplers_vertex_[i].value;
+            e->si_v[i] = current_sampler_bindless_indices_vertex_[i];
+          }
+          for (uint32_t i = 0; i < dc_smp_p; ++i) {
+            e->smp_p[i] = current_samplers_pixel_[i].value;
+            e->si_p[i] = current_sampler_bindless_indices_pixel_[i];
+          }
+          e->smp_uid_v = current_sampler_layout_uid_vertex_;
+          e->smp_uid_p = current_sampler_layout_uid_pixel_;
+          e->tex_uid_v = current_texture_layout_uid_vertex_;
+          e->tex_uid_p = current_texture_layout_uid_pixel_;
+          e->di_n_v = uint8_t(g_dc_di_cur_n_v);
+          e->di_n_p = uint8_t(g_dc_di_cur_n_p);
+          std::memcpy(e->di_v, g_dc_di_cur_v, g_dc_di_cur_n_v * sizeof(uint32_t));
+          std::memcpy(e->di_p, g_dc_di_cur_p, g_dc_di_cur_n_p * sizeof(uint32_t));
+          e->valid = 1;
+          if (dc_refresh) {
+            ++g_dc.refresh;
+          } else {
+            ++g_dc.rec;
+          }
+        }
+      }
+    }
+  }
 
   if (memexport_used) {
     // Make sure this memexporting draw is ordered with other work using shared
@@ -15009,6 +15568,11 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
   }
 
+  // [dcache] consume: the sampler params, heap indices, layout uids and the
+  // descriptor-indices packs are the entry's; the derivation loops below are
+  // skipped. The float / fetch / bool-loop composes stay live.
+  const DcEntry* dc_b = g_dc_bind;
+
   // [NR-RUF] 5-4-5-2: the fast path. When the v2 verdict proves this draw's
   // inputs byte-identical to its previous execution THIS frame (the pool
   // ring keeps that execution's uploads alive), restore the binding state
@@ -15192,7 +15756,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   size_t sampler_count_vertex = samplers_vertex.size();
   // [NR-RUF] under a fast restore the params/uids/indices are the bundle's
   // (byte-proven identical); the derivation loops are the cost being skipped.
-  if (sampler_count_vertex && !nr_rub_fast_restore) {
+  if (sampler_count_vertex && !nr_rub_fast_restore && !dc_b) {
     if (current_sampler_layout_uid_vertex_ != sampler_layout_uid_vertex) {
       current_sampler_layout_uid_vertex_ = sampler_layout_uid_vertex;
       cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
@@ -15226,7 +15790,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     texture_count_pixel = textures_pixel->size();
     samplers_pixel = &pixel_shader->GetSamplerBindingsAfterTranslation();
     sampler_count_pixel = samplers_pixel->size();
-    if (sampler_count_pixel && !nr_rub_fast_restore) {
+    if (sampler_count_pixel && !nr_rub_fast_restore && !dc_b) {
       if (current_sampler_layout_uid_pixel_ != sampler_layout_uid_pixel) {
         current_sampler_layout_uid_pixel_ = sampler_layout_uid_pixel;
         cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
@@ -15261,19 +15825,58 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
 
   if (g_draw_prof) g_bind_ns[1] += prof_ns_since(_bp_smp0);
 
+  if (dc_b) {
+    // [dcache] the member restore (the NrRufRestoreFromBundle shape, from
+    // the entry): sampler params + heap indices, layout uids, and the SRV
+    // keys of the restored bindings for the next derived draw's freshness
+    // check.
+    current_sampler_layout_uid_vertex_ = dc_b->smp_uid_v;
+    current_sampler_layout_uid_pixel_ = dc_b->smp_uid_p;
+    current_texture_layout_uid_vertex_ = dc_b->tex_uid_v;
+    current_texture_layout_uid_pixel_ = dc_b->tex_uid_p;
+    current_samplers_vertex_.resize(
+        std::max(current_samplers_vertex_.size(), size_t(dc_b->smp_n_v)));
+    current_sampler_bindless_indices_vertex_.resize(
+        std::max(current_sampler_bindless_indices_vertex_.size(), size_t(dc_b->smp_n_v)));
+    for (uint32_t i = 0; i < dc_b->smp_n_v; ++i) {
+      current_samplers_vertex_[i].value = dc_b->smp_v[i];
+      current_sampler_bindless_indices_vertex_[i] = dc_b->si_v[i];
+    }
+    current_samplers_pixel_.resize(
+        std::max(current_samplers_pixel_.size(), size_t(dc_b->smp_n_p)));
+    current_sampler_bindless_indices_pixel_.resize(
+        std::max(current_sampler_bindless_indices_pixel_.size(), size_t(dc_b->smp_n_p)));
+    for (uint32_t i = 0; i < dc_b->smp_n_p; ++i) {
+      current_samplers_pixel_[i].value = dc_b->smp_p[i];
+      current_sampler_bindless_indices_pixel_[i] = dc_b->si_p[i];
+    }
+    if (texture_count_vertex) {
+      current_texture_srv_keys_vertex_.resize(
+          std::max(current_texture_srv_keys_vertex_.size(), size_t(texture_count_vertex)));
+      texture_cache_->WriteActiveTextureSRVKeys(current_texture_srv_keys_vertex_.data(),
+                                                textures_vertex.data(), texture_count_vertex);
+    }
+    if (texture_count_pixel) {
+      current_texture_srv_keys_pixel_.resize(
+          std::max(current_texture_srv_keys_pixel_.size(), size_t(texture_count_pixel)));
+      texture_cache_->WriteActiveTextureSRVKeys(current_texture_srv_keys_pixel_.data(),
+                                                textures_pixel->data(), texture_count_pixel);
+    }
+  }
+
   // [NR-BNDP] sub-bracket 2 (key): srv-key freshness checks.
   auto _bp_key0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
   // Texture-key freshness (cache bookkeeping over keys the 5-3b-2 gate
   // proved equal to our derivation).
-  if (texture_count_vertex && cbuffer_binding_descriptor_indices_vertex_.up_to_date &&
+  if (!dc_b && texture_count_vertex && cbuffer_binding_descriptor_indices_vertex_.up_to_date &&
       (current_texture_layout_uid_vertex_ != texture_layout_uid_vertex ||
        !texture_cache_->AreActiveTextureSRVKeysUpToDate(current_texture_srv_keys_vertex_.data(),
                                                         textures_vertex.data(),
                                                         texture_count_vertex))) {
     cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
   }
-  if (texture_count_pixel && cbuffer_binding_descriptor_indices_pixel_.up_to_date &&
+  if (!dc_b && texture_count_pixel && cbuffer_binding_descriptor_indices_pixel_.up_to_date &&
       (current_texture_layout_uid_pixel_ != texture_layout_uid_pixel ||
        !texture_cache_->AreActiveTextureSRVKeysUpToDate(current_texture_srv_keys_pixel_.data(),
                                                         textures_pixel->data(),
@@ -15291,8 +15894,9 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   // Sampler heap indices: the shared find-or-allocate; overflow refuses to
   // the emulated path (which owns the heap-switch machinery). Everything
   // allocated up to a refusal stays valid for the retry.
-  if ((sampler_count_vertex && !cbuffer_binding_descriptor_indices_vertex_.up_to_date) ||
-      (sampler_count_pixel && !cbuffer_binding_descriptor_indices_pixel_.up_to_date)) {
+  if (!dc_b &&
+      ((sampler_count_vertex && !cbuffer_binding_descriptor_indices_vertex_.up_to_date) ||
+       (sampler_count_pixel && !cbuffer_binding_descriptor_indices_pixel_.up_to_date))) {
     if (sampler_count_vertex && !cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
       current_sampler_bindless_indices_vertex_.resize(std::max(
           current_sampler_bindless_indices_vertex_.size(), size_t(sampler_count_vertex)));
@@ -15369,7 +15973,24 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
                              : std::chrono::steady_clock::time_point{};
   // Descriptor-indices constant buffers - ours, sized by the 1-BASED slot
   // rule (max_slot + 1, never tex+smp: [[descriptor-slots-one-based]]).
-  if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
+  if (dc_b) {
+    // [dcache] the entry's pack, uploaded only when the bound one differs.
+    const uint32_t dc_n = dc_b->di_n_v;
+    if (!(cbuffer_binding_descriptor_indices_vertex_.up_to_date && g_dc_di_cur_n_v == dc_n &&
+          std::memcmp(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t)) == 0)) {
+      uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+          frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+          nullptr, nullptr, &cbuffer_binding_descriptor_indices_vertex_.address));
+      if (!descriptor_indices) {
+        return false;
+      }
+      std::memcpy(descriptor_indices, dc_b->di_v, dc_n * sizeof(uint32_t));
+      std::memcpy(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t));
+      g_dc_di_cur_n_v = dc_n;
+      cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
+      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesVertex);
+    }
+  } else if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
     uint32_t span = 0;
     for (size_t i = 0; i < texture_count_vertex; ++i) {
       span = std::max(span, textures_vertex[i].bindless_descriptor_index + 1);
@@ -15391,7 +16012,10 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     }
     // [NR-RUB] staging redirect: full-span publish (the 1-based slot rule
     // means span_alloc already covers the last slot -- nothing is dropped).
-    uint32_t* nr_rub_di = descriptor_indices;
+    // [dcache] composed in cached memory first (never read the upload heap
+    // back): the bytes are also the bound-pack record.
+    uint32_t dc_stage[kDcDiCur];
+    uint32_t* nr_rub_di = span_alloc <= kDcDiCur ? dc_stage : descriptor_indices;
     if (g_nr_rub_cmp && g_rub_stage_ok) {
       g_rub_stage.di_v.resize(span_alloc);
       nr_rub_di = g_rub_stage.di_v.data();
@@ -15409,6 +16033,12 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (nr_rub_di != descriptor_indices) {
       std::memcpy(descriptor_indices, nr_rub_di, span_alloc * sizeof(uint32_t));
     }
+    if (span_alloc <= kDcDiCur) {
+      std::memcpy(g_dc_di_cur_v, nr_rub_di, span_alloc * sizeof(uint32_t));
+      g_dc_di_cur_n_v = span_alloc;
+    } else {
+      g_dc_di_cur_n_v = UINT32_MAX;
+    }
     ++g_nr_swap_probe.di_v;
     current_texture_layout_uid_vertex_ = texture_layout_uid_vertex;
     if (texture_count_vertex) {
@@ -15420,7 +16050,24 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesVertex);
   }
-  if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
+  if (dc_b) {
+    // [dcache] the entry's pack, uploaded only when the bound one differs.
+    const uint32_t dc_n = dc_b->di_n_p;
+    if (!(cbuffer_binding_descriptor_indices_pixel_.up_to_date && g_dc_di_cur_n_p == dc_n &&
+          std::memcmp(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t)) == 0)) {
+      uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+          frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+          nullptr, nullptr, &cbuffer_binding_descriptor_indices_pixel_.address));
+      if (!descriptor_indices) {
+        return false;
+      }
+      std::memcpy(descriptor_indices, dc_b->di_p, dc_n * sizeof(uint32_t));
+      std::memcpy(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t));
+      g_dc_di_cur_n_p = dc_n;
+      cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
+      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
+    }
+  } else if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
     uint32_t span = 0;
     for (size_t i = 0; i < texture_count_pixel; ++i) {
       span = std::max(span, (*textures_pixel)[i].bindless_descriptor_index + 1);
@@ -15440,7 +16087,8 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (!descriptor_indices) {
       return false;
     }
-    uint32_t* nr_rub_di = descriptor_indices;
+    uint32_t dc_stage[kDcDiCur];
+    uint32_t* nr_rub_di = span_alloc <= kDcDiCur ? dc_stage : descriptor_indices;
     if (g_nr_rub_cmp && g_rub_stage_ok) {
       g_rub_stage.di_p.resize(span_alloc);
       nr_rub_di = g_rub_stage.di_p.data();
@@ -15458,6 +16106,12 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (nr_rub_di != descriptor_indices) {
       std::memcpy(descriptor_indices, nr_rub_di, span_alloc * sizeof(uint32_t));
     }
+    if (span_alloc <= kDcDiCur) {
+      std::memcpy(g_dc_di_cur_p, nr_rub_di, span_alloc * sizeof(uint32_t));
+      g_dc_di_cur_n_p = span_alloc;
+    } else {
+      g_dc_di_cur_n_p = UINT32_MAX;
+    }
     ++g_nr_swap_probe.di_p;
     current_texture_layout_uid_pixel_ = texture_layout_uid_pixel;
     if (texture_count_pixel) {
@@ -15470,6 +16124,36 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
   }
   if (g_draw_prof) g_bind_ns[4] += prof_ns_since(_bp_di0);
+
+  if (g_dc_bind_verify) {
+    // [dcache] verify: what the derivation produced against the entry.
+    const DcEntry& v = *g_dc_bind_verify;
+    bool dc_seq = v.smp_n_v == sampler_count_vertex && v.smp_n_p == sampler_count_pixel &&
+                  v.smp_uid_v == current_sampler_layout_uid_vertex_ &&
+                  v.smp_uid_p == current_sampler_layout_uid_pixel_ &&
+                  v.tex_uid_v == current_texture_layout_uid_vertex_ &&
+                  v.tex_uid_p == current_texture_layout_uid_pixel_;
+    for (uint32_t i = 0; dc_seq && i < sampler_count_vertex && i < kDcSmpMax; ++i) {
+      dc_seq = v.smp_v[i] == current_samplers_vertex_[i].value &&
+               v.si_v[i] == current_sampler_bindless_indices_vertex_[i];
+    }
+    for (uint32_t i = 0; dc_seq && i < sampler_count_pixel && i < kDcSmpMax; ++i) {
+      dc_seq = v.smp_p[i] == current_samplers_pixel_[i].value &&
+               v.si_p[i] == current_sampler_bindless_indices_pixel_[i];
+    }
+    if (!dc_seq) {
+      ++g_dc.ne_smp;
+      g_dc_bind_ne = true;
+    }
+    const bool dc_deq =
+        g_dc_di_cur_n_v == v.di_n_v && g_dc_di_cur_n_p == v.di_n_p &&
+        std::memcmp(g_dc_di_cur_v, v.di_v, v.di_n_v * sizeof(uint32_t)) == 0 &&
+        std::memcmp(g_dc_di_cur_p, v.di_p, v.di_n_p * sizeof(uint32_t)) == 0;
+    if (!dc_deq) {
+      ++g_dc.ne_di;
+      g_dc_bind_ne = true;
+    }
+  }
 
   // [NR-BNDP] sub-bracket 5 (root): the root-parameter tail.
   auto _bp_root0 = g_draw_prof ? std::chrono::steady_clock::now()

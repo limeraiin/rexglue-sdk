@@ -512,6 +512,15 @@ class TextureCache {
   // a restored binding can be compared against the one the real derivation
   // produces from the same fetch constants.
   void NrTexDesync(uint32_t mask) { texture_bindings_in_sync_ &= ~mask; }
+  // [dcache] For bindings restored from a CROSS-FRAME entry: any bound
+  // texture whose guest memory was written since the capture (its watch
+  // fired, outdated_mask set) reloads through the request's own load path.
+  // Only the derivation is skipped; the load rule is unchanged.
+  void NrTexEnsureLoaded(uint32_t mask);
+  // [dcache] Bumped whenever a Texture object is destroyed (eviction, clear):
+  // a cross-frame entry holding Texture pointers from an older generation
+  // must not be restored.
+  uint32_t nr_texture_destroy_generation() const { return nr_texture_destroy_generation_; }
   // The part of a texture request that is NOT derivation and still has to run
   // for a restored draw: usage marking and the resource transitions.
   virtual void NrTexBarriersOnly(uint32_t /*mask*/) {}
@@ -666,6 +675,7 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+  uint32_t nr_texture_destroy_generation_ = 0;  // [dcache]
 };
 
 }  // namespace rex::graphics

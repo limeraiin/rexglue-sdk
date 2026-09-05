@@ -298,6 +298,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       // doesn't imply that it's not bound currently. Reset bindings if
       // any texture has been destroyed.
       ResetTextureBindings();
+      ++nr_texture_destroy_generation_;  // [dcache]
     }
     // Remove the texture from the map and destroy it via its unique_ptr.
     auto found_texture_it = textures_.find(texture->key());
@@ -509,6 +510,66 @@ bool TextureCache::NrTexRestore(const NrTexSnap* snaps, uint32_t count) {
     NrTexRestoreImpl(index, snaps[i]);
   }
   return true;
+}
+
+// [dcache] The load half of a texture request over bindings that were
+// restored, not derived: the same PrepareTextureLoad / RequestRanges /
+// CommitPreparedTextureLoad sequence RequestTextures runs, over every bound
+// texture whose outdated mask is set. A texture that is up to date costs one
+// atomic load.
+void TextureCache::NrTexEnsureLoaded(uint32_t mask) {
+  constexpr size_t kMaxLoads = 2 * xenos::kTextureFetchConstantCount;
+  PendingTextureLoad loads[kMaxLoads];
+  PendingSharedMemoryRange ranges[2 * kMaxLoads];
+  size_t load_count = 0, range_count = 0;
+  auto queue = [&](Texture* texture) {
+    if (!texture || !texture->outdated_mask() || load_count >= kMaxLoads) {
+      return;
+    }
+    for (size_t i = 0; i < load_count; ++i) {
+      if (loads[i].texture == texture) {
+        return;
+      }
+    }
+    PendingTextureLoad pending_load;
+    PendingSharedMemoryRange pending_ranges[2];
+    size_t pending_range_count = 0;
+    if (!PrepareTextureLoad(*texture, pending_load, pending_ranges, pending_range_count)) {
+      return;
+    }
+    loads[load_count++] = pending_load;
+    for (size_t i = 0; i < pending_range_count; ++i) {
+      ranges[range_count++] = pending_ranges[i];
+    }
+  };
+  uint32_t remaining = mask, index;
+  while (rex::bit_scan_forward(remaining, &index)) {
+    remaining &= ~(UINT32_C(1) << index);
+    const TextureBinding* binding = GetValidTextureBinding(index);
+    if (!binding) {
+      continue;
+    }
+    queue(binding->texture);
+    queue(binding->texture_signed);
+  }
+  if (!load_count) {
+    return;
+  }
+  bool ranges_ok = true;
+  if (range_count) {
+    std::pair<uint32_t, uint32_t> pairs[2 * kMaxLoads];
+    for (size_t i = 0; i < range_count; ++i) {
+      pairs[i] = std::make_pair(ranges[i].start, ranges[i].length);
+    }
+    ranges_ok = shared_memory().RequestRanges(pairs, range_count);
+  }
+  for (size_t i = 0; i < load_count; ++i) {
+    if (ranges_ok) {
+      CommitPreparedTextureLoad(loads[i]);
+    } else if (loads[i].texture != nullptr) {
+      LoadTextureData(*loads[i].texture);
+    }
+  }
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -867,6 +928,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  ++nr_texture_destroy_generation_;  // [dcache]
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
