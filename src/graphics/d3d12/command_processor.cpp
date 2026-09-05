@@ -384,14 +384,6 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
-// [hiz-cycle] Drive 843 (Intel 720p): direct draws with NO Hi-Z under a 1x1
-// scissor were 5 ms/fr cheaper than the Hi-Z ExecuteIndirect form hiding
-// 21% of the indices; the Hi-Z may be a net loss on Intel now that the pool
-// is off there and the plain draws are draw-only. Seconds per phase, two
-// phases in place: the gpu_hiz mode / off. Read the [hiz] phase= windows
-// with geo-sum. 0 = no cycling. Temporary: delete with the drive that reads it.
-REXCVAR_DEFINE_INT32(gpu_hiz_cycle, 0, "GPU/D3D12",
-                     "[hiz-cycle] Hi-Z re-price A/B, seconds per phase (0 = off).");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
@@ -2965,9 +2957,86 @@ struct GkSlot {
 };
 std::vector<GkSlot> g_gk_tab;
 
+// [sort] State-sorting census (drive 843: a PSO switch rides 72% of the
+// city's draws, the shape of the 10 ms per-draw fixed cost on Intel). A
+// WINDOW is a run of issued draws of the pool's provable reorder class
+// (PoolClassOpaque: color ONE/ZERO/ADD, alpha ONE/ZERO or ZERO/ZERO, z test
+// AND z write) inside one pass; any non-class draw, pass change, copy,
+// submit or frame end closes it (the same PoolClose seams). Per window: the
+// draws, the PSO switches they carried and the DISTINCT PSOs; a sort by PSO
+// would leave at most `distinct` switches per window, so the frame's
+// removable switches = sum(switch - distinct). Always on, 1 Hz.
+struct SortAcc {
+  uint64_t draws = 0, cls = 0, sw = 0, sw_win = 0, wins = 0, win_draws = 0, distinct = 0,
+           saved = 0, ovf = 0, frames = 0, frame_pso = 0;
+  uint64_t hist[5] = {};  // windows by draws: 1 / 2-3 / 4-9 / 10-49 / 50+
+  uint32_t maxwin = 0;
+};
+SortAcc g_sort;
+const void* g_sort_prev_pso = nullptr;
+bool g_sort_win_open = false;
+uint32_t g_sort_win_draws = 0, g_sort_win_sw = 0;
+std::vector<const void*> g_sort_win_psos;
+std::unordered_set<const void*> g_sort_frame_psos;
+constexpr size_t kSortMaxWinPsos = 1024;
+
+void SortWindowClose() {
+  if (!g_sort_win_open) return;
+  g_sort_win_open = false;
+  const uint32_t n = g_sort_win_draws;
+  ++g_sort.wins;
+  g_sort.win_draws += n;
+  ++g_sort.hist[n < 2 ? 0 : n < 4 ? 1 : n < 10 ? 2 : n < 50 ? 3 : 4];
+  if (n > g_sort.maxwin) g_sort.maxwin = n;
+  const uint64_t d = g_sort_win_psos.size();
+  g_sort.distinct += d;
+  g_sort.sw_win += g_sort_win_sw;
+  if (g_sort_win_sw > d) g_sort.saved += g_sort_win_sw - d;
+}
+
+void SortCensusDraw(const void* pso, bool cls) {
+  ++g_sort.draws;
+  const bool sw = pso != g_sort_prev_pso;
+  g_sort_prev_pso = pso;
+  if (sw) ++g_sort.sw;
+  g_sort_frame_psos.insert(pso);
+  if (!cls) {
+    SortWindowClose();
+    return;
+  }
+  ++g_sort.cls;
+  if (!g_sort_win_open) {
+    g_sort_win_open = true;
+    g_sort_win_draws = 0;
+    g_sort_win_sw = 0;
+    g_sort_win_psos.clear();
+  }
+  ++g_sort_win_draws;
+  if (sw) ++g_sort_win_sw;
+  if (std::find(g_sort_win_psos.begin(), g_sort_win_psos.end(), pso) == g_sort_win_psos.end()) {
+    if (g_sort_win_psos.size() < kSortMaxWinPsos) {
+      g_sort_win_psos.push_back(pso);
+    } else {
+      ++g_sort.ovf;
+    }
+  }
+}
+
+void SortFrameEnd() {
+  SortWindowClose();
+  ++g_sort.frames;
+  g_sort.frame_pso += g_sort_frame_psos.size();
+  g_sort_frame_psos.clear();
+}
+
 enum PoolCloseReason { kPoolCloseClass, kPoolClosePass, kPoolCloseCopy, kPoolCloseFrame,
                        kPoolCloseSubmit };
 void PoolClose(PoolCloseReason why) {
+  if (why == kPoolCloseFrame) {
+    SortFrameEnd();  // [sort]
+  } else if (why != kPoolCloseClass) {
+    SortWindowClose();  // [sort] a class break is counted at the draw itself
+  }
   for (uint32_t i = 0; i < g_pool_batch_n; ++i) {
     const uint32_t n = g_pool_batches[i].count;
     ++g_pool.hist[n < 2 ? 0 : n < 4 ? 1 : n < 10 ? 2 : n < 50 ? 3 : 4];
@@ -6555,23 +6624,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       // 47.5 / plain draws issued directly 47.8 / off 49.3 fps: the per-draw
       // ExecuteIndirect costs nothing, the Hi-Z is neutral on the RTX (its
       // win is the Intel's); the decomposition cycler is deleted.
-      uint32_t hp = hv < 0 || hv > 2 ? 0 : uint32_t(hv);
-      {  // [hiz-cycle] alternate the latched mode with off every N seconds.
-        const int32_t cyc = REXCVAR_GET(gpu_hiz_cycle);
-        if (cyc > 0 && hp != 0) {
-          const auto now = std::chrono::steady_clock::now();
-          if (hiz_cycle_start_ == std::chrono::steady_clock::time_point{}) {
-            hiz_cycle_start_ = now;
-          } else if (now - hiz_cycle_start_ >= std::chrono::seconds(cyc)) {
-            hiz_cycle_start_ = now;
-            hiz_cycle_off_ = !hiz_cycle_off_;
-          }
-          if (hiz_cycle_off_) hp = 0;
-        } else {
-          hiz_cycle_off_ = false;
-          hiz_cycle_start_ = {};
-        }
-      }
+      // Drive 844 (Intel 720p, pool off, draw-only plain draws): skip 18.3 fps
+      // / GPU 55.5 / draw class 41.9 vs off 17.2 / 58.6 / 45.9 at matched dpf:
+      // the Hi-Z buys 4 ms of draw work for 2 ms of its own. Kept; the
+      // skip/off cycler is deleted.
+      const uint32_t hp = hv < 0 || hv > 2 ? 0 : uint32_t(hv);
       if (hp != hiz_phase_ || k1 != hiz_k_ || hrb != hiz_rebuild_) {
         if (hiz_window_.open) HizWindowClose(5);
         hiz_phase_ = hp;
@@ -6618,6 +6675,30 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             cd(Cmd::kD3DCopyBufferRegion) + cd(Cmd::kD3DCopyResource) + cd(Cmd::kCopyTexture) +
                 cd(Cmd::kD3DCopyTextureRegion),
             cd(Cmd::kD3DBeginQuery) + cd(Cmd::kD3DEndQuery));
+        {  // [sort] the state-sorting census (windows of the reorder class).
+          static SortAcc s_sort;
+          const SortAcc& c = g_sort;
+          auto sd = [&](uint64_t SortAcc::*m) { return double(c.*m - s_sort.*m); };
+          const double sfr = std::max(sd(&SortAcc::frames), 1.0);
+          const double sdr = std::max(sd(&SortAcc::draws), 1.0);
+          const double swins = std::max(sd(&SortAcc::wins), 1.0);
+          const double ssw = std::max(sd(&SortAcc::sw), 1.0);
+          double hist[5];
+          for (int i = 0; i < 5; ++i) hist[i] = 100.0 * double(c.hist[i] - s_sort.hist[i]) / swins;
+          REXGPU_INFO(
+              "[sort] /fr: draws {:.0f} class {:.1f}% | pso sw {:.0f} ({:.1f}% of draws) in-window "
+              "{:.0f} | win {:.1f} draws/win {:.1f} maxwin {} sizes 1/2-3/4-9/10-49/50+="
+              "{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% | distinct/win {:.1f} | sorted sw {:.0f} "
+              "SAVES {:.0f} ({:.1f}% of sw) | frame distinct pso {:.0f} | ovf {}",
+              sd(&SortAcc::draws) / sfr, 100.0 * sd(&SortAcc::cls) / sdr, sd(&SortAcc::sw) / sfr,
+              100.0 * sd(&SortAcc::sw) / sdr, sd(&SortAcc::sw_win) / sfr, sd(&SortAcc::wins) / sfr,
+              sd(&SortAcc::win_draws) / swins, c.maxwin, hist[0], hist[1], hist[2], hist[3], hist[4],
+              sd(&SortAcc::distinct) / swins, (sd(&SortAcc::sw) - sd(&SortAcc::saved)) / sfr,
+              sd(&SortAcc::saved) / sfr, 100.0 * sd(&SortAcc::saved) / ssw,
+              sd(&SortAcc::frame_pso) / sfr, c.ovf - s_sort.ovf);
+          s_sort = c;
+          g_sort.maxwin = 0;
+        }
       }
       const uint64_t draws = d(&PoolStats::draws), hit = d(&PoolStats::hit),
                      opq = d(&PoolStats::opq), opened = d(&PoolStats::opened),
@@ -8285,6 +8366,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     deferred_command_list_.SetPipelineStateHandle(reinterpret_cast<void*>(pipeline_handle));
     current_guest_pipeline_ = pipeline_handle;
     current_external_pipeline_ = nullptr;
+  }
+  if (g_pool_on) {  // [sort] the census keys on what is bound
+    SortCensusDraw(nr_native_pipeline && g_nr_native_pso_bind
+                       ? static_cast<const void*>(nr_native_pipeline)
+                       : static_cast<const void*>(pipeline_handle),
+                   pool_class_ok);
   }
   if (g_draw_prof) g_draw_ns[17] += prof_ns_since(_dp_npso0);
 
