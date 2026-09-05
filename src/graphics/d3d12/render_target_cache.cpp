@@ -107,16 +107,19 @@ REXCVAR_DEFINE_BOOL(gpu_nr_dump_probe, false, "GPU",
                     "rectangles it resolved to, with the owning render target "
                     "of each, once per second.");
 
-// [xfer] The in-place A/B for the render-target-cache ownership transfers
-// (the EDRAM aliasing emulation: every rebind of a host render target over
-// tiles another one last wrote copies those tiles across). Seconds per phase;
-// 0 = off (every transfer performed, the shipped behaviour). Phase "all" then
-// phase "skip" (no transfer performed; every host render target keeps its own
-// contents, ownership still tracked so resolves find their source). Read with
-// the 1 Hz [xfer] line and tools/geo-sum.py. Temporary: deleted once the
-// drive decides.
+// [xfer] SHIPPED 2026-09-05 (drive 833, RTX 1440p no-vsync heavy city):
+// NO ownership transfer is performed. The transfers were the EDRAM aliasing
+// emulation (every rebind of a host render target over tiles another one
+// last wrote copied those tiles across); Jade creates every temporary render
+// target at the same EDRAM offset on purpose and never reads aliased content
+// (city census: 0 of 152k transfers read before a write). Each host render
+// target keeps its own contents; ownership is still tracked so resolves find
+// their source. 45.0 -> 52.7 fps, GPU 20.9 -> 10.5 ms/frame, no visual change.
+// The cycler (seconds per phase, skip then all) stays only for the Intel
+// re-gate and the menu / battle / cutscene look; 0 = the shipped no-transfer
+// behaviour. Delete it, and then the transfer machinery, when those decide.
 REXCVAR_DEFINE_INT32(gpu_xfer_cycle, 0, "GPU/D3D12",
-                     "[xfer] A/B: seconds per phase, all transfers / no transfers (0 = off).");
+                     "[xfer] A/B: seconds per phase, no transfers / all transfers (0 = shipped, none).");
 
 // [NR-DETILE] N-6-5. The frozen-rows instrument's companion.
 //
@@ -4732,9 +4735,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         xfer_cycle_phase_ ^= 1;
         REXGPU_INFO("[xfer-cyc] phase={}", xfer_cycle_phase_ ? "skip" : "all");
       }
-    } else if (xfer_cycle_phase_) {
-      xfer_cycle_phase_ = 0;
-      REXGPU_INFO("[xfer-cyc] phase=all (cycler off)");
+    } else if (!xfer_cycle_phase_) {
+      xfer_cycle_phase_ = 1;
+      REXGPU_INFO("[xfer-cyc] phase=skip (shipped: no transfers)");
     }
     if (render_target_transfers) {
       for (uint32_t i = 0; i < render_target_count; ++i) {

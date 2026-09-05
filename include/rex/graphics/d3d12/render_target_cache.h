@@ -835,7 +835,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   uint64_t xfer_use_executed_ = 0, xfer_use_executed_last_ = 0;
   uint64_t xfer_use_skipped_ = 0, xfer_use_skipped_last_ = 0;
   uint64_t xfer_use_work_passes_ = 0, xfer_use_work_passes_last_ = 0;
-  uint32_t xfer_cycle_phase_ = 0;  // 0 = all transfers performed, 1 = all skipped
+  uint32_t xfer_cycle_phase_ = 1;  // 1 = no transfers (shipped), 0 = all performed (A/B only)
   std::chrono::steady_clock::time_point xfer_cycle_phase_start_{};
   void XferUseAdd(RenderTargetKey dest, const Transfer& transfer);
   void XferUseFinalize(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles,
