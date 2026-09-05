@@ -1273,11 +1273,9 @@ class D3D12CommandProcessor : public CommandProcessor {
                      uint32_t idx_count);
   ID3D12CommandSignature* HizCommandSignature(bool indexed);  // [constant, draw]
   void HizInstanceBaseReset();  // root constant 0 before a plain instanced draw
-  // [intel-probe] gpu_intel_probe: 0 shipped, 1 scissor1, 2 tri1 (temporary).
-  uint32_t intel_probe_phase_ = 0;
-  std::chrono::steady_clock::time_point intel_probe_start_{};
-  std::chrono::steady_clock::time_point intel_probe_report_{};
-  void IntelProbeTick();
+  // [hiz-cycle] gpu_hiz_cycle: the latched Hi-Z mode alternates with off (temporary).
+  bool hiz_cycle_off_ = false;
+  std::chrono::steady_clock::time_point hiz_cycle_start_{};
   uint32_t hiz_window_serial_ = 0;
   bool inst_base_dirty_ = true;
   std::unordered_map<ID3D12RootSignature*, Microsoft::WRL::ComPtr<ID3D12CommandSignature>>

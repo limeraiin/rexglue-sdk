@@ -384,15 +384,14 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
-// [intel-probe] Drive 841 (Intel 720p, pool off): 17.3 fps, GPU 58.7 ms/fr,
-// draw class 42.9 of which fill ~18 (drive 840). Seconds per phase, three
-// phases in place: shipped / scissor1 (every draw's scissor 1x1: the fill
-// removed) / tri1 (scissor 1x1 AND every draw's vertex count clamped to 3:
-// the vertex work removed too, what remains is the per-draw fixed cost:
-// state and pipeline switches, barriers, the ExecuteIndirect itself). Price
-// phases, visually wrong. 0 = off. Delete with the drive that reads it.
-REXCVAR_DEFINE_INT32(gpu_intel_probe, 0, "GPU/D3D12",
-                     "[intel-probe] draw-class decomposition A/B, seconds per phase (0 = off).");
+// [hiz-cycle] Drive 843 (Intel 720p): direct draws with NO Hi-Z under a 1x1
+// scissor were 5 ms/fr cheaper than the Hi-Z ExecuteIndirect form hiding
+// 21% of the indices; the Hi-Z may be a net loss on Intel now that the pool
+// is off there and the plain draws are draw-only. Seconds per phase, two
+// phases in place: the gpu_hiz mode / off. Read the [hiz] phase= windows
+// with geo-sum. 0 = no cycling. Temporary: delete with the drive that reads it.
+REXCVAR_DEFINE_INT32(gpu_hiz_cycle, 0, "GPU/D3D12",
+                     "[hiz-cycle] Hi-Z re-price A/B, seconds per phase (0 = off).");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
@@ -6556,7 +6555,23 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       // 47.5 / plain draws issued directly 47.8 / off 49.3 fps: the per-draw
       // ExecuteIndirect costs nothing, the Hi-Z is neutral on the RTX (its
       // win is the Intel's); the decomposition cycler is deleted.
-      const uint32_t hp = hv < 0 || hv > 2 ? 0 : uint32_t(hv);
+      uint32_t hp = hv < 0 || hv > 2 ? 0 : uint32_t(hv);
+      {  // [hiz-cycle] alternate the latched mode with off every N seconds.
+        const int32_t cyc = REXCVAR_GET(gpu_hiz_cycle);
+        if (cyc > 0 && hp != 0) {
+          const auto now = std::chrono::steady_clock::now();
+          if (hiz_cycle_start_ == std::chrono::steady_clock::time_point{}) {
+            hiz_cycle_start_ = now;
+          } else if (now - hiz_cycle_start_ >= std::chrono::seconds(cyc)) {
+            hiz_cycle_start_ = now;
+            hiz_cycle_off_ = !hiz_cycle_off_;
+          }
+          if (hiz_cycle_off_) hp = 0;
+        } else {
+          hiz_cycle_off_ = false;
+          hiz_cycle_start_ = {};
+        }
+      }
       if (hp != hiz_phase_ || k1 != hiz_k_ || hrb != hiz_rebuild_) {
         if (hiz_window_.open) HizWindowClose(5);
         hiz_phase_ = hp;
@@ -8764,10 +8779,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     } else {
       OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawInstanced(
-          intel_probe_phase_ == 2  // [intel-probe]
-              ? std::min<uint32_t>(primitive_processing_result.host_draw_vertex_count, 3)
-              : primitive_processing_result.host_draw_vertex_count,
-          1, 0, 0);
+          primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
       OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
   } else {
@@ -8861,10 +8873,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     } else {
       OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawIndexedInstanced(
-          intel_probe_phase_ == 2  // [intel-probe]
-              ? std::min<uint32_t>(primitive_processing_result.host_draw_vertex_count, 3)
-              : primitive_processing_result.host_draw_vertex_count,
-          1, 0, 0, 0);
+          primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
       OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
     if (scratch_index_buffer != nullptr) {
@@ -12857,11 +12866,6 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   scissor_rect.top = LONG(scissor.offset[1]);
   scissor_rect.right = LONG(scissor.offset[0] + scissor.extent[0]);
   scissor_rect.bottom = LONG(scissor.offset[1] + scissor.extent[1]);
-  IntelProbeTick();  // [intel-probe]
-  if (intel_probe_phase_ != 0) {
-    scissor_rect.right = scissor_rect.left + 1;
-    scissor_rect.bottom = scissor_rect.top + 1;
-  }
   SetScissorRect(scissor_rect);
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
@@ -16632,7 +16636,7 @@ void D3D12CommandProcessor::HizAppend(uint32_t slot, const HizDrawPending* d, ui
   }
   e[6] = slot;
   e[7] = 0;  // argument dword 4: base vertex (indexed) / start instance
-  e[8] = intel_probe_phase_ == 2 ? std::min<uint32_t>(host_count, 3) : host_count;  // [intel-probe]
+  e[8] = host_count;
   e[9] = 1;   // instances
   e[10] = 0;  // start index / start vertex
   e[11] = 0;  // base vertex (indexed) / start instance (non-indexed)
@@ -16725,26 +16729,6 @@ ID3D12CommandSignature* D3D12CommandProcessor::HizCommandSignaturePlain(bool ind
   return sig.Get();
 }
 
-void D3D12CommandProcessor::IntelProbeTick() {
-  const int32_t seconds = REXCVAR_GET(gpu_intel_probe);
-  if (seconds <= 0) {
-    intel_probe_phase_ = 0;
-    return;
-  }
-  const auto now = std::chrono::steady_clock::now();
-  if (intel_probe_start_ == std::chrono::steady_clock::time_point{}) {
-    intel_probe_start_ = now;
-  } else if (now - intel_probe_start_ >= std::chrono::seconds(seconds)) {
-    intel_probe_start_ = now;
-    intel_probe_phase_ = (intel_probe_phase_ + 1) % 4;
-  }
-  if (now - intel_probe_report_ >= std::chrono::seconds(1)) {
-    intel_probe_report_ = now;
-    static const char* const kNames[4] = {"shipped", "scissor1", "tri1", "tri1direct"};
-    REXGPU_INFO("[intel-probe] phase={}", kNames[intel_probe_phase_]);
-  }
-}
-
 void D3D12CommandProcessor::HizInstanceBaseReset() {
   const uint32_t zero = 0;
   deferred_command_list_.D3DSetGraphicsRoot32BitConstants(
@@ -16763,7 +16747,6 @@ bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_coun
   if (!hiz_available_ || !d.valid || hiz_phase_ == 0) {
     return false;
   }
-  if (intel_probe_phase_ == 3) return false;  // [intel-probe] tri1direct: no per-draw EI
   // Drive 838 (Intel 720p): a draw-only signature for the plain draws took
   // the draw class 81 -> 60 ms/frame (the root-constant element is the
   // Intel driver's slow path per call); the pooled batches keep [constant,
