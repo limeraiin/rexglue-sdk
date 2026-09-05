@@ -2984,10 +2984,13 @@ inline void GeoCount(uint32_t n, bool hit) {
 // ── [dcache] the per-draw identity cache of derived state ─────────────────
 // Design: NEXT-AGENT.md "THE DESIGN PASS (2026-09-05 night)". The identity is
 // a 128-bit XXH3 over one byte vector: draw args, IB facts, VS/PS ucode
-// hashes, every used VB and texture fetch constant, the pass registers, the
-// pool snapshot ranges (kPoolRegRanges) and the bool/loop constants, plus the
-// pool-open variant bit. NOT in it: the float constants (composed per draw)
-// and anything below 0x2000. An entry holds the derived state that is a pure
+// hashes, every used texture fetch constant, the pass registers, the pool
+// snapshot ranges (kPoolRegRanges) and the bool/loop constants, plus the
+// pool-open variant bit. NOT in it: the float constants (composed per
+// draw), the VERTEX fetch constants (smoke 855: animated geometry rotates
+// its vertex buffer address every frame, and nothing derived reads them:
+// the fetch pack is a live memcpy, residency and cull are live) and
+// anything below 0x2000. An entry holds the derived state that is a pure
 // function of the identity AND persistent on the host: the pipeline handle,
 // root signature and native PSO object (never evicted), the prim result
 // (frame-scoped converted index buffers refuse), the texture snaps (the
@@ -3004,6 +3007,7 @@ constexpr uint32_t kDcProbe = 8;
 constexpr uint32_t kDcEntries = 24576;
 struct DcEntry {
   uint64_t h1 = 0, h2 = 0;
+  uint32_t slot = UINT32_MAX;  // its table slot (UINT32_MAX = free)
   uint32_t frame = 0;    // last hit or record (g_dc_frame)
   uint32_t tex_gen = 0;  // texture cache destroy generation at capture
   uint8_t valid = 0, pool_open = 0, ps_inst = 0, ib_dma = 0, tex_count = 0;
@@ -3035,6 +3039,7 @@ struct DcId {
 std::vector<DcSlot> g_dc_slots;
 std::vector<DcEntry> g_dc_entries;
 uint32_t g_dc_entries_used = 0;
+uint32_t g_dc_clock = 0;  // the clock hand for pool-full evictions outside the run
 uint32_t g_dc_frame = 1;
 int32_t g_dc_mode = 0;        // per-frame latch of gpu_dcache: 0 off, 1 verify, 2 consume
 bool g_dc_cycle_off = false;  // gpu_dcache_cycle: the off phase
@@ -3068,7 +3073,7 @@ DcId DcIdentity(const RegisterFile& regs, const D3D12Shader* vs, const D3D12Shad
                 uint32_t prim, uint32_t index_count, bool major_mode_explicit, bool has_ib,
                 uint32_t ib_base, uint32_t ib_fmt, uint32_t ib_count, uint32_t ib_endian,
                 bool pool_open_pred) {
-  uint32_t buf[16 + 96 * 2 + 32 * 6 + 8 + kPoolRegCount + 40];
+  uint32_t buf[16 + 32 * 6 + 8 + kPoolRegCount + 40];
   uint32_t n = 0;
   buf[n++] = prim;
   buf[n++] = index_count;
@@ -3086,16 +3091,6 @@ DcId DcIdentity(const RegisterFile& regs, const D3D12Shader* vs, const D3D12Shad
   buf[n++] = uint32_t(ph >> 32);
   buf[n++] = pool_open_pred ? 1u : 0u;
   buf[n++] = ps_active ? 1u : 0u;
-  const Shader::ConstantRegisterMap& vcm = vs->constant_register_map();
-  for (uint32_t i = 0; i < rex::countof(vcm.vertex_fetch_bitmap); ++i) {
-    uint32_t bits = vcm.vertex_fetch_bitmap[i], j;
-    while (rex::bit_scan_forward(bits, &j)) {
-      bits &= ~(uint32_t(1) << j);
-      const uint32_t r = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (i * 32 + j) * 2;
-      buf[n++] = regs[r];
-      buf[n++] = regs[r + 1];
-    }
-  }
   uint32_t tm = vs->GetUsedTextureMaskAfterTranslation() |
                 (ps_active ? ps_active->GetUsedTextureMaskAfterTranslation() : 0u);
   uint32_t ti;
@@ -3151,8 +3146,8 @@ DcEntry* DcLookup(const DcId& id) {
 
 // A fresh entry for a new identity: an empty slot of the probe run when the
 // pool has room, else the run's least recently hit slot is evicted and its
-// entry reused. Null when the run is all empty and the pool is full (never
-// in practice: the pool is smaller than the table).
+// entry reused; a full pool under an all-empty run evicts by clock hand,
+// skipping entries hit within the last two frames.
 DcEntry* DcInsert(const DcId& id) {
   const uint32_t mask = (1u << kDcSlotBits) - 1;
   uint32_t i = DcHome(id.h1);
@@ -3172,9 +3167,39 @@ DcEntry* DcInsert(const DcId& id) {
     idx = g_dc_entries_used++;
     slot = empty;
     ++g_dc.miss_new;
-  } else if (oldest != UINT32_MAX) {
+  } else if (oldest != UINT32_MAX && (empty == UINT32_MAX || g_dc_entries_used >= kDcEntries)) {
     idx = g_dc_slots[oldest].idx;
     slot = oldest;
+    ++g_dc.miss_evict;
+  } else if (empty != UINT32_MAX) {
+    // The run is all empty and the pool is full: a clock victim elsewhere.
+    uint32_t victim = UINT32_MAX, victim_frame = UINT32_MAX;
+    for (uint32_t tries = 0; tries < 64; ++tries) {
+      const uint32_t c = g_dc_clock;
+      g_dc_clock = (g_dc_clock + 1) % kDcEntries;
+      const DcEntry& v = g_dc_entries[c];
+      if (v.slot == UINT32_MAX) {
+        victim = c;  // an orphan: free already
+        break;
+      }
+      if (v.frame + 2 < g_dc_frame) {
+        victim = c;
+        break;
+      }
+      if (v.frame < victim_frame) {
+        victim_frame = v.frame;
+        victim = c;
+      }
+    }
+    if (victim == UINT32_MAX) {
+      ++g_dc.ref_full;
+      return nullptr;
+    }
+    idx = victim;
+    if (g_dc_entries[victim].slot != UINT32_MAX) {
+      g_dc_slots[g_dc_entries[victim].slot].idx = UINT32_MAX;
+    }
+    slot = empty;
     ++g_dc.miss_evict;
   } else {
     ++g_dc.ref_full;
@@ -3186,6 +3211,7 @@ DcEntry* DcInsert(const DcId& id) {
   s.frame = g_dc_frame;
   DcEntry& e = g_dc_entries[idx];
   e = DcEntry{};
+  e.slot = slot;
   e.h1 = id.h1;
   e.h2 = id.h2;
   e.frame = g_dc_frame;
@@ -8293,7 +8319,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   DcId dc_id;
   if (g_dc_mode != 0 && !g_dc_cycle_off) {
     ++g_dc.draws;
-    if (g_nr_swap && bindless_resources_used_ && !g_instance && !g_nr_tile_on &&
+    // The tile replay LATCH (gpu_nr_tile_replay, default on) is not the
+    // gate: every draw is dormant under the de-tile; only a live recording /
+    // replay refuses, exactly as the pool refuses.
+    if (g_nr_swap && bindless_resources_used_ && !g_instance &&
         !(g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0) && !g_nr_span_consume) {
       ++g_dc.elig;
       const bool dc_pool_pred =
