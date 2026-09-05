@@ -379,6 +379,14 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void InitializeTrace() override;
 
+ public:
+  // [sort] state sorting inside the reorder class (see the gpu_sort comment);
+  // SortWindowClose is public for the pool's close seams.
+  void SortSegBegin(const void* pso, bool cls);
+  void SortSegEnd();
+  void SortWindowClose(uint32_t reason);
+  void SortLatchReset();
+
  private:
   static constexpr uint32_t kQueueFrames = 3;
 

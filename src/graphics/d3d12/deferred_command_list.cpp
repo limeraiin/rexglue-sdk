@@ -663,6 +663,186 @@ void DeferredCommandList::NrDspCompareSpan(const uintmax_t* prev, size_t prev_le
   if (skip_fresh_barriers && (a_rem || b_rem)) out->length_differs = true;
 }
 
+// [sort] state keys: fixed-function and pipeline kinds, then one per
+// graphics root parameter index (last writer wins per key; a root signature
+// set invalidates every root key).
+namespace {
+enum : uint32_t {
+  kSkPipe = 0, kSkRs, kSkIb, kSkTopo, kSkVp, kSkSc, kSkBlend, kSkSref, kSkSample,
+  kSkRoot0 = 16, kSkKeys = 48
+};
+constexpr uint32_t kSkAction = 0xFFFFFFFFu;
+constexpr uint32_t kSkBreak = 0xFFFFFFFEu;
+}  // namespace
+
+uint32_t DeferredCommandList::SortClassify(const uintmax_t* cmd) const {
+  const CommandHeader& h = *reinterpret_cast<const CommandHeader*>(cmd);
+  const uintmax_t* a = cmd + kCommandHeaderSizeElements;
+  switch (h.command) {
+    case Command::kD3DSetPipelineState:
+    case Command::kSetPipelineStateHandle: return kSkPipe;
+    case Command::kD3DSetGraphicsRootSignature: return kSkRs;
+    case Command::kD3DIASetIndexBuffer: return kSkIb;
+    case Command::kD3DIASetPrimitiveTopology: return kSkTopo;
+    case Command::kRSSetViewport: return kSkVp;
+    case Command::kRSSetScissorRect: return kSkSc;
+    case Command::kD3DOMSetBlendFactor: return kSkBlend;
+    case Command::kD3DOMSetStencilRef: return kSkSref;
+    case Command::kD3DSetSamplePositions: return kSkSample;
+    case Command::kD3DSetGraphicsRoot32BitConstants: {
+      const auto& c = *reinterpret_cast<const SetRoot32BitConstantsHeader*>(a);
+      if (c.dest_offset_in_32bit_values != 0) return kSkBreak;  // a partial write is not a state
+      return c.root_parameter_index < kSkKeys - kSkRoot0 ? kSkRoot0 + c.root_parameter_index
+                                                          : kSkBreak;
+    }
+    case Command::kD3DSetGraphicsRootConstantBufferView:
+    case Command::kD3DSetGraphicsRootDescriptorTable:
+    case Command::kD3DSetGraphicsRootShaderResourceView:
+    case Command::kD3DSetGraphicsRootUnorderedAccessView: {
+      const uint32_t idx = *reinterpret_cast<const UINT*>(a);
+      return idx < kSkKeys - kSkRoot0 ? kSkRoot0 + idx : kSkBreak;
+    }
+    case Command::kD3DDrawIndexedInstanced:
+    case Command::kD3DDrawInstanced:
+    case Command::kD3DExecuteIndirect:
+    case Command::kD3DBeginQuery:
+    case Command::kD3DEndQuery: return kSkAction;
+    default: return kSkBreak;
+  }
+}
+
+bool DeferredCommandList::SortWindow(const SortSegIn* segs, size_t n, SortStats* st) {
+  if (n < 2) return false;
+  const uintmax_t* base = command_stream_.data();
+  auto cmd_len = [](const uintmax_t* p) {
+    return kCommandHeaderSizeElements +
+           size_t(reinterpret_cast<const CommandHeader*>(p)->arguments_size_elements);
+  };
+  auto same = [&](const uintmax_t* x, const uintmax_t* y) {
+    if (!x || !y) return false;
+    const size_t lx = cmd_len(x);
+    return lx == cmd_len(y) && std::memcmp(x, y, lx * sizeof(uintmax_t)) == 0;
+  };
+  // Pass 1: parse, classify, and the record-order effective state per segment.
+  sort_segs_.resize(n);
+  sort_eff_.assign(n * kSkKeys, nullptr);
+  const uintmax_t* rec[kSkKeys] = {};
+  uint64_t union_mask = 0;
+  const size_t win_begin = segs[0].begin, win_end = segs[n - 1].end;
+  if (win_end > command_stream_.size()) return false;
+  for (size_t i = 0; i < n; ++i) {
+    SortSeg& s = sort_segs_[i];
+    s.begin = segs[i].begin;
+    s.end = segs[i].end;
+    s.pso = segs[i].pso;
+    s.act_begin = SIZE_MAX;
+    s.brk = false;
+    if (s.end < s.begin || (i && s.begin != sort_segs_[i - 1].end)) return false;
+    bool post = false, seen_action = false;
+    for (size_t off = s.begin; off < s.end;) {
+      const uintmax_t* p = base + off;
+      const size_t len = cmd_len(p);
+      if (off + len > s.end) return false;  // malformed
+      const uint32_t k = SortClassify(p);
+      if (k == kSkAction) {
+        seen_action = true;
+        if (s.act_begin == SIZE_MAX) s.act_begin = off;
+      } else if (k == kSkBreak) {
+        s.brk = true;
+      } else {
+        if (seen_action) post = true;
+        if (k == kSkPipe) ++st->sw_before;
+        if (k == kSkRs) {
+          for (uint32_t r = kSkRoot0; r < kSkKeys; ++r) rec[r] = nullptr;
+        }
+        rec[k] = p;
+        union_mask |= uint64_t(1) << k;
+      }
+      off += len;
+    }
+    if (post) {
+      ++st->post;
+      s.brk = true;
+    }
+    if (s.brk) ++st->brk;
+    std::memcpy(&sort_eff_[i * kSkKeys], rec, sizeof(rec));
+  }
+  // Pass 2: runs of sortable segments, each stable-sorted by pipeline.
+  sort_order_.resize(n);
+  bool any = false;
+  for (size_t i = 0; i < n;) {
+    if (sort_segs_[i].brk) {
+      sort_order_[i] = uint32_t(i);
+      ++i;
+      continue;
+    }
+    size_t j = i;
+    while (j < n && !sort_segs_[j].brk) {
+      sort_order_[j] = uint32_t(j);
+      ++j;
+    }
+    if (j - i >= 2) {
+      const void* first = sort_segs_[i].pso;
+      bool mixed = false;
+      for (size_t k = i + 1; k < j && !mixed; ++k) mixed = sort_segs_[k].pso != first;
+      if (mixed) {
+        std::stable_sort(sort_order_.begin() + i, sort_order_.begin() + j,
+                         [&](uint32_t a, uint32_t b) {
+                           return sort_segs_[a].pso < sort_segs_[b].pso;
+                         });
+        ++st->runs;
+        st->sorted += uint32_t(j - i);
+        any = true;
+      }
+    }
+    i = j;
+  }
+  if (!any) return false;
+  // Pass 3: rebuild in the new order with the running state of that order.
+  sort_scratch_.clear();
+  const uintmax_t* run[kSkKeys] = {};
+  auto emit = [&](const uintmax_t* p) {
+    sort_scratch_.insert(sort_scratch_.end(), p, p + cmd_len(p));
+  };
+  for (size_t idx = 0; idx < n; ++idx) {
+    const SortSeg& s = sort_segs_[sort_order_[idx]];
+    if (s.brk) {
+      sort_scratch_.insert(sort_scratch_.end(), base + s.begin, base + s.end);
+      for (size_t off = s.begin; off < s.end;) {
+        const uintmax_t* p = base + off;
+        const uint32_t k = SortClassify(p);
+        if (k != kSkAction && k != kSkBreak) {
+          if (k == kSkRs) {
+            for (uint32_t r = kSkRoot0; r < kSkKeys; ++r) run[r] = nullptr;
+          }
+          run[k] = p;
+          if (k == kSkPipe) ++st->sw_after;
+        }
+        off += cmd_len(p);
+      }
+      continue;
+    }
+    const uintmax_t* const* e = &sort_eff_[size_t(sort_order_[idx]) * kSkKeys];
+    for (uint32_t k = 0; k < kSkKeys; ++k) {
+      if (!((union_mask >> k) & 1)) continue;
+      const uintmax_t* p = e[k];
+      if (!p || same(p, run[k])) continue;
+      emit(p);
+      run[k] = p;
+      if (k == kSkRs) {
+        for (uint32_t r = kSkRoot0; r < kSkKeys; ++r) run[r] = nullptr;
+      }
+      if (k == kSkPipe) ++st->sw_after;
+    }
+    if (s.act_begin != SIZE_MAX) {
+      sort_scratch_.insert(sort_scratch_.end(), base + s.act_begin, base + s.end);
+    }
+  }
+  st->elems = sort_scratch_.size();
+  SortReplaceRange(win_begin, win_end, sort_scratch_.data(), sort_scratch_.size());
+  return true;
+}
+
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
   ++command_counts_[size_t(command) & 63];  // [cmd]
   size_t arguments_size_elements =

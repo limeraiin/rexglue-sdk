@@ -384,6 +384,23 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
+// [sort] Drive 845 (Intel 720p heavy city): a PSO switch on 2380 of 3460
+// draws per frame, 2030 of them inside windows of the provable reorder
+// class (48 windows/fr, 57 draws and 12.5 distinct PSOs each); a sort by
+// PSO inside each window removes 1450 switches/fr (61%). The sorter: every
+// class draw records a SEGMENT (its pipeline bind through its draw); at the
+// window's close (a non-class draw, a pass change, a copy, a submit, the
+// frame end, or any foreign command between two segments) the deferred
+// list rewrites the window sorted by PSO with the state deduped in the new
+// order (DeferredCommandList::SortWindow). The recorder's latches are reset
+// at window open (the first segment carries the full state) and after a
+// rewrite (the GPU's state is the sorted order's last). 0 = off (kill
+// switch), 1 = on.
+REXCVAR_DEFINE_INT32(gpu_sort, 1, "GPU/D3D12",
+                     "[sort] state sorting by pipeline inside the reorder class: 0 off, 1 on.");
+// Temporary A/B: seconds per phase (on / off); [sort] phase= names it.
+REXCVAR_DEFINE_INT32(gpu_sort_cycle, 0, "GPU/D3D12",
+                     "[sort] A/B cycler, seconds per phase on/off (0 = none). Temporary.");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
@@ -2927,6 +2944,7 @@ struct PoolStats {
   uint64_t ref_pred = 0, ref_cap = 0, ref_vfy_regs = 0, ref_vfy_ps = 0, ref_vfy_bl = 0,
            ref_elig = 0, ref_tile = 0, ref_alloc = 0, ref_psbig = 0, ref_ovf = 0;
   uint64_t close_class = 0, close_pass = 0, close_copy = 0, close_frame = 0, close_submit = 0;
+  uint64_t close_sort = 0;  // [sort] closed so its ExecuteIndirect patches land before bytes move
   uint64_t ei_patched = 0, ei_unpatched = 0;  // [hiz-pool] exact-count patches at close
   uint64_t hist[5] = {0, 0, 0, 0, 0};  // closed batch sizes 1 / 2-3 / 4-9 / 10-49 / 50+
   uint64_t inst_bytes = 0, frames = 0;
@@ -2971,8 +2989,27 @@ struct SortAcc {
            saved = 0, ovf = 0, frames = 0, frame_pso = 0;
   uint64_t hist[5] = {};  // windows by draws: 1 / 2-3 / 4-9 / 10-49 / 50+
   uint32_t maxwin = 0;
+  // The sorter (the rewrite itself).
+  uint64_t rewrites = 0, runs = 0, sorted = 0, sw_before = 0, sw_after = 0, brk = 0, post = 0,
+           ref_gen = 0, ref_one = 0, ref_bindful = 0, ref_tile = 0, elems = 0, ns = 0;
+  uint64_t closes[10] = {};  // class/pass/copy/frame/submit/foreign/abort/tile/off/latch
 };
 SortAcc g_sort;
+enum SortCloseReason : uint32_t {
+  kSortCloseClass = 0, kSortClosePass, kSortCloseCopy, kSortCloseFrame, kSortCloseSubmit,
+  kSortCloseForeign, kSortCloseAbort, kSortCloseTile, kSortCloseOff, kSortCloseLatch
+};
+struct SortWin {
+  bool open = false, seg_open = false;
+  size_t begin = 0;
+  uint64_t gen = 0;
+  std::vector<DeferredCommandList::SortSegIn> segs;
+};
+SortWin g_sort_win;
+bool g_sort_on = true;  // latched per frame: the cvar and the cycler
+bool g_sort_cycle_off = false;
+std::chrono::steady_clock::time_point g_sort_cycle_start{};
+D3D12CommandProcessor* g_sort_cp = nullptr;
 const void* g_sort_prev_pso = nullptr;
 bool g_sort_win_open = false;
 uint32_t g_sort_win_draws = 0, g_sort_win_sw = 0;
@@ -2980,7 +3017,7 @@ std::vector<const void*> g_sort_win_psos;
 std::unordered_set<const void*> g_sort_frame_psos;
 constexpr size_t kSortMaxWinPsos = 1024;
 
-void SortWindowClose() {
+void SortCensusWinClose() {
   if (!g_sort_win_open) return;
   g_sort_win_open = false;
   const uint32_t n = g_sort_win_draws;
@@ -3001,7 +3038,7 @@ void SortCensusDraw(const void* pso, bool cls) {
   if (sw) ++g_sort.sw;
   g_sort_frame_psos.insert(pso);
   if (!cls) {
-    SortWindowClose();
+    SortCensusWinClose();
     return;
   }
   ++g_sort.cls;
@@ -3023,19 +3060,19 @@ void SortCensusDraw(const void* pso, bool cls) {
 }
 
 void SortFrameEnd() {
-  SortWindowClose();
+  SortCensusWinClose();
   ++g_sort.frames;
   g_sort.frame_pso += g_sort_frame_psos.size();
   g_sort_frame_psos.clear();
 }
 
 enum PoolCloseReason { kPoolCloseClass, kPoolClosePass, kPoolCloseCopy, kPoolCloseFrame,
-                       kPoolCloseSubmit };
+                       kPoolCloseSubmit, kPoolCloseSort };
 void PoolClose(PoolCloseReason why) {
   if (why == kPoolCloseFrame) {
     SortFrameEnd();  // [sort]
-  } else if (why != kPoolCloseClass) {
-    SortWindowClose();  // [sort] a class break is counted at the draw itself
+  } else if (why != kPoolCloseClass && why != kPoolCloseSort) {
+    SortCensusWinClose();  // [sort] a class break is counted at the draw itself
   }
   for (uint32_t i = 0; i < g_pool_batch_n; ++i) {
     const uint32_t n = g_pool_batches[i].count;
@@ -3063,6 +3100,7 @@ void PoolClose(PoolCloseReason why) {
       case kPoolCloseCopy: ++g_pool.close_copy; break;
       case kPoolCloseFrame: ++g_pool.close_frame; break;
       case kPoolCloseSubmit: ++g_pool.close_submit; break;
+      case kPoolCloseSort: ++g_pool.close_sort; break;
     }
   }
   g_pool_batch_n = 0;
@@ -3076,6 +3114,12 @@ void PoolClose(PoolCloseReason why) {
   if (why == kPoolClosePass || why == kPoolCloseCopy || why == kPoolCloseFrame ||
       why == kPoolCloseSubmit) {
     g_pool_pass_open = false;
+  }
+  // [sort] the same seams close the sort window, after the pool's patches.
+  if (g_sort_cp && why != kPoolCloseSort) {
+    static const uint32_t kMap[5] = {kSortCloseClass, kSortClosePass, kSortCloseCopy,
+                                     kSortCloseFrame, kSortCloseSubmit};
+    g_sort_cp->SortWindowClose(kMap[why]);
   }
 }
 
@@ -6637,6 +6681,25 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
       hiz_frame_slots_ = 0;
     }
+    {  // [sort] latch: the kill switch and the temporary cycler.
+      bool on = REXCVAR_GET(gpu_sort) != 0;
+      const int32_t cyc = REXCVAR_GET(gpu_sort_cycle);
+      if (on && cyc > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (g_sort_cycle_start == std::chrono::steady_clock::time_point{}) {
+          g_sort_cycle_start = now;
+        } else if (now - g_sort_cycle_start >= std::chrono::seconds(cyc)) {
+          g_sort_cycle_start = now;
+          g_sort_cycle_off = !g_sort_cycle_off;
+        }
+        if (g_sort_cycle_off) on = false;
+      } else {
+        g_sort_cycle_off = false;
+        g_sort_cycle_start = {};
+      }
+      if (on != g_sort_on) SortWindowClose(kSortCloseLatch);
+      g_sort_on = on;
+    }
     if (g_pool_on) PoolClose(kPoolCloseFrame);
     ++g_pool_frame;
     ++g_pool.frames;
@@ -6675,7 +6738,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             cd(Cmd::kD3DCopyBufferRegion) + cd(Cmd::kD3DCopyResource) + cd(Cmd::kCopyTexture) +
                 cd(Cmd::kD3DCopyTextureRegion),
             cd(Cmd::kD3DBeginQuery) + cd(Cmd::kD3DEndQuery));
-        {  // [sort] the state-sorting census (windows of the reorder class).
+        {  // [sort] the state-sorting census (windows of the reorder class) and the sorter.
           static SortAcc s_sort;
           const SortAcc& c = g_sort;
           auto sd = [&](uint64_t SortAcc::*m) { return double(c.*m - s_sort.*m); };
@@ -6683,19 +6746,30 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           const double sdr = std::max(sd(&SortAcc::draws), 1.0);
           const double swins = std::max(sd(&SortAcc::wins), 1.0);
           const double ssw = std::max(sd(&SortAcc::sw), 1.0);
-          double hist[5];
+          double hist[5], cl[10];
           for (int i = 0; i < 5; ++i) hist[i] = 100.0 * double(c.hist[i] - s_sort.hist[i]) / swins;
+          for (int i = 0; i < 10; ++i) cl[i] = double(c.closes[i] - s_sort.closes[i]) / sfr;
           REXGPU_INFO(
-              "[sort] /fr: draws {:.0f} class {:.1f}% | pso sw {:.0f} ({:.1f}% of draws) in-window "
-              "{:.0f} | win {:.1f} draws/win {:.1f} maxwin {} sizes 1/2-3/4-9/10-49/50+="
+              "[sort] phase={} /fr: draws {:.0f} class {:.1f}% | pso sw {:.0f} ({:.1f}% of draws) "
+              "in-window {:.0f} | win {:.1f} draws/win {:.1f} maxwin {} sizes 1/2-3/4-9/10-49/50+="
               "{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% | distinct/win {:.1f} | sorted sw {:.0f} "
-              "SAVES {:.0f} ({:.1f}% of sw) | frame distinct pso {:.0f} | ovf {}",
-              sd(&SortAcc::draws) / sfr, 100.0 * sd(&SortAcc::cls) / sdr, sd(&SortAcc::sw) / sfr,
-              100.0 * sd(&SortAcc::sw) / sdr, sd(&SortAcc::sw_win) / sfr, sd(&SortAcc::wins) / sfr,
-              sd(&SortAcc::win_draws) / swins, c.maxwin, hist[0], hist[1], hist[2], hist[3], hist[4],
-              sd(&SortAcc::distinct) / swins, (sd(&SortAcc::sw) - sd(&SortAcc::saved)) / sfr,
-              sd(&SortAcc::saved) / sfr, 100.0 * sd(&SortAcc::saved) / ssw,
-              sd(&SortAcc::frame_pso) / sfr, c.ovf - s_sort.ovf);
+              "SAVES {:.0f} ({:.1f}% of sw) | frame distinct pso {:.0f} | ovf {} || rewrites {:.1f} "
+              "runs {:.1f} segs {:.0f} sw {:.0f}->{:.0f} brk {:.1f} post {:.1f} | close "
+              "cls/pass/copy/fr/sub/foreign/abort/tile/off/latch={:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/"
+              "{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f} | refuse gen {} one {:.1f} bindful {} tile {} | "
+              "{:.0f} KB/fr {:.0f} us/fr",
+              g_sort_on ? "on" : "off", sd(&SortAcc::draws) / sfr, 100.0 * sd(&SortAcc::cls) / sdr,
+              sd(&SortAcc::sw) / sfr, 100.0 * sd(&SortAcc::sw) / sdr, sd(&SortAcc::sw_win) / sfr,
+              sd(&SortAcc::wins) / sfr, sd(&SortAcc::win_draws) / swins, c.maxwin, hist[0], hist[1],
+              hist[2], hist[3], hist[4], sd(&SortAcc::distinct) / swins,
+              (sd(&SortAcc::sw) - sd(&SortAcc::saved)) / sfr, sd(&SortAcc::saved) / sfr,
+              100.0 * sd(&SortAcc::saved) / ssw, sd(&SortAcc::frame_pso) / sfr, c.ovf - s_sort.ovf,
+              sd(&SortAcc::rewrites) / sfr, sd(&SortAcc::runs) / sfr, sd(&SortAcc::sorted) / sfr,
+              sd(&SortAcc::sw_before) / sfr, sd(&SortAcc::sw_after) / sfr, sd(&SortAcc::brk) / sfr,
+              sd(&SortAcc::post) / sfr, cl[0], cl[1], cl[2], cl[3], cl[4], cl[5], cl[6], cl[7],
+              cl[8], cl[9], c.ref_gen - s_sort.ref_gen, sd(&SortAcc::ref_one) / sfr,
+              c.ref_bindful - s_sort.ref_bindful, c.ref_tile - s_sort.ref_tile,
+              sd(&SortAcc::elems) * 8.0 / 1024.0 / sfr, sd(&SortAcc::ns) / 1000.0 / sfr);
           s_sort = c;
           g_sort.maxwin = 0;
         }
@@ -6947,6 +7021,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     if (!g_pool_on) {
       PoolReset();
       g_pool_on = true;
+      g_sort_cp = this;  // [sort]
       g_pool_intel_off = GetD3D12Provider().GetAdapterVendorID() ==
                          ui::GraphicsProvider::GpuVendorID::kIntel;
       if (g_pool_intel_off) REXGPU_INFO("[pool] Intel adapter: the draw pool issues plain draws");
@@ -8353,6 +8428,13 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     }
   }
 
+  // [sort] the segment opens here: everything from the bind to the draw.
+  if (g_pool_on) {
+    SortSegBegin(nr_native_pipeline && g_nr_native_pso_bind
+                     ? static_cast<const void*>(nr_native_pipeline)
+                     : static_cast<const void*>(pipeline_handle),
+                 pool_class_ok);
+  }
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
   if (nr_native_pipeline && g_nr_native_pso_bind) {
@@ -8366,12 +8448,6 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     deferred_command_list_.SetPipelineStateHandle(reinterpret_cast<void*>(pipeline_handle));
     current_guest_pipeline_ = pipeline_handle;
     current_external_pipeline_ = nullptr;
-  }
-  if (g_pool_on) {  // [sort] the census keys on what is bound
-    SortCensusDraw(nr_native_pipeline && g_nr_native_pso_bind
-                       ? static_cast<const void*>(nr_native_pipeline)
-                       : static_cast<const void*>(pipeline_handle),
-                   pool_class_ok);
   }
   if (g_draw_prof) g_draw_ns[17] += prof_ns_since(_dp_npso0);
 
@@ -8967,6 +9043,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
   }
+  SortSegEnd();  // [sort]
 
   if (memexport_used) {
     // Make sure this memexporting draw is ordered with other work using shared
@@ -16814,6 +16891,106 @@ ID3D12CommandSignature* D3D12CommandProcessor::HizCommandSignaturePlain(bool ind
   }
   cache.emplace(rs, sig);
   return sig.Get();
+}
+
+// [sort] The recorder's emission latches: everything the next draw would
+// otherwise dedupe against the record order. Emits nothing.
+void D3D12CommandProcessor::SortLatchReset() {
+  ff_viewport_update_needed_ = true;
+  ff_scissor_update_needed_ = true;
+  ff_blend_factor_update_needed_ = true;
+  ff_stencil_ref_update_needed_ = true;
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  inst_base_dirty_ = true;
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+}
+
+void D3D12CommandProcessor::SortSegBegin(const void* pso, bool cls) {
+  SortCensusDraw(pso, cls);  // the census (what a sort could remove)
+  if (!g_sort_on) return;
+  if (!cls) {
+    SortWindowClose(kSortCloseClass);
+    return;
+  }
+  if (!bindless_resources_used_) {
+    ++g_sort.ref_bindful;
+    return;
+  }
+  if (g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0 || g_parallel_record) {
+    ++g_sort.ref_tile;
+    SortWindowClose(kSortCloseTile);
+    return;
+  }
+  const size_t here = deferred_command_list_.next_command_offset();
+  const uint64_t gen = deferred_command_list_.reset_generation();
+  if (g_sort_win.open) {
+    if (g_sort_win.seg_open) {
+      SortWindowClose(kSortCloseAbort);  // the previous draw never reached its draw
+    } else if (g_sort_win.gen != gen || g_sort_win.segs.back().end != here) {
+      SortWindowClose(kSortCloseForeign);  // something else recorded between two segments
+    }
+  }
+  if (!g_sort_win.open) {
+    g_sort_win.open = true;
+    g_sort_win.begin = deferred_command_list_.next_command_offset();
+    g_sort_win.gen = deferred_command_list_.reset_generation();
+    g_sort_win.segs.clear();
+    SortLatchReset();  // the first segment carries the full state
+  }
+  g_sort_win.segs.push_back({deferred_command_list_.next_command_offset(), 0, pso});
+  g_sort_win.seg_open = true;
+}
+
+void D3D12CommandProcessor::SortSegEnd() {
+  if (!g_sort_win.open || !g_sort_win.seg_open) return;
+  g_sort_win.segs.back().end = deferred_command_list_.next_command_offset();
+  g_sort_win.seg_open = false;
+}
+
+void D3D12CommandProcessor::SortWindowClose(uint32_t reason) {
+  if (!g_sort_win.open) return;
+  g_sort_win.open = false;
+  if (g_sort_win.seg_open) {
+    g_sort_win.segs.pop_back();  // its bytes stay where they are, after the window
+    g_sort_win.seg_open = false;
+  }
+  ++g_sort.closes[reason < 10 ? reason : 9];
+  const auto t0 = std::chrono::steady_clock::now();
+  bool rewrote = false;
+  if (g_sort_win.gen != deferred_command_list_.reset_generation()) {
+    ++g_sort.ref_gen;
+  } else if (g_sort_win.segs.size() < 2) {
+    ++g_sort.ref_one;
+  } else {
+    // The pool patches its ExecuteIndirect counts by stream offset: land
+    // them before any byte moves.
+    if (g_pool_batch_n) PoolClose(kPoolCloseSort);
+    DeferredCommandList::SortStats st;
+    rewrote = deferred_command_list_.SortWindow(g_sort_win.segs.data(), g_sort_win.segs.size(),
+                                                &st);
+    g_sort.runs += st.runs;
+    g_sort.sorted += st.sorted;
+    g_sort.brk += st.brk;
+    g_sort.post += st.post;
+    if (rewrote) {
+      g_sort.sw_before += st.sw_before;
+      g_sort.sw_after += st.sw_after;
+      g_sort.elems += st.elems;
+    } else {
+      ++g_sort.ref_one;
+    }
+  }
+  if (rewrote) {
+    ++g_sort.rewrites;
+    SortLatchReset();  // the GPU's state is now the sorted order's last
+  }
+  g_sort.ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count());
+  g_sort_win.segs.clear();
 }
 
 void D3D12CommandProcessor::HizInstanceBaseReset() {

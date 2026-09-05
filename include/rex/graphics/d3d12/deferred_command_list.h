@@ -190,6 +190,39 @@ class DeferredCommandList {
   static void NrSprPatchViewAddress(uintmax_t* span, uint32_t offset,
                                     uint64_t gpu_address);
 
+  // [sort] State sorting inside the reorder class. A window is a run of
+  // draw SEGMENTS (each [begin, end) = one draw's recording, from its
+  // pipeline bind to its draw, contiguous in the stream). SortWindow parses
+  // them, splits the window into runs at segments that carry anything but
+  // graphics state / draws / queries (a dispatch, a barrier, a copy, a heap
+  // set: emitted verbatim in place), stable-sorts every run by pipeline
+  // object, and rebuilds the window: each segment's EFFECTIVE state (its own
+  // sets, else what it inherited in record order) is emitted only where it
+  // differs from the running state of the new order, then its actions. The
+  // window's first segment carries the full state (the recorder's latches
+  // are reset at window open), so an inherited nullptr means "not used by
+  // this draw". The rewrite splices the stream in place (the tail after the
+  // window moves). Returns true when bytes were rewritten.
+  struct SortSegIn {
+    size_t begin, end;
+    const void* pso;
+  };
+  struct SortStats {
+    uint32_t runs = 0, sorted = 0, brk = 0, post = 0, sw_before = 0, sw_after = 0;
+    size_t elems = 0;
+  };
+  bool SortWindow(const SortSegIn* segs, size_t n, SortStats* st);
+  const uintmax_t* stream_data() const { return command_stream_.data(); }
+  void SortReplaceRange(size_t begin, size_t end, const uintmax_t* data, size_t len) {
+    const size_t old_len = end - begin;
+    if (len > old_len) {
+      command_stream_.insert(command_stream_.begin() + end, len - old_len, uintmax_t(0));
+    } else if (len < old_len) {
+      command_stream_.erase(command_stream_.begin() + begin + len, command_stream_.begin() + end);
+    }
+    std::memcpy(command_stream_.data() + begin, data, len * sizeof(uintmax_t));
+  }
+
   // [GPU-PRECORD] Phase 1a-ii: move the recorded command stream out (leaving this
   // list empty, ready to record the next segment) for later ordered replay.
   std::vector<uintmax_t> TakeStream() {
@@ -858,6 +891,17 @@ class DeferredCommandList {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  // [sort] scratch, reused across windows.
+  struct SortSeg {
+    size_t begin, end, act_begin;
+    const void* pso;
+    bool brk;
+  };
+  uint32_t SortClassify(const uintmax_t* cmd) const;
+  std::vector<uintmax_t> sort_scratch_;
+  std::vector<const uintmax_t*> sort_eff_;
+  std::vector<uint32_t> sort_order_;
+  std::vector<SortSeg> sort_segs_;
   // [NR-BFC] see reset_generation().
   uint64_t reset_generation_ = 0;
 };
