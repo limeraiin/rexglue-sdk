@@ -47,6 +47,45 @@ class DeferredCommandList {
   // by an AV in NrBfcScan on the first smoke).
   uint64_t reset_generation() const { return reset_generation_; }
 
+  // [hiz-pool] The element offset the next WriteCommand records at, and the
+  // patch of a recorded ExecuteIndirect's MaxCommandCount at such an offset.
+  // The per-instance pool batch records its ExecuteIndirect with the batch
+  // capacity and patches the EXACT final count at pool close (always before
+  // this list executes), so the capacity-long tail of zeroed elements is
+  // never executed: on the Intel UHD every element costs real GPU time
+  // (drive 834: the draw class 41 -> 87 ms/frame from the tails alone).
+  // Validated against the reset generation, the record's header and its
+  // signature / argument buffer; a refused patch leaves the capacity, which
+  // the test shader's tail zeroing keeps correct.
+  size_t next_command_offset() const { return command_stream_.size(); }
+  bool PatchExecuteIndirectMaxCount(size_t offset, uint64_t generation,
+                                    ID3D12CommandSignature* command_signature,
+                                    ID3D12Resource* argument_buffer,
+                                    UINT64 argument_buffer_offset, UINT max_command_count) {
+    if (generation != reset_generation_) {
+      return false;
+    }
+    constexpr size_t kArgsElements =
+        (sizeof(D3DExecuteIndirectArguments) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+    if (offset + kCommandHeaderSizeElements + kArgsElements > command_stream_.size()) {
+      return false;
+    }
+    const CommandHeader& header =
+        *reinterpret_cast<const CommandHeader*>(command_stream_.data() + offset);
+    if (header.command != Command::kD3DExecuteIndirect ||
+        header.arguments_size_elements != kArgsElements) {
+      return false;
+    }
+    auto& args = *reinterpret_cast<D3DExecuteIndirectArguments*>(command_stream_.data() + offset +
+                                                                 kCommandHeaderSizeElements);
+    if (args.command_signature != command_signature || args.argument_buffer != argument_buffer ||
+        args.argument_buffer_offset != argument_buffer_offset) {
+      return false;
+    }
+    args.max_command_count = max_command_count;
+    return true;
+  }
+
   // [NR-BFC] Census over the stream tail from `start_elements`: per-class
   // command counts for the buffer-replay design (the stream is
   // self-describing, so the scan needs no execution). `graphics_cbv_by_root`

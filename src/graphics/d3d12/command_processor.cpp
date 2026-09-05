@@ -2872,8 +2872,15 @@ struct PoolBatch {
   // (vertex) count every element draws, hiz_dir = the depth test direction.
   uint32_t hiz_base, hiz_serial, idx_count;
   uint8_t hiz_dir;
+  // [hiz-pool] the recorded ExecuteIndirect of the per-instance form, for
+  // the exact-count patch at close (ei_offset SIZE_MAX = none).
+  size_t ei_offset;
+  uint64_t ei_gen, ei_arg_offset;
+  ID3D12CommandSignature* ei_sig;
+  ID3D12Resource* ei_buf;
 };
 std::vector<PoolBatch> g_pool_batches;  // arena, reused per window
+DeferredCommandList* g_pool_dcl = nullptr;  // [hiz-pool] the list the batches record into
 // [occ] the open submission's tags (a pool batch writes its final instance
 // count into its tag at close, which always precedes the submission's
 // resolve: kPoolCloseSubmit runs before the deferred list executes).
@@ -2913,6 +2920,7 @@ struct PoolStats {
   uint64_t ref_pred = 0, ref_cap = 0, ref_vfy_regs = 0, ref_vfy_ps = 0, ref_vfy_bl = 0,
            ref_elig = 0, ref_tile = 0, ref_alloc = 0, ref_psbig = 0, ref_ovf = 0;
   uint64_t close_class = 0, close_pass = 0, close_copy = 0, close_frame = 0, close_submit = 0;
+  uint64_t ei_patched = 0, ei_unpatched = 0;  // [hiz-pool] exact-count patches at close
   uint64_t hist[5] = {0, 0, 0, 0, 0};  // closed batch sizes 1 / 2-3 / 4-9 / 10-49 / 50+
   uint64_t inst_bytes = 0, frames = 0;
   // [GEO] the iGPU's work unit is geometry, not draws (drive 766 reread +
@@ -2948,6 +2956,18 @@ void PoolClose(PoolCloseReason why) {
   for (uint32_t i = 0; i < g_pool_batch_n; ++i) {
     const uint32_t n = g_pool_batches[i].count;
     ++g_pool.hist[n < 2 ? 0 : n < 4 ? 1 : n < 10 ? 2 : n < 50 ? 3 : 4];
+    // [hiz-pool] the exact count into the recorded ExecuteIndirect: the
+    // batch takes no more instances from here, the list has not executed.
+    PoolBatch& eb = g_pool_batches[i];
+    if (eb.ei_offset != SIZE_MAX && g_pool_dcl) {
+      if (g_pool_dcl->PatchExecuteIndirectMaxCount(eb.ei_offset, eb.ei_gen, eb.ei_sig, eb.ei_buf,
+                                                   eb.ei_arg_offset, n)) {
+        ++g_pool.ei_patched;
+      } else {
+        ++g_pool.ei_unpatched;
+      }
+      eb.ei_offset = SIZE_MAX;
+    }
     // [occ] the batch's final instance count into its census tag.
     const uint32_t t = g_pool_batches[i].occ_tag;
     if (t < g_occ_sub_tags.size()) g_occ_sub_tags[t].inst = n;
@@ -6551,7 +6571,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           "batches/fr={:.1f} sizes 1/2-3/4-9/10-49/50+={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}% "
           "| refuse pred1={} cap={} vfy regs/ps/bl={}/{}/{} elig={} tile={} alloc={} psbig={} "
           "ovf={} | close class/pass/copy/frame/submit={}/{}/{}/{}/{} | inst {:.1f} MB/s "
-          "| psinst open/fr={:.1f} hit/fr={:.1f}",
+          "| psinst open/fr={:.1f} hit/fr={:.1f} | ei patched/unpatched={}/{}",
           draws, draws - hit, 100.0 * double(hit) / dd, double(draws) / fr,
           double(draws - hit) / fr, 100.0 * double(opq) / dd, 100.0 * double(hit) / dd,
           double(opened) / fr, 100.0 * double(hist[0]) / bb, 100.0 * double(hist[1]) / bb,
@@ -6563,7 +6583,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           d(&PoolStats::close_pass), d(&PoolStats::close_copy), d(&PoolStats::close_frame),
           d(&PoolStats::close_submit),
           secs > 0 ? double(d(&PoolStats::inst_bytes)) / secs / 1048576.0 : 0.0,
-          double(d(&PoolStats::opened_ps)) / fr, double(d(&PoolStats::hit_ps)) / fr);
+          double(d(&PoolStats::opened_ps)) / fr, double(d(&PoolStats::hit_ps)) / fr,
+          d(&PoolStats::ei_patched), d(&PoolStats::ei_unpatched));
       {
         const uint64_t gp = d(&PoolStats::geo_idx_plain), gh = d(&PoolStats::geo_idx_hit);
         uint64_t gd[6], gi[6], gds = 0, gis = 0;
@@ -9148,6 +9169,8 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
   b.hiz_base = UINT32_MAX;  // [hiz-pool] decided below
   b.hiz_serial = 0;
   b.hiz_dir = 0;
+  b.ei_offset = SIZE_MAX;
+  g_pool_dcl = &deferred_command_list_;
   b.idx_count = host_draw_vertex_count;
   std::memcpy(b.float_bitmap, cm.float_bitmap, sizeof(b.float_bitmap));
   b.inst = mapping + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
@@ -9220,6 +9243,12 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
       ++hiz_acc_.pool_open;
       OccDrawBegin();  // [occ] the batch = one query; its count lands at close
       occ_draw_hiz_ = base + 1;
+      // Recorded with the capacity; PoolClose patches the exact count.
+      b.ei_offset = deferred_command_list_.next_command_offset();
+      b.ei_gen = deferred_command_list_.reset_generation();
+      b.ei_sig = hsig;
+      b.ei_buf = hiz_args_.Get();
+      b.ei_arg_offset = uint64_t(base) * kHizArgsStride;
       deferred_command_list_.D3DExecuteIndirect(hsig, capacity, hiz_args_.Get(),
                                                 uint64_t(base) * kHizArgsStride);
       b.occ_tag = OccDrawEnd(host_draw_vertex_count, 1);
