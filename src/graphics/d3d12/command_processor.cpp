@@ -384,6 +384,15 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
+// [intel-probe] Drive 841 (Intel 720p, pool off): 17.3 fps, GPU 58.7 ms/fr,
+// draw class 42.9 of which fill ~18 (drive 840). Seconds per phase, three
+// phases in place: shipped / scissor1 (every draw's scissor 1x1: the fill
+// removed) / tri1 (scissor 1x1 AND every draw's vertex count clamped to 3:
+// the vertex work removed too, what remains is the per-draw fixed cost:
+// state and pipeline switches, barriers, the ExecuteIndirect itself). Price
+// phases, visually wrong. 0 = off. Delete with the drive that reads it.
+REXCVAR_DEFINE_INT32(gpu_intel_probe, 0, "GPU/D3D12",
+                     "[intel-probe] draw-class decomposition A/B, seconds per phase (0 = off).");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
@@ -8726,8 +8735,11 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       // [hiz] issued as an ExecuteIndirect whose arguments the checkpoint writes.
     } else {
       OccDrawBegin();  // [occ]
-      deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
-                                              0, 0);
+      deferred_command_list_.D3DDrawInstanced(
+          intel_probe_phase_ == 2  // [intel-probe]
+              ? std::min<uint32_t>(primitive_processing_result.host_draw_vertex_count, 3)
+              : primitive_processing_result.host_draw_vertex_count,
+          1, 0, 0);
       OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
   } else {
@@ -8821,7 +8833,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     } else {
       OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawIndexedInstanced(
-          primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+          intel_probe_phase_ == 2  // [intel-probe]
+              ? std::min<uint32_t>(primitive_processing_result.host_draw_vertex_count, 3)
+              : primitive_processing_result.host_draw_vertex_count,
+          1, 0, 0, 0);
       OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
     if (scratch_index_buffer != nullptr) {
@@ -12814,6 +12829,11 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   scissor_rect.top = LONG(scissor.offset[1]);
   scissor_rect.right = LONG(scissor.offset[0] + scissor.extent[0]);
   scissor_rect.bottom = LONG(scissor.offset[1] + scissor.extent[1]);
+  IntelProbeTick();  // [intel-probe]
+  if (intel_probe_phase_ != 0) {
+    scissor_rect.right = scissor_rect.left + 1;
+    scissor_rect.bottom = scissor_rect.top + 1;
+  }
   SetScissorRect(scissor_rect);
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
@@ -16584,7 +16604,7 @@ void D3D12CommandProcessor::HizAppend(uint32_t slot, const HizDrawPending* d, ui
   }
   e[6] = slot;
   e[7] = 0;  // argument dword 4: base vertex (indexed) / start instance
-  e[8] = host_count;
+  e[8] = intel_probe_phase_ == 2 ? std::min<uint32_t>(host_count, 3) : host_count;  // [intel-probe]
   e[9] = 1;   // instances
   e[10] = 0;  // start index / start vertex
   e[11] = 0;  // base vertex (indexed) / start instance (non-indexed)
@@ -16675,6 +16695,26 @@ ID3D12CommandSignature* D3D12CommandProcessor::HizCommandSignaturePlain(bool ind
   }
   cache.emplace(rs, sig);
   return sig.Get();
+}
+
+void D3D12CommandProcessor::IntelProbeTick() {
+  const int32_t seconds = REXCVAR_GET(gpu_intel_probe);
+  if (seconds <= 0) {
+    intel_probe_phase_ = 0;
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (intel_probe_start_ == std::chrono::steady_clock::time_point{}) {
+    intel_probe_start_ = now;
+  } else if (now - intel_probe_start_ >= std::chrono::seconds(seconds)) {
+    intel_probe_start_ = now;
+    intel_probe_phase_ = (intel_probe_phase_ + 1) % 3;
+  }
+  if (now - intel_probe_report_ >= std::chrono::seconds(1)) {
+    intel_probe_report_ = now;
+    static const char* const kNames[3] = {"shipped", "scissor1", "tri1"};
+    REXGPU_INFO("[intel-probe] phase={}", kNames[intel_probe_phase_]);
+  }
 }
 
 void D3D12CommandProcessor::HizInstanceBaseReset() {
