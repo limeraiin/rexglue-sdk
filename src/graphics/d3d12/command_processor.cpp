@@ -384,6 +384,14 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
+// [intel-probe] Drive 839 (Intel 720p): heavy city 13.5 fps, GPU 76 ms/fr,
+// draw class 59.5 (drive 815's pool-bypass form: 41). Seconds per phase, three
+// phases cycled in place: shipped / nopool (the draw pool off: every draw a
+// plain draw, the form of drive 815 plus the draw-only signature) / scissor1
+// (every draw's scissor 1x1: the fill removed, a PRICE phase, visually wrong).
+// 0 = off. Delete with the drive that reads it.
+REXCVAR_DEFINE_INT32(gpu_intel_probe, 0, "GPU/D3D12",
+                     "[intel-probe] draw-class decomposition A/B, seconds per phase (0 = off).");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
@@ -7746,7 +7754,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         // form (its own Hi-Z entry, hidden alone); a batch whose window
         // closed refuses the hit and the draw reopens a fresh one.
         PoolSlot* pool_slot = nullptr;
-        PoolBatch* pool_batch = PoolMatch(pool_key, regs, pool_ps, &pool_slot);
+        PoolBatch* pool_batch =  // [intel-probe] nopool: no hits either
+            intel_probe_phase_ == 1 ? nullptr : PoolMatch(pool_key, regs, pool_ps, &pool_slot);
         bool pool_hit = false;
         if (pool_batch) {
           if (pool_batch->hiz_base != UINT32_MAX) {
@@ -7966,7 +7975,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   bool pool_open = false;
   // [hiz-pool] an eligible opener opens (the per-instance form); drive 821
   // found the bypass's other half still here: batches/frame 485 -> 58.
-  if (g_pool_on && pool_class_ok && !g_instance) {
+  if (g_pool_on && pool_class_ok && !g_instance && intel_probe_phase_ != 1) {  // [intel-probe]
     if (pool_pred < 2) {
       ++g_pool.ref_pred;
     } else if (g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0) {
@@ -12803,6 +12812,11 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   scissor_rect.top = LONG(scissor.offset[1]);
   scissor_rect.right = LONG(scissor.offset[0] + scissor.extent[0]);
   scissor_rect.bottom = LONG(scissor.offset[1] + scissor.extent[1]);
+  IntelProbeTick();  // [intel-probe]
+  if (intel_probe_phase_ == 2) {
+    scissor_rect.right = scissor_rect.left + 1;
+    scissor_rect.bottom = scissor_rect.top + 1;
+  }
   SetScissorRect(scissor_rect);
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
@@ -16664,6 +16678,26 @@ ID3D12CommandSignature* D3D12CommandProcessor::HizCommandSignaturePlain(bool ind
   }
   cache.emplace(rs, sig);
   return sig.Get();
+}
+
+void D3D12CommandProcessor::IntelProbeTick() {
+  const int32_t seconds = REXCVAR_GET(gpu_intel_probe);
+  if (seconds <= 0) {
+    intel_probe_phase_ = 0;
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (intel_probe_start_ == std::chrono::steady_clock::time_point{}) {
+    intel_probe_start_ = now;
+  } else if (now - intel_probe_start_ >= std::chrono::seconds(seconds)) {
+    intel_probe_start_ = now;
+    intel_probe_phase_ = (intel_probe_phase_ + 1) % 3;
+  }
+  if (now - intel_probe_report_ >= std::chrono::seconds(1)) {
+    intel_probe_report_ = now;
+    static const char* const kNames[3] = {"shipped", "nopool", "scissor1"};
+    REXGPU_INFO("[intel-probe] phase={}", kNames[intel_probe_phase_]);
+  }
 }
 
 void D3D12CommandProcessor::HizInstanceBaseReset() {

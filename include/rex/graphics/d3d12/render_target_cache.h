@@ -828,6 +828,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // learned from the census, executed from then on. Drive 838: the expanded
   // map's 1x depth Z2880t/p16/m0 read its skipped d2d transfer.
   std::unordered_set<uint64_t> xfer_live_pairs_;
+  std::unordered_set<uint64_t> xfer_ignored_pairs_;  // cross-kind, named once
   // Ranges a resolve clear filled and no draw has touched since, per key.
   struct XferClearedRange {
     RenderTargetKey key;
@@ -849,8 +850,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   std::chrono::steady_clock::time_point xfer_cycle_phase_start_{};
   void XferUseAdd(RenderTargetKey dest, const Transfer& transfer);
   void XferUseFinalize(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles,
-                       XferUseOutcome pending_outcome, XferUseOutcome written_outcome);
-  void XferUseNoteDraw(RenderTargetKey key, bool reads_dest);
+                       XferUseOutcome pending_outcome, XferUseOutcome written_outcome,
+                       uint32_t reason = 0);
+  // reason bits: 1 z test, 2 stencil, 4 blend factor/op, 8 partial write mask.
+  void XferUseNoteDraw(RenderTargetKey key, bool reads_dest, uint32_t reason = 0);
   void XferUseNoteClear(RenderTargetKey key, const Transfer::Rectangle& rectangle,
                         uint64_t value);
   // [xfer] The forwarded clear: with no transfers performed, a transfer whose

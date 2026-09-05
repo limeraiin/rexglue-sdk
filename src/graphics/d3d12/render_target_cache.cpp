@@ -1476,7 +1476,8 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
             stencil_reads = !(front_writes && back_writes);
           }
           const bool depth_reads = z_reads || stencil_reads;
-          XferUseNoteDraw(used[0]->key(), depth_reads);
+          XferUseNoteDraw(used[0]->key(), depth_reads,
+                          (z_reads ? 1u : 0u) | (stencil_reads ? 2u : 0u));
         }
         auto factor_reads_dest = [](xenos::BlendFactor f) {
           return f == xenos::BlendFactor::kDstColor || f == xenos::BlendFactor::kOneMinusDstColor ||
@@ -1488,7 +1489,7 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
             continue;
           }
           auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
-          const bool color_reads =
+          const bool blend_reads =
               factor_reads_dest(blend.color_srcblend) ||
               blend.color_destblend != xenos::BlendFactor::kZero ||
               blend.color_comb_fcn == xenos::BlendOp::kMin ||
@@ -1496,9 +1497,10 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
               factor_reads_dest(blend.alpha_srcblend) ||
               blend.alpha_destblend != xenos::BlendFactor::kZero ||
               blend.alpha_comb_fcn == xenos::BlendOp::kMin ||
-              blend.alpha_comb_fcn == xenos::BlendOp::kMax ||
-              ((normalized_color_mask >> (i * 4)) & 0xF) != 0xF;
-          XferUseNoteDraw(used[1 + i]->key(), color_reads);
+              blend.alpha_comb_fcn == xenos::BlendOp::kMax;
+          const bool mask_reads = ((normalized_color_mask >> (i * 4)) & 0xF) != 0xF;
+          XferUseNoteDraw(used[1 + i]->key(), blend_reads || mask_reads,
+                          (blend_reads ? 4u : 0u) | (mask_reads ? 8u : 0u));
         }
       }
       SetCommandListRenderTargets(depth_and_color_render_targets);
@@ -4586,22 +4588,31 @@ std::string D3D12RenderTargetCache::XferKeyStr(RenderTargetKey key) {
 
 void D3D12RenderTargetCache::XferUseFinalize(RenderTargetKey key, uint32_t start_tiles,
                                              uint32_t end_tiles, XferUseOutcome pending_outcome,
-                                             XferUseOutcome written_outcome) {
+                                             XferUseOutcome written_outcome, uint32_t reason) {
   for (size_t i = 0; i < xfer_use_records_.size();) {
     XferUseRecord& r = xfer_use_records_[i];
     if (r.dest == key && r.start_tiles < end_tiles && start_tiles < r.end_tiles) {
       const XferUseOutcome outcome = r.written ? written_outcome : pending_outcome;
       ++xfer_use_counts_[r.cls][outcome];
       if (outcome == kXferUseReadDraw || outcome == kXferUseReadResolve) {
-        // [xfer-live] a skipped transfer that was read: learn the pair.
+        // [xfer-live] a skipped transfer that was read. Same-kind pairs (c2c,
+        // d2d) carry data: learn the pair, execute it from now on. Cross-kind
+        // pairs (depth bits read as color or color bits as depth) were garbage
+        // on the console as well: never executed, named once. Drive 839: the
+        // d2c pair C0t/p4/m2 <- Z0t/p4/m2 (a partial write mask) cost the
+        // Intel 5 ms/frame for nothing visible.
         const uint64_t pair = (uint64_t(r.dest.key) << 32) | r.source.key;
-        if (xfer_live_pairs_.insert(pair).second) {
+        const bool cross_kind = r.cls == 1 || r.cls == 2;
+        auto& set = cross_kind ? xfer_ignored_pairs_ : xfer_live_pairs_;
+        if (set.insert(pair).second) {
           REXGPU_WARN(
-              "[xfer-live] LEARN dest={} src={} tiles {}-{} outcome={} fromcleared={} "
-              "srcclr={}-{}: executed from now on",
-              XferKeyStr(r.dest), XferKeyStr(r.source), r.start_tiles, r.end_tiles,
-              outcome == kXferUseReadDraw ? "rd" : "rres", r.from_cleared ? 1 : 0,
-              r.src_clear_start, r.src_clear_end);
+              "[xfer-live] {} dest={} src={} tiles {}-{} outcome={} reason=z{}s{}b{}m{} "
+              "fromcleared={} srcclr={}-{}: {}",
+              cross_kind ? "IGNORE" : "LEARN", XferKeyStr(r.dest), XferKeyStr(r.source),
+              r.start_tiles, r.end_tiles, outcome == kXferUseReadDraw ? "rd" : "rres",
+              (reason >> 0) & 1, (reason >> 1) & 1, (reason >> 2) & 1, (reason >> 3) & 1,
+              r.from_cleared ? 1 : 0, r.src_clear_start, r.src_clear_end,
+              cross_kind ? "cross-kind, never executed" : "executed from now on");
         }
       }
       auto& by_key = xfer_use_by_key_[r.dest.key];
@@ -4653,7 +4664,8 @@ void D3D12RenderTargetCache::XferUseAdd(RenderTargetKey dest, const Transfer& tr
   xfer_use_records_.push_back(r);
 }
 
-void D3D12RenderTargetCache::XferUseNoteDraw(RenderTargetKey key, bool reads_dest) {
+void D3D12RenderTargetCache::XferUseNoteDraw(RenderTargetKey key, bool reads_dest,
+                                             uint32_t reason) {
   for (size_t i = 0; i < xfer_cleared_ranges_.size();) {
     if (xfer_cleared_ranges_[i].key == key) {
       xfer_cleared_ranges_[i] = xfer_cleared_ranges_.back();
@@ -4663,7 +4675,8 @@ void D3D12RenderTargetCache::XferUseNoteDraw(RenderTargetKey key, bool reads_des
     ++i;
   }
   if (reads_dest) {
-    XferUseFinalize(key, 0, xenos::kEdramTileCount, kXferUseReadDraw, kXferUseWrittenReadDraw);
+    XferUseFinalize(key, 0, xenos::kEdramTileCount, kXferUseReadDraw, kXferUseWrittenReadDraw,
+                    reason);
     return;
   }
   for (XferUseRecord& r : xfer_use_records_) {
