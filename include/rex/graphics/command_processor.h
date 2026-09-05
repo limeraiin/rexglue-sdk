@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -46,6 +47,31 @@ class Shader;
 // gpu_dedupe_constants cvar; 0 = off, 1 = census only, 2 = census + dedupe.
 // Command-processor thread only, so a plain int is correct.
 extern int g_n7_n8b_phase;
+
+// [stall] The CP-thread stall catcher (always on). Drive 848 (RTX 1440p
+// --no-vsync, CP-bound at ~18 ms/frame): fps ran 56/56/38 every third
+// second at a CONSTANT draw count - ~320 ms lost inside the indirect-buffer
+// bracket every 3 s, no fence wait, no PSO wait, no swap time. These running
+// ticks (steady_clock ns, CP thread only) split every indirect buffer's time
+// into the classes that can block the thread; ExecuteIndirectBuffer keeps the
+// slowest buffer of each 1 Hz window with its class deltas, and the [n7] ring
+// reporter prints it as [stall] beside the window's class totals.
+struct CpStallTicks {
+  uint64_t tex = 0;    // texture_cache_->RequestTextures (loads, creates)
+  uint64_t mem = 0;    // shared_memory_->RequestRange (uploads)
+  uint64_t rt = 0;     // render_target_cache_->Update (binds, transfers)
+  uint64_t prim = 0;   // primitive_processor_->Process
+  uint64_t sub = 0;    // EndSubmission, whole (deferred list execute + ...)
+  uint64_t ecl = 0;    //   of which ExecuteCommandLists (the driver's submit)
+  uint64_t pso = 0;    // CP-thread pipeline creates
+  uint64_t draws = 0;  // count, not ticks
+};
+extern CpStallTicks g_cp_stall;
+inline uint64_t CpStallNow() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
 
 // [NR-5C] Register-write epoch map for the skip-unchanged-record-applies
 // lever (gpu_nr_apply_skip). Every path that writes the register file at or

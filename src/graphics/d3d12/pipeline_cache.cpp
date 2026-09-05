@@ -3903,6 +3903,7 @@ ID3D12PipelineState* PipelineCache::CreateGraphicsPipelineWithLibrary(
   uint64_t create_ticks = rex::chrono::Clock::QueryHostTickCount() - create_start;
   if (GetCurrentThreadId() == cp_thread_id_.load(std::memory_order_relaxed)) {
     g_hitch_probe.pso_cp_ticks.fetch_add(create_ticks, std::memory_order_relaxed);
+    g_cp_stall.pso += create_ticks * 1000000000ull / rex::chrono::Clock::QueryHostTickFrequency();  // [stall]
     g_hitch_probe.pso_cp_creates.fetch_add(1, std::memory_order_relaxed);
     if (create_ticks > g_hitch_probe.pso_cp_max_ticks.load(std::memory_order_relaxed)) {
       g_hitch_probe.pso_cp_max_ticks.store(create_ticks, std::memory_order_relaxed);

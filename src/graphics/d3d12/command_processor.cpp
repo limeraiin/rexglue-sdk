@@ -397,13 +397,16 @@ REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
 // rewrite (the GPU's state is the sorted order's last). Drive 847 (Intel
 // 720p, matched dpf): on 18.6 fps / GPU 54.0 / draw class 40.1 vs off
 // 17.6 / 57.6 / 43.5, in-window switches 1916 -> 600 (~2.6 us per switch
-// on Intel), no visual defect; 0.83 ms/fr of CP time. SHIPPED. 0 = off
-// (kill switch for the tester: a reorder is the visual-defect class).
-REXCVAR_DEFINE_INT32(gpu_sort, 1, "GPU/D3D12",
-                     "[sort] state sorting by pipeline inside the reorder class: 0 off, 1 on.");
-// Temporary A/B: seconds per phase (on / off); [sort] phase= names it.
-REXCVAR_DEFINE_INT32(gpu_sort_cycle, 0, "GPU/D3D12",
-                     "[sort] A/B cycler, seconds per phase on/off (0 = none). Temporary.");
+// on Intel), no visual defect; 0.83 ms/fr of CP time. Drive 848 (RTX 3060
+// 1440p --no-vsync, CP-bound, matched dpf 3386, same view): on ~52.9 fps /
+// off ~56.0 at the unstalled seconds, GPU draw class equal (~6.9 ms/fr both):
+// a PSO switch costs the NVIDIA GPU nothing and the rewrite costs the CP
+// ~1 ms/frame. VENDOR-KEYED like the pool: the sort is on for Intel only.
+// -1 = by vendor (Intel on, others off); 0 = off everywhere (the tester's
+// kill switch: a reorder is the visual-defect class); 1 = on everywhere.
+REXCVAR_DEFINE_INT32(gpu_sort, -1, "GPU/D3D12",
+                     "[sort] state sorting by pipeline inside the reorder class: -1 by vendor "
+                     "(Intel on), 0 off, 1 on.");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
@@ -3009,9 +3012,7 @@ struct SortWin {
   std::vector<DeferredCommandList::SortSegIn> segs;
 };
 SortWin g_sort_win;
-bool g_sort_on = true;  // latched per frame: the cvar and the cycler
-bool g_sort_cycle_off = false;
-std::chrono::steady_clock::time_point g_sort_cycle_start{};
+bool g_sort_on = true;  // latched per frame from the cvar and the vendor
 D3D12CommandProcessor* g_sort_cp = nullptr;
 const void* g_sort_prev_pso = nullptr;
 bool g_sort_win_open = false;
@@ -6684,22 +6685,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
       hiz_frame_slots_ = 0;
     }
-    {  // [sort] latch: the kill switch and the temporary cycler.
-      bool on = REXCVAR_GET(gpu_sort) != 0;
-      const int32_t cyc = REXCVAR_GET(gpu_sort_cycle);
-      if (on && cyc > 0) {
-        const auto now = std::chrono::steady_clock::now();
-        if (g_sort_cycle_start == std::chrono::steady_clock::time_point{}) {
-          g_sort_cycle_start = now;
-        } else if (now - g_sort_cycle_start >= std::chrono::seconds(cyc)) {
-          g_sort_cycle_start = now;
-          g_sort_cycle_off = !g_sort_cycle_off;
-        }
-        if (g_sort_cycle_off) on = false;
-      } else {
-        g_sort_cycle_off = false;
-        g_sort_cycle_start = {};
-      }
+    {  // [sort] latch: by vendor (drive 847 Intel win, drive 848 RTX loss)
+       // unless the cvar forces it.
+      const int32_t sv = REXCVAR_GET(gpu_sort);
+      const bool on = sv < 0 ? g_pool_intel_off : sv != 0;
       if (on != g_sort_on) SortWindowClose(kSortCloseLatch);
       g_sort_on = on;
     }
@@ -7536,6 +7525,7 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
+  ++g_cp_stall.draws;  // [stall]
   // [NR-ISSUE] Increment 4d: the base executor armed this draw to be issued
   // from the composed shadow register file. Unsupported alongside precord
   // capture (both default off): fall through to the normal path there, but
@@ -8108,7 +8098,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_draw_prof) g_draw_ns[20] += prof_ns_since(_dp_cen0);
   auto _dp_prim0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
+  const uint64_t _st_prim0 = CpStallNow();  // [stall]
   bool _dp_prim_ok = primitive_processor_->Process(primitive_processing_result);
+  g_cp_stall.prim += CpStallNow() - _st_prim0;
   if (g_draw_prof) g_draw_ns[0] += prof_ns_since(_dp_prim0);
   if (!_dp_prim_ok) {
     return false;
@@ -8250,8 +8242,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_draw_prof) g_draw_ns[13] += prof_ns_since(_dp_omods0);
   auto _dp_rt0 = g_draw_prof ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
+  const uint64_t _st_rt0 = CpStallNow();  // [stall]
   bool _dp_rt_ok = render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                                 normalized_color_mask, *vertex_shader);
+  g_cp_stall.rt += CpStallNow() - _st_rt0;
   if (g_draw_prof) g_draw_ns[1] += prof_ns_since(_dp_rt0);
   if (!_dp_rt_ok) {
     return false;
@@ -8404,7 +8398,9 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_draw_prof) g_draw_ns[22] += prof_ns_since(_dp_pret0);
   auto _dp_tex0 = g_draw_prof ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
+  const uint64_t _st_tex0 = CpStallNow();  // [stall]
   texture_cache_->RequestTextures(used_texture_mask);
+  g_cp_stall.tex += CpStallNow() - _st_tex0;
   // [NR-TIL] N-4-1: open the pipeline piece (texture loads and their
   // barriers are behind us; the pipeline set is the only thing ahead of the
   // viewport).
@@ -8704,8 +8700,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           ++g_draw_res_cnt[4];
         }
       }
+      const uint64_t _st_mem0 = CpStallNow();  // [stall]
       const bool nr_res_range_ok =
           shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2);
+      g_cp_stall.mem += CpStallNow() - _st_mem0;
       if (g_nr_res && g_nr_res_vf_active) {
         if (g_nr_res_vf_obs_count < kNrResMaxRequests) {
           g_nr_res_vf_obs[g_nr_res_vf_obs_count].start = vfetch_constant.address << 2;
@@ -10954,7 +10952,9 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
   // key-freshness valve over the bundle's keys -- the same live check the
   // fast path keeps; a stale key means the di pack must be recomposed,
   // which only the full path can do.
+  const uint64_t _st_tex0 = CpStallNow();  // [stall]
   texture_cache_->RequestTextures(pay.tex_mask);
+  g_cp_stall.tex += CpStallNow() - _st_tex0;
   const std::vector<D3D12Shader::TextureBinding>& nr_tex_v =
       vs->GetTextureBindingsAfterTranslation();
   if (!nr_tex_v.empty() &&
@@ -10985,8 +10985,11 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
       draw_util::GetNormalizedDepthControl(regs);
   const uint32_t normalized_color_mask =
       ps ? draw_util::GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vs)) {
+  const uint64_t _st_rt0 = CpStallNow();  // [stall]
+  const bool _st_rt_ok = render_target_cache_->Update(
+      is_rasterization_done, normalized_depth_control, normalized_color_mask, *vs);
+  g_cp_stall.rt += CpStallNow() - _st_rt0;
+  if (!_st_rt_ok) {
     ++w.fb_rt;
     return false;
   }
@@ -11108,8 +11111,11 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2,
-                                        vfetch_constant.size << 2)) {
+      const uint64_t _st_mem0 = CpStallNow();  // [stall]
+      const bool _st_mem_ok =
+          shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2);
+      g_cp_stall.mem += CpStallNow() - _st_mem0;
+      if (!_st_mem_ok) {
         ++w.fb_vf;
         return false;
       }
@@ -11120,9 +11126,14 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
   }
   // Index residency (guest DMA only; builtin buffers are static, converted
   // was refused at record).
-  if (pay.ib_dma && !shared_memory_->RequestRange(pay.ib_base, pay.ib_size)) {
-    ++w.fb_ib;
-    return false;
+  if (pay.ib_dma) {
+    const uint64_t _st_mem0 = CpStallNow();  // [stall]
+    const bool _st_ib_ok = shared_memory_->RequestRange(pay.ib_base, pay.ib_size);
+    g_cp_stall.mem += CpStallNow() - _st_mem0;
+    if (!_st_ib_ok) {
+      ++w.fb_ib;
+      return false;
+    }
   }
   // [NR-SPD] post-head coverage: the head (restore, sys upload) may have
   // cleared root-up-to-date bits; every root the recording's exit context
@@ -12780,6 +12791,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 }
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+  struct StallSub {  // [stall] the whole of EndSubmission
+    uint64_t t0 = CpStallNow();
+    ~StallSub() { g_cp_stall.sub += CpStallNow() - t0; }
+  } _st_sub;
   // [GPU-PRECORD] Phase 1b-0: record any pending captured draws before the
   // submission closes, otherwise they would be lost.
   PrecordFlush();
@@ -12867,7 +12882,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     HizResolveSubmission();  // [hiz] verdict slots -> readback, on the real list
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
+    const uint64_t _st_ecl0 = CpStallNow();  // [stall]
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    g_cp_stall.ecl += CpStallNow() - _st_ecl0;
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;

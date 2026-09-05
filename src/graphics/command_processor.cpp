@@ -1617,6 +1617,15 @@ inline void N8Classify(uint32_t base, uint32_t n, bool per_dword) {
 // non-skip buffers = ib minus the skip path's own buf) and the swap.
 uint64_t g_n7_ib_ns = 0, g_n7_ib_calls = 0;
 uint64_t g_n7_swap_ns = 0, g_n7_swap_calls = 0;
+// [stall] running class ticks (written by the backend) and the window's
+// slowest indirect buffer with its class deltas (written below, printed by
+// the [n7] ring reporter, reset there).
+struct StallBest {
+  uint64_t ns = 0, ptr = 0, count = 0, swap_ns = 0;
+  CpStallTicks d;
+};
+StallBest g_stall_best;
+uint64_t g_stall_slow_n = 0, g_stall_slow_ns = 0;  // buffers over 20 ms
 
 // [N7] Executed draws, unconditional. One increment at the single IssueDraw
 // call site; draws de-tile removed never reach it, so this counts what the
@@ -5515,6 +5524,8 @@ void NrSdbObserve(xenos::ShaderType shader_type, uint32_t guest_address,
 }
 
 }  // namespace
+// [stall] the backend-written class ticks (declared in the header).
+CpStallTicks g_cp_stall;
 
 void CommandProcessor::WorkerThreadMain() {
   if (!SetupContext()) {
@@ -6287,6 +6298,29 @@ void CommandProcessor::WorkerThreadMain() {
               exec_ms > 0 ? 100.0 * inl_ms / exec_ms : 0.0);
           n7_last_ib_ns = g_n7_ib_ns; n7_last_swap_ns = g_n7_swap_ns;
           n7_last_ib_calls = g_n7_ib_calls; n7_last_swap_calls = g_n7_swap_calls;
+        }
+        {  // [stall] the window's class totals and its slowest buffer.
+          static CpStallTicks s_last;
+          const CpStallTicks& c = g_cp_stall;
+          auto ms = [](uint64_t ns) { return double(ns) / 1e6; };
+          const StallBest& b = g_stall_best;
+          const uint64_t named = b.d.tex + b.d.mem + b.d.rt + b.d.prim + b.d.sub + b.d.pso +
+                                 b.swap_ns;
+          REXGPU_INFO(
+              "[stall] win tex {:.1f} mem {:.1f} rt {:.1f} prim {:.1f} sub {:.1f} (ecl {:.1f}) "
+              "pso {:.1f} ms | slow(>20ms) {} bufs {:.1f}ms | max ib {:.2f}ms @{:#010x}/{}dw "
+              "draws {} : tex {:.2f} mem {:.2f} rt {:.2f} prim {:.2f} sub {:.2f} (ecl {:.2f}) "
+              "pso {:.2f} swap {:.2f} other {:.2f}",
+              ms(c.tex - s_last.tex), ms(c.mem - s_last.mem), ms(c.rt - s_last.rt),
+              ms(c.prim - s_last.prim), ms(c.sub - s_last.sub), ms(c.ecl - s_last.ecl),
+              ms(c.pso - s_last.pso), g_stall_slow_n, ms(g_stall_slow_ns), ms(b.ns), b.ptr,
+              b.count, b.d.draws, ms(b.d.tex), ms(b.d.mem), ms(b.d.rt), ms(b.d.prim),
+              ms(b.d.sub), ms(b.d.ecl), ms(b.d.pso), ms(b.swap_ns),
+              ms(b.ns > named ? b.ns - named : 0));
+          s_last = c;
+          g_stall_best = StallBest{};
+          g_stall_slow_n = 0;
+          g_stall_slow_ns = 0;
         }
         // [N8] the applied-dword census. This is the number that says whether
         // N-8 is about render state at all.
@@ -8374,12 +8408,38 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   const auto n7_ib_t0 = std::chrono::steady_clock::now();
   struct N7IbEnd {
     std::chrono::steady_clock::time_point t0;
+    uint32_t ptr, count;
+    CpStallTicks s0;
+    uint64_t swap0;
     ~N7IbEnd() {
-      g_n7_ib_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - t0).count();
+      const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - t0)
+                                       .count());
+      g_n7_ib_ns += ns;
       ++g_n7_ib_calls;
+      // [stall] keep the window's slowest buffer with its class deltas.
+      if (ns >= 20000000ull) {
+        ++g_stall_slow_n;
+        g_stall_slow_ns += ns;
+      }
+      if (ns > g_stall_best.ns) {
+        StallBest& b = g_stall_best;
+        b.ns = ns;
+        b.ptr = ptr;
+        b.count = count;
+        b.swap_ns = g_n7_swap_ns - swap0;
+        const CpStallTicks& c = g_cp_stall;
+        b.d.tex = c.tex - s0.tex;
+        b.d.mem = c.mem - s0.mem;
+        b.d.rt = c.rt - s0.rt;
+        b.d.prim = c.prim - s0.prim;
+        b.d.sub = c.sub - s0.sub;
+        b.d.ecl = c.ecl - s0.ecl;
+        b.d.pso = c.pso - s0.pso;
+        b.d.draws = c.draws - s0.draws;
+      }
     }
-  } n7_ib_end{n7_ib_t0};
+  } n7_ib_end{n7_ib_t0, ptr, count, g_cp_stall, g_n7_swap_ns};
 
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
 
