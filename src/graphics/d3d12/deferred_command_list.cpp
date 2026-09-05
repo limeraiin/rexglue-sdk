@@ -664,6 +664,7 @@ void DeferredCommandList::NrDspCompareSpan(const uintmax_t* prev, size_t prev_le
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
+  ++command_counts_[size_t(command) & 63];  // [cmd]
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
   size_t offset = command_stream_.size();

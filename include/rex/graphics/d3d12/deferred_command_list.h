@@ -637,6 +637,7 @@ class DeferredCommandList {
   }
 
  private:
+ public:
   enum class Command {
     kD3DClearDepthStencilView,
     kD3DClearRenderTargetView,
@@ -681,6 +682,8 @@ class DeferredCommandList {
     kEndDebugMarker,
     kInsertDebugMarker,
   };
+
+ private:
 
   struct CommandHeader {
     Command command;
@@ -836,6 +839,14 @@ class DeferredCommandList {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+
+ public:
+  // [cmd] commands recorded, per kind, cumulative (the 1 Hz [cmd] line
+  // prints per-frame deltas: what a draw costs the GPU in state changes).
+  uint64_t command_counts_[64] = {};
+  uint64_t command_count(Command c) const { return command_counts_[size_t(c)]; }
+
+ private:
 
   // [GPU-PRECORD] Core replay over an arbitrary stream range; Execute/ExecuteStream
   // both delegate here so segment replay and full-list replay share one code path.

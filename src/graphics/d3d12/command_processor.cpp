@@ -6576,6 +6576,34 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       s_pp_last = pp_now;
       const PoolStats& c = g_pool;
       auto d = [&](uint64_t PoolStats::*f) { return c.*f - s_pp.*f; };
+      {  // [cmd] the per-frame command census (state changes per draw).
+        using Cmd = DeferredCommandList::Command;
+        static uint64_t s_cmd_last[64] = {};
+        const double frames = double(std::max<uint64_t>(d(&PoolStats::frames), 1));
+        auto cd = [&](Cmd k) {
+          const uint64_t now = deferred_command_list_.command_count(k);
+          const double r = double(now - s_cmd_last[size_t(k)]) / frames;
+          s_cmd_last[size_t(k)] = now;
+          return r;
+        };
+        REXGPU_INFO(
+            "[cmd] /fr: pso {:.0f} psoh {:.0f} rs {:.0f} cbv {:.0f} c32 {:.0f} tbl {:.0f} srv {:.0f} "
+            "heaps {:.0f} ib {:.0f} topo {:.0f} vp {:.0f} sc {:.0f} rt {:.0f} blend {:.0f} sref "
+            "{:.0f} bar {:.0f} ei {:.0f} drawi {:.0f} draw {:.0f} disp {:.0f} clr {:.0f} copy {:.0f} "
+            "q {:.0f}",
+            cd(Cmd::kD3DSetPipelineState), cd(Cmd::kSetPipelineStateHandle),
+            cd(Cmd::kD3DSetGraphicsRootSignature), cd(Cmd::kD3DSetGraphicsRootConstantBufferView),
+            cd(Cmd::kD3DSetGraphicsRoot32BitConstants), cd(Cmd::kD3DSetGraphicsRootDescriptorTable),
+            cd(Cmd::kD3DSetGraphicsRootShaderResourceView), cd(Cmd::kSetDescriptorHeaps),
+            cd(Cmd::kD3DIASetIndexBuffer), cd(Cmd::kD3DIASetPrimitiveTopology), cd(Cmd::kRSSetViewport),
+            cd(Cmd::kRSSetScissorRect), cd(Cmd::kD3DOMSetRenderTargets), cd(Cmd::kD3DOMSetBlendFactor),
+            cd(Cmd::kD3DOMSetStencilRef), cd(Cmd::kD3DResourceBarrier), cd(Cmd::kD3DExecuteIndirect),
+            cd(Cmd::kD3DDrawIndexedInstanced), cd(Cmd::kD3DDrawInstanced), cd(Cmd::kD3DDispatch),
+            cd(Cmd::kD3DClearRenderTargetView) + cd(Cmd::kD3DClearDepthStencilView),
+            cd(Cmd::kD3DCopyBufferRegion) + cd(Cmd::kD3DCopyResource) + cd(Cmd::kCopyTexture) +
+                cd(Cmd::kD3DCopyTextureRegion),
+            cd(Cmd::kD3DBeginQuery) + cd(Cmd::kD3DEndQuery));
+      }
       const uint64_t draws = d(&PoolStats::draws), hit = d(&PoolStats::hit),
                      opq = d(&PoolStats::opq), opened = d(&PoolStats::opened),
                      frames = d(&PoolStats::frames);
@@ -16708,11 +16736,11 @@ void D3D12CommandProcessor::IntelProbeTick() {
     intel_probe_start_ = now;
   } else if (now - intel_probe_start_ >= std::chrono::seconds(seconds)) {
     intel_probe_start_ = now;
-    intel_probe_phase_ = (intel_probe_phase_ + 1) % 3;
+    intel_probe_phase_ = (intel_probe_phase_ + 1) % 4;
   }
   if (now - intel_probe_report_ >= std::chrono::seconds(1)) {
     intel_probe_report_ = now;
-    static const char* const kNames[3] = {"shipped", "scissor1", "tri1"};
+    static const char* const kNames[4] = {"shipped", "scissor1", "tri1", "tri1direct"};
     REXGPU_INFO("[intel-probe] phase={}", kNames[intel_probe_phase_]);
   }
 }
@@ -16735,6 +16763,7 @@ bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_coun
   if (!hiz_available_ || !d.valid || hiz_phase_ == 0) {
     return false;
   }
+  if (intel_probe_phase_ == 3) return false;  // [intel-probe] tri1direct: no per-draw EI
   // Drive 838 (Intel 720p): a draw-only signature for the plain draws took
   // the draw class 81 -> 60 ms/frame (the root-constant element is the
   // Intel driver's slow path per call); the pooled batches keep [constant,
