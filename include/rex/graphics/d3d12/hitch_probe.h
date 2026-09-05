@@ -48,6 +48,10 @@ struct HitchProbe {
   std::atomic<uint64_t> lib_hits{0};
   std::atomic<uint64_t> lib_misses{0};
   std::atomic<uint64_t> lib_stores{0};
+  // A store refused: the name is already in the library with a blob the load
+  // rejected (a stale entry; the library cannot replace it). Any nonzero here
+  // is a pipeline recompiled on EVERY boot.
+  std::atomic<uint64_t> lib_store_fails{0};
 };
 
 extern HitchProbe g_hitch_probe;

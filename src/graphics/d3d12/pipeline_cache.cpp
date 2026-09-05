@@ -3839,9 +3839,15 @@ ID3D12PipelineState* PipelineCache::CreateGraphicsPipelineWithLibrary(
       uint64_t vs_hash;
       uint64_t ps_hash;
       uint64_t gs_hash;
+      // The serialized root signature's hash: the library cannot replace an
+      // entry, so a name blind to the root signature went stale for good when
+      // the layout changed (2026-09-05: 6738 pipelines recompiled on every
+      // boot, 98 s on the Intel UHD, hidden on NVIDIA by the driver cache).
+      uint64_t rs_hash;
     } key;
     std::memset(&key, 0, sizeof(key));
     key.desc = state_desc;
+    key.rs_hash = command_processor_.GetRootSignatureHash(state_desc.pRootSignature);
     key.desc.pRootSignature = nullptr;
     key.desc.VS.pShaderBytecode = nullptr;
     key.desc.PS.pShaderBytecode = nullptr;
@@ -3879,6 +3885,14 @@ ID3D12PipelineState* PipelineCache::CreateGraphicsPipelineWithLibrary(
         if (SUCCEEDED(pipeline_library_->StorePipeline(name, state))) {
           pipeline_library_stores_unserialized_.fetch_add(1, std::memory_order_relaxed);
           g_hitch_probe.lib_stores.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          g_hitch_probe.lib_store_fails.fetch_add(1, std::memory_order_relaxed);
+          if (!pipeline_library_stale_reported_.exchange(true, std::memory_order_relaxed)) {
+            REXGPU_WARN(
+                "[pso-lib] a store was refused: the library holds a stale blob under this "
+                "name; such pipelines recompile on EVERY boot. Delete {} to rebuild it.",
+                rex::path_to_utf8(pipeline_library_path_));
+          }
         }
       } else {
         state = nullptr;

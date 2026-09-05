@@ -35,8 +35,13 @@ bool ReleaseAndNull(T& object) {
   return false;
 };
 
+// blob_hash_out (optional): XXH3 of the serialized root signature, the
+// identity a persisted pipeline-library name must include (the pipeline
+// library cannot replace an entry, so a name that ignores the root signature
+// goes stale forever when the layout changes).
 ID3D12RootSignature* CreateRootSignature(const D3D12Provider& provider,
-                                         const D3D12_ROOT_SIGNATURE_DESC& desc);
+                                         const D3D12_ROOT_SIGNATURE_DESC& desc,
+                                         uint64_t* blob_hash_out = nullptr);
 
 ID3D12PipelineState* CreateComputePipeline(ID3D12Device* device, const void* shader,
                                            size_t shader_size, ID3D12RootSignature* root_signature);

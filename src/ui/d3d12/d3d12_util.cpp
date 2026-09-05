@@ -17,7 +17,8 @@ namespace rex::ui::d3d12 {
 namespace util {
 
 ID3D12RootSignature* CreateRootSignature(const D3D12Provider& provider,
-                                         const D3D12_ROOT_SIGNATURE_DESC& desc) {
+                                         const D3D12_ROOT_SIGNATURE_DESC& desc,
+                                         uint64_t* blob_hash_out) {
   ID3DBlob* blob;
   ID3DBlob* error_blob = nullptr;
   if (FAILED(provider.SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob,
@@ -35,6 +36,15 @@ ID3D12RootSignature* CreateRootSignature(const D3D12Provider& provider,
   ID3D12RootSignature* root_signature = nullptr;
   provider.GetDevice()->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
                                             IID_PPV_ARGS(&root_signature));
+  if (blob_hash_out) {
+    // FNV-1a over the serialized blob: an identity, not a distribution.
+    const uint8_t* bytes = static_cast<const uint8_t*>(blob->GetBufferPointer());
+    uint64_t hash = 14695981039346656037ull;
+    for (size_t i = 0; i < blob->GetBufferSize(); ++i) {
+      hash = (hash ^ bytes[i]) * 1099511628211ull;
+    }
+    *blob_hash_out = hash;
+  }
   blob->Release();
   return root_signature;
 }

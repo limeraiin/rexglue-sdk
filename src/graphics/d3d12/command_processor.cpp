@@ -384,6 +384,15 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
+// [hiz-sig] Intel drive 835: the draw class 41 -> 87 ms/frame since the
+// Hi-Z argument slots gained the instance-base root constant (every tested
+// draw and every pooled batch is an ExecuteIndirect whose signature carries a
+// non-draw argument; the exact-count patch changed nothing). Seconds per
+// phase: 0 shipped / 1 draw-only signature everywhere (price only, pooled
+// instances render wrong) / 2 draw-only for plain draws only. 0 = off.
+REXCVAR_DEFINE_INT32(gpu_hiz_sig_probe, 0, "GPU/D3D12",
+                     "[hiz-sig] A/B of the ExecuteIndirect signature shape, seconds per phase "
+                     "(0 = off).");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
@@ -4054,8 +4063,9 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
     ++desc.NumParameters;
   }
 
+  uint64_t root_signature_hash = 0;
   ID3D12RootSignature* root_signature =
-      ui::d3d12::util::CreateRootSignature(GetD3D12Provider(), desc);
+      ui::d3d12::util::CreateRootSignature(GetD3D12Provider(), desc, &root_signature_hash);
   if (root_signature == nullptr) {
     REXGPU_ERROR(
         "Failed to create a root signature with {} pixel textures, {} pixel "
@@ -4064,6 +4074,7 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
     return nullptr;
   }
   root_signatures_bindful_.emplace(index, root_signature);
+  root_signature_hashes_.emplace(root_signature, root_signature_hash);
   return root_signature;
 }
 
@@ -4944,8 +4955,9 @@ bool D3D12CommandProcessor::SetupContext() {
       parameter.Constants.Num32BitValues = 1;
       parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     }
-    root_signature_bindless_vs_ =
-        ui::d3d12::util::CreateRootSignature(provider, root_signature_bindless_desc);
+    uint64_t root_signature_bindless_hash = 0;
+    root_signature_bindless_vs_ = ui::d3d12::util::CreateRootSignature(
+        provider, root_signature_bindless_desc, &root_signature_bindless_hash);
     if (!root_signature_bindless_vs_) {
       REXGPU_ERROR(
           "Failed to create the global root signature for bindless resources, "
@@ -4956,14 +4968,16 @@ bool D3D12CommandProcessor::SetupContext() {
         D3D12_SHADER_VISIBILITY_DOMAIN;
     root_parameters_bindless[kRootParameter_Bindless_DescriptorIndicesVertex].ShaderVisibility =
         D3D12_SHADER_VISIBILITY_DOMAIN;
-    root_signature_bindless_ds_ =
-        ui::d3d12::util::CreateRootSignature(provider, root_signature_bindless_desc);
+    root_signature_hashes_.emplace(root_signature_bindless_vs_, root_signature_bindless_hash);
+    root_signature_bindless_ds_ = ui::d3d12::util::CreateRootSignature(
+        provider, root_signature_bindless_desc, &root_signature_bindless_hash);
     if (!root_signature_bindless_ds_) {
       REXGPU_ERROR(
           "Failed to create the global root signature for bindless resources, "
           "the version for use with tessellation");
       return false;
     }
+    root_signature_hashes_.emplace(root_signature_bindless_ds_, root_signature_bindless_hash);
   }
 
   primitive_processor_ = std::make_unique<D3D12PrimitiveProcessor>(
@@ -9209,7 +9223,10 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
   bool per_instance = false;
   if (hiz_available_ && hiz_phase_ != 0 && (hiz_draw_.valid || hiz_draw_.dir_hint) &&
       hiz_frame_slots_ + capacity <= kHizMaxPerFrame) {
-    ID3D12CommandSignature* hsig = HizCommandSignature(indexed);
+    HizSigProbeTick();
+    const bool pool_plain_sig = hiz_sig_phase_ == 1;  // [hiz-sig] the price phase
+    ID3D12CommandSignature* hsig =
+        pool_plain_sig ? HizCommandSignaturePlain(indexed) : HizCommandSignature(indexed);
     const uint8_t open_dir = hiz_draw_.valid ? hiz_draw_.dir : hiz_draw_.dir_hint;
     if (hsig && HizWindowEnsure(open_dir) && hiz_window_.run_count < kHizMaxRuns) {
       const HizDrawPending d = hiz_draw_;
@@ -9248,9 +9265,8 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
       b.ei_gen = deferred_command_list_.reset_generation();
       b.ei_sig = hsig;
       b.ei_buf = hiz_args_.Get();
-      b.ei_arg_offset = uint64_t(base) * kHizArgsStride;
-      deferred_command_list_.D3DExecuteIndirect(hsig, capacity, hiz_args_.Get(),
-                                                uint64_t(base) * kHizArgsStride);
+      b.ei_arg_offset = uint64_t(base) * kHizArgsStride + (pool_plain_sig ? 4 : 0);
+      deferred_command_list_.D3DExecuteIndirect(hsig, capacity, hiz_args_.Get(), b.ei_arg_offset);
       b.occ_tag = OccDrawEnd(host_draw_vertex_count, 1);
       occ_draw_hiz_ = 0;
       inst_base_dirty_ = true;
@@ -12699,14 +12715,18 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         uint64_t lib_hit = hp.lib_hits.exchange(0, std::memory_order_relaxed);
         uint64_t lib_miss = hp.lib_misses.exchange(0, std::memory_order_relaxed);
         uint64_t lib_store = hp.lib_stores.exchange(0, std::memory_order_relaxed);
-        if (fence_n | qops_n | endsub_n | cp_n | thr_n | lib_hit | lib_miss | lib_store) {
+        uint64_t lib_stale = hp.lib_store_fails.exchange(0, std::memory_order_relaxed);
+        if (fence_n | qops_n | endsub_n | cp_n | thr_n | lib_hit | lib_miss | lib_store |
+            lib_stale) {
           double to_ms = 1000.0 / double(hitch_freq);
           REXGPU_INFO(
               "[hitch] fence {:.1f}ms/{} qops {:.1f}ms/{} psowait {:.1f}ms/{} | "
-              "pso cp {:.1f}ms/{} max {:.1f}ms thr {:.1f}ms/{} | lib hit {} miss {} store {}",
+              "pso cp {:.1f}ms/{} max {:.1f}ms thr {:.1f}ms/{} | lib hit {} miss {} store {} "
+              "stale {}",
               double(fence_t) * to_ms, fence_n, double(qops_t) * to_ms, qops_n,
               double(endsub_t) * to_ms, endsub_n, double(cp_t) * to_ms, cp_n,
-              double(cp_max) * to_ms, double(thr_t) * to_ms, thr_n, lib_hit, lib_miss, lib_store);
+              double(cp_max) * to_ms, double(thr_t) * to_ms, thr_n, lib_hit, lib_miss, lib_store,
+              lib_stale);
         }
         // [gpu-census] same 1 Hz window: what the GPU spent the second on.
         GpuCensusReport1Hz();
@@ -16630,6 +16650,57 @@ ID3D12CommandSignature* D3D12CommandProcessor::HizCommandSignature(bool indexed)
   return sig.Get();
 }
 
+ID3D12CommandSignature* D3D12CommandProcessor::HizCommandSignaturePlain(bool indexed) {
+  ID3D12RootSignature* rs = current_graphics_root_signature_;
+  if (!rs) {
+    return nullptr;
+  }
+  auto& cache = hiz_cmdsig_plain_[indexed ? 1 : 0];
+  auto it = cache.find(rs);
+  if (it != cache.end()) {
+    return it->second.Get();
+  }
+  D3D12_INDIRECT_ARGUMENT_DESC arg = {};
+  arg.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+  D3D12_COMMAND_SIGNATURE_DESC desc = {};
+  desc.ByteStride = kHizArgsStride;
+  desc.NumArgumentDescs = 1;
+  desc.pArgumentDescs = &arg;
+  Microsoft::WRL::ComPtr<ID3D12CommandSignature> sig;
+  // A draw-only signature needs no root signature.
+  if (FAILED(GetD3D12Provider().GetDevice()->CreateCommandSignature(&desc, nullptr,
+                                                                    IID_PPV_ARGS(&sig)))) {
+    REXGPU_WARN("[hiz-sig] draw-only command signature failed");
+    cache.emplace(rs, nullptr);
+    return nullptr;
+  }
+  cache.emplace(rs, sig);
+  return sig.Get();
+}
+
+void D3D12CommandProcessor::HizSigProbeTick() {
+  const int32_t seconds = REXCVAR_GET(gpu_hiz_sig_probe);
+  const auto now = std::chrono::steady_clock::now();
+  if (seconds <= 0) {
+    if (hiz_sig_phase_) {
+      hiz_sig_phase_ = 0;
+      REXGPU_INFO("[hiz-sig] phase=shipped (probe off)");
+    }
+    return;
+  }
+  if (hiz_sig_phase_start_ == std::chrono::steady_clock::time_point{}) {
+    hiz_sig_phase_start_ = now;
+  } else if (now - hiz_sig_phase_start_ >= std::chrono::seconds(seconds)) {
+    hiz_sig_phase_start_ = now;
+    hiz_sig_phase_ = (hiz_sig_phase_ + 1) % 3;
+  }
+  if (now - hiz_sig_last_report_ >= std::chrono::seconds(1)) {
+    hiz_sig_last_report_ = now;
+    static const char* const kNames[3] = {"shipped", "drawonly", "plainonly"};
+    REXGPU_INFO("[hiz-sig] phase={}", kNames[hiz_sig_phase_]);
+  }
+}
+
 void D3D12CommandProcessor::HizInstanceBaseReset() {
   const uint32_t zero = 0;
   deferred_command_list_.D3DSetGraphicsRoot32BitConstants(
@@ -16648,7 +16719,10 @@ bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_coun
   if (!hiz_available_ || !d.valid || hiz_phase_ == 0) {
     return false;
   }
-  ID3D12CommandSignature* sig = HizCommandSignature(indexed);
+  HizSigProbeTick();
+  const bool plain_sig = hiz_sig_phase_ != 0;  // [hiz-sig]
+  ID3D12CommandSignature* sig =
+      plain_sig ? HizCommandSignaturePlain(indexed) : HizCommandSignature(indexed);
   if (!sig) {
     HizRefuse(8, d.index_count);
     return false;
@@ -16668,10 +16742,10 @@ bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_coun
   OccDrawBegin();  // [occ]
   occ_draw_hiz_ = slot + 1;
   deferred_command_list_.D3DExecuteIndirect(sig, 1, hiz_args_.Get(),
-                                            uint64_t(slot) * kHizArgsStride);
+                                            uint64_t(slot) * kHizArgsStride + (plain_sig ? 4 : 0));
   OccDrawEnd(host_draw_vertex_count, 0);
   occ_draw_hiz_ = 0;
-  inst_base_dirty_ = true;  // the element set the root constant
+  if (!plain_sig) inst_base_dirty_ = true;  // the element set the root constant
   return true;
 }
 

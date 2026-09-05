@@ -517,6 +517,7 @@ class PipelineCache {
   std::vector<uint8_t> pipeline_library_data_;
   std::filesystem::path pipeline_library_path_;
   std::mutex pipeline_library_mutex_;
+  std::atomic<bool> pipeline_library_stale_reported_{false};
   std::atomic<uint32_t> pipeline_library_stores_unserialized_{0};
   // True while the boot-from-storage creation pass runs: the [hitch] per
   // single >5ms WARN is suppressed there (the pass has its own summary line

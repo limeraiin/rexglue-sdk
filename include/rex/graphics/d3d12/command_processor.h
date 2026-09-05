@@ -199,6 +199,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   void SubmitBarriers();
 
   // Finds or creates root signature for a pipeline.
+  // [pso-lib] 0 for a root signature this processor did not create.
+  uint64_t GetRootSignatureHash(ID3D12RootSignature* root_signature) const {
+    auto it = root_signature_hashes_.find(root_signature);
+    return it != root_signature_hashes_.end() ? it->second : 0;
+  }
   ID3D12RootSignature* GetRootSignature(const DxbcShader* vertex_shader,
                                         const DxbcShader* pixel_shader, bool tessellated);
 
@@ -1045,6 +1050,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_map<uint32_t, ID3D12RootSignature*> root_signatures_bindful_;
   ID3D12RootSignature* root_signature_bindless_vs_ = nullptr;
   ID3D12RootSignature* root_signature_bindless_ds_ = nullptr;
+  // [pso-lib] XXH3 of each guest root signature's serialized blob, folded
+  // into the persisted pipeline-library names (see GetRootSignatureHash).
+  std::unordered_map<ID3D12RootSignature*, uint64_t> root_signature_hashes_;
 
   std::unique_ptr<D3D12PrimitiveProcessor> primitive_processor_;
 
@@ -1268,6 +1276,20 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool inst_base_dirty_ = true;
   std::unordered_map<ID3D12RootSignature*, Microsoft::WRL::ComPtr<ID3D12CommandSignature>>
       hiz_cmdsig_[2];
+  // [hiz-sig] the probe of the signature SHAPE (gpu_hiz_sig_probe): a
+  // draw-only command signature over the same argument slots, reading each
+  // element's draw arguments at +4 (the instance base dword is skipped, the
+  // root constant is not touched). Phase 0 = shipped ([constant, draw]
+  // everywhere), 1 = draw-only everywhere (pooled instances all render as
+  // instance 0: a PRICE phase, visually wrong), 2 = draw-only for plain
+  // draws, [constant, draw] for the pooled batches (renders correctly).
+  ID3D12CommandSignature* HizCommandSignaturePlain(bool indexed);
+  std::unordered_map<ID3D12RootSignature*, Microsoft::WRL::ComPtr<ID3D12CommandSignature>>
+      hiz_cmdsig_plain_[2];
+  uint32_t hiz_sig_phase_ = 0;
+  std::chrono::steady_clock::time_point hiz_sig_phase_start_{};
+  std::chrono::steady_clock::time_point hiz_sig_last_report_{};
+  void HizSigProbeTick();
   void HizRefuse(uint32_t reason, uint32_t idx) {
     ++hiz_acc_.refuse[reason];
     hiz_acc_.refuse_idx[reason] += idx;
