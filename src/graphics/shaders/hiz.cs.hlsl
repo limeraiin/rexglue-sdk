@@ -82,8 +82,18 @@ void hiz_build(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID,
   }
 }
 
+// [hiz-sub] The sub-box test (drive 840: the whole-box rule hid 21% of the
+// frame's indices where 58% are hidden and cullable; an object running
+// away from the camera has its nearest corner far in front of the tiles
+// its far end covers). When the whole box is not hidden and the entry
+// carries its clip matrix, object-space box and viewport (flag bit 5), the
+// box is split at its midpoints into 8 sub-boxes, each projected here (8
+// corners through the 4x5 clip matrix, the same viewport transform and
+// precision margin as the CPU's whole-box path) and tested by the same
+// rule; the draw is hidden when every sub-box is (verdict word 2).
+//
 // Table layout: dword 0 = entry count, dword 1 = run count; entries at byte
-// 16, 48 bytes each; runs at 16 + entry_cap * 48, 16 bytes each: {base slot,
+// 16, 208 bytes each; runs at 16 + entry_cap * 208, 16 bytes each: {base slot,
 // capacity, count, pad} = a per-instance pool batch whose elements
 // [count, capacity) the thread zeroes (the batch executes capacity elements
 // with no GPU-side count read).
@@ -98,8 +108,111 @@ void hiz_build(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID,
 //   uint   slot          indirect-argument / verdict slot
 //   uint   args4         argument dword 4 (the base vertex of indexed draws)
 //   uint4  args0         DrawIndexed/Draw argument dwords 0..3
+//   [hiz-sub] dwords 12..50 (flag bit 5): float m[20] (4x5 row-major clip =
+//   m x (pos.xyz, pos.w, 1)), float4 box_min (xyz, pos.w), float3 box_max,
+//   float3 ndc_scale, float3 ndc_offset, float2 xy_offset, float2 xy_extent,
+//   float z_min, float z_max; dword 51 pad.
 // Slot layout (32 B): dword 0 = the instance base root constant, dwords
 // 1..5 = the draw arguments (the command signature is [constant, draw]).
+// Every tile of [tx0, tx1] x [ty0, ty1] nearer than z_near (the whole-box rule).
+bool hiz_tiles_hidden(int tx0, int ty0, int tx1, int ty1, float z_near, bool reversed) {
+  tx0 = max(tx0, 0);
+  ty0 = max(ty0, 0);
+  tx1 = min(tx1, int(hiz_tiles_x) - 1);
+  ty1 = min(ty1, int(hiz_tiles_y) - 1);
+  bool hidden = tx0 <= tx1 && ty0 <= ty1;
+  [loop]
+  for (int ty = ty0; ty <= ty1 && hidden; ++ty) {
+    [loop]
+    for (int tx = tx0; tx <= tx1 && hidden; ++tx) {
+      float2 t = hiz_buffer[uint(ty) * hiz_tiles_x + uint(tx)];
+      if (reversed ? (z_near >= t.x) : (z_near <= t.y)) {
+        hidden = false;
+      }
+    }
+  }
+  return hidden;
+}
+
+// [hiz-sub] all 8 sub-boxes of the entry's box hidden.
+bool hiz_sub_hidden(uint base, bool reversed) {
+  float m[20];
+  [unroll]
+  for (uint k = 0u; k < 20u; ++k) {
+    m[k] = asfloat(hiz_table.Load(base + 48u + k * 4u));
+  }
+  float4 bmn = asfloat(hiz_table.Load4(base + 128u));
+  float3 bmx = asfloat(hiz_table.Load3(base + 144u));
+  float3 ndc_scale = asfloat(hiz_table.Load3(base + 156u));
+  float3 ndc_offset = asfloat(hiz_table.Load3(base + 168u));
+  float2 xy_off = asfloat(hiz_table.Load2(base + 180u));
+  float2 xy_ext = asfloat(hiz_table.Load2(base + 188u));
+  float z_min = asfloat(hiz_table.Load(base + 196u));
+  float z_max = asfloat(hiz_table.Load(base + 200u));
+  float3 mid = 0.5f * (bmn.xyz + bmx);
+  bool all_hidden = true;
+  [loop]
+  for (uint sb = 0u; sb < 8u && all_hidden; ++sb) {
+    float3 smn = float3((sb & 1u) ? mid.x : bmn.x, (sb & 2u) ? mid.y : bmn.y,
+                        (sb & 4u) ? mid.z : bmn.z);
+    float3 smx = float3((sb & 1u) ? bmx.x : mid.x, (sb & 2u) ? bmx.y : mid.y,
+                        (sb & 4u) ? bmx.z : mid.z);
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    float zn = reversed ? -1e30f : 1e30f;
+    bool ok = true;
+    [loop]
+    for (uint c = 0u; c < 8u && ok; ++c) {
+      float3 p = float3((c & 1u) ? smx.x : smn.x, (c & 2u) ? smx.y : smn.y,
+                        (c & 4u) ? smx.z : smn.z);
+      float4 clip;
+      [unroll]
+      for (uint r = 0u; r < 4u; ++r) {
+        clip[r] = m[r * 5u] * p.x + m[r * 5u + 1u] * p.y + m[r * 5u + 2u] * p.z +
+                  m[r * 5u + 3u] * bmn.w + m[r * 5u + 4u];
+      }
+      if (!(clip.w > 1e-6f)) {
+        ok = false;  // a corner at or behind the camera plane
+        continue;
+      }
+      float iw = 1.0f / clip.w;
+      float nx = clip.x * iw * ndc_scale.x + ndc_offset.x;
+      float ny = clip.y * iw * ndc_scale.y + ndc_offset.y;
+      float nz = clip.z * iw * ndc_scale.z + ndc_offset.z;
+      if (isnan(nx) || isnan(ny) || isnan(nz)) {
+        ok = false;
+        continue;
+      }
+      nz = saturate(nz);
+      float px = xy_off.x + (nx * 0.5f + 0.5f) * xy_ext.x;
+      float py = xy_off.y + (0.5f - ny * 0.5f) * xy_ext.y;
+      float hz = z_min + nz * (z_max - z_min);
+      x0 = min(x0, px);
+      x1 = max(x1, px);
+      y0 = min(y0, py);
+      y1 = max(y1, py);
+      zn = reversed ? max(zn, hz) : min(zn, hz);
+    }
+    if (!ok) {
+      all_hidden = false;
+      continue;
+    }
+    x0 = max(x0, xy_off.x) - 1.0f;
+    y0 = max(y0, xy_off.y) - 1.0f;
+    x1 = min(x1, xy_off.x + xy_ext.x) + 1.0f;
+    y1 = min(y1, xy_off.y + xy_ext.y) + 1.0f;
+    if (x1 <= x0 || y1 <= y0) {
+      continue;  // entirely outside the viewport: nothing of it is drawn
+    }
+    float eps = abs(zn) * (1.0f / 262144.0f) + (1.0f / 4194304.0f);
+    zn = reversed ? zn + eps : zn - eps;
+    if (!hiz_tiles_hidden(int(floor(x0 / 8.0f)), int(floor(y0 / 8.0f)),
+                          int(ceil(x1 / 8.0f)) - 1, int(ceil(y1 / 8.0f)) - 1, zn, reversed)) {
+      all_hidden = false;
+    }
+  }
+  return all_hidden;
+}
+
 [numthreads(64, 1, 1)]
 void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   uint i = dispatch_id.x;
@@ -109,7 +222,7 @@ void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
     if (r >= hiz_table.Load(4u)) {
       return;
     }
-    uint rb = 16u + hiz_entry_cap * 48u + r * 16u;
+    uint rb = 16u + hiz_entry_cap * 208u + r * 16u;
     uint run_base = hiz_table.Load(rb);
     uint run_cap = hiz_table.Load(rb + 4u);
     uint run_count = hiz_table.Load(rb + 8u);
@@ -124,7 +237,7 @@ void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   if (i >= count) {
     return;
   }
-  uint base = 16u + i * 48u;
+  uint base = 16u + i * 208u;
   float4 rect = asfloat(hiz_table.Load4(base));
   float z_near = asfloat(hiz_table.Load(base + 16u));
   uint flags = hiz_table.Load(base + 20u);
@@ -140,20 +253,15 @@ void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   ty0 = max(ty0, 0);
   tx1 = min(tx1, int(hiz_tiles_x) - 1);
   ty1 = min(ty1, int(hiz_tiles_y) - 1);
-  bool hidden = hiz_mode != 0u && (flags & 2u) == 0u && tx0 <= tx1 && ty0 <= ty1;
+  bool testable = hiz_mode != 0u && (flags & 2u) == 0u;
+  bool reversed = (flags & 1u) != 0u;
+  uint verdict = 0u;
+  bool hidden = testable && hiz_tiles_hidden(tx0, ty0, tx1, ty1, z_near, reversed);
   if (hidden) {
-    bool reversed = (flags & 1u) != 0u;
-    [loop]
-    for (int ty = ty0; ty <= ty1 && hidden; ++ty) {
-      [loop]
-      for (int tx = tx0; tx <= tx1; ++tx) {
-        float2 t = hiz_buffer[uint(ty) * hiz_tiles_x + uint(tx)];
-        if (reversed ? (z_near >= t.x) : (z_near <= t.y)) {
-          hidden = false;
-          break;
-        }
-      }
-    }
+    verdict = 1u;
+  } else if (testable && (flags & 32u) != 0u && hiz_sub_hidden(base, reversed)) {
+    hidden = true;
+    verdict = 2u;  // [hiz-sub]
   }
   uint instances = (hidden && hiz_mode == 2u) ? 0u : args0.y;
   uint ab = slot * 32u;
@@ -167,5 +275,5 @@ void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
     hiz_args.Store4(ab + 4u, uint4(args0.x, instances, args0.z, args0.w));
     hiz_args.Store(ab + 20u, args4);
   }
-  hiz_verdict.Store(slot * 4u, hidden ? 1u : 0u);
+  hiz_verdict.Store(slot * 4u, verdict);
 }
