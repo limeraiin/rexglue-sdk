@@ -107,6 +107,17 @@ REXCVAR_DEFINE_BOOL(gpu_nr_dump_probe, false, "GPU",
                     "rectangles it resolved to, with the owning render target "
                     "of each, once per second.");
 
+// [xfer] The in-place A/B for the render-target-cache ownership transfers
+// (the EDRAM aliasing emulation: every rebind of a host render target over
+// tiles another one last wrote copies those tiles across). Seconds per phase;
+// 0 = off (every transfer performed, the shipped behaviour). Phase "all" then
+// phase "skip" (no transfer performed; every host render target keeps its own
+// contents, ownership still tracked so resolves find their source). Read with
+// the 1 Hz [xfer] line and tools/geo-sum.py. Temporary: deleted once the
+// drive decides.
+REXCVAR_DEFINE_INT32(gpu_xfer_cycle, 0, "GPU/D3D12",
+                     "[xfer] A/B: seconds per phase, all transfers / no transfers (0 = off).");
+
 // [NR-DETILE] N-6-5. The frozen-rows instrument's companion.
 //
 // The city EDRAM readback says rows 256..720 of BOTH the tiled colour and the
@@ -1435,6 +1446,58 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
           last_update_accumulated_render_targets();
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
+      // [xfer] The read census: does this draw read what the transfers landed?
+      // Depth: a depth or stencil test that can reject. Color: a blend factor
+      // that samples the destination, a min/max blend op, or a partial write
+      // mask. Everything else is a plain write (coverage unknown).
+      {
+        const RegisterFile& regs = register_file();
+        RenderTarget* const* used = last_update_used_render_targets();
+        if (used[0]) {
+          auto op_writes = [](xenos::StencilOp op) {
+            return op == xenos::StencilOp::kReplace || op == xenos::StencilOp::kZero;
+          };
+          const auto& dc = normalized_depth_control;
+          const bool z_reads = dc.z_enable && dc.zfunc != xenos::CompareFunction::kAlways;
+          // A stencil pass is a pure write only when nothing can depend on the
+          // old value: func ALWAYS and every reachable op replaces.
+          bool stencil_reads = false;
+          if (dc.stencil_enable) {
+            const bool front_writes = dc.stencilfunc == xenos::CompareFunction::kAlways &&
+                                      op_writes(dc.stencilzpass) &&
+                                      (!z_reads || op_writes(dc.stencilzfail));
+            const bool back_writes = !dc.backface_enable ||
+                                     (dc.stencilfunc_bf == xenos::CompareFunction::kAlways &&
+                                      op_writes(dc.stencilzpass_bf) &&
+                                      (!z_reads || op_writes(dc.stencilzfail_bf)));
+            stencil_reads = !(front_writes && back_writes);
+          }
+          const bool depth_reads = z_reads || stencil_reads;
+          XferUseNoteDraw(used[0]->key(), depth_reads);
+        }
+        auto factor_reads_dest = [](xenos::BlendFactor f) {
+          return f == xenos::BlendFactor::kDstColor || f == xenos::BlendFactor::kOneMinusDstColor ||
+                 f == xenos::BlendFactor::kDstAlpha || f == xenos::BlendFactor::kOneMinusDstAlpha ||
+                 f == xenos::BlendFactor::kSrcAlphaSaturate;
+        };
+        for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+          if (!used[1 + i]) {
+            continue;
+          }
+          auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+          const bool color_reads =
+              factor_reads_dest(blend.color_srcblend) ||
+              blend.color_destblend != xenos::BlendFactor::kZero ||
+              blend.color_comb_fcn == xenos::BlendOp::kMin ||
+              blend.color_comb_fcn == xenos::BlendOp::kMax ||
+              factor_reads_dest(blend.alpha_srcblend) ||
+              blend.alpha_destblend != xenos::BlendFactor::kZero ||
+              blend.alpha_comb_fcn == xenos::BlendOp::kMin ||
+              blend.alpha_comb_fcn == xenos::BlendOp::kMax ||
+              ((normalized_color_mask >> (i * 4)) & 0xF) != 0xF;
+          XferUseNoteDraw(used[1 + i]->key(), color_reads);
+        }
+      }
       SetCommandListRenderTargets(depth_and_color_render_targets);
     } break;
     // [N-10b deletion c] the kPixelShaderInterlock (ROV) case is DELETED.
@@ -4509,12 +4572,199 @@ D3D12RenderTargetCache::GetOrCreateNativeHostDepthScratch(D3D12RenderTarget& des
   return &scratch;
 }
 
+// [xfer] The transfer read census. Records are few (tens live at once: one
+// per transfer landed and not yet finalized), so linear scans are fine.
+static constexpr size_t kXferUseRecordCap = 1024;
+
+void D3D12RenderTargetCache::XferUseFinalize(RenderTargetKey key, uint32_t start_tiles,
+                                             uint32_t end_tiles, XferUseOutcome pending_outcome,
+                                             XferUseOutcome written_outcome) {
+  for (size_t i = 0; i < xfer_use_records_.size();) {
+    XferUseRecord& r = xfer_use_records_[i];
+    if (r.dest == key && r.start_tiles < end_tiles && start_tiles < r.end_tiles) {
+      const XferUseOutcome outcome = r.written ? written_outcome : pending_outcome;
+      ++xfer_use_counts_[r.cls][outcome];
+      auto& by_key = xfer_use_by_key_[r.dest.key];
+      ++by_key[outcome];
+      if (r.from_cleared) {
+        ++by_key[kXferUseOutcomeCount];
+      }
+      r = xfer_use_records_.back();
+      xfer_use_records_.pop_back();
+      continue;
+    }
+    ++i;
+  }
+}
+
+void D3D12RenderTargetCache::XferUseAdd(RenderTargetKey dest, const Transfer& transfer) {
+  const RenderTargetKey source = transfer.source ? transfer.source->key() : RenderTargetKey();
+  // The source loses these tiles: whatever landed in it there was never read.
+  XferUseFinalize(source, transfer.start_tiles, transfer.end_tiles, kXferUseTaken,
+                  kXferUseWrittenTaken);
+  XferUseFinalize(dest, transfer.start_tiles, transfer.end_tiles, kXferUseTaken,
+                  kXferUseWrittenTaken);
+  if (xfer_use_records_.size() >= kXferUseRecordCap) {
+    ++xfer_use_counts_[xfer_use_records_.front().cls][kXferUseEvicted];
+    xfer_use_records_.front() = xfer_use_records_.back();
+    xfer_use_records_.pop_back();
+  }
+  XferUseRecord r;
+  r.dest = dest;
+  r.start_tiles = transfer.start_tiles;
+  r.end_tiles = transfer.end_tiles;
+  // c2c 0, d2c 1, c2d 2, d2d 3.
+  r.cls = (dest.is_depth ? 2u : 0u) | (source.is_depth ? 1u : 0u);
+  r.written = false;
+  r.from_cleared = false;
+  for (const XferClearedRange& c : xfer_cleared_ranges_) {
+    if (c.key == source && c.start_tiles <= transfer.start_tiles &&
+        transfer.end_tiles <= c.end_tiles) {
+      r.from_cleared = true;
+      ++xfer_use_const_[r.cls];
+      break;
+    }
+  }
+  xfer_use_records_.push_back(r);
+}
+
+void D3D12RenderTargetCache::XferUseNoteDraw(RenderTargetKey key, bool reads_dest) {
+  for (size_t i = 0; i < xfer_cleared_ranges_.size();) {
+    if (xfer_cleared_ranges_[i].key == key) {
+      xfer_cleared_ranges_[i] = xfer_cleared_ranges_.back();
+      xfer_cleared_ranges_.pop_back();
+      continue;
+    }
+    ++i;
+  }
+  if (reads_dest) {
+    XferUseFinalize(key, 0, xenos::kEdramTileCount, kXferUseReadDraw, kXferUseWrittenReadDraw);
+    return;
+  }
+  for (XferUseRecord& r : xfer_use_records_) {
+    if (r.dest == key) {
+      r.written = true;
+    }
+  }
+}
+
+void D3D12RenderTargetCache::XferUseNoteClear(RenderTargetKey key,
+                                              const Transfer::Rectangle& rectangle) {
+  const uint32_t rows_per_tile_row =
+      xenos::kEdramTileHeightSamples >> uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X);
+  const uint32_t pitch_tiles = key.GetPitchTiles();
+  const uint32_t start_tiles =
+      key.base_tiles + (rectangle.y_pixels / rows_per_tile_row) * pitch_tiles;
+  const uint32_t end_tiles =
+      key.base_tiles +
+      ((rectangle.y_pixels + rectangle.height_pixels + rows_per_tile_row - 1) / rows_per_tile_row) *
+          pitch_tiles;
+  XferUseFinalize(key, start_tiles, end_tiles, kXferUseCleared, kXferUseCleared);
+  if (xfer_cleared_ranges_.size() < 64) {
+    xfer_cleared_ranges_.push_back({key, start_tiles, end_tiles});
+  }
+}
+
+void D3D12RenderTargetCache::XferUseNoteResolveRead(RenderTargetKey key, uint32_t start_tiles,
+                                                    uint32_t end_tiles) {
+  XferUseFinalize(key, start_tiles, end_tiles, kXferUseReadResolve, kXferUseWrittenResolve);
+}
+
+void D3D12RenderTargetCache::XferUseReport() {
+  static const char* const kClassNames[kXferUseClassCount] = {"c2c", "d2c", "c2d", "d2d"};
+  std::string per_class;
+  for (uint32_t c = 0; c < kXferUseClassCount; ++c) {
+    uint64_t d[kXferUseOutcomeCount];
+    uint64_t total = 0;
+    for (uint32_t o = 0; o < kXferUseOutcomeCount; ++o) {
+      d[o] = xfer_use_counts_[c][o] - xfer_use_counts_last_[c][o];
+      xfer_use_counts_last_[c][o] = xfer_use_counts_[c][o];
+      total += d[o];
+    }
+    const uint64_t k = xfer_use_const_[c] - xfer_use_const_last_[c];
+    xfer_use_const_last_[c] = xfer_use_const_[c];
+    per_class += fmt::format(
+        " | {} {} taken/wrtaken/clr/rd/wrrd/rres/wrres/ev={}/{}/{}/{}/{}/{}/{}/{} const={}",
+        kClassNames[c], total, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], k);
+  }
+  if (!xfer_use_by_key_.empty()) {
+    std::string per_key;
+    for (const auto& kv : xfer_use_by_key_) {
+      RenderTargetKey key;
+      key.key = kv.first;
+      const auto& v = kv.second;
+      per_key += fmt::format(" | {}{}t/p{}/m{}: {}/{}/{}/{}/{}/{}/{}/{} const={}",
+                             key.is_depth ? "Z" : "C", uint32_t(key.base_tiles),
+                             uint32_t(key.pitch_tiles_at_32bpp), uint32_t(key.msaa_samples), v[0],
+                             v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+    }
+    REXGPU_INFO("[xfer-key] taken/wrtaken/clr/rd/wrrd/rres/wrres/ev{}", per_key);
+    xfer_use_by_key_.clear();
+  }
+  REXGPU_INFO("[xfer] phase={} passes/s={} exec/s={} skip/s={} live={}{}",
+              xfer_cycle_phase_ ? "skip" : "all",
+              xfer_use_work_passes_ - xfer_use_work_passes_last_,
+              xfer_use_executed_ - xfer_use_executed_last_,
+              xfer_use_skipped_ - xfer_use_skipped_last_, xfer_use_records_.size(), per_class);
+  xfer_use_work_passes_last_ = xfer_use_work_passes_;
+  xfer_use_executed_last_ = xfer_use_executed_;
+  xfer_use_skipped_last_ = xfer_use_skipped_;
+}
+
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
     const uint64_t* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
   assert_true(GetPath() == Path::kHostRenderTargets);
+
+  // [xfer] The cycler, the read census records, and the skip itself. The skip
+  // substitutes empty transfer lists: nothing below copies, the resolve clear
+  // (if any) still runs, ownership was already claimed by the caller.
+  {
+    const int32_t cycle_seconds = REXCVAR_GET(gpu_xfer_cycle);
+    const auto now = std::chrono::steady_clock::now();
+    if (cycle_seconds > 0) {
+      if (xfer_cycle_phase_start_ == std::chrono::steady_clock::time_point{}) {
+        xfer_cycle_phase_start_ = now;
+      } else if (now - xfer_cycle_phase_start_ >= std::chrono::seconds(cycle_seconds)) {
+        xfer_cycle_phase_start_ = now;
+        xfer_cycle_phase_ ^= 1;
+        REXGPU_INFO("[xfer-cyc] phase={}", xfer_cycle_phase_ ? "skip" : "all");
+      }
+    } else if (xfer_cycle_phase_) {
+      xfer_cycle_phase_ = 0;
+      REXGPU_INFO("[xfer-cyc] phase=all (cycler off)");
+    }
+    if (render_target_transfers) {
+      for (uint32_t i = 0; i < render_target_count; ++i) {
+        if (!render_targets[i]) {
+          continue;
+        }
+        const RenderTargetKey dest_key = render_targets[i]->key();
+        for (const Transfer& transfer : render_target_transfers[i]) {
+          XferUseAdd(dest_key, transfer);
+          if (xfer_cycle_phase_) {
+            ++xfer_use_skipped_;
+          } else {
+            ++xfer_use_executed_;
+          }
+        }
+      }
+      if (xfer_cycle_phase_) {
+        static const std::vector<Transfer> kNoTransfers[1 + xenos::kMaxColorRenderTargets];
+        assert_true(render_target_count <= 1 + xenos::kMaxColorRenderTargets);
+        render_target_transfers = kNoTransfers;
+      }
+    }
+    if (render_target_resolve_clear_values && resolve_clear_rectangle) {
+      for (uint32_t i = 0; i < render_target_count; ++i) {
+        if (render_targets[i]) {
+          XferUseNoteClear(render_targets[i]->key(), *resolve_clear_rectangle);
+        }
+      }
+    }
+  }
 
   // [NR-DETILE] N-6. The resolve path measured correct end to end, so the
   // mod-512 fold must already be in the render target when the resolve reads
@@ -4598,6 +4848,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   // invalidates an open Hi-Z window (the checkpoint's depth may have moved).
   if (gpu_census_work) {
     ++transfer_epoch_;
+    ++xfer_use_work_passes_;  // [xfer]
   }
   std::optional<D3D12CommandProcessor::GpuCensusScope> gpu_census_scope;
   if (gpu_census_work) {
@@ -5445,6 +5696,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         xfer_census_modes_[3], xfer_census_modes_[4], xfer_census_modes_[5], xfer_census_modes_[6],
         xfer_census_modes_[7], xfer_census_stencil_bit_, xfer_census_hds_fail_,
         xfer_census_hds_native_);
+    XferUseReport();  // [xfer]
   }
 }
 
@@ -6735,6 +6987,8 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
   }
 
   RenderTargetKey rt_key = render_target->key();
+  // [xfer] The resolve reads this owner's tiles.
+  XferUseNoteResolveRead(rt_key, dump_base, dump_base + dump_rows * dump_pitch);
   const draw_util::ResolveEdramInfo& edram_info =
       resolve_info.IsCopyingDepth() ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
   // The owner's layout must be the resolve's layout, or the legacy path would
@@ -7366,6 +7620,13 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  dump_rectangles_);
+  // [xfer] The dump path (the direct resolve declined) reads every owner.
+  for (const ResolveCopyDumpRectangle& r : dump_rectangles_) {
+    if (r.render_target) {
+      XferUseNoteResolveRead(r.render_target->key(), dump_base + r.row_first * dump_pitch,
+                             dump_base + (r.row_first + r.rows) * dump_pitch);
+    }
+  }
   // [NR-DETILE] N-6 probe: which tiles this dump actually covers, and who owns
   // them. A dump that stops short of the requested span leaves those EDRAM
   // tiles holding whatever was there before, which is exactly the shape of the

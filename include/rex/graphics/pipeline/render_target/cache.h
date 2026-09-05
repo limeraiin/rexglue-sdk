@@ -516,6 +516,11 @@ class RenderTargetCache {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_accumulated_render_targets_;
   }
+  // [xfer] The render targets the LAST draw actually used (nullptr where a
+  // slot is bound but not written by that draw), for the read census.
+  RenderTarget* const* last_update_used_render_targets() const {
+    return last_update_used_render_targets_;
+  }
   const std::vector<Transfer>* last_update_transfers() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;

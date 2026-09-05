@@ -789,6 +789,62 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   uint64_t xfer_census_hds_native_ = 0;
   std::chrono::steady_clock::time_point xfer_census_last_report_{};
 
+  // [xfer] The transfer READ census and the in-place skip cycler
+  // (gpu_xfer_cycle). One record per ownership transfer landed (or skipped)
+  // into a destination range; it is finalized by the first later event on
+  // that range: the tiles taken away again (never touched), a resolve clear,
+  // a draw that reads the destination (blend factor / partial mask / depth or
+  // stencil test), a resolve reading it, or a plain write first and then one
+  // of those. Live = read before any write; the written-then-read outcomes
+  // are the coverage question a visual drive answers.
+  enum XferUseOutcome : uint32_t {
+    kXferUseTaken,
+    kXferUseWrittenTaken,
+    kXferUseCleared,
+    kXferUseReadDraw,
+    kXferUseWrittenReadDraw,
+    kXferUseReadResolve,
+    kXferUseWrittenResolve,
+    kXferUseEvicted,
+    kXferUseOutcomeCount,
+  };
+  // c2c / d2c / c2d / d2d by the (source, dest) depth bits.
+  static constexpr uint32_t kXferUseClassCount = 4;
+  struct XferUseRecord {
+    RenderTargetKey dest;
+    uint32_t start_tiles;
+    uint32_t end_tiles;
+    uint32_t cls;
+    bool written;
+    bool from_cleared;  // the source range still held a resolve clear
+  };
+  std::vector<XferUseRecord> xfer_use_records_;
+  // Ranges a resolve clear filled and no draw has touched since, per key.
+  struct XferClearedRange {
+    RenderTargetKey key;
+    uint32_t start_tiles;
+    uint32_t end_tiles;
+  };
+  std::vector<XferClearedRange> xfer_cleared_ranges_;
+  uint64_t xfer_use_const_[kXferUseClassCount] = {};
+  uint64_t xfer_use_const_last_[kXferUseClassCount] = {};
+  // Per destination key, this second: outcomes + const, printed as [xfer-key].
+  std::map<uint32_t, std::array<uint64_t, kXferUseOutcomeCount + 1>> xfer_use_by_key_;
+  uint64_t xfer_use_counts_[kXferUseClassCount][kXferUseOutcomeCount] = {};
+  uint64_t xfer_use_counts_last_[kXferUseClassCount][kXferUseOutcomeCount] = {};
+  uint64_t xfer_use_executed_ = 0, xfer_use_executed_last_ = 0;
+  uint64_t xfer_use_skipped_ = 0, xfer_use_skipped_last_ = 0;
+  uint64_t xfer_use_work_passes_ = 0, xfer_use_work_passes_last_ = 0;
+  uint32_t xfer_cycle_phase_ = 0;  // 0 = all transfers performed, 1 = all skipped
+  std::chrono::steady_clock::time_point xfer_cycle_phase_start_{};
+  void XferUseAdd(RenderTargetKey dest, const Transfer& transfer);
+  void XferUseFinalize(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles,
+                       XferUseOutcome pending_outcome, XferUseOutcome written_outcome);
+  void XferUseNoteDraw(RenderTargetKey key, bool reads_dest);
+  void XferUseNoteClear(RenderTargetKey key, const Transfer::Rectangle& rectangle);
+  void XferUseNoteResolveRead(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles);
+  void XferUseReport();
+
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> transfer_vertex_buffer_pool_;
 
   ID3D12RootSignature* transfer_root_signatures_[size_t(TransferRootSignatureIndex::kCount)] = {};
