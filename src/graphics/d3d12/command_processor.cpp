@@ -388,8 +388,8 @@ REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
 // Hi-Z argument slots gained the instance-base root constant (every tested
 // draw and every pooled batch is an ExecuteIndirect whose signature carries a
 // non-draw argument; the exact-count patch changed nothing). Seconds per
-// phase: 0 shipped / 1 draw-only signature everywhere (price only, pooled
-// instances render wrong) / 2 draw-only for plain draws only. 0 = off.
+// phase: shipped / plainonly (a draw-only signature and element layout for
+// the plain draws; the pooled batches keep [constant, draw]). 0 = off.
 REXCVAR_DEFINE_INT32(gpu_hiz_sig_probe, 0, "GPU/D3D12",
                      "[hiz-sig] A/B of the ExecuteIndirect signature shape, seconds per phase "
                      "(0 = off).");
@@ -9223,10 +9223,7 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
   bool per_instance = false;
   if (hiz_available_ && hiz_phase_ != 0 && (hiz_draw_.valid || hiz_draw_.dir_hint) &&
       hiz_frame_slots_ + capacity <= kHizMaxPerFrame) {
-    HizSigProbeTick();
-    const bool pool_plain_sig = hiz_sig_phase_ == 1;  // [hiz-sig] the price phase
-    ID3D12CommandSignature* hsig =
-        pool_plain_sig ? HizCommandSignaturePlain(indexed) : HizCommandSignature(indexed);
+    ID3D12CommandSignature* hsig = HizCommandSignature(indexed);
     const uint8_t open_dir = hiz_draw_.valid ? hiz_draw_.dir : hiz_draw_.dir_hint;
     if (hsig && HizWindowEnsure(open_dir) && hiz_window_.run_count < kHizMaxRuns) {
       const HizDrawPending d = hiz_draw_;
@@ -9265,7 +9262,7 @@ bool D3D12CommandProcessor::PoolOpenAndDraw(uint64_t key, const RegisterFile& re
       b.ei_gen = deferred_command_list_.reset_generation();
       b.ei_sig = hsig;
       b.ei_buf = hiz_args_.Get();
-      b.ei_arg_offset = uint64_t(base) * kHizArgsStride + (pool_plain_sig ? 4 : 0);
+      b.ei_arg_offset = uint64_t(base) * kHizArgsStride;
       deferred_command_list_.D3DExecuteIndirect(hsig, capacity, hiz_args_.Get(), b.ei_arg_offset);
       b.occ_tag = OccDrawEnd(host_draw_vertex_count, 1);
       occ_draw_hiz_ = 0;
@@ -16569,19 +16566,19 @@ bool D3D12CommandProcessor::HizWindowEnsure(uint8_t dir) {
 // instance base root constant, then the draw arguments) and, when d is set,
 // the rect and depth to test; otherwise never hidden (flags bit 1).
 void D3D12CommandProcessor::HizAppend(uint32_t slot, const HizDrawPending* d, uint32_t inst,
-                                      uint32_t host_count) {
+                                      uint32_t host_count, bool plain_layout) {
   hiz_slot_idx_[slot] = host_count;
   uint32_t* e = reinterpret_cast<uint32_t*>(hiz_window_.entries +
                                             size_t(hiz_window_.count) * kHizEntryBytes);
   if (d) {
     std::memcpy(e, d->rect, 4 * sizeof(float));
     std::memcpy(e + 4, &d->z_near, sizeof(float));
-    e[5] = (d->dir == 1 ? 1u : 0u) | (inst << 8);
+    e[5] = (d->dir == 1 ? 1u : 0u) | (plain_layout ? 16u : 0u) | (inst << 8);
     ++hiz_acc_.tested;
     hiz_acc_.tested_idx += host_count;
   } else {
     std::memset(e, 0, 5 * sizeof(uint32_t));
-    e[5] = 2u | (inst << 8);
+    e[5] = 2u | (plain_layout ? 16u : 0u) | (inst << 8);
   }
   e[6] = slot;
   e[7] = 0;  // argument dword 4: base vertex (indexed) / start instance
@@ -16692,11 +16689,11 @@ void D3D12CommandProcessor::HizSigProbeTick() {
     hiz_sig_phase_start_ = now;
   } else if (now - hiz_sig_phase_start_ >= std::chrono::seconds(seconds)) {
     hiz_sig_phase_start_ = now;
-    hiz_sig_phase_ = (hiz_sig_phase_ + 1) % 3;
+    hiz_sig_phase_ = (hiz_sig_phase_ + 1) % 2;
   }
   if (now - hiz_sig_last_report_ >= std::chrono::seconds(1)) {
     hiz_sig_last_report_ = now;
-    static const char* const kNames[3] = {"shipped", "drawonly", "plainonly"};
+    static const char* const kNames[2] = {"shipped", "plainonly"};
     REXGPU_INFO("[hiz-sig] phase={}", kNames[hiz_sig_phase_]);
   }
 }
@@ -16738,11 +16735,11 @@ bool D3D12CommandProcessor::HizDraw(bool indexed, uint32_t host_draw_vertex_coun
   const uint32_t slot = hiz_slot_next_ & (kHizRing - 1);
   ++hiz_slot_next_;
   ++hiz_frame_slots_;
-  HizAppend(slot, &d, 0, host_draw_vertex_count);
+  HizAppend(slot, &d, 0, host_draw_vertex_count, plain_sig);
   OccDrawBegin();  // [occ]
   occ_draw_hiz_ = slot + 1;
   deferred_command_list_.D3DExecuteIndirect(sig, 1, hiz_args_.Get(),
-                                            uint64_t(slot) * kHizArgsStride + (plain_sig ? 4 : 0));
+                                            uint64_t(slot) * kHizArgsStride);
   OccDrawEnd(host_draw_vertex_count, 0);
   occ_draw_hiz_ = 0;
   if (!plain_sig) inst_base_dirty_ = true;  // the element set the root constant

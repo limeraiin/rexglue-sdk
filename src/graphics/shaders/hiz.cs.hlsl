@@ -157,8 +157,15 @@ void hiz_test(uint3 dispatch_id : SV_DispatchThreadID) {
   }
   uint instances = (hidden && hiz_mode == 2u) ? 0u : args0.y;
   uint ab = slot * 32u;
-  hiz_args.Store(ab, flags >> 8u);  // the instance base root constant
-  hiz_args.Store4(ab + 4u, uint4(args0.x, instances, args0.z, args0.w));
-  hiz_args.Store(ab + 20u, args4);
+  if ((flags & 16u) != 0u) {
+    // [hiz-sig] the draw-only layout: the draw arguments at dword 0, no root
+    // constant (the plain-draw site's draw-only command signature).
+    hiz_args.Store4(ab, uint4(args0.x, instances, args0.z, args0.w));
+    hiz_args.Store2(ab + 16u, uint2(args4, 0u));
+  } else {
+    hiz_args.Store(ab, flags >> 8u);  // the instance base root constant
+    hiz_args.Store4(ab + 4u, uint4(args0.x, instances, args0.z, args0.w));
+    hiz_args.Store(ab + 20u, args4);
+  }
   hiz_verdict.Store(slot * 4u, hidden ? 1u : 0u);
 }

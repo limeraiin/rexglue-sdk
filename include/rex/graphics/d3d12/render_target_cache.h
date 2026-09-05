@@ -824,6 +824,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     RenderTargetKey key;
     uint32_t start_tiles;
     uint32_t end_tiles;
+    uint64_t value;  // the guest clear value (the EDRAM bit pattern)
   };
   std::vector<XferClearedRange> xfer_cleared_ranges_;
   uint64_t xfer_use_const_[kXferUseClassCount] = {};
@@ -841,7 +842,23 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void XferUseFinalize(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles,
                        XferUseOutcome pending_outcome, XferUseOutcome written_outcome);
   void XferUseNoteDraw(RenderTargetKey key, bool reads_dest);
-  void XferUseNoteClear(RenderTargetKey key, const Transfer::Rectangle& rectangle);
+  void XferUseNoteClear(RenderTargetKey key, const Transfer::Rectangle& rectangle,
+                        uint64_t value);
+  // [xfer] The forwarded clear: with no transfers performed, a transfer whose
+  // source range still holds a resolve clear (nothing drawn there since) is a
+  // clear of the destination range with that guest value - the console's
+  // clear landed in aliased memory and the game relies on it under the next
+  // key (the expanded-map panel of 2026-09-05 was a target that kept the
+  // map pass's pixels where the game expected the clear color). The cleared
+  // state propagates along the chain.
+  const XferClearedRange* XferFindCleared(RenderTargetKey key, uint32_t start_tiles,
+                                          uint32_t end_tiles) const;
+  void XferMarkCleared(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles,
+                       uint64_t value);
+  void ClearRenderTargetRectangles(D3D12RenderTarget& dest_d3d12_rt, uint64_t clear_value,
+                                   const D3D12_RECT* rects, uint32_t rect_count);
+  uint64_t xfer_use_forwarded_[kXferUseClassCount] = {};
+  uint64_t xfer_use_forwarded_last_[kXferUseClassCount] = {};
   void XferUseNoteResolveRead(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles);
   void XferUseReport();
 

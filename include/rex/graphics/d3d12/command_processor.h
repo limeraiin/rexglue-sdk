@@ -1267,7 +1267,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   struct HizDrawPending;
   bool HizWindowValidate(uint8_t dir);  // closes a window that no longer holds
   bool HizWindowEnsure(uint8_t dir);    // validate, then open one when needed
-  void HizAppend(uint32_t slot, const HizDrawPending* d, uint32_t inst, uint32_t host_count);
+  void HizAppend(uint32_t slot, const HizDrawPending* d, uint32_t inst, uint32_t host_count,
+                 bool plain_layout = false);
   bool HizPoolAppend(uint32_t base, uint32_t serial, uint32_t inst, uint8_t dir,
                      uint32_t idx_count);
   ID3D12CommandSignature* HizCommandSignature(bool indexed);  // [constant, draw]
@@ -1283,6 +1284,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // everywhere), 1 = draw-only everywhere (pooled instances all render as
   // instance 0: a PRICE phase, visually wrong), 2 = draw-only for plain
   // draws, [constant, draw] for the pooled batches (renders correctly).
+  // (The draw-only-everywhere phase was dropped: a 4-byte argument offset
+  // removed the device in smoke 836; the plain slots use a second element
+  // layout instead, the draw arguments at dword 0, flag bit 4 to the CS.)
   ID3D12CommandSignature* HizCommandSignaturePlain(bool indexed);
   std::unordered_map<ID3D12RootSignature*, Microsoft::WRL::ComPtr<ID3D12CommandSignature>>
       hiz_cmdsig_plain_[2];

@@ -4620,13 +4620,9 @@ void D3D12RenderTargetCache::XferUseAdd(RenderTargetKey dest, const Transfer& tr
   r.cls = (dest.is_depth ? 2u : 0u) | (source.is_depth ? 1u : 0u);
   r.written = false;
   r.from_cleared = false;
-  for (const XferClearedRange& c : xfer_cleared_ranges_) {
-    if (c.key == source && c.start_tiles <= transfer.start_tiles &&
-        transfer.end_tiles <= c.end_tiles) {
-      r.from_cleared = true;
-      ++xfer_use_const_[r.cls];
-      break;
-    }
+  if (XferFindCleared(source, transfer.start_tiles, transfer.end_tiles)) {
+    r.from_cleared = true;
+    ++xfer_use_const_[r.cls];
   }
   xfer_use_records_.push_back(r);
 }
@@ -4651,8 +4647,26 @@ void D3D12RenderTargetCache::XferUseNoteDraw(RenderTargetKey key, bool reads_des
   }
 }
 
+const D3D12RenderTargetCache::XferClearedRange* D3D12RenderTargetCache::XferFindCleared(
+    RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles) const {
+  for (const XferClearedRange& c : xfer_cleared_ranges_) {
+    if (c.key == key && c.start_tiles <= start_tiles && end_tiles <= c.end_tiles) {
+      return &c;
+    }
+  }
+  return nullptr;
+}
+
+void D3D12RenderTargetCache::XferMarkCleared(RenderTargetKey key, uint32_t start_tiles,
+                                             uint32_t end_tiles, uint64_t value) {
+  if (xfer_cleared_ranges_.size() < 64) {
+    xfer_cleared_ranges_.push_back({key, start_tiles, end_tiles, value});
+  }
+}
+
 void D3D12RenderTargetCache::XferUseNoteClear(RenderTargetKey key,
-                                              const Transfer::Rectangle& rectangle) {
+                                              const Transfer::Rectangle& rectangle,
+                                              uint64_t value) {
   const uint32_t rows_per_tile_row =
       xenos::kEdramTileHeightSamples >> uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X);
   const uint32_t pitch_tiles = key.GetPitchTiles();
@@ -4663,9 +4677,7 @@ void D3D12RenderTargetCache::XferUseNoteClear(RenderTargetKey key,
       ((rectangle.y_pixels + rectangle.height_pixels + rows_per_tile_row - 1) / rows_per_tile_row) *
           pitch_tiles;
   XferUseFinalize(key, start_tiles, end_tiles, kXferUseCleared, kXferUseCleared);
-  if (xfer_cleared_ranges_.size() < 64) {
-    xfer_cleared_ranges_.push_back({key, start_tiles, end_tiles});
-  }
+  XferMarkCleared(key, start_tiles, end_tiles, value);
 }
 
 void D3D12RenderTargetCache::XferUseNoteResolveRead(RenderTargetKey key, uint32_t start_tiles,
@@ -4686,9 +4698,11 @@ void D3D12RenderTargetCache::XferUseReport() {
     }
     const uint64_t k = xfer_use_const_[c] - xfer_use_const_last_[c];
     xfer_use_const_last_[c] = xfer_use_const_[c];
+    const uint64_t fw = xfer_use_forwarded_[c] - xfer_use_forwarded_last_[c];
+    xfer_use_forwarded_last_[c] = xfer_use_forwarded_[c];
     per_class += fmt::format(
-        " | {} {} taken/wrtaken/clr/rd/wrrd/rres/wrres/ev={}/{}/{}/{}/{}/{}/{}/{} const={}",
-        kClassNames[c], total, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], k);
+        " | {} {} taken/wrtaken/clr/rd/wrrd/rres/wrres/ev={}/{}/{}/{}/{}/{}/{}/{} const={} fwd={}",
+        kClassNames[c], total, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], k, fw);
   }
   if (!xfer_use_by_key_.empty()) {
     std::string per_key;
@@ -4714,6 +4728,153 @@ void D3D12RenderTargetCache::XferUseReport() {
   xfer_use_skipped_last_ = xfer_use_skipped_;
 }
 
+// [xfer] The resolve clear's executor, also the forwarded clear's: the guest
+// clear value converted for the destination's format, N rectangles.
+void D3D12RenderTargetCache::ClearRenderTargetRectangles(D3D12RenderTarget& dest_d3d12_rt,
+                                                         uint64_t clear_value,
+                                                         const D3D12_RECT* rects,
+                                                         uint32_t rect_count) {
+  if (!rect_count) {
+    return;
+  }
+  const RenderTargetKey dest_rt_key = dest_d3d12_rt.key();
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  if (dest_rt_key.is_depth) {
+    uint32_t depth_guest_clear_value = (uint32_t(clear_value) >> 8) & 0xFFFFFF;
+    float depth_host_clear_value = 0.0f;
+    switch (dest_rt_key.GetDepthFormat()) {
+      case xenos::DepthRenderTargetFormat::kD24S8:
+        depth_host_clear_value = xenos::UNorm24To32(depth_guest_clear_value);
+        break;
+      case xenos::DepthRenderTargetFormat::kD24FS8:
+        // Taking [0, 2) -> [0, 1) remapping into account.
+        depth_host_clear_value = xenos::Float20e4To32(depth_guest_clear_value) * 0.5f;
+        break;
+    }
+    command_processor_.PushTransitionBarrier(
+        dest_d3d12_rt.resource(),
+        dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    command_processor_.SubmitBarriers();
+    command_list.D3DClearDepthStencilView(dest_d3d12_rt.descriptor_draw().GetHandle(),
+                                          D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                          depth_host_clear_value, UINT(clear_value) & 0xFF, rect_count,
+                                          rects);
+  } else {
+    float color_clear_value[4] = {};
+    bool clear_via_drawing = false;
+    switch (dest_rt_key.GetColorFormat()) {
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
+        for (uint32_t j = 0; j < 4; ++j) {
+          color_clear_value[j] = ((clear_value >> (j * 8)) & 0xFF) * (1.0f / 0xFF);
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+        // 8_8_8_8_GAMMA is represented by linear stored in
+        // R16G16B16A16_UNORM.
+        for (uint32_t j = 0; j < 4; ++j) {
+          color_clear_value[j] = ((clear_value >> (j * 8)) & 0xFF) * (1.0f / 0xFF);
+        }
+        for (uint32_t j = 0; j < 3; ++j) {
+          color_clear_value[j] = xenos::PWLGammaToLinear(color_clear_value[j]);
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
+        for (uint32_t j = 0; j < 3; ++j) {
+          color_clear_value[j] = ((clear_value >> (j * 10)) & 0x3FF) * (1.0f / 0x3FF);
+        }
+        color_clear_value[3] = ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
+      } break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+        for (uint32_t j = 0; j < 3; ++j) {
+          color_clear_value[j] = xenos::Float7e3To32((clear_value >> (j * 10)) & 0x3FF);
+        }
+        color_clear_value[3] = ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
+      } break;
+      case xenos::ColorRenderTargetFormat::k_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_FLOAT: {
+        // Using uint for loading both. Disregarding the current -32...32
+        // vs. -1...1 settings for consistency with color clear via depth
+        // aliasing.
+        for (uint32_t j = 0; j < 2; ++j) {
+          color_clear_value[j] = float((clear_value >> (j * 16)) & 0xFFFF);
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
+        // Using uint for loading both. Disregarding the current -32...32
+        // vs. -1...1 settings for consistency with color clear via depth
+        // aliasing.
+        for (uint32_t j = 0; j < 4; ++j) {
+          color_clear_value[j] = float((clear_value >> (j * 16)) & 0xFFFF);
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_32_FLOAT: {
+        // Using uint for proper denormal and NaN handling.
+        color_clear_value[0] = float(uint32_t(clear_value));
+        // Numbers > 2^24 can't be represented with a step of 1 as floats,
+        // need to clear by drawing a uint rectangle.
+        if (uint64_t(color_clear_value[0]) != uint32_t(clear_value)) {
+          clear_via_drawing = true;
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_32_32_FLOAT: {
+        // Using uint for proper denormal and NaN handling.
+        color_clear_value[0] = float(uint32_t(clear_value));
+        color_clear_value[1] = float(uint32_t(clear_value >> 32));
+        // Numbers > 2^24 can't be represented with a step of 1 as floats,
+        // need to clear by drawing a uint rectangle.
+        if (uint64_t(color_clear_value[0]) != uint32_t(clear_value) ||
+            uint64_t(color_clear_value[1]) != uint32_t(clear_value >> 32)) {
+          clear_via_drawing = true;
+        }
+      } break;
+    }
+    command_processor_.PushTransitionBarrier(
+        dest_d3d12_rt.resource(),
+        dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_RENDER_TARGET),
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (clear_via_drawing) {
+      D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv_handle =
+          dest_d3d12_rt.descriptor_load_separate().IsValid()
+              ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
+              : dest_d3d12_rt.descriptor_draw().GetHandle();
+      command_list.D3DOMSetRenderTargets(1, &clear_rtv_handle, FALSE, nullptr);
+      are_current_command_list_render_targets_valid_ = true;
+      for (uint32_t r = 0; r < rect_count; ++r) {
+        const D3D12_RECT& clear_rect = rects[r];
+        D3D12_VIEWPORT clear_viewport;
+        clear_viewport.TopLeftX = float(clear_rect.left);
+        clear_viewport.TopLeftY = float(clear_rect.top);
+        clear_viewport.Width = float(clear_rect.right - clear_rect.left);
+        clear_viewport.Height = float(clear_rect.bottom - clear_rect.top);
+        clear_viewport.MinDepth = 0.0f;
+        clear_viewport.MaxDepth = 1.0f;
+        command_processor_.SetViewport(clear_viewport);
+        command_processor_.SetScissorRect(clear_rect);
+        command_processor_.SetExternalGraphicsRootSignature(uint32_rtv_clear_root_signature_);
+        uint32_t clear_via_drawing_value[2] = {uint32_t(clear_value),
+                                               uint32_t(clear_value >> 32)};
+        command_list.D3DSetGraphicsRoot32BitConstants(0, 2, clear_via_drawing_value, 0);
+        command_processor_.SetExternalPipeline(uint32_rtv_clear_pipelines_[size_t(
+            dest_rt_key.GetColorFormat() ==
+            xenos::ColorRenderTargetFormat::k_32_32_FLOAT)][size_t(dest_rt_key.msaa_samples)]);
+        command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        command_list.D3DDrawInstanced(3, 1, 0, 0);
+      }
+    } else {
+      command_processor_.SubmitBarriers();
+      command_list.D3DClearRenderTargetView(
+          dest_d3d12_rt.descriptor_load_separate().IsValid()
+              ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
+              : dest_d3d12_rt.descriptor_draw().GetHandle(),
+          color_clear_value, rect_count, rects);
+    }
+  }
+}
+
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
@@ -4723,7 +4884,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   // [xfer] The cycler, the read census records, and the skip itself. The skip
   // substitutes empty transfer lists: nothing below copies, the resolve clear
-  // (if any) still runs, ownership was already claimed by the caller.
+  // (if any) still runs, ownership was already claimed by the caller. A
+  // transfer from a resolve-cleared source becomes a forwarded clear.
+  struct XferForward {
+    uint32_t dest;
+    uint32_t count;
+    uint64_t value;
+    D3D12_RECT rects[Transfer::kMaxRectanglesWithCutout];
+  };
+  std::vector<XferForward> xfer_forwards;
   {
     const int32_t cycle_seconds = REXCVAR_GET(gpu_xfer_cycle);
     const auto now = std::chrono::steady_clock::now();
@@ -4749,6 +4918,35 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           XferUseAdd(dest_key, transfer);
           if (xfer_cycle_phase_) {
             ++xfer_use_skipped_;
+            // The forwarded clear (see XferFindCleared).
+            const RenderTargetKey source_key =
+                transfer.source ? transfer.source->key() : RenderTargetKey();
+            const XferClearedRange* cleared =
+                XferFindCleared(source_key, transfer.start_tiles, transfer.end_tiles);
+            if (cleared) {
+              XferForward f;
+              f.dest = i;
+              f.value = cleared->value;
+              Transfer::Rectangle rects[Transfer::kMaxRectanglesWithCutout];
+              f.count = transfer.GetRectangles(dest_key.base_tiles, dest_key.GetPitchTiles(),
+                                               dest_key.msaa_samples, dest_key.Is64bpp(), rects,
+                                               resolve_clear_rectangle);
+              for (uint32_t r = 0; r < f.count; ++r) {
+                f.rects[r].left = LONG(rects[r].x_pixels * draw_resolution_scale_x());
+                f.rects[r].top = LONG(rects[r].y_pixels * draw_resolution_scale_y());
+                f.rects[r].right =
+                    LONG((rects[r].x_pixels + rects[r].width_pixels) * draw_resolution_scale_x());
+                f.rects[r].bottom =
+                    LONG((rects[r].y_pixels + rects[r].height_pixels) * draw_resolution_scale_y());
+              }
+              if (f.count) {
+                xfer_forwards.push_back(f);
+                ++xfer_use_forwarded_[(dest_key.is_depth ? 2u : 0u) |
+                                      (source_key.is_depth ? 1u : 0u)];
+                XferMarkCleared(dest_key, transfer.start_tiles, transfer.end_tiles,
+                                cleared->value);
+              }
+            }
           } else {
             ++xfer_use_executed_;
           }
@@ -4763,7 +4961,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     if (render_target_resolve_clear_values && resolve_clear_rectangle) {
       for (uint32_t i = 0; i < render_target_count; ++i) {
         if (render_targets[i]) {
-          XferUseNoteClear(render_targets[i]->key(), *resolve_clear_rectangle);
+          XferUseNoteClear(render_targets[i]->key(), *resolve_clear_rectangle,
+                           render_target_resolve_clear_values[i]);
         }
       }
     }
@@ -4838,7 +5037,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   // [gpu-census] this function runs ~once per draw and almost always records
   // nothing (the 52k/s "passes" are calls, not work) - only bracket the GPU
   // class when there IS work, or two timestamps per draw would be emitted.
-  bool gpu_census_work = resolve_clear_needed;
+  bool gpu_census_work = resolve_clear_needed || !xfer_forwards.empty();
   if (!gpu_census_work && render_target_transfers) {
     for (uint32_t i = 0; i < render_target_count; ++i) {
       if (render_targets[i] && !render_target_transfers[i].empty()) {
@@ -4856,6 +5055,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   std::optional<D3D12CommandProcessor::GpuCensusScope> gpu_census_scope;
   if (gpu_census_work) {
     gpu_census_scope.emplace(command_processor_, D3D12CommandProcessor::kGpuCensusXfer);
+  }
+  // [xfer] The forwarded clears.
+  for (const XferForward& f : xfer_forwards) {
+    ClearRenderTargetRectangles(*static_cast<D3D12RenderTarget*>(render_targets[f.dest]),
+                                f.value, f.rects, f.count);
   }
 
   D3D12_RECT clear_rect;
@@ -5550,138 +5754,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
     // Perform the clear.
     if (resolve_clear_needed) {
-      uint64_t clear_value = render_target_resolve_clear_values[i];
-      if (dest_rt_key.is_depth) {
-        uint32_t depth_guest_clear_value = (uint32_t(clear_value) >> 8) & 0xFFFFFF;
-        float depth_host_clear_value = 0.0f;
-        switch (dest_rt_key.GetDepthFormat()) {
-          case xenos::DepthRenderTargetFormat::kD24S8:
-            depth_host_clear_value = xenos::UNorm24To32(depth_guest_clear_value);
-            break;
-          case xenos::DepthRenderTargetFormat::kD24FS8:
-            // Taking [0, 2) -> [0, 1) remapping into account.
-            depth_host_clear_value = xenos::Float20e4To32(depth_guest_clear_value) * 0.5f;
-            break;
-        }
-        command_processor_.PushTransitionBarrier(
-            dest_d3d12_rt.resource(),
-            dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
-            D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        command_processor_.SubmitBarriers();
-        command_list.D3DClearDepthStencilView(dest_d3d12_rt.descriptor_draw().GetHandle(),
-                                              D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-                                              depth_host_clear_value, UINT(clear_value) & 0xFF, 1,
-                                              &clear_rect);
-      } else {
-        float color_clear_value[4] = {};
-        bool clear_via_drawing = false;
-        switch (dest_rt_key.GetColorFormat()) {
-          case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
-            for (uint32_t j = 0; j < 4; ++j) {
-              color_clear_value[j] = ((clear_value >> (j * 8)) & 0xFF) * (1.0f / 0xFF);
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
-            // 8_8_8_8_GAMMA is represented by linear stored in
-            // R16G16B16A16_UNORM.
-            for (uint32_t j = 0; j < 4; ++j) {
-              color_clear_value[j] = ((clear_value >> (j * 8)) & 0xFF) * (1.0f / 0xFF);
-            }
-            for (uint32_t j = 0; j < 3; ++j) {
-              color_clear_value[j] = xenos::PWLGammaToLinear(color_clear_value[j]);
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-          case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
-            for (uint32_t j = 0; j < 3; ++j) {
-              color_clear_value[j] = ((clear_value >> (j * 10)) & 0x3FF) * (1.0f / 0x3FF);
-            }
-            color_clear_value[3] = ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
-          } break;
-          case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-          case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
-            for (uint32_t j = 0; j < 3; ++j) {
-              color_clear_value[j] = xenos::Float7e3To32((clear_value >> (j * 10)) & 0x3FF);
-            }
-            color_clear_value[3] = ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
-          } break;
-          case xenos::ColorRenderTargetFormat::k_16_16:
-          case xenos::ColorRenderTargetFormat::k_16_16_FLOAT: {
-            // Using uint for loading both. Disregarding the current -32...32
-            // vs. -1...1 settings for consistency with color clear via depth
-            // aliasing.
-            for (uint32_t j = 0; j < 2; ++j) {
-              color_clear_value[j] = float((clear_value >> (j * 16)) & 0xFFFF);
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-          case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
-            // Using uint for loading both. Disregarding the current -32...32
-            // vs. -1...1 settings for consistency with color clear via depth
-            // aliasing.
-            for (uint32_t j = 0; j < 4; ++j) {
-              color_clear_value[j] = float((clear_value >> (j * 16)) & 0xFFFF);
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_32_FLOAT: {
-            // Using uint for proper denormal and NaN handling.
-            color_clear_value[0] = float(uint32_t(clear_value));
-            // Numbers > 2^24 can't be represented with a step of 1 as floats,
-            // need to clear by drawing a uint rectangle.
-            if (uint64_t(color_clear_value[0]) != uint32_t(clear_value)) {
-              clear_via_drawing = true;
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_32_32_FLOAT: {
-            // Using uint for proper denormal and NaN handling.
-            color_clear_value[0] = float(uint32_t(clear_value));
-            color_clear_value[1] = float(uint32_t(clear_value >> 32));
-            // Numbers > 2^24 can't be represented with a step of 1 as floats,
-            // need to clear by drawing a uint rectangle.
-            if (uint64_t(color_clear_value[0]) != uint32_t(clear_value) ||
-                uint64_t(color_clear_value[1]) != uint32_t(clear_value >> 32)) {
-              clear_via_drawing = true;
-            }
-          } break;
-        }
-        command_processor_.PushTransitionBarrier(
-            dest_d3d12_rt.resource(),
-            dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_RENDER_TARGET),
-            D3D12_RESOURCE_STATE_RENDER_TARGET);
-        if (clear_via_drawing) {
-          D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv_handle =
-              dest_d3d12_rt.descriptor_load_separate().IsValid()
-                  ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
-                  : dest_d3d12_rt.descriptor_draw().GetHandle();
-          command_list.D3DOMSetRenderTargets(1, &clear_rtv_handle, FALSE, nullptr);
-          are_current_command_list_render_targets_valid_ = true;
-          D3D12_VIEWPORT clear_viewport;
-          clear_viewport.TopLeftX = float(clear_rect.left);
-          clear_viewport.TopLeftY = float(clear_rect.top);
-          clear_viewport.Width = float(clear_rect.right - clear_rect.left);
-          clear_viewport.Height = float(clear_rect.bottom - clear_rect.top);
-          clear_viewport.MinDepth = 0.0f;
-          clear_viewport.MaxDepth = 1.0f;
-          command_processor_.SetViewport(clear_viewport);
-          command_processor_.SetScissorRect(clear_rect);
-          command_processor_.SetExternalGraphicsRootSignature(uint32_rtv_clear_root_signature_);
-          uint32_t clear_via_drawing_value[2] = {uint32_t(clear_value),
-                                                 uint32_t(clear_value >> 32)};
-          command_list.D3DSetGraphicsRoot32BitConstants(0, 2, clear_via_drawing_value, 0);
-          command_processor_.SetExternalPipeline(uint32_rtv_clear_pipelines_[size_t(
-              dest_rt_key.GetColorFormat() ==
-              xenos::ColorRenderTargetFormat::k_32_32_FLOAT)][size_t(dest_rt_key.msaa_samples)]);
-          command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-          command_list.D3DDrawInstanced(3, 1, 0, 0);
-        } else {
-          command_processor_.SubmitBarriers();
-          command_list.D3DClearRenderTargetView(
-              dest_d3d12_rt.descriptor_load_separate().IsValid()
-                  ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
-                  : dest_d3d12_rt.descriptor_draw().GetHandle(),
-              color_clear_value, 1, &clear_rect);
-        }
-      }
+      ClearRenderTargetRectangles(dest_d3d12_rt, render_target_resolve_clear_values[i],
+                                  &clear_rect, 1);
     }
   }
 
