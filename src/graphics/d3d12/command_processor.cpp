@@ -394,8 +394,11 @@ REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
 // list rewrites the window sorted by PSO with the state deduped in the new
 // order (DeferredCommandList::SortWindow). The recorder's latches are reset
 // at window open (the first segment carries the full state) and after a
-// rewrite (the GPU's state is the sorted order's last). 0 = off (kill
-// switch), 1 = on.
+// rewrite (the GPU's state is the sorted order's last). Drive 847 (Intel
+// 720p, matched dpf): on 18.6 fps / GPU 54.0 / draw class 40.1 vs off
+// 17.6 / 57.6 / 43.5, in-window switches 1916 -> 600 (~2.6 us per switch
+// on Intel), no visual defect; 0.83 ms/fr of CP time. SHIPPED. 0 = off
+// (kill switch for the tester: a reorder is the visual-defect class).
 REXCVAR_DEFINE_INT32(gpu_sort, 1, "GPU/D3D12",
                      "[sort] state sorting by pipeline inside the reorder class: 0 off, 1 on.");
 // Temporary A/B: seconds per phase (on / off); [sort] phase= names it.
