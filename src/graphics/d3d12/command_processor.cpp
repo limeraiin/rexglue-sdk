@@ -3271,6 +3271,260 @@ void DcReport(double secs) {
   s_last = c;
 }
 
+// ── [dcache-miss] the miss attribution census (gpu_dcache 1 only) ─────────
+// Drive 856: standing still in the city the identity hits only 34%: 66% of
+// draws mint a new identity every frame while the pool's predictor proves
+// the pool key cross-frame stable. This names the strobing component. Two
+// tables hold LAST FRAME's first occurrence, keyed by hashes of the identity
+// with parts left out:
+//  core = the identity minus the snapshot (prim, counts, IB, VS/PS, the used
+//         texture fetch constants, the pass regs). A key-time MISS whose core
+//         key was seen last frame is a repeat the snapshot failed: every
+//         differing snapshot dword is counted (161 counters, the top 8 named
+//         at 1 Hz) and so is each differing component (a range of
+//         kPoolRegRanges, bool, loop, the pool-open variant bit).
+//  excl = the core minus ONE of {IB, textures, pass}, tagged. A miss whose
+//         core key was NOT seen last frame asks which single part rotated
+//         with the rest identical (ib / tex / pass); two matches = ambiguous
+//         (another draw differs from this one in just that part), none = a
+//         new draw or a multi-part change.
+// Counters only; every eligible draw touches the tables so the next frame
+// has this one. Delete with the drive that names the register.
+constexpr uint32_t kDcmSnap = kPoolRegCount + 40;
+constexpr uint32_t kDcmCoreBits = 14;
+constexpr uint32_t kDcmExclBits = 16;
+constexpr uint32_t kDcmProbe = 4;
+struct DcmCore {
+  uint64_t key;
+  uint32_t frame;  // 0 = fresh
+  uint32_t pred;
+  uint32_t regs[kDcmSnap];
+};
+struct DcmExcl {
+  uint64_t key;
+  uint32_t frame;
+  uint32_t pad;
+};
+std::vector<DcmCore> g_dcm_core;
+std::vector<DcmExcl> g_dcm_excl;
+uint32_t g_dcm_reg_index[kDcmSnap];  // snapshot dword -> register index
+uint8_t g_dcm_reg_comp[kDcmSnap];    // snapshot dword -> component (0..9 range, 10 bool, 11 loop)
+struct DcmStats {
+  uint64_t draws = 0, miss = 0, inv = 0, stale = 0, rep = 0, full = 0, gap = 0;
+  uint64_t same = 0, one = 0, many = 0;
+  uint64_t comp[13] = {};  // ranges 0..9, bool, loop, pred
+  uint64_t nk_ib = 0, nk_tex = 0, nk_pass = 0, nk_amb = 0, nk_new = 0;
+  uint64_t reg[kDcmSnap] = {};
+};
+DcmStats g_dcm;
+
+void DcmInit() {
+  g_dcm_core.assign(size_t(1) << kDcmCoreBits, DcmCore{});
+  g_dcm_excl.assign(size_t(1) << kDcmExclBits, DcmExcl{});
+  uint32_t k = 0, r = 0;
+  for (const auto& rr : kPoolRegRanges) {
+    for (uint32_t i = rr[0]; i < rr[1]; ++i) {
+      g_dcm_reg_index[k] = i;
+      g_dcm_reg_comp[k++] = uint8_t(r);
+    }
+    ++r;
+  }
+  for (uint32_t i = 0; i < 8; ++i) {
+    g_dcm_reg_index[k] = XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i;
+    g_dcm_reg_comp[k++] = 10;
+  }
+  for (uint32_t i = 0; i < 32; ++i) {
+    g_dcm_reg_index[k] = XE_GPU_REG_SHADER_CONSTANT_LOOP_00 + i;
+    g_dcm_reg_comp[k++] = 11;
+  }
+}
+
+// The slot of this key (frame != 0 = seen), or a claimed stale slot (frame
+// 0), or null when the run is live (counted). peek = never claim.
+template <typename T>
+T* DcmFind(std::vector<T>& tab, uint32_t bits, uint64_t key, bool peek) {
+  const uint32_t mask = (1u << bits) - 1;
+  uint32_t i = uint32_t(key ^ (key >> 29) ^ (key >> 47)) & mask;
+  T* stale = nullptr;
+  for (uint32_t p = 0; p < kDcmProbe; ++p) {
+    T& s = tab[i];
+    if (s.frame != 0 && s.key == key) return &s;
+    if (!stale && s.frame + 1 < g_dc_frame) stale = &s;
+    i = (i + 1) & mask;
+  }
+  if (peek) return nullptr;
+  if (!stale) {
+    ++g_dcm.full;
+    return nullptr;
+  }
+  stale->key = key;
+  stale->frame = 0;
+  return stale;
+}
+
+inline bool DcmSeenLast(const DcmExcl* e) { return e && e->frame + 1 == g_dc_frame; }
+
+// cls: 0 hit, 1 no entry, 2 entry invalid (its record refused), 3 entry
+// stale (heap / generation / shader object).
+void DcmDraw(const RegisterFile& regs, const D3D12Shader* vs, const D3D12Shader* ps, uint32_t prim,
+             uint32_t index_count, bool major_mode_explicit, bool has_ib, uint32_t ib_base,
+             uint32_t ib_fmt, uint32_t ib_count, uint32_t ib_endian, bool pred, uint32_t cls) {
+  if (g_dcm_core.empty()) DcmInit();
+  ++g_dcm.draws;
+  // The parts, hashed apart so the exclusions share them.
+  uint32_t shape[8], ib[5], tex[32 * 6], pass[8], snap[kDcmSnap];
+  uint32_t n = 0;
+  shape[n++] = prim;
+  shape[n++] = index_count;
+  shape[n++] = major_mode_explicit ? 1u : 0u;
+  const uint64_t vh = vs->ucode_data_hash();
+  shape[n++] = uint32_t(vh);
+  shape[n++] = uint32_t(vh >> 32);
+  const uint64_t ph = ps ? ps->ucode_data_hash() : 0;
+  shape[n++] = uint32_t(ph);
+  shape[n++] = uint32_t(ph >> 32);
+  shape[n++] = ps ? 1u : 0u;
+  const uint64_t hs = XXH3_64bits(shape, n * sizeof(uint32_t));
+  ib[0] = has_ib ? 1u : 0u;
+  ib[1] = ib_base;
+  ib[2] = ib_fmt;
+  ib[3] = ib_count;
+  ib[4] = ib_endian;
+  const uint64_t hi = XXH3_64bits(ib, sizeof(ib));
+  n = 0;
+  uint32_t tm = vs->GetUsedTextureMaskAfterTranslation() |
+                (ps ? ps->GetUsedTextureMaskAfterTranslation() : 0u);
+  uint32_t ti;
+  while (rex::bit_scan_forward(tm, &ti)) {
+    tm &= ~(uint32_t(1) << ti);
+    const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * ti;
+    for (uint32_t j = 0; j < 6; ++j) tex[n++] = regs[base + j];
+  }
+  const uint64_t ht = XXH3_64bits(tex, n * sizeof(uint32_t));
+  n = 0;
+  pass[n++] = regs[XE_GPU_REG_RB_SURFACE_INFO];
+  pass[n++] = regs[XE_GPU_REG_RB_MODECONTROL];
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    pass[n++] = regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
+  }
+  pass[n++] = regs[XE_GPU_REG_RB_DEPTH_INFO];
+  const uint64_t hp = XXH3_64bits(pass, n * sizeof(uint32_t));
+  for (uint32_t k = 0; k < kDcmSnap; ++k) snap[k] = regs[g_dcm_reg_index[k]];
+  const uint64_t core = inst_mix(inst_mix(inst_mix(hs, hi), ht), hp);
+  const uint64_t x_ib = inst_mix(inst_mix(inst_mix(hs ^ 0x9E3779B97F4A7C15ull, 1), ht), hp);
+  const uint64_t x_tex = inst_mix(inst_mix(inst_mix(hs ^ 0xC2B2AE3D27D4EB4Full, hi), 2), hp);
+  const uint64_t x_pass = inst_mix(inst_mix(inst_mix(hs ^ 0x165667B19E3779F9ull, hi), ht), 3);
+
+  DcmCore* c = DcmFind(g_dcm_core, kDcmCoreBits, core, false);
+  const bool core_this = c && c->frame == g_dc_frame;
+  const bool core_last = c && c->frame != 0 && c->frame + 1 == g_dc_frame;
+  if (cls == 1) {
+    ++g_dcm.miss;
+    if (core_this) {
+      ++g_dcm.rep;
+    } else if (core_last) {
+      uint32_t nd = 0;
+      bool comp[13] = {};
+      for (uint32_t k = 0; k < kDcmSnap; ++k) {
+        if (c->regs[k] != snap[k]) {
+          ++nd;
+          ++g_dcm.reg[k];
+          comp[g_dcm_reg_comp[k]] = true;
+        }
+      }
+      if ((c->pred != 0) != pred) {
+        ++nd;
+        comp[12] = true;
+      }
+      for (uint32_t i = 0; i < 13; ++i) {
+        if (comp[i]) ++g_dcm.comp[i];
+      }
+      if (nd == 0) {
+        ++g_dcm.same;
+      } else if (nd == 1) {
+        ++g_dcm.one;
+      } else {
+        ++g_dcm.many;
+      }
+    } else {
+      if (c && c->frame != 0) ++g_dcm.gap;
+      const bool r_ib = DcmSeenLast(DcmFind(g_dcm_excl, kDcmExclBits, x_ib, true));
+      const bool r_tex = DcmSeenLast(DcmFind(g_dcm_excl, kDcmExclBits, x_tex, true));
+      const bool r_pass = DcmSeenLast(DcmFind(g_dcm_excl, kDcmExclBits, x_pass, true));
+      const uint32_t nr = uint32_t(r_ib) + uint32_t(r_tex) + uint32_t(r_pass);
+      if (nr == 1) {
+        if (r_ib) {
+          ++g_dcm.nk_ib;
+        } else if (r_tex) {
+          ++g_dcm.nk_tex;
+        } else {
+          ++g_dcm.nk_pass;
+        }
+      } else if (nr > 1) {
+        ++g_dcm.nk_amb;
+      } else {
+        ++g_dcm.nk_new;
+      }
+    }
+  } else if (cls == 2) {
+    ++g_dcm.inv;
+  } else if (cls == 3) {
+    ++g_dcm.stale;
+  }
+  // The update: the first occurrence of each key this frame is the record.
+  if (c && !core_this) {
+    c->frame = g_dc_frame;
+    c->pred = pred ? 1u : 0u;
+    std::memcpy(c->regs, snap, sizeof(snap));
+  }
+  for (const uint64_t x : {x_ib, x_tex, x_pass}) {
+    DcmExcl* e = DcmFind(g_dcm_excl, kDcmExclBits, x, false);
+    if (e && e->frame != g_dc_frame) e->frame = g_dc_frame;
+  }
+}
+
+void DcmReport(double secs) {
+  static DcmStats s_last;
+  const DcmStats& c = g_dcm;
+  auto d = [&](uint64_t DcmStats::*f) { return c.*f - s_last.*f; };
+  uint64_t comp[13];
+  for (uint32_t i = 0; i < 13; ++i) comp[i] = c.comp[i] - s_last.comp[i];
+  REXGPU_INFO(
+      "[dcache-miss] draws/s={:.0f} miss/s={:.0f} | seen: same={} one={} many={} rep={} inv={} "
+      "stale={} gap={} | comp rng={},{},{},{},{},{},{},{},{},{} bool={} loop={} pred={} | nokey: "
+      "ib={} tex={} pass={} amb={} new={} | full={}",
+      double(d(&DcmStats::draws)) / secs, double(d(&DcmStats::miss)) / secs, d(&DcmStats::same),
+      d(&DcmStats::one), d(&DcmStats::many), d(&DcmStats::rep), d(&DcmStats::inv),
+      d(&DcmStats::stale), d(&DcmStats::gap), comp[0], comp[1], comp[2], comp[3], comp[4], comp[5],
+      comp[6], comp[7], comp[8], comp[9], comp[10], comp[11], comp[12], d(&DcmStats::nk_ib),
+      d(&DcmStats::nk_tex), d(&DcmStats::nk_pass), d(&DcmStats::nk_amb), d(&DcmStats::nk_new),
+      d(&DcmStats::full));
+  // The top 8 differing snapshot registers of this second, named.
+  struct Top {
+    uint32_t k;
+    uint64_t n;
+  } top[8] = {};
+  for (uint32_t k = 0; k < kDcmSnap; ++k) {
+    const uint64_t n = c.reg[k] - s_last.reg[k];
+    if (n == 0 || n <= top[7].n) continue;
+    uint32_t i = 7;
+    while (i > 0 && top[i - 1].n < n) {
+      top[i] = top[i - 1];
+      --i;
+    }
+    top[i] = {k, n};
+  }
+  std::string tops;
+  for (const Top& t : top) {
+    if (t.n == 0) break;
+    const uint32_t r = g_dcm_reg_index[t.k];
+    const RegisterInfo* info = RegisterFile::GetRegisterInfo(r);
+    tops += fmt::format(" {:04X}{}{}={}", r, info ? ":" : "", info ? info->name : "", t.n);
+  }
+  if (!tops.empty()) REXGPU_INFO("[dcache-miss] top:{}", tops);
+  s_last = c;
+}
+
 // [GKEY] rung-2 census window table (epoch-tagged like the pool tables;
 // defined with the census below, cleared with them on an epoch wrap).
 struct GkSlot {
@@ -7020,6 +7274,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       const PoolStats& c = g_pool;
       auto d = [&](uint64_t PoolStats::*f) { return c.*f - s_pp.*f; };
       DcReport(secs);  // [dcache]
+      if (g_dc_mode == 1) DcmReport(secs);  // [dcache-miss]
       {  // [cmd] the per-frame command census (state changes per draw).
         using Cmd = DeferredCommandList::Command;
         static uint64_t s_cmd_last[64] = {};
@@ -8360,6 +8615,16 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         }
       } else {
         dc_record = true;
+      }
+      if (g_dc_mode == 1) {  // [dcache-miss] the attribution census (verify only)
+        DcmDraw(regs, vertex_shader, static_cast<D3D12Shader*>(active_pixel_shader()),
+                uint32_t(primitive_type), index_count, major_mode_explicit,
+                index_buffer_info != nullptr,
+                index_buffer_info ? index_buffer_info->guest_base : 0u,
+                index_buffer_info ? uint32_t(index_buffer_info->format) : 0u,
+                index_buffer_info ? index_buffer_info->count : 0u,
+                index_buffer_info ? uint32_t(index_buffer_info->endianness) : 0u, dc_pool_pred,
+                dc_hit ? 0u : !dc ? 1u : !dc->valid ? 2u : 3u);
       }
     } else {
       ++g_dc.ref_class;
