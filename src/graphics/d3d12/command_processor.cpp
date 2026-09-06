@@ -394,8 +394,6 @@ REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
 REXCVAR_DEFINE_INT32(gpu_dcache, 2, "GPU/D3D12",
                      "[dcache] per-draw identity cache of derived state: 0 off, 1 verify "
                      "(derive and compare), 2 consume (default).");
-REXCVAR_DEFINE_INT32(gpu_dcache_cycle, 0, "GPU/D3D12",
-                     "[dcache] A/B: seconds per phase, consume / off (0 = shipped, none).");
 // [sort] Drive 845 (Intel 720p heavy city): a PSO switch on 2380 of 3460
 // draws per frame, 2030 of them inside windows of the provable reorder
 // class (48 windows/fr, 57 draws and 12.5 distinct PSOs each); a sort by
@@ -3060,7 +3058,6 @@ uint32_t g_dc_entries_used = 0;
 uint32_t g_dc_clock = 0;  // the clock hand for pool-full evictions outside the run
 uint32_t g_dc_frame = 1;
 int32_t g_dc_mode = 0;        // per-frame latch of gpu_dcache: 0 off, 1 verify, 2 consume
-bool g_dc_cycle_off = false;  // gpu_dcache_cycle: the off phase
 // The bindings half talks to NrUpdateBindings through these (set around the
 // call by IssueDrawImpl): the entry to restore from (consume), the entry to
 // compare against (verify).
@@ -3277,8 +3274,7 @@ void DcReport(double secs) {
   const double draws = double(std::max<uint64_t>(d(&DcStats::draws), 1));
   const double elig = double(std::max<uint64_t>(d(&DcStats::elig), 1));
   const double recs = double(d(&DcStats::rec) + d(&DcStats::refresh));
-  const char* phase = g_dc_mode == 0 ? "off" : g_dc_mode == 1 ? "verify"
-                                              : g_dc_cycle_off ? "off" : "consume";
+  const char* phase = g_dc_mode == 0 ? "off" : g_dc_mode == 1 ? "verify" : "consume";
   REXGPU_INFO(
       "[dcache] phase={} draws/s={:.0f} elig={:.1f}% hit={:.1f}% | miss new={} evict={} | refuse "
       "class={} conv={} tex={} di={} smp={} variant={} gen={} heap={} texref={} ps={} ibreq={} "
@@ -7280,18 +7276,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     if (g_pool_on) PoolClose(kPoolCloseFrame);
     ++g_pool_frame;
     ++g_dc_frame;  // [dcache]
-    {  // [dcache] per-frame latch: the mode and the A/B cycler phase.
+    {  // [dcache] per-frame latch of the mode (drives 859/860 shipped it:
+       // RTX 1440p +6.5..+8.2 fps, Intel neutral; the cycler is gone).
       const int32_t dm = REXCVAR_GET(gpu_dcache);
       g_dc_mode = (dm >= 0 && dm <= 2) ? dm : 0;
-      const int32_t dcyc = REXCVAR_GET(gpu_dcache_cycle);
-      if (dcyc > 0 && g_dc_mode == 2) {
-        static const auto s_dc_t0 = std::chrono::steady_clock::now();
-        const double dc_el =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_dc_t0).count();
-        g_dc_cycle_off = (uint64_t(dc_el / double(dcyc)) & 1) != 0;
-      } else {
-        g_dc_cycle_off = false;
-      }
     }
     ++g_pool.frames;
     static PoolStats s_pp;
@@ -8601,7 +8589,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   DcEntry* dc = nullptr;
   bool dc_consume = false, dc_verify = false, dc_record = false, dc_bind_ok = false;
   DcId dc_id;
-  if (g_dc_mode != 0 && !g_dc_cycle_off) {
+  if (g_dc_mode != 0) {
     ++g_dc.draws;
     // The tile replay LATCH (gpu_nr_tile_replay, default on) is not the
     // gate: every draw is dormant under the de-tile; only a live recording /
@@ -9832,7 +9820,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
 
   // [dcache] the record: a miss, an invalid entry or a verify mismatch of an
   // eligible draw that reached emission stores its derived state.
-  if (dc_record && g_dc_mode != 0 && !g_dc_cycle_off) {
+  if (dc_record && g_dc_mode != 0) {
     const uint32_t dc_smp_v = uint32_t(vertex_shader->GetSamplerBindingsAfterTranslation().size());
     const uint32_t dc_smp_p =
         pixel_shader ? uint32_t(pixel_shader->GetSamplerBindingsAfterTranslation().size()) : 0u;
