@@ -3005,6 +3005,18 @@ constexpr uint32_t kDcDiCur = 64;
 constexpr uint32_t kDcSlotBits = 16;
 constexpr uint32_t kDcProbe = 8;
 constexpr uint32_t kDcEntries = 24576;
+// The identity's snapshot ranges: kPoolRegRanges minus the registers drive
+// 857's census named as per-frame strobes that only LIVE stages read (they
+// changed on 100% / 31% of the repeats the identity failed, standing still):
+// PA_CL_UCP_0..5 (0x2388-0x239F, the user clip planes: read by the system
+// constants only) and RB_BLEND_RED..ALPHA (0x2105-0x2108, the blend constant:
+// read by the fixed-function update only, which has its own dirty check).
+// Everything left feeds the pipeline, the viewport (in the entry), the
+// bindings or the pool's variant. The pool keeps comparing the full ranges.
+constexpr uint32_t kDcRegRanges[][2] = {
+    {0x2000, 0x2006}, {0x200E, 0x2010}, {0x2080, 0x208C}, {0x2100, 0x2105}, {0x2109, 0x2115},
+    {0x2180, 0x2185}, {0x2200, 0x220C}, {0x2280, 0x2295}, {0x2300, 0x2309}, {0x2312, 0x2313},
+    {0x2380, 0x2388}};
 struct DcEntry {
   uint64_t h1 = 0, h2 = 0;
   uint32_t slot = UINT32_MAX;  // its table slot (UINT32_MAX = free)
@@ -3055,6 +3067,9 @@ bool g_dc_bind_ne = false;  // verify: the bindings half found a mismatch
 // whether the entry's pack is already the bound one.
 uint32_t g_dc_di_cur_v[kDcDiCur], g_dc_di_cur_p[kDcDiCur];
 uint32_t g_dc_di_cur_n_v = UINT32_MAX, g_dc_di_cur_n_p = UINT32_MAX;
+// [dcache] verify attribution (drive 857: ne di 29% of hits with ne tex 0):
+// whether the derive recomposed each pack on this draw.
+bool g_dc_di_recomp_v = false, g_dc_di_recomp_p = false;
 struct DcStats {
   uint64_t draws = 0, elig = 0, hit = 0, verify = 0, miss_new = 0, miss_evict = 0;
   uint64_t rec = 0, refresh = 0;
@@ -3062,6 +3077,11 @@ struct DcStats {
            ref_gen = 0, ref_heap = 0, ref_texref = 0, ref_ps = 0, ref_ibreq = 0, ref_bind = 0,
            ref_full = 0;
   uint64_t ne_prim = 0, ne_pso = 0, ne_npso = 0, ne_tex = 0, ne_smp = 0, ne_di = 0, ne_vp = 0;
+  // The verify attribution: samplers by layout / parameters / heap index;
+  // the packs by length, and per differing dword its slot kind (texture,
+  // sampler, neither) and whether the pack was not even recomposed this draw.
+  uint64_t ne_smp_lay = 0, ne_smp_par = 0, ne_smp_idx = 0;
+  uint64_t ne_di_len = 0, ne_di_tex = 0, ne_di_smp = 0, ne_di_other = 0, ne_di_stale = 0;
 };
 DcStats g_dc;
 
@@ -3105,7 +3125,7 @@ DcId DcIdentity(const RegisterFile& regs, const D3D12Shader* vs, const D3D12Shad
     buf[n++] = regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
   }
   buf[n++] = regs[XE_GPU_REG_RB_DEPTH_INFO];
-  for (const auto& r : kPoolRegRanges) {
+  for (const auto& r : kDcRegRanges) {
     for (uint32_t i = r[0]; i < r[1]; ++i) buf[n++] = regs[i];
   }
   for (uint32_t i = 0; i < 8; ++i) buf[n++] = regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i];
@@ -3257,7 +3277,8 @@ void DcReport(double secs) {
       "[dcache] phase={} draws/s={:.0f} elig={:.1f}% hit={:.1f}% | miss new={} evict={} | refuse "
       "class={} conv={} tex={} di={} smp={} variant={} gen={} heap={} texref={} ps={} ibreq={} "
       "bind={} full={} | rec/s={:.0f} refresh/s={:.0f} hits/rec={:.1f} | ne prim={} pso={} "
-      "npso={} tex={} smp={} di={} vp={} | entries {}/{}",
+      "npso={} tex={} smp={} di={} vp={} | entries {}/{} | ne2 smp lay/par/idx={}/{}/{} di "
+      "len/tex/smp/other/stale={}/{}/{}/{}/{}",
       phase, draws / secs, 100.0 * elig / draws, 100.0 * double(d(&DcStats::hit)) / elig,
       d(&DcStats::miss_new), d(&DcStats::miss_evict), d(&DcStats::ref_class),
       d(&DcStats::ref_conv), d(&DcStats::ref_tex), d(&DcStats::ref_di), d(&DcStats::ref_smp),
@@ -3267,7 +3288,9 @@ void DcReport(double secs) {
       d(&DcStats::refresh) / secs, recs > 0 ? double(d(&DcStats::hit)) / recs : 0.0,
       d(&DcStats::ne_prim), d(&DcStats::ne_pso), d(&DcStats::ne_npso), d(&DcStats::ne_tex),
       d(&DcStats::ne_smp), d(&DcStats::ne_di), d(&DcStats::ne_vp), g_dc_entries_used,
-      kDcEntries);
+      kDcEntries, d(&DcStats::ne_smp_lay), d(&DcStats::ne_smp_par), d(&DcStats::ne_smp_idx),
+      d(&DcStats::ne_di_len), d(&DcStats::ne_di_tex), d(&DcStats::ne_di_smp),
+      d(&DcStats::ne_di_other), d(&DcStats::ne_di_stale));
   s_last = c;
 }
 
@@ -15798,6 +15821,8 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
                                              ID3D12RootSignature* root_signature,
                                              bool shared_memory_is_uav, bool* refused_out) {
   ++g_n8c_binds;  // [N8C] the per-draw denominator for the four upload counters.
+  g_dc_di_recomp_v = false;  // [dcache] verify attribution
+  g_dc_di_recomp_p = false;
   // [NR-SWP] Phase 5-3b swap: this project's own UpdateBindings, bindless
   // path only, operating on the SAME member state machine as the emulated
   // one (dirty flags, constant pool, sampler allocator, root-parameter
@@ -16330,6 +16355,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (span_alloc <= kDcDiCur) {
       std::memcpy(g_dc_di_cur_v, nr_rub_di, span_alloc * sizeof(uint32_t));
       g_dc_di_cur_n_v = span_alloc;
+      g_dc_di_recomp_v = true;
     } else {
       g_dc_di_cur_n_v = UINT32_MAX;
     }
@@ -16403,6 +16429,7 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     if (span_alloc <= kDcDiCur) {
       std::memcpy(g_dc_di_cur_p, nr_rub_di, span_alloc * sizeof(uint32_t));
       g_dc_di_cur_n_p = span_alloc;
+      g_dc_di_recomp_p = true;
     } else {
       g_dc_di_cur_n_p = UINT32_MAX;
     }
@@ -16420,29 +16447,97 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   if (g_draw_prof) g_bind_ns[4] += prof_ns_since(_bp_di0);
 
   if (g_dc_bind_verify) {
-    // [dcache] verify: what the derivation produced against the entry.
+    // [dcache] verify: what the derivation produced against the entry,
+    // attributed (drive 857: ne di on 29% of hits with ne tex 0).
     const DcEntry& v = *g_dc_bind_verify;
-    bool dc_seq = v.smp_n_v == sampler_count_vertex && v.smp_n_p == sampler_count_pixel &&
-                  v.smp_uid_v == current_sampler_layout_uid_vertex_ &&
-                  v.smp_uid_p == current_sampler_layout_uid_pixel_ &&
-                  v.tex_uid_v == current_texture_layout_uid_vertex_ &&
-                  v.tex_uid_p == current_texture_layout_uid_pixel_;
-    for (uint32_t i = 0; dc_seq && i < sampler_count_vertex && i < kDcSmpMax; ++i) {
-      dc_seq = v.smp_v[i] == current_samplers_vertex_[i].value &&
-               v.si_v[i] == current_sampler_bindless_indices_vertex_[i];
+    const bool dc_lay = v.smp_n_v == sampler_count_vertex && v.smp_n_p == sampler_count_pixel &&
+                        v.smp_uid_v == current_sampler_layout_uid_vertex_ &&
+                        v.smp_uid_p == current_sampler_layout_uid_pixel_ &&
+                        v.tex_uid_v == current_texture_layout_uid_vertex_ &&
+                        v.tex_uid_p == current_texture_layout_uid_pixel_;
+    bool dc_par = dc_lay, dc_idx = dc_lay;
+    for (uint32_t i = 0; dc_lay && i < sampler_count_vertex && i < kDcSmpMax; ++i) {
+      if (v.smp_v[i] != current_samplers_vertex_[i].value) dc_par = false;
+      if (v.si_v[i] != current_sampler_bindless_indices_vertex_[i]) dc_idx = false;
     }
-    for (uint32_t i = 0; dc_seq && i < sampler_count_pixel && i < kDcSmpMax; ++i) {
-      dc_seq = v.smp_p[i] == current_samplers_pixel_[i].value &&
-               v.si_p[i] == current_sampler_bindless_indices_pixel_[i];
+    for (uint32_t i = 0; dc_lay && i < sampler_count_pixel && i < kDcSmpMax; ++i) {
+      if (v.smp_p[i] != current_samplers_pixel_[i].value) dc_par = false;
+      if (v.si_p[i] != current_sampler_bindless_indices_pixel_[i]) dc_idx = false;
     }
-    if (!dc_seq) {
+    if (!dc_lay) {
+      ++g_dc.ne_smp_lay;
+    } else {
+      if (!dc_par) ++g_dc.ne_smp_par;
+      if (!dc_idx) ++g_dc.ne_smp_idx;
+    }
+    if (!(dc_lay && dc_par && dc_idx)) {
       ++g_dc.ne_smp;
       g_dc_bind_ne = true;
     }
-    const bool dc_deq =
-        g_dc_di_cur_n_v == v.di_n_v && g_dc_di_cur_n_p == v.di_n_p &&
-        std::memcmp(g_dc_di_cur_v, v.di_v, v.di_n_v * sizeof(uint32_t)) == 0 &&
-        std::memcmp(g_dc_di_cur_p, v.di_p, v.di_n_p * sizeof(uint32_t)) == 0;
+    bool dc_deq = g_dc_di_cur_n_v == v.di_n_v && g_dc_di_cur_n_p == v.di_n_p;
+    if (!dc_deq) {
+      ++g_dc.ne_di_len;
+    } else {
+      static uint32_t s_dc_di_samples = 0;
+      static auto s_dc_di_t0 = std::chrono::steady_clock::now();
+      auto dc_attr = [&](char stage, const uint32_t* cur, const uint32_t* ent, uint32_t n,
+                         const D3D12Shader::TextureBinding* tb, size_t tn,
+                         const D3D12Shader::SamplerBinding* sb, size_t sn, bool recomposed) {
+        for (uint32_t k = 0; k < n; ++k) {
+          if (cur[k] == ent[k]) continue;
+          dc_deq = false;
+          int kind = 2;
+          uint32_t fc = UINT32_MAX;
+          for (size_t i = 0; i < tn; ++i) {
+            if (tb[i].bindless_descriptor_index == k) {
+              kind = 0;
+              fc = tb[i].fetch_constant;
+              break;
+            }
+          }
+          for (size_t i = 0; kind == 2 && i < sn; ++i) {
+            if (sb[i].bindless_descriptor_index == k) {
+              kind = 1;
+              fc = sb[i].fetch_constant;
+            }
+          }
+          if (kind == 0) {
+            ++g_dc.ne_di_tex;
+          } else if (kind == 1) {
+            ++g_dc.ne_di_smp;
+          } else {
+            ++g_dc.ne_di_other;
+          }
+          if (!recomposed) ++g_dc.ne_di_stale;
+          const auto now = std::chrono::steady_clock::now();
+          if (now - s_dc_di_t0 >= std::chrono::seconds(1)) {
+            s_dc_di_t0 = now;
+            s_dc_di_samples = 0;
+          }
+          if (s_dc_di_samples < 4) {
+            ++s_dc_di_samples;
+            uint64_t texh = 0;
+            uint32_t has = 0;
+            if (kind == 0 && fc != UINT32_MAX) {
+              nr::ResSrvBindingFacts f;
+              texture_cache_->NrDescribeActiveBinding(fc, &f);
+              texh = f.texture_handle;
+              has = f.has_binding;
+            }
+            REXGPU_INFO(
+                "[dcache] di ne stage={} slot={} kind={} fc={} entry={} now={} recomposed={} "
+                "tex={:#x} has={} frame={} entry_frame={}",
+                stage, k, kind == 0 ? "tex" : kind == 1 ? "smp" : "other", fc, ent[k], cur[k],
+                recomposed ? 1 : 0, texh, has, g_dc_frame, v.frame);
+          }
+        }
+      };
+      dc_attr('v', g_dc_di_cur_v, v.di_v, v.di_n_v, textures_vertex.data(), texture_count_vertex,
+              samplers_vertex.data(), sampler_count_vertex, g_dc_di_recomp_v);
+      dc_attr('p', g_dc_di_cur_p, v.di_p, v.di_n_p, textures_pixel ? textures_pixel->data() : nullptr,
+              texture_count_pixel, samplers_pixel ? samplers_pixel->data() : nullptr,
+              sampler_count_pixel, g_dc_di_recomp_p);
+    }
     if (!dc_deq) {
       ++g_dc.ne_di;
       g_dc_bind_ne = true;
