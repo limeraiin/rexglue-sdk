@@ -30,6 +30,29 @@ REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
 namespace rex::graphics {
 using namespace ucode;
 
+// [ia] One input element per {binding, first word, word count}; the register
+// is v2 + the element's index. The analysis caps eligible shaders at 30
+// fetches (v2..v31), so this never overflows for an eligible shader.
+uint32_t DxbcShaderTranslator::FindOrAddVertexInputElement(uint32_t binding,
+                                                           uint32_t offset_bytes,
+                                                           uint32_t word_count) {
+  for (const VertexInputElement& e : vertex_input_elements_) {
+    if (e.binding == binding && e.offset_bytes == offset_bytes && e.word_count == word_count) {
+      return e.register_index;
+    }
+  }
+  if (vertex_input_elements_.size() >= kMaxVertexInputElements) {
+    assert_always();
+    return UINT32_MAX;
+  }
+  VertexInputElement& e = vertex_input_elements_.emplace_back();
+  e.binding = binding;
+  e.offset_bytes = offset_bytes;
+  e.word_count = word_count;
+  e.register_index = kInRegisterVSVertexInput0 + uint32_t(vertex_input_elements_.size() - 1);
+  return e.register_index;
+}
+
 void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
   if (emit_source_map_) {
@@ -49,6 +72,33 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     // Unpacking assumes at least some word is needed.
     StoreResult(instr.result, dxbc::Src::LF(0.0f));
     return;
+  }
+
+  // [ia] The input-assembler variant: the needed words of this fetch arrive
+  // in an input register the IA filled from a host-order vertex buffer view
+  // (offset = the fetch's dword offset + the first needed word, stride = the
+  // binding's). No address math, no shared-memory load, no endian switch;
+  // the unpack below runs unchanged on the same words.
+  uint32_t ia_register = UINT32_MAX;
+  uint32_t ia_first_word = 0, ia_last_word = 0;
+  if (needed_words && IsVertexShaderIaFetch()) {
+    uint32_t binding = UINT32_MAX;
+    for (const Shader::VertexBinding& vertex_binding : current_shader().vertex_bindings()) {
+      if (vertex_binding.fetch_constant == instr.operands[1].storage_index) {
+        binding = uint32_t(vertex_binding.binding_index);
+        break;
+      }
+    }
+    rex::bit_scan_forward(needed_words, &ia_first_word);
+    ia_last_word = ia_first_word;
+    while (needed_words >> (ia_last_word + 1)) {
+      ++ia_last_word;
+    }
+    const int32_t first_offset_words = instr.attributes.offset + int32_t(ia_first_word);
+    if (binding != UINT32_MAX && first_offset_words >= 0) {
+      ia_register = FindOrAddVertexInputElement(binding, uint32_t(first_offset_words) * 4,
+                                                ia_last_word - ia_first_word + 1);
+    }
   }
 
   // Create a 2-component dxbc::Src for the fetch constant (vf0 is in [0].xy of
@@ -73,7 +123,9 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   //   vfetch_mini).
 
   dxbc::Src address_src(dxbc::Src::R(system_temp_grad_v_vfetch_address_, dxbc::Src::kWWWW));
-  if (!instr.is_mini_fetch) {
+  // [ia] An IA variant never needs the address (every fetch of an eligible
+  // shader takes the IA path; a mini fetch has its own element).
+  if (!instr.is_mini_fetch && !IsVertexShaderIaFetch()) {
     dxbc::Dest address_dest(dxbc::Dest::R(system_temp_grad_v_vfetch_address_, 0b1000));
     if (instr.attributes.stride) {
       // Convert the index to an integer by flooring or by rounding to the
@@ -116,6 +168,20 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     return;
   }
 
+  dxbc::Src result_src(dxbc::Src::R(system_temp_result_));
+
+  if (ia_register != UINT32_MAX) {
+    // [ia] result.<needed words> = v[element].<x..>: word w of the fetch is
+    // component (w - first) of the element.
+    uint32_t ia_swizzle = 0;
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t src_component =
+          (c >= ia_first_word && c <= ia_last_word) ? (c - ia_first_word) : 0;
+      ia_swizzle |= src_component << (c * 2);
+    }
+    a_.OpMov(dxbc::Dest::R(system_temp_result_, needed_words),
+             dxbc::Src::V1D(ia_register, ia_swizzle));
+  } else {
   dxbc::Dest address_temp_dest(dxbc::Dest::R(system_temp_result_, 0b1000));
   dxbc::Src address_temp_src(dxbc::Src::R(system_temp_result_, dxbc::Src::kWWWW));
 
@@ -209,8 +275,6 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   }
   a_.OpEndIf();
 
-  dxbc::Src result_src(dxbc::Src::R(system_temp_result_));
-
   // - Endian swap the words.
 
   {
@@ -262,6 +326,7 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     // Release endian_temp (if allocated) and swap_temp.
     PopSystemTemp((endian_temp != swap_temp) ? 2 : 1);
   }
+  }  // [ia] the shared-memory load + endian swap (the raw variant)
 
   // - Unpack the format.
 

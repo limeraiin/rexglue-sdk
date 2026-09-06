@@ -1832,6 +1832,15 @@ ID3D12PipelineState* PipelineCache::NrNativePipeline(void* pipeline_handle,
   if (vs) {
     blobs.vs = vs->data();
     blobs.vs_size = vs->size();
+    // [ia] The input-assembler variant's elements (thread-local like the
+    // delegated builder's: creation runs on several threads).
+    const auto& ia_elements = runtime_description.vertex_shader->GetVertexInputElements();
+    if (!ia_elements.empty()) {
+      thread_local std::vector<D3D12_INPUT_ELEMENT_DESC> tls_npso_input_elements;
+      BuildD3D12InputElements(ia_elements, tls_npso_input_elements);
+      blobs.input_elements = tls_npso_input_elements.data();
+      blobs.input_element_count = uint32_t(tls_npso_input_elements.size());
+    }
   }
   if (runtime_description.pixel_shader) {
     const std::vector<uint8_t>* ps =
@@ -3392,6 +3401,28 @@ const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey 
 // runtime description on the same thread. Reads the runtime description and
 // the render target cache's device-level properties; writes only state_desc,
 // which it zeroes first so two builds are byte-comparable.
+void PipelineCache::BuildD3D12InputElements(
+    const std::vector<DxbcShaderTranslator::VertexInputElement>& elements,
+    std::vector<D3D12_INPUT_ELEMENT_DESC>& out) {
+  static const DXGI_FORMAT kWordFormats[4] = {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_UINT,
+                                              DXGI_FORMAT_R32G32B32_UINT,
+                                              DXGI_FORMAT_R32G32B32A32_UINT};
+  out.clear();
+  out.reserve(elements.size());
+  for (size_t i = 0; i < elements.size(); ++i) {
+    const DxbcShaderTranslator::VertexInputElement& e = elements[i];
+    D3D12_INPUT_ELEMENT_DESC d = {};
+    d.SemanticName = "XEVF";
+    d.SemanticIndex = UINT(i);
+    d.Format = kWordFormats[std::clamp<uint32_t>(e.word_count, 1, 4) - 1];
+    d.InputSlot = e.binding;
+    d.AlignedByteOffset = e.offset_bytes;
+    d.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    d.InstanceDataStepRate = 0;
+    out.push_back(d);
+  }
+}
+
 bool PipelineCache::BuildD3D12PipelineStateDesc(
     const PipelineRuntimeDescription& runtime_description,
     D3D12_GRAPHICS_PIPELINE_STATE_DESC& state_desc) {
@@ -3515,6 +3546,18 @@ bool PipelineCache::BuildD3D12PipelineStateDesc(
     }
     state_desc.VS.pShaderBytecode = runtime_description.vertex_shader->translated_binary().data();
     state_desc.VS.BytecodeLength = runtime_description.vertex_shader->translated_binary().size();
+    // [ia] The input-assembler variant declares its elements; the array lives
+    // in thread-local storage (creation runs on several threads) and is valid
+    // until this thread's next build, which is after the create.
+    {
+      const auto& elements = runtime_description.vertex_shader->GetVertexInputElements();
+      if (!elements.empty()) {
+        thread_local std::vector<D3D12_INPUT_ELEMENT_DESC> tls_input_elements;
+        BuildD3D12InputElements(elements, tls_input_elements);
+        state_desc.InputLayout.pInputElementDescs = tls_input_elements.data();
+        state_desc.InputLayout.NumElements = UINT(tls_input_elements.size());
+      }
+    }
     PipelinePrimitiveTopologyType primitive_topology_type =
         PipelinePrimitiveTopologyType(description.primitive_topology_type_or_tessellation_mode);
     switch (primitive_topology_type) {
@@ -3844,10 +3887,24 @@ ID3D12PipelineState* PipelineCache::CreateGraphicsPipelineWithLibrary(
       // the layout changed (2026-09-05: 6738 pipelines recompiled on every
       // boot, 98 s on the Intel UHD, hidden on NVIDIA by the driver cache).
       uint64_t rs_hash;
+      // [ia] The input layout's elements (the pointer is zeroed below).
+      uint64_t il_hash;
     } key;
     std::memset(&key, 0, sizeof(key));
     key.desc = state_desc;
     key.rs_hash = command_processor_.GetRootSignatureHash(state_desc.pRootSignature);
+    if (state_desc.InputLayout.NumElements && state_desc.InputLayout.pInputElementDescs) {
+      struct ElementKey {
+        uint32_t semantic_index, format, slot, offset;
+      };
+      ElementKey element_keys[32];
+      const uint32_t n = std::min<uint32_t>(state_desc.InputLayout.NumElements, 32);
+      for (uint32_t i = 0; i < n; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& e = state_desc.InputLayout.pInputElementDescs[i];
+        element_keys[i] = {e.SemanticIndex, uint32_t(e.Format), e.InputSlot, e.AlignedByteOffset};
+      }
+      key.il_hash = XXH3_64bits(element_keys, sizeof(ElementKey) * n) ^ n;
+    }
     key.desc.pRootSignature = nullptr;
     key.desc.VS.pShaderBytecode = nullptr;
     key.desc.PS.pShaderBytecode = nullptr;

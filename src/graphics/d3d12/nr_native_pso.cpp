@@ -158,6 +158,11 @@ uint32_t NrNpsoBuildStateDesc(const NrPsoDesc& desc, const NrNpsoEnv& env,
   }
   out->VS.pShaderBytecode = blobs.vs;
   out->VS.BytecodeLength = blobs.vs_size;
+  // [ia] The input-assembler variant's elements.
+  if (blobs.input_elements && blobs.input_element_count) {
+    out->InputLayout.pInputElementDescs = blobs.input_elements;
+    out->InputLayout.NumElements = blobs.input_element_count;
+  }
   switch (desc.primitive_topology_type_or_tessellation_mode) {
     case kNrPsoTopologyPoint:
       out->PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
@@ -408,6 +413,26 @@ uint32_t NrNpsoCompareStateDesc(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& ours,
     std::memset(&(a.*kStages[stage]), 0, sizeof(D3D12_SHADER_BYTECODE));
     std::memset(&(b.*kStages[stage]), 0, sizeof(D3D12_SHADER_BYTECODE));
   }
+  // [ia] The input layout's elements live in different arrays by
+  // construction: compare them by value, then exclude the pointer.
+  if (a.InputLayout.NumElements != b.InputLayout.NumElements) {
+    *offset_out = uint32_t(offsetof(D3D12_GRAPHICS_PIPELINE_STATE_DESC, InputLayout));
+    return kNrNpsoCmpField;
+  }
+  for (uint32_t i = 0; i < a.InputLayout.NumElements; ++i) {
+    const D3D12_INPUT_ELEMENT_DESC& ea = a.InputLayout.pInputElementDescs[i];
+    const D3D12_INPUT_ELEMENT_DESC& eb = b.InputLayout.pInputElementDescs[i];
+    if (ea.SemanticIndex != eb.SemanticIndex || ea.Format != eb.Format ||
+        ea.InputSlot != eb.InputSlot || ea.AlignedByteOffset != eb.AlignedByteOffset ||
+        ea.InputSlotClass != eb.InputSlotClass ||
+        ea.InstanceDataStepRate != eb.InstanceDataStepRate ||
+        std::strcmp(ea.SemanticName ? ea.SemanticName : "", eb.SemanticName ? eb.SemanticName : "")) {
+      *offset_out = uint32_t(offsetof(D3D12_GRAPHICS_PIPELINE_STATE_DESC, InputLayout));
+      return kNrNpsoCmpField;
+    }
+  }
+  a.InputLayout.pInputElementDescs = nullptr;
+  b.InputLayout.pInputElementDescs = nullptr;
   const uint8_t* pa = reinterpret_cast<const uint8_t*>(&a);
   const uint8_t* pb = reinterpret_cast<const uint8_t*>(&b);
   for (size_t i = 0; i < sizeof(a); ++i) {

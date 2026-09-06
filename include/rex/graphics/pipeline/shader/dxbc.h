@@ -26,6 +26,17 @@ class DxbcShader : public Shader {
    public:
     DxbcTranslation(DxbcShader& shader, uint64_t modification)
         : Translation(shader, modification) {}
+
+    // [ia] The input elements this translation's vertex shader declares (the
+    // input-assembler variant only; empty otherwise). Slot = the shader's
+    // vertex_bindings() index; stride = that binding's stride_words * 4.
+    const std::vector<DxbcShaderTranslator::VertexInputElement>& GetVertexInputElements() const {
+      return vertex_input_elements_;
+    }
+
+   private:
+    friend class DxbcShaderTranslator;
+    std::vector<DxbcShaderTranslator::VertexInputElement> vertex_input_elements_;
   };
 
   DxbcShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash, const uint32_t* ucode_dwords,

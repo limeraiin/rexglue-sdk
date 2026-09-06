@@ -168,6 +168,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // instead of the single shared block. Only emitted when the shader has
       // float constants and does NOT use dynamic float addressing.
       uint32_t instanced : 1;
+      // [ia] The input-assembler vertex fetch variant: every vfetch reads its
+      // words from an input register (v2..) the IA fetched from a host-order
+      // vertex buffer view instead of the shared memory ld_raw + endian swap
+      // chain; r0.x = utof(SV_VertexID) with no swap, offset or clamp (the
+      // draw binds a host-order index buffer and BaseVertexLocation). Only
+      // honoured for a shader whose PosPath::ia_eligible is set.
+      uint32_t ia_fetch : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -639,6 +646,32 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // fixed register above every layout-dependent one (VS: o31, PS: v31).
   static constexpr uint32_t kInterstageRegisterInstanceID = 31;
   static constexpr uint32_t kInRegisterDSControlPointIndex = 0;
+  // [ia] The first vertex input element register (XEVF0 = v2, XEVF1 = v3...).
+  static constexpr uint32_t kInRegisterVSVertexInput0 = 2;
+
+ public:
+  // [ia] One D3D12 input element of the input-assembler variant: `word_count`
+  // consecutive dwords at `offset_bytes` of vertex binding `binding` (the
+  // shader's vertex_bindings() index = the input slot), delivered as uints in
+  // v[register_index].x.. (semantic XEVF<n>, n = the element's index).
+  struct VertexInputElement {
+    uint32_t binding;
+    uint32_t offset_bytes;
+    uint32_t word_count;
+    uint32_t register_index;
+  };
+  // v2..v31 (SM 5.1 has 32 input registers; XEINSTANCEID is an OUTPUT, o31).
+  static constexpr uint32_t kMaxVertexInputElements = 30;
+
+ private:
+  // [ia] True when this translation is the input-assembler fetch variant of an
+  // eligible vertex shader.
+  bool IsVertexShaderIaFetch() const {
+    return IsDxbcVertexShader() && GetDxbcShaderModification().vertex.ia_fetch &&
+           current_shader().pos_path().ia_eligible;
+  }
+  uint32_t FindOrAddVertexInputElement(uint32_t binding, uint32_t offset_bytes,
+                                       uint32_t word_count);
 
   // [GPU-INST] True when the current translation is the instancing variant of a
   // vertex shader that actually has instanceable float constants (has float
@@ -1125,6 +1158,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t uav_index_edram_;
 
   std::vector<SamplerBinding> sampler_bindings_;
+
+  // [ia] The input elements of the current translation (empty unless the
+  // input-assembler variant); copied to the DxbcTranslation in PostTranslation.
+  std::vector<VertexInputElement> vertex_input_elements_;
 };
 
 }  // namespace rex::graphics

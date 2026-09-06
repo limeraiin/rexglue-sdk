@@ -326,6 +326,11 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
     pos_tracker_->Finish(pos_path_);
     delete pos_tracker_;
     pos_tracker_ = nullptr;
+    // [ia] a dynamically addressed r# may alias r0.x: the raw path only.
+    if (pos_path_.ia_eligible && uses_register_dynamic_addressing_) {
+      pos_path_.ia_eligible = false;
+      pos_path_.ia_reason = PosPath::kIaDynamicAddressing;
+    }
   }
   is_ucode_analyzed_ = true;
 

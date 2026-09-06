@@ -114,6 +114,7 @@ void DxbcShaderTranslator::Reset() {
   ShaderTranslator::Reset();
 
   shader_code_.clear();
+  vertex_input_elements_.clear();  // [ia]
 
   cbuffer_count_ = 0;
   // System constants always used in prologues/epilogues.
@@ -359,6 +360,20 @@ void DxbcShaderTranslator::StartVertexShader_LoadVertexIndex() {
 
   dxbc::Dest index_dest(dxbc::Dest::R(reg, 0b0001));
   dxbc::Src index_src(dxbc::Src::R(reg, dxbc::Src::kXXXX));
+
+  // [ia] The input-assembler variant: the draw binds a host-order index
+  // buffer and carries VGT_INDX_OFFSET in BaseVertexLocation, so SV_VertexID
+  // IS the guest vertex index (no swap, no offset, no line-loop closing: the
+  // draw path refuses line loops; the 24-bit mask and the VGT_MIN/MAX clamp
+  // are dropped, an app contract the IA cannot apply).
+  if (IsVertexShaderIaFetch()) {
+    a_.OpUToF(index_dest, dxbc::Src::V1D(kInRegisterVSVertexIndex, dxbc::Src::kXXXX));
+    if (uses_register_dynamic_addressing) {
+      a_.OpMov(dxbc::Dest::X(0, 0, 0b0001), index_src);
+      PopSystemTemp();
+    }
+    return;
+  }
 
   // Check if the closing vertex of a non-indexed line loop is being processed.
   a_.OpINE(
@@ -1255,6 +1270,12 @@ void DxbcShaderTranslator::PostTranslation() {
   Shader::Translation& translation = current_translation();
   if (!translation.is_valid()) {
     return;
+  }
+  // [ia] The input elements belong to the translation (only the
+  // input-assembler variant declares any).
+  if (DxbcShader::DxbcTranslation* dxbc_translation =
+          dynamic_cast<DxbcShader::DxbcTranslation*>(&translation)) {
+    dxbc_translation->vertex_input_elements_ = vertex_input_elements_;
   }
   DxbcShader* dxbc_shader = dynamic_cast<DxbcShader*>(&translation.shader());
   if (dxbc_shader &&
@@ -2613,6 +2634,26 @@ void DxbcShaderTranslator::WriteInputSignature() {
       instance_id.always_reads_mask = 0b0001;
     }
 
+    // [ia] The vertex input elements (XEVF<n>, uint words) of the
+    // input-assembler variant; records stay contiguous before the strings.
+    const uint32_t vertex_input_count = uint32_t(vertex_input_elements_.size());
+    size_t vertex_input_position = shader_object_.size();
+    if (vertex_input_count) {
+      shader_object_.resize(shader_object_.size() + vertex_input_count * kParameterDwords);
+      parameter_count += vertex_input_count;
+      for (uint32_t i = 0; i < vertex_input_count; ++i) {
+        auto& element = *reinterpret_cast<dxbc::SignatureParameter*>(
+            shader_object_.data() + vertex_input_position + i * kParameterDwords);
+        const VertexInputElement& e = vertex_input_elements_[i];
+        element.semantic_index = i;
+        element.system_value = dxbc::Name::kUndefined;
+        element.component_type = dxbc::SignatureRegisterComponentType::kUInt32;
+        element.register_index = e.register_index;
+        element.mask = uint8_t((1u << e.word_count) - 1);
+        element.always_reads_mask = element.mask;
+      }
+    }
+
     // Semantic names.
     uint32_t semantic_offset = uint32_t((shader_object_.size() - blob_position) * sizeof(uint32_t));
     {
@@ -2626,6 +2667,15 @@ void DxbcShaderTranslator::WriteInputSignature() {
                                                                        instance_id_position);
       instance_id.semantic_name_ptr = semantic_offset;
       semantic_offset += dxbc::AppendAlignedString(shader_object_, "SV_InstanceID");
+    }
+    if (vertex_input_count) {
+      // [ia] one shared name, distinct semantic indices.
+      for (uint32_t i = 0; i < vertex_input_count; ++i) {
+        auto& element = *reinterpret_cast<dxbc::SignatureParameter*>(
+            shader_object_.data() + vertex_input_position + i * kParameterDwords);
+        element.semantic_name_ptr = semantic_offset;
+      }
+      semantic_offset += dxbc::AppendAlignedString(shader_object_, "XEVF");
     }
   } else if (IsDxbcDomainShader()) {
     // Control point indices, byte-swapped, biased according to the base index
@@ -3409,6 +3459,10 @@ void DxbcShaderTranslator::WriteShaderCode() {
       if (IsVertexShaderInstanced()) {
         ao_.OpDclInputSGV(dxbc::Dest::V1D(kInRegisterVSInstanceID, 0b0001),
                           dxbc::Name::kInstanceID);
+      }
+      // [ia] The vertex input elements of the input-assembler variant.
+      for (const VertexInputElement& e : vertex_input_elements_) {
+        ao_.OpDclInput(dxbc::Dest::V1D(e.register_index, (1u << e.word_count) - 1));
       }
     }
     // Interpolator output.

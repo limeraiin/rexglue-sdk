@@ -41,6 +41,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
+#include <rex/graphics/d3d12/vb_mirror.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -1316,6 +1317,34 @@ class D3D12CommandProcessor : public CommandProcessor {
       hiz_verdict_readback_;
   const uint32_t* hiz_verdict_mapping_ = nullptr;
   bool hiz_available_ = false;
+
+  // [ia] The input-assembler vertex path (NEXT-AGENT.md 2026-09-07): the
+  // host-order mirror, the per-frame phase latch (the cycler), the current
+  // draw's indirect-argument dwords 2/3 (start vertex / base vertex, also
+  // written into the Hi-Z table) and the vertex buffer view latches.
+  bool InitializeIaResources();
+  void ShutdownIaResources();
+  void IaLatchReset() {
+    for (IaVbLatch& l : ia_vb_latch_) {
+      l = IaVbLatch{};
+    }
+  }
+  void IaReport1Hz(double secs, double frames);
+  std::unique_ptr<VbMirror> vb_mirror_;
+  bool ia_available_ = false;
+  uint32_t ia_phase_ = 0;  // latched per frame: 1 IA, 0 raw
+  uint32_t ia_arg_dword2_ = 0;
+  uint32_t ia_arg_dword3_ = 0;
+  struct IaVbLatch {
+    D3D12_GPU_VIRTUAL_ADDRESS va = 0;
+    uint32_t size = 0, stride = 0;
+  };
+  IaVbLatch ia_vb_latch_[8];
+  struct IaAcc {
+    uint64_t draws = 0, ia = 0, ref_off = 0, ref_shader = 0, ref_type = 0, ref_memx = 0,
+             ref_lloop = 0, ref_pool = 0, ref_fetch = 0, ref_alloc = 0, indxoff = 0, clamp = 0,
+             vb_binds = 0, ib_mirror = 0;
+  } ia_acc_;
   uint32_t hiz_phase_ = 0, hiz_k_ = 300, hiz_rebuild_ = 800;  // latched at frame end
   uint32_t hiz_slot_next_ = 0, hiz_sub_first_slot_ = 0, hiz_frame_slots_ = 0;
   // The last Hi-Z build: its depth target, the transfer epoch it saw and the

@@ -66,6 +66,25 @@ struct PosPath {
   xenos::SignedRepeatingFractionMode signed_rf_mode =
       xenos::SignedRepeatingFractionMode::kZeroClampMinusOne;
 
+  // [ia] The input-assembler vertex path: every vfetch_full of the shader
+  // indexes by r0.x untouched so far through an absolute fetch constant, no
+  // fetch has a negative offset or a zero / oversized stride, and when the
+  // control flow is not straight-line (loops, calls, jumps) r0.x is never
+  // written at all (program order is not execution order then). Then each
+  // fetch is a static D3D12 input element and the vertex buffer view carries
+  // the fetch constant. Independent of `eligible` (the position path).
+  enum IaReason : uint8_t {
+    kIaOk = 0,
+    kIaNoFetch,      // no vertex fetch at all
+    kIaIndexReg,     // a fetch is not indexed by an untouched r0.x
+    kIaControlFlow,  // loops / jumps and r0.x written somewhere
+    kIaAttribute,    // a negative offset, a zero or > 2048-byte stride
+    kIaOverflow,     // more fetches than the tracker holds
+    kIaDynamicAddressing,  // r# addressed dynamically (set by the shader)
+  };
+  bool ia_eligible = false;
+  IaReason ia_reason = kIaNoFetch;
+
   // m[i][j] from the vertex shader's float constants (256 float4).
   void Evaluate(const float* consts, float m[4][5]) const;
   // A compact human-readable form of M, for the per-shader log line.

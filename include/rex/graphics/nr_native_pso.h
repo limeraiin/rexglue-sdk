@@ -130,6 +130,10 @@ struct NrNpsoBlobs {
   size_t float24_round_ps_size;
   const void* float24_truncate_ps;
   size_t float24_truncate_ps_size;
+  // [ia] The vertex shader's input elements (the input-assembler variant);
+  // null / 0 for the raw-fetch variant. Caller-owned like the bytecode.
+  const D3D12_INPUT_ELEMENT_DESC* input_elements;
+  uint32_t input_element_count;
 };
 
 // ---------------------------------------------------------------------------

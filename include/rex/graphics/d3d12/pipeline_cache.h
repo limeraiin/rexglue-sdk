@@ -373,6 +373,11 @@ class PipelineCache {
   // mapping can be run for comparison without creating anything.
   bool BuildD3D12PipelineStateDesc(const PipelineRuntimeDescription& runtime_description,
                                    D3D12_GRAPHICS_PIPELINE_STATE_DESC& state_desc);
+  // [ia] The D3D12 input elements of an input-assembler vertex shader variant
+  // (XEVF<i>, uint words, slot = the vertex binding index).
+  static void BuildD3D12InputElements(
+      const std::vector<DxbcShaderTranslator::VertexInputElement>& elements,
+      std::vector<D3D12_INPUT_ELEMENT_DESC>& out);
   // [NR-NPSO] Phase 5-3a: the two callbacks the native pipeline cache reaches
   // Direct3D through, so that the module itself holds no device.
   static ID3D12PipelineState* NrNativePsoCreate(void* ctx,

@@ -384,6 +384,17 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // = hidden verdict with visible samples, must be 0), 2 skip.
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
+// [ia] The input-assembler vertex path (NEXT-AGENT.md 2026-09-07): eligible
+// vertex shaders read their attributes from host-order vertex buffer views
+// (the mirror) through the IA instead of the translated per-vertex shared
+// memory fetch; the index buffer is the mirror's too.
+REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
+                     "[ia] input-assembler vertex fetch: 0 off (the translated raw fetch), 1 on "
+                     "(default).");
+REXCVAR_DEFINE_INT32(gpu_ia_cycle, 0, "GPU/D3D12",
+                     "[ia] the in-place A/B: seconds per phase (on, then off); 0 = no cycling.");
+REXCVAR_DEFINE_UINT32(gpu_ia_mb, 256, "GPU/D3D12",
+                      "[ia] the host-order vertex/index mirror's budget in MB (64 MB chunks).");
 // [dcache] The per-draw IDENTITY cache of derived state (NEXT-AGENT.md, the
 // design pass after drive 853). A draw whose identity (everything the
 // derivation reads except the float constants) was seen before takes its
@@ -3022,6 +3033,7 @@ struct DcEntry {
   uint32_t tex_gen = 0;  // texture cache destroy generation at capture
   uint8_t valid = 0, pool_open = 0, ps_inst = 0, ib_dma = 0, tex_count = 0;
   uint8_t smp_n_v = 0, smp_n_p = 0, di_n_v = 0, di_n_p = 0;
+  uint8_t ia = 0;  // [ia] recorded under the input-assembler variant
   // Drive 858: a stage with no texture and no sampler bindings never dirties
   // or recomposes its pack (the derive gates are texture_count / sampler
   // count), so its pack mirror and layout uids are whatever the last bound
@@ -6130,6 +6142,7 @@ bool D3D12CommandProcessor::SetupContext() {
   InitializeOccCensusResources();
   nr_cull_.Initialize(memory_, shared_memory_.get());  // [cull]
   InitializeHizResources();                             // [hiz]
+  InitializeIaResources();                              // [ia]
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -6149,6 +6162,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   ShutdownOcclusionQueryResources();
   ShutdownGpuCensusResources();
   ShutdownOccCensusResources();
+  ShutdownIaResources();   // [ia]
   ShutdownHizResources();  // [hiz]
   nr_cull_.Shutdown();     // [cull]
 
@@ -7281,6 +7295,22 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       const int32_t dm = REXCVAR_GET(gpu_dcache);
       g_dc_mode = (dm >= 0 && dm <= 2) ? dm : 0;
     }
+    {  // [ia] per-frame phase latch: the cycler (seconds per phase) or the cvar.
+      uint32_t ia_phase = 0;
+      if (ia_available_) {
+        const int32_t cyc = REXCVAR_GET(gpu_ia_cycle);
+        if (cyc > 0) {
+          static const auto s_ia_t0 = std::chrono::steady_clock::now();
+          const double el =
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - s_ia_t0).count();
+          ia_phase = (uint64_t(el / double(cyc)) & 1) ? 0 : 1;
+        } else {
+          ia_phase = REXCVAR_GET(gpu_ia) != 0 ? 1 : 0;
+        }
+      }
+      ia_phase_ = ia_phase;
+      if (vb_mirror_) vb_mirror_->BeginFrame(uint32_t(g_pool_frame), submission_current_);
+    }
     ++g_pool.frames;
     static PoolStats s_pp;
     static auto s_pp_last = std::chrono::steady_clock::now();
@@ -7304,14 +7334,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         };
         REXGPU_INFO(
             "[cmd] /fr: pso {:.0f} psoh {:.0f} rs {:.0f} cbv {:.0f} c32 {:.0f} tbl {:.0f} srv {:.0f} "
-            "heaps {:.0f} ib {:.0f} topo {:.0f} vp {:.0f} sc {:.0f} rt {:.0f} blend {:.0f} sref "
-            "{:.0f} bar {:.0f} ei {:.0f} drawi {:.0f} draw {:.0f} disp {:.0f} clr {:.0f} copy {:.0f} "
-            "q {:.0f}",
+            "heaps {:.0f} ib {:.0f} vb {:.0f} topo {:.0f} vp {:.0f} sc {:.0f} rt {:.0f} blend "
+            "{:.0f} sref {:.0f} bar {:.0f} ei {:.0f} drawi {:.0f} draw {:.0f} disp {:.0f} clr "
+            "{:.0f} copy {:.0f} q {:.0f}",
             cd(Cmd::kD3DSetPipelineState), cd(Cmd::kSetPipelineStateHandle),
             cd(Cmd::kD3DSetGraphicsRootSignature), cd(Cmd::kD3DSetGraphicsRootConstantBufferView),
             cd(Cmd::kD3DSetGraphicsRoot32BitConstants), cd(Cmd::kD3DSetGraphicsRootDescriptorTable),
             cd(Cmd::kD3DSetGraphicsRootShaderResourceView), cd(Cmd::kSetDescriptorHeaps),
-            cd(Cmd::kD3DIASetIndexBuffer), cd(Cmd::kD3DIASetPrimitiveTopology), cd(Cmd::kRSSetViewport),
+            cd(Cmd::kD3DIASetIndexBuffer), cd(Cmd::kD3DIASetVertexBuffers),
+            cd(Cmd::kD3DIASetPrimitiveTopology), cd(Cmd::kRSSetViewport),
             cd(Cmd::kRSSetScissorRect), cd(Cmd::kD3DOMSetRenderTargets), cd(Cmd::kD3DOMSetBlendFactor),
             cd(Cmd::kD3DOMSetStencilRef), cd(Cmd::kD3DResourceBarrier), cd(Cmd::kD3DExecuteIndirect),
             cd(Cmd::kD3DDrawIndexedInstanced), cd(Cmd::kD3DDrawInstanced), cd(Cmd::kD3DDispatch),
@@ -7319,6 +7350,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             cd(Cmd::kD3DCopyBufferRegion) + cd(Cmd::kD3DCopyResource) + cd(Cmd::kCopyTexture) +
                 cd(Cmd::kD3DCopyTextureRegion),
             cd(Cmd::kD3DBeginQuery) + cd(Cmd::kD3DEndQuery));
+        IaReport1Hz(secs, frames);  // [ia]
         {  // [sort] the state-sorting census (windows of the reorder class) and the sorter.
           static SortAcc s_sort;
           const SortAcc& c = g_sort;
@@ -8888,13 +8920,99 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kQuadList &&
       pixel_shader->constant_register_map().float_count != 0 && g_pool_last_pred &&
       g_pool_frame - g_pool_last_pred->ps_delta_frame <= 1;
+  // [ia] The input-assembler vertex path: decided before the modification
+  // is chosen. Every mirror entry (the vertex buffers and a kGuestDMA index
+  // buffer) is acquired now (no commands recorded); the fills are emitted
+  // after the residency loop, right before the draw's own barriers.
+  bool ia_draw = false;
+  VbMirror::Entry* ia_vb_entries[8] = {};
+  VbMirror::Entry* ia_ib_entry = nullptr;
+  ia_arg_dword2_ = 0;
+  ia_arg_dword3_ = 0;
+  {
+    ++ia_acc_.draws;
+    const std::vector<Shader::VertexBinding>& ia_bindings = vertex_shader->vertex_bindings();
+    const uint32_t ia_indx_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+    if (!ia_available_ || ia_phase_ == 0) {
+      ++ia_acc_.ref_off;
+    } else if (!vertex_shader->pos_path().ia_eligible || ia_bindings.empty() ||
+               ia_bindings.size() > rex::countof(ia_vb_entries)) {
+      ++ia_acc_.ref_shader;
+    } else if (primitive_processing_result.host_vertex_shader_type !=
+               Shader::HostVertexShaderType::kVertex) {
+      ++ia_acc_.ref_type;
+    } else if (memexport_used) {
+      ++ia_acc_.ref_memx;
+    } else if (primitive_type == xenos::PrimitiveType::kLineLoop ||
+               primitive_processing_result.line_loop_closing_index != 0) {
+      ++ia_acc_.ref_lloop;
+    } else if ((pool_open || start_instanced) && ia_indx_offset != 0) {
+      // A batch shares one base vertex: a nonzero offset stays raw there.
+      ++ia_acc_.ref_pool;
+    } else {
+      vb_mirror_->DropPendingFills();
+      ia_draw = true;
+      for (size_t b = 0; b < ia_bindings.size(); ++b) {
+        const xenos::xe_gpu_vertex_fetch_t vf =
+            regs.GetVertexFetch(ia_bindings[b].fetch_constant);
+        if (vf.type != xenos::FetchConstantType::kVertex || vf.size == 0) {
+          ia_draw = false;
+          ++ia_acc_.ref_fetch;
+          break;
+        }
+        VbMirror::Entry* e = vb_mirror_->Acquire(vf.address << 2, vf.size << 2, uint32_t(vf.endian));
+        if (!e) {
+          ia_draw = false;
+          ++ia_acc_.ref_alloc;
+          break;
+        }
+        ia_vb_entries[b] = e;
+      }
+      if (ia_draw && primitive_processing_result.index_buffer_type ==
+                         PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+        const uint32_t ib_bytes =
+            primitive_processing_result.host_draw_vertex_count *
+            (primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4);
+        ia_ib_entry = vb_mirror_->Acquire(
+            primitive_processing_result.guest_index_base, ib_bytes,
+            uint32_t(primitive_processing_result.host_shader_index_endian));
+        if (!ia_ib_entry) {
+          ia_draw = false;
+          ++ia_acc_.ref_alloc;
+        } else {
+          ++ia_acc_.ib_mirror;
+        }
+      }
+      if (!ia_draw) {
+        vb_mirror_->DropPendingFills();
+      }
+    }
+    if (ia_draw) {
+      ++ia_acc_.ia;
+      if (ia_indx_offset) {
+        ++ia_acc_.indxoff;
+      }
+      if (primitive_processing_result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+        ia_arg_dword2_ = ia_indx_offset;  // StartVertexLocation
+      } else {
+        ia_arg_dword3_ = ia_indx_offset;  // BaseVertexLocation
+      }
+      // The VGT_MIN/MAX clamp is an app contract the IA cannot apply: counted.
+      if (regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx != 0 ||
+          regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx < 0xFFFF) {
+        ++ia_acc_.clamp;
+      }
+    }
+  }
   // [dcache] the entry was recorded under another pool variant (the
   // instanced VS / PS-instanced PS are other pipelines; the PS-instanced
   // choice is a per-key runtime fact outside the identity): derive this draw
   // and re-record. The prim result was the entry's, so it is re-derived
-  // (Process is idempotent).
+  // (Process is idempotent). [ia] the IA variant is another pipeline too.
   if ((dc_consume || dc_verify) &&
-      ((dc->pool_open != 0) != pool_open || (dc->ps_inst != 0) != pool_ps_inst)) {
+      ((dc->pool_open != 0) != pool_open || (dc->ps_inst != 0) != pool_ps_inst ||
+       (dc->ia != 0) != ia_draw)) {
     ++g_dc.ref_variant;
     if (dc_consume && !primitive_processor_->Process(primitive_processing_result)) {
       return false;
@@ -8916,6 +9034,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       pipeline_cache_->GetCurrentVertexShaderModification(
           *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
           start_instanced || pool_open);
+  vertex_shader_modification.vertex.ia_fetch = ia_draw ? 1 : 0;  // [ia]
   DxbcShaderTranslator::Modification pixel_shader_modification =
       pixel_shader
           ? pipeline_cache_->GetCurrentPixelShaderModification(
@@ -9507,6 +9626,34 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   if (g_nr_res) {
     NrResVfetchFinishDraw(0);
   }
+  // [ia] The mirror fills (after the residency uploads, before the draw's
+  // own barriers) and the vertex buffer views. The views are latched; the
+  // latches reset wherever the topology latch does and with the sorter (a
+  // sort window's segments may move, so the sorter's venue binds every draw).
+  if (ia_draw) {
+    if (vb_mirror_->HasPendingFills()) {
+      shared_memory_->UseForReading();
+      vb_mirror_->EmitFills();
+    }
+    const std::vector<Shader::VertexBinding>& ia_bindings = vertex_shader->vertex_bindings();
+    for (size_t b = 0; b < ia_bindings.size(); ++b) {
+      const VbMirror::Entry* e = ia_vb_entries[b];
+      const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(ia_bindings[b].fetch_constant);
+      D3D12_VERTEX_BUFFER_VIEW view;
+      view.BufferLocation = vb_mirror_->GpuAddress(*e) + ((vf.address << 2) - e->start);
+      view.SizeInBytes = vf.size << 2;
+      view.StrideInBytes = ia_bindings[b].stride_words * 4;
+      IaVbLatch& l = ia_vb_latch_[b];
+      if (g_sort_on || l.va != view.BufferLocation || l.size != view.SizeInBytes ||
+          l.stride != view.StrideInBytes) {
+        deferred_command_list_.D3DIASetVertexBuffers(UINT(b), 1, &view);
+        l.va = view.BufferLocation;
+        l.size = view.SizeInBytes;
+        l.stride = view.StrideInBytes;
+        ++ia_acc_.vb_binds;
+      }
+    }
+  }
   if (g_draw_prof) g_draw_ns[9] += prof_ns_since(_dp_tres0);
 
   // [GPU-DRAW-DUMP] Native-renderer R&D (Ch.9 path B): emit this draw's full
@@ -9715,7 +9862,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     } else {
       OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawInstanced(
-          primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+          primitive_processing_result.host_draw_vertex_count, 1, ia_arg_dword2_, 0);
       OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
   } else {
@@ -9748,6 +9895,15 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           PushTransitionBarrier(scratch_index_buffer, D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_INDEX_BUFFER);
           index_buffer_view.BufferLocation = scratch_index_buffer->GetGPUVirtualAddress();
+        } else if (ia_ib_entry) {
+          // [ia] the host-order copy (the entry starts 4-aligned below the base).
+          index_buffer_view.BufferLocation =
+              vb_mirror_->GpuAddress(*ia_ib_entry) +
+              (primitive_processing_result.guest_index_base - ia_ib_entry->start);
+          // [NR-SPR] a mirror address can be evicted: never replayable.
+          if (g_spr_open || g_tile_rec_open) {
+            g_spr_cap.refused = true;
+          }
         } else {
           index_buffer_view.BufferLocation =
               shared_memory_->GetGPUAddress() + primitive_processing_result.guest_index_base;
@@ -9809,7 +9965,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     } else {
       OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawIndexedInstanced(
-          primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+          primitive_processing_result.host_draw_vertex_count, 1, 0, INT(ia_arg_dword3_), 0);
       OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
     if (scratch_index_buffer != nullptr) {
@@ -9865,6 +10021,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         e->frame = g_dc_frame;
         e->pool_open = pool_open ? 1 : 0;
         e->ps_inst = pool_ps_inst ? 1 : 0;
+        e->ia = ia_draw ? 1 : 0;  // [ia]
         e->pso = pipeline_handle;
         e->rootsig = root_signature;
         e->npso = nr_native_pipeline;
@@ -10891,6 +11048,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
 
   primitive_processor_->CompletedSubmissionUpdated();
 
+  if (vb_mirror_) vb_mirror_->CompletedSubmissionUpdated(submission_completed_);  // [ia]
+
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
 }
 
@@ -10970,6 +11129,7 @@ void D3D12CommandProcessor::ForceFullDrawStateReemit() {
     sampler_bindful_heap_current_ = nullptr;
   }
   primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  IaLatchReset();  // [ia]
 
   std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
   std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
@@ -11461,6 +11621,7 @@ void D3D12CommandProcessor::NrSprDrawBegin(uint32_t key, bool reusable) {
           current_graphics_root_signature_ = nullptr;
           current_graphics_root_up_to_date_ = 0;
           primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  IaLatchReset();  // [ia]
           return;
         }
         s.used = 0;
@@ -11481,6 +11642,7 @@ void D3D12CommandProcessor::NrSprDrawBegin(uint32_t key, bool reusable) {
   current_graphics_root_signature_ = nullptr;
   current_graphics_root_up_to_date_ = 0;
   primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  IaLatchReset();  // [ia]
 }
 
 void D3D12CommandProcessor::NrSprDrawEnd() {
@@ -12099,6 +12261,7 @@ bool D3D12CommandProcessor::NrSpanReplayTry() {
     current_graphics_root_signature_ = nullptr;
     current_graphics_root_up_to_date_ = 0;
     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  IaLatchReset();  // [ia]
     current_shared_memory_binding_is_uav_ = false;
   }
   ++w.rep;
@@ -13586,6 +13749,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       OccBeginSubmission();
     }
     HizBeginSubmission();  // [hiz] no window may span a submission
+    if (vb_mirror_) vb_mirror_->BeginFrame(uint32_t(g_pool_frame), submission_current_);  // [ia]
     // [GPU-PRECORD] Phase 1a: count draws per submission (segment boundaries);
     // clear any segment streams (defensive — EndSubmission already drains them).
     parallel_record_counter_ = 0;
@@ -13609,6 +13773,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       sampler_bindful_heap_current_ = nullptr;
     }
     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  IaLatchReset();  // [ia]
 
     render_target_cache_->BeginSubmission();
 
@@ -13877,6 +14042,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       render_target_cache_->ClearCache();
 
       shared_memory_->ClearCache();
+
+      if (vb_mirror_) vb_mirror_->ClearCache();  // [ia]
     }
   }
 
@@ -17453,6 +17620,58 @@ ID3D12CommandSignature* D3D12CommandProcessor::DrawCommandSignature(bool indexed
   return sig.Get();
 }
 
+// [ia] The input-assembler vertex path's host resources: the mirror (and its
+// fill pipeline) - see vb_mirror.cpp.
+bool D3D12CommandProcessor::InitializeIaResources() {
+  ia_available_ = false;
+  vb_mirror_ = std::make_unique<VbMirror>(*this, *shared_memory_);
+  if (!vb_mirror_->Initialize(REXCVAR_GET(gpu_ia_mb), 64)) {
+    vb_mirror_.reset();
+    REXGPU_WARN("[ia] off: the host-order mirror failed to initialize");
+    return false;
+  }
+  ia_available_ = true;
+  return true;
+}
+
+void D3D12CommandProcessor::ShutdownIaResources() {
+  ia_available_ = false;
+  ia_phase_ = 0;
+  vb_mirror_.reset();
+}
+
+void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
+  static IaAcc s_last;
+  static VbMirror::Stats s_mlast;
+  const IaAcc& c = ia_acc_;
+  auto d = [&](uint64_t IaAcc::*f) { return double(c.*f - s_last.*f); };
+  const double draws = d(&IaAcc::draws);
+  if (!vb_mirror_ || draws <= 0.0) {
+    s_last = c;
+    return;
+  }
+  const VbMirror::Stats& m = vb_mirror_->stats();
+  auto md = [&](uint64_t VbMirror::Stats::*f) { return double(m.*f - s_mlast.*f); };
+  const double fr = std::max(frames, 1.0);
+  const double s = std::max(secs, 1e-3);
+  REXGPU_INFO(
+      "[ia] phase={} draws/fr {:.0f} ia {:.1f}% | refuse/fr off/shader/type/memx/lloop/pool/fetch/"
+      "alloc {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} | indxoff/fr {:.1f} clamp/fr "
+      "{:.1f} ibmirror/fr {:.0f} | vb binds/fr {:.0f} | mirror entries {} MB {:.1f}/{} chunks {} | "
+      "fills/s {:.0f} MB/s {:.2f} hits/s {:.0f} evict/s {:.0f} allocfail/s {:.0f}",
+      ia_phase_ ? "on" : "off", draws / fr, 100.0 * d(&IaAcc::ia) / draws, d(&IaAcc::ref_off) / fr,
+      d(&IaAcc::ref_shader) / fr, d(&IaAcc::ref_type) / fr, d(&IaAcc::ref_memx) / fr,
+      d(&IaAcc::ref_lloop) / fr, d(&IaAcc::ref_pool) / fr, d(&IaAcc::ref_fetch) / fr,
+      d(&IaAcc::ref_alloc) / fr, d(&IaAcc::indxoff) / fr, d(&IaAcc::clamp) / fr,
+      d(&IaAcc::ib_mirror) / fr, d(&IaAcc::vb_binds) / fr, vb_mirror_->entry_count(),
+      double(vb_mirror_->bytes_used()) / double(1u << 20), vb_mirror_->bytes_budget() >> 20,
+      vb_mirror_->chunk_count(), md(&VbMirror::Stats::fills) / s,
+      md(&VbMirror::Stats::fill_bytes) / s / double(1u << 20), md(&VbMirror::Stats::hits) / s,
+      md(&VbMirror::Stats::evicts) / s, md(&VbMirror::Stats::alloc_fail) / s);
+  s_last = c;
+  s_mlast = m;
+}
+
 bool D3D12CommandProcessor::InitializeHizResources() {
   hiz_available_ = false;
   if (!bindless_resources_used_) {
@@ -17934,8 +18153,8 @@ void D3D12CommandProcessor::HizAppend(uint32_t slot, const HizDrawPending* d, ui
   e[7] = 0;  // argument dword 4: base vertex (indexed) / start instance
   e[8] = host_count;
   e[9] = 1;   // instances
-  e[10] = 0;  // start index / start vertex
-  e[11] = 0;  // base vertex (indexed) / start instance (non-indexed)
+  e[10] = ia_arg_dword2_;  // start index / start vertex ([ia]: VGT_INDX_OFFSET, non-indexed)
+  e[11] = ia_arg_dword3_;  // base vertex (indexed, [ia]: VGT_INDX_OFFSET) / start instance
   ++hiz_window_.count;
   hiz_window_.header[0] = hiz_window_.count;  // read by the test CS at GPU time
 }
@@ -18038,6 +18257,7 @@ void D3D12CommandProcessor::SortLatchReset() {
   current_graphics_root_up_to_date_ = 0;
   inst_base_dirty_ = true;
   primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  IaLatchReset();  // [ia]
 }
 
 void D3D12CommandProcessor::SortSegBegin(const void* pso, bool cls) {

@@ -190,6 +190,8 @@ struct PosPathTracker::Impl {
   Fetch last_full{};
   bool cf_unsafe = false;
   bool r0x_written = false;
+  bool fetch_overflow = false;  // [ia] a fetch the tracker could not hold
+  bool mini_without_full = false;  // [ia] a vfetch_mini with no full before it
 
   Impl() {
     for (auto& r : reg) {
@@ -294,11 +296,13 @@ void PosPathTracker::OnVertexFetch(const ParsedVertexFetchInstruction& instr, bo
     fe = im.last_full;
     fe.attributes = instr.attributes;
     if (!im.have_full) {
+      im.mini_without_full = true;
       im.Store(instr.result, nullptr, true);
       return;
     }
   }
   if (im.nfetch >= kMaxFetches) {
+    im.fetch_overflow = true;
     im.Store(instr.result, nullptr, true);
     return;
   }
@@ -363,6 +367,34 @@ void PosPathTracker::Finish(PosPath& out) {
   Impl& im = *impl_;
   out = PosPath{};
   out.eligible = false;
+  // [ia] The input-assembler verdict, before the position path's own early
+  // returns (the two are independent).
+  {
+    out.ia_eligible = false;
+    out.ia_reason = PosPath::kIaOk;
+    if (im.nfetch == 0) {
+      out.ia_reason = PosPath::kIaNoFetch;
+    } else if (im.fetch_overflow || im.mini_without_full || im.nfetch > 30) {
+      // 30: the elements live in v2..v31 (SM 5.1 has 32 input registers).
+      out.ia_reason = PosPath::kIaOverflow;
+    } else if (im.cf_unsafe && im.r0x_written) {
+      out.ia_reason = PosPath::kIaControlFlow;
+    } else {
+      for (uint32_t i = 0; i < im.nfetch; ++i) {
+        const Impl::Fetch& fe = im.fetches[i];
+        if (!fe.index_ok) {
+          out.ia_reason = PosPath::kIaIndexReg;
+          break;
+        }
+        if (fe.attributes.offset < 0 || fe.attributes.stride == 0 ||
+            fe.attributes.stride * 4 > 2048) {
+          out.ia_reason = PosPath::kIaAttribute;
+          break;
+        }
+      }
+    }
+    out.ia_eligible = out.ia_reason == PosPath::kIaOk;
+  }
   if (im.cf_unsafe) {
     out.reason = PosPath::kControlFlow;
     return;
