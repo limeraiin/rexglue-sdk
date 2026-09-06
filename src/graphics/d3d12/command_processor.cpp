@@ -3024,6 +3024,12 @@ struct DcEntry {
   uint32_t tex_gen = 0;  // texture cache destroy generation at capture
   uint8_t valid = 0, pool_open = 0, ps_inst = 0, ib_dma = 0, tex_count = 0;
   uint8_t smp_n_v = 0, smp_n_p = 0, di_n_v = 0, di_n_p = 0;
+  // Drive 858: a stage with no texture and no sampler bindings never dirties
+  // or recomposes its pack (the derive gates are texture_count / sampler
+  // count), so its pack mirror and layout uids are whatever the last bound
+  // stage left. Such a stage is recorded as UNBOUND (di_n 0): nothing is
+  // compared, nothing is restored, exactly as the derive path leaves it.
+  uint8_t bound_v = 0, bound_p = 0;
   void* pso = nullptr;
   ID3D12RootSignature* rootsig = nullptr;
   ID3D12PipelineState* npso = nullptr;
@@ -9830,6 +9836,11 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     const uint32_t dc_smp_v = uint32_t(vertex_shader->GetSamplerBindingsAfterTranslation().size());
     const uint32_t dc_smp_p =
         pixel_shader ? uint32_t(pixel_shader->GetSamplerBindingsAfterTranslation().size()) : 0u;
+    const bool dc_bound_v =
+        dc_smp_v != 0 || !vertex_shader->GetTextureBindingsAfterTranslation().empty();
+    const bool dc_bound_p =
+        dc_smp_p != 0 ||
+        (pixel_shader && !pixel_shader->GetTextureBindingsAfterTranslation().empty());
     bool dc_ok = true;
     if (!dc_bind_ok) {
       ++g_dc.ref_bind;
@@ -9846,8 +9857,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     } else if (uint32_t(rex::bit_count(used_texture_mask)) > kDcTexMax) {
       ++g_dc.ref_tex;
       dc_ok = false;
-    } else if (g_dc_di_cur_n_v == UINT32_MAX || g_dc_di_cur_n_v > kDcDiMax ||
-               g_dc_di_cur_n_p == UINT32_MAX || g_dc_di_cur_n_p > kDcDiMax) {
+    } else if ((dc_bound_v && (g_dc_di_cur_n_v == UINT32_MAX || g_dc_di_cur_n_v > kDcDiMax)) ||
+               (dc_bound_p && (g_dc_di_cur_n_p == UINT32_MAX || g_dc_di_cur_n_p > kDcDiMax))) {
       ++g_dc.ref_di;
       dc_ok = false;
     } else if (dc_smp_v > kDcSmpMax || dc_smp_p > kDcSmpMax ||
@@ -9907,10 +9918,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           e->smp_uid_p = current_sampler_layout_uid_pixel_;
           e->tex_uid_v = current_texture_layout_uid_vertex_;
           e->tex_uid_p = current_texture_layout_uid_pixel_;
-          e->di_n_v = uint8_t(g_dc_di_cur_n_v);
-          e->di_n_p = uint8_t(g_dc_di_cur_n_p);
-          std::memcpy(e->di_v, g_dc_di_cur_v, g_dc_di_cur_n_v * sizeof(uint32_t));
-          std::memcpy(e->di_p, g_dc_di_cur_p, g_dc_di_cur_n_p * sizeof(uint32_t));
+          e->bound_v = dc_bound_v ? 1 : 0;
+          e->bound_p = dc_bound_p ? 1 : 0;
+          e->di_n_v = dc_bound_v ? uint8_t(g_dc_di_cur_n_v) : 0;
+          e->di_n_p = dc_bound_p ? uint8_t(g_dc_di_cur_n_p) : 0;
+          std::memcpy(e->di_v, g_dc_di_cur_v, e->di_n_v * sizeof(uint32_t));
+          std::memcpy(e->di_p, g_dc_di_cur_p, e->di_n_p * sizeof(uint32_t));
           e->valid = 1;
           if (dc_refresh) {
             ++g_dc.refresh;
@@ -16149,10 +16162,14 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     // the entry): sampler params + heap indices, layout uids, and the SRV
     // keys of the restored bindings for the next derived draw's freshness
     // check.
-    current_sampler_layout_uid_vertex_ = dc_b->smp_uid_v;
-    current_sampler_layout_uid_pixel_ = dc_b->smp_uid_p;
-    current_texture_layout_uid_vertex_ = dc_b->tex_uid_v;
-    current_texture_layout_uid_pixel_ = dc_b->tex_uid_p;
+    if (dc_b->bound_v) {
+      current_sampler_layout_uid_vertex_ = dc_b->smp_uid_v;
+      current_texture_layout_uid_vertex_ = dc_b->tex_uid_v;
+    }
+    if (dc_b->bound_p) {
+      current_sampler_layout_uid_pixel_ = dc_b->smp_uid_p;
+      current_texture_layout_uid_pixel_ = dc_b->tex_uid_p;
+    }
     current_samplers_vertex_.resize(
         std::max(current_samplers_vertex_.size(), size_t(dc_b->smp_n_v)));
     current_sampler_bindless_indices_vertex_.resize(
@@ -16293,9 +16310,11 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   // Descriptor-indices constant buffers - ours, sized by the 1-BASED slot
   // rule (max_slot + 1, never tex+smp: [[descriptor-slots-one-based]]).
   if (dc_b) {
-    // [dcache] the entry's pack, uploaded only when the bound one differs.
+    // [dcache] the entry's pack, uploaded only when the bound one differs;
+    // an unbound stage is left alone (drive 858).
     const uint32_t dc_n = dc_b->di_n_v;
-    if (!(cbuffer_binding_descriptor_indices_vertex_.up_to_date && g_dc_di_cur_n_v == dc_n &&
+    if (dc_b->bound_v &&
+        !(cbuffer_binding_descriptor_indices_vertex_.up_to_date && g_dc_di_cur_n_v == dc_n &&
           std::memcmp(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t)) == 0)) {
       uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
           frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
@@ -16371,9 +16390,11 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesVertex);
   }
   if (dc_b) {
-    // [dcache] the entry's pack, uploaded only when the bound one differs.
+    // [dcache] the entry's pack, uploaded only when the bound one differs;
+    // an unbound stage is left alone (drive 858).
     const uint32_t dc_n = dc_b->di_n_p;
-    if (!(cbuffer_binding_descriptor_indices_pixel_.up_to_date && g_dc_di_cur_n_p == dc_n &&
+    if (dc_b->bound_p &&
+        !(cbuffer_binding_descriptor_indices_pixel_.up_to_date && g_dc_di_cur_n_p == dc_n &&
           std::memcmp(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t)) == 0)) {
       uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
           frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
@@ -16450,11 +16471,34 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     // [dcache] verify: what the derivation produced against the entry,
     // attributed (drive 857: ne di on 29% of hits with ne tex 0).
     const DcEntry& v = *g_dc_bind_verify;
-    const bool dc_lay = v.smp_n_v == sampler_count_vertex && v.smp_n_p == sampler_count_pixel &&
-                        v.smp_uid_v == current_sampler_layout_uid_vertex_ &&
-                        v.smp_uid_p == current_sampler_layout_uid_pixel_ &&
-                        v.tex_uid_v == current_texture_layout_uid_vertex_ &&
-                        v.tex_uid_p == current_texture_layout_uid_pixel_;
+    const bool dc_vb = texture_count_vertex != 0 || sampler_count_vertex != 0;
+    const bool dc_pb = texture_count_pixel != 0 || sampler_count_pixel != 0;
+    const bool dc_lay =
+        v.smp_n_v == sampler_count_vertex && v.smp_n_p == sampler_count_pixel &&
+        (v.bound_v != 0) == dc_vb && (v.bound_p != 0) == dc_pb &&
+        (!dc_vb || (v.smp_uid_v == current_sampler_layout_uid_vertex_ &&
+                    v.tex_uid_v == current_texture_layout_uid_vertex_)) &&
+        (!dc_pb || (v.smp_uid_p == current_sampler_layout_uid_pixel_ &&
+                    v.tex_uid_p == current_texture_layout_uid_pixel_));
+    if (!dc_lay) {
+      static uint32_t s_dc_lay_samples = 0;
+      static auto s_dc_lay_t0 = std::chrono::steady_clock::now();
+      const auto now = std::chrono::steady_clock::now();
+      if (now - s_dc_lay_t0 >= std::chrono::seconds(1)) {
+        s_dc_lay_t0 = now;
+        s_dc_lay_samples = 0;
+      }
+      if (s_dc_lay_samples < 2) {
+        ++s_dc_lay_samples;
+        REXGPU_INFO(
+            "[dcache] lay ne smp_n v/p entry={}/{} now={}/{} bound entry={}/{} now={}/{} smp_uid "
+            "v/p entry={:#x}/{:#x} now={:#x}/{:#x} tex_uid v/p entry={:#x}/{:#x} now={:#x}/{:#x}",
+            v.smp_n_v, v.smp_n_p, sampler_count_vertex, sampler_count_pixel, v.bound_v, v.bound_p,
+            dc_vb ? 1 : 0, dc_pb ? 1 : 0, v.smp_uid_v, v.smp_uid_p,
+            current_sampler_layout_uid_vertex_, current_sampler_layout_uid_pixel_, v.tex_uid_v,
+            v.tex_uid_p, current_texture_layout_uid_vertex_, current_texture_layout_uid_pixel_);
+      }
+    }
     bool dc_par = dc_lay, dc_idx = dc_lay;
     for (uint32_t i = 0; dc_lay && i < sampler_count_vertex && i < kDcSmpMax; ++i) {
       if (v.smp_v[i] != current_samplers_vertex_[i].value) dc_par = false;
@@ -16474,7 +16518,8 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
       ++g_dc.ne_smp;
       g_dc_bind_ne = true;
     }
-    bool dc_deq = g_dc_di_cur_n_v == v.di_n_v && g_dc_di_cur_n_p == v.di_n_p;
+    bool dc_deq = (!dc_vb || g_dc_di_cur_n_v == v.di_n_v) &&
+                  (!dc_pb || g_dc_di_cur_n_p == v.di_n_p);
     if (!dc_deq) {
       ++g_dc.ne_di_len;
     } else {
@@ -16532,11 +16577,17 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
           }
         }
       };
-      dc_attr('v', g_dc_di_cur_v, v.di_v, v.di_n_v, textures_vertex.data(), texture_count_vertex,
-              samplers_vertex.data(), sampler_count_vertex, g_dc_di_recomp_v);
-      dc_attr('p', g_dc_di_cur_p, v.di_p, v.di_n_p, textures_pixel ? textures_pixel->data() : nullptr,
-              texture_count_pixel, samplers_pixel ? samplers_pixel->data() : nullptr,
-              sampler_count_pixel, g_dc_di_recomp_p);
+      if (dc_vb) {
+        dc_attr('v', g_dc_di_cur_v, v.di_v, v.di_n_v, textures_vertex.data(),
+                texture_count_vertex, samplers_vertex.data(), sampler_count_vertex,
+                g_dc_di_recomp_v);
+      }
+      if (dc_pb) {
+        dc_attr('p', g_dc_di_cur_p, v.di_p, v.di_n_p,
+                textures_pixel ? textures_pixel->data() : nullptr, texture_count_pixel,
+                samplers_pixel ? samplers_pixel->data() : nullptr, sampler_count_pixel,
+                g_dc_di_recomp_p);
+      }
     }
     if (!dc_deq) {
       ++g_dc.ne_di;
