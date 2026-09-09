@@ -447,7 +447,10 @@ void VbMirror::EmitFills() {
       stats_.fill_pages += run.page_count;
       if (verify_slot && verify_slot->count < kVerifyPagesMax &&
           verify_frame_pages_ < verify_pages_per_frame_) {
-        verify_slot->page[verify_slot->count] = run.page_first;
+        // The first and the LAST page of the run alternately: the first
+        // page alone cannot see a dispatch that stops short.
+        verify_slot->page[verify_slot->count] =
+            (stats_.fills & 1) ? run.page_first + run.page_count - 1 : run.page_first;
         verify_slot->endian[verify_slot->count] = endian;
         ++verify_slot->count;
         ++verify_frame_pages_;

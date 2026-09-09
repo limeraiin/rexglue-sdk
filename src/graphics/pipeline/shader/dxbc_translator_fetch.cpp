@@ -27,6 +27,10 @@
 REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
                     "Scale texture offsets with draw resolution");
 
+// [ia] gpu_ia 3 = the hybrid bisect (see below). Defined in the D3D12 command
+// processor at global scope.
+REXCVAR_DECLARE(int32_t, gpu_ia);
+
 namespace rex::graphics {
 using namespace ucode;
 
@@ -81,6 +85,12 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   // the unpack below runs unchanged on the same words.
   uint32_t ia_register = UINT32_MAX;
   uint32_t ia_first_word = 0, ia_last_word = 0;
+  // [ia] gpu_ia 3 = the HYBRID bisect: an element lying within words 0-2
+  // arrives through the IA, every later element is fetched raw (the address
+  // is computed as in the raw variant, from r0.x = utof(SV_VertexID)). The
+  // world visible under the hybrid = the IA's delivery of later elements is
+  // the fault; still black = the fault is not the vertex data.
+  const bool ia_hybrid = IsVertexShaderIaFetch() && REXCVAR_GET(gpu_ia) == 3;
   if (needed_words && IsVertexShaderIaFetch()) {
     uint32_t binding = UINT32_MAX;
     for (const Shader::VertexBinding& vertex_binding : current_shader().vertex_bindings()) {
@@ -95,9 +105,11 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
       ++ia_last_word;
     }
     const int32_t first_offset_words = instr.attributes.offset + int32_t(ia_first_word);
-    if (binding != UINT32_MAX && first_offset_words >= 0) {
-      ia_register = FindOrAddVertexInputElement(binding, uint32_t(first_offset_words) * 4,
-                                                ia_last_word - ia_first_word + 1);
+    const uint32_t ia_word_count = ia_last_word - ia_first_word + 1;
+    if (binding != UINT32_MAX && first_offset_words >= 0 &&
+        (!ia_hybrid || uint32_t(first_offset_words) + ia_word_count <= 3)) {
+      ia_register =
+          FindOrAddVertexInputElement(binding, uint32_t(first_offset_words) * 4, ia_word_count);
     }
   }
 
@@ -124,8 +136,9 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
 
   dxbc::Src address_src(dxbc::Src::R(system_temp_grad_v_vfetch_address_, dxbc::Src::kWWWW));
   // [ia] An IA variant never needs the address (every fetch of an eligible
-  // shader takes the IA path; a mini fetch has its own element).
-  if (!instr.is_mini_fetch && !IsVertexShaderIaFetch()) {
+  // shader takes the IA path; a mini fetch has its own element) - except the
+  // hybrid bisect, whose raw fetches need it.
+  if (!instr.is_mini_fetch && (!IsVertexShaderIaFetch() || ia_hybrid)) {
     dxbc::Dest address_dest(dxbc::Dest::R(system_temp_grad_v_vfetch_address_, 0b1000));
     if (instr.attributes.stride) {
       // Convert the index to an integer by flooring or by rounding to the

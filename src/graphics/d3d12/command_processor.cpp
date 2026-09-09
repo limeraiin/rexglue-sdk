@@ -392,7 +392,12 @@ REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
                      "[ia] input-assembler vertex fetch: 0 off (the translated raw fetch), 1 on "
                      "(default), 2 = the bisect: IA with the views bound to the RAW shared memory "
                      "(no shadow, guest byte order: garbage geometry expected, black = the IA "
-                     "side).");
+                     "side), 3 = the HYBRID bisect: elements within words 0-2 through the IA, "
+                     "later elements through the raw fetch.");
+REXCVAR_DEFINE_UINT32(gpu_ia_dump, 0, "GPU/D3D12",
+                      "[ia-dump] log the runtime parameters (views, strides, attributes, index "
+                      "buffer, draw arguments) of the first N IA draws carrying an attribute past "
+                      "word 2.");
 REXCVAR_DEFINE_UINT32(gpu_ia_verify, 0, "GPU/D3D12",
                       "[ia] shadow verify: pages per frame read back and compared with the "
                       "byte-swapped guest memory (0 = off, 16 max).");
@@ -8119,6 +8124,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                 apply_gamma_dest_initial_state);
         }
 
+        // [ia] The cycle marker (user rule: the active phase must be visible
+        // at the top-left in any test mode).
+        IaSwapMarker(guest_output_resource);
+
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue.
@@ -9692,6 +9701,54 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         l.size = view.SizeInBytes;
         l.stride = view.StrideInBytes;
         ++ia_acc_.vb_binds;
+      }
+    }
+    // [ia-dump] gpu_ia_dump N: the runtime parameters of the first N IA draws
+    // carrying an attribute past word 2 (the class that draws black), one
+    // block per draw: what the GPU is given, against the model.
+    if (ia_dump_left_) {
+      bool past_word2 = false;
+      for (const Shader::VertexBinding& vb : ia_bindings) {
+        for (const Shader::VertexBinding::Attribute& a : vb.attributes) {
+          if (a.fetch_instr.attributes.offset >= 3) {
+            past_word2 = true;
+          }
+        }
+      }
+      if (past_word2) {
+        --ia_dump_left_;
+        REXGPU_INFO(
+            "[ia-dump] draw vs {:016X} ps {:016X} vsmod {:016X} prim {} ibtype {} ibfmt {} "
+            "ibendian {} ibbase {:08X} count {} indxoff {} pool {} inst {} hiz {} args2/3 {}/{} "
+            "ia_ib_va {:X}",
+            vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0),
+            vertex_shader_modification.value, uint32_t(primitive_type),
+            uint32_t(primitive_processing_result.index_buffer_type),
+            uint32_t(primitive_processing_result.host_index_format),
+            uint32_t(primitive_processing_result.host_shader_index_endian),
+            primitive_processing_result.guest_index_base,
+            primitive_processing_result.host_draw_vertex_count,
+            regs.Get<reg::VGT_INDX_OFFSET>().indx_offset, pool_open ? 1 : 0,
+            start_instanced ? 1 : 0, hiz_draw_.valid ? 1 : 0, ia_arg_dword2_, ia_arg_dword3_,
+            uint64_t(ia_ib_va));
+        for (size_t b = 0; b < ia_bindings.size(); ++b) {
+          const xenos::xe_gpu_vertex_fetch_t vf =
+              regs.GetVertexFetch(ia_bindings[b].fetch_constant);
+          std::string attrs;
+          for (const Shader::VertexBinding::Attribute& a : ia_bindings[b].attributes) {
+            attrs += fmt::format(" @{}:fmt{}{}", a.fetch_instr.attributes.offset,
+                                 uint32_t(a.fetch_instr.attributes.data_format),
+                                 a.fetch_instr.is_mini_fetch ? "m" : "");
+          }
+          REXGPU_INFO(
+              "[ia-dump]  b{} fc{} addr {:08X} size {} B endian {} stride {} dw -> view va {:X} "
+              "base {:X} size {} stride {} |{}",
+              b, ia_bindings[b].fetch_constant, uint32_t(vf.address) << 2,
+              uint32_t(vf.size) << 2, uint32_t(vf.endian), ia_bindings[b].stride_words,
+              uint64_t(ia_vb_va[b]), uint64_t(ia_vb_va[b]) - (uint64_t(vf.address) << 2),
+              uint32_t(vf.size) << 2, ia_bindings[b].stride_words * 4, attrs);
+        }
       }
     }
   }
@@ -17667,6 +17724,7 @@ bool D3D12CommandProcessor::InitializeIaResources() {
     return false;
   }
   vb_mirror_->SetVerify(memory_, std::min<uint32_t>(REXCVAR_GET(gpu_ia_verify), 16));
+  ia_dump_left_ = REXCVAR_GET(gpu_ia_dump);
   ia_available_ = true;
   return true;
 }
@@ -17675,6 +17733,78 @@ void D3D12CommandProcessor::ShutdownIaResources() {
   ia_available_ = false;
   ia_phase_ = 0;
   vb_mirror_.reset();
+  if (ia_marker_upload_) {
+    ia_marker_upload_->Unmap(0, nullptr);
+    ia_marker_upload_.Reset();
+    ia_marker_mapping_ = nullptr;
+  }
+  ia_marker_phase_ = -1;
+}
+
+// [ia] The cycle marker: a 64x64 block copied into the top-left of the guest
+// output at swap, drawn only while a test mode is active (a cycler, gpu_ia 2
+// or 3). Green = IA on, red = raw (the off phase), blue = the hybrid bisect
+// (gpu_ia 3), yellow = the raw memory through the IA (gpu_ia 2).
+void D3D12CommandProcessor::IaSwapMarker(ID3D12Resource* guest_output) {
+  const int32_t mode = REXCVAR_GET(gpu_ia);
+  if (!guest_output || (REXCVAR_GET(gpu_ia_cycle) == 0 && mode != 2 && mode != 3)) {
+    return;
+  }
+  const int phase = ia_phase_ == 0 ? 0 : (mode == 3 ? 2 : (mode == 2 ? 3 : 1));
+  constexpr uint32_t kSide = 64, kPitch = 256;  // R10G10B10A2: 64 * 4 = 256 (aligned)
+  if (!ia_marker_upload_) {
+    ID3D12Device* device = GetD3D12Provider().GetDevice();
+    D3D12_RESOURCE_DESC desc;
+    ui::d3d12::util::FillBufferResourceDesc(desc, kSide * kPitch, D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload,
+                                               D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&ia_marker_upload_)))) {
+      return;
+    }
+    void* mapping = nullptr;
+    if (FAILED(ia_marker_upload_->Map(0, nullptr, &mapping)) || !mapping) {
+      ia_marker_upload_.Reset();
+      return;
+    }
+    ia_marker_mapping_ = static_cast<uint8_t*>(mapping);
+    ia_marker_phase_ = -1;
+  }
+  if (ia_marker_phase_ != phase) {
+    // R10G10B10A2_UNORM: r | g << 10 | b << 20 | a << 30.
+    static const uint32_t kColors[4] = {
+        1023u | (3u << 30),                  // 0 red: raw (off)
+        (1023u << 10) | (3u << 30),          // 1 green: IA on
+        (1023u << 20) | (3u << 30),          // 2 blue: the hybrid (gpu_ia 3)
+        1023u | (1023u << 10) | (3u << 30),  // 3 yellow: raw memory through the IA (gpu_ia 2)
+    };
+    for (uint32_t y = 0; y < kSide; ++y) {
+      uint32_t* row = reinterpret_cast<uint32_t*>(ia_marker_mapping_ + y * kPitch);
+      for (uint32_t x = 0; x < kSide; ++x) {
+        row[x] = kColors[phase];
+      }
+    }
+    ia_marker_phase_ = phase;
+  }
+  D3D12_TEXTURE_COPY_LOCATION dst;
+  dst.pResource = guest_output;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION src;
+  src.pResource = ia_marker_upload_.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src.PlacedFootprint.Offset = 0;
+  src.PlacedFootprint.Footprint.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  src.PlacedFootprint.Footprint.Width = kSide;
+  src.PlacedFootprint.Footprint.Height = kSide;
+  src.PlacedFootprint.Footprint.Depth = 1;
+  src.PlacedFootprint.Footprint.RowPitch = kPitch;
+  PushTransitionBarrier(guest_output, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyTextureRegion(&dst, 16, 16, 0, &src, nullptr);
+  PushTransitionBarrier(guest_output, D3D12_RESOURCE_STATE_COPY_DEST,
+                        ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
 }
 
 void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
