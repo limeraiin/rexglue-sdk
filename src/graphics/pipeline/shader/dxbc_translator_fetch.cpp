@@ -85,12 +85,16 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   // the unpack below runs unchanged on the same words.
   uint32_t ia_register = UINT32_MAX;
   uint32_t ia_first_word = 0, ia_last_word = 0;
-  // [ia] gpu_ia 3 = the HYBRID bisect: an element lying within words 0-2
-  // arrives through the IA, every later element is fetched raw (the address
-  // is computed as in the raw variant, from r0.x = utof(SV_VertexID)). The
-  // world visible under the hybrid = the IA's delivery of later elements is
-  // the fault; still black = the fault is not the vertex data.
-  const bool ia_hybrid = IsVertexShaderIaFetch() && REXCVAR_GET(gpu_ia) == 3;
+  // [ia] The HYBRID bisects (the raw fetches compute the address as in the
+  // raw variant, from r0.x = utof(SV_VertexID)):
+  //   gpu_ia 3: elements within words 0-2 through the IA, later ones raw
+  //             (drive 867: STILL BLACK - the later elements are not it);
+  //   gpu_ia 4: the inverse: words 0-2 raw, later elements through the IA;
+  //   gpu_ia 5: EVERY element raw: the IA variant with no input layout, so
+  //             only the index path, the shadow IB, BaseVertexLocation and
+  //             the pipeline differ from the raw variant.
+  const int32_t ia_mode = REXCVAR_GET(gpu_ia);
+  const bool ia_hybrid = IsVertexShaderIaFetch() && ia_mode >= 3 && ia_mode <= 5;
   if (needed_words && IsVertexShaderIaFetch()) {
     uint32_t binding = UINT32_MAX;
     for (const Shader::VertexBinding& vertex_binding : current_shader().vertex_bindings()) {
@@ -106,8 +110,13 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     }
     const int32_t first_offset_words = instr.attributes.offset + int32_t(ia_first_word);
     const uint32_t ia_word_count = ia_last_word - ia_first_word + 1;
-    if (binding != UINT32_MAX && first_offset_words >= 0 &&
-        (!ia_hybrid || uint32_t(first_offset_words) + ia_word_count <= 3)) {
+    bool ia_take = true;
+    if (ia_hybrid) {
+      ia_take = ia_mode == 3   ? uint32_t(first_offset_words) + ia_word_count <= 3
+                : ia_mode == 4 ? first_offset_words >= 3
+                               : false;
+    }
+    if (binding != UINT32_MAX && first_offset_words >= 0 && ia_take) {
       ia_register =
           FindOrAddVertexInputElement(binding, uint32_t(first_offset_words) * 4, ia_word_count);
     }

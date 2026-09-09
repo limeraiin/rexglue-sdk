@@ -393,7 +393,10 @@ REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
                      "(default), 2 = the bisect: IA with the views bound to the RAW shared memory "
                      "(no shadow, guest byte order: garbage geometry expected, black = the IA "
                      "side), 3 = the HYBRID bisect: elements within words 0-2 through the IA, "
-                     "later elements through the raw fetch.");
+                     "later elements through the raw fetch (drive 867: still black), 4 = the "
+                     "inverse hybrid (words 0-2 raw, later elements IA), 5 = every element raw "
+                     "inside the IA variant (only the index path, the shadow IB, "
+                     "BaseVertexLocation and the pipeline differ).");
 REXCVAR_DEFINE_UINT32(gpu_ia_dump, 0, "GPU/D3D12",
                       "[ia-dump] log the runtime parameters (views, strides, attributes, index "
                       "buffer, draw arguments) of the first N IA draws carrying an attribute past "
@@ -17747,10 +17750,23 @@ void D3D12CommandProcessor::ShutdownIaResources() {
 // (gpu_ia 3), yellow = the raw memory through the IA (gpu_ia 2).
 void D3D12CommandProcessor::IaSwapMarker(ID3D12Resource* guest_output) {
   const int32_t mode = REXCVAR_GET(gpu_ia);
-  if (!guest_output || (REXCVAR_GET(gpu_ia_cycle) == 0 && mode != 2 && mode != 3)) {
+  if (!guest_output || (REXCVAR_GET(gpu_ia_cycle) == 0 && mode < 2)) {
     return;
   }
-  const int phase = ia_phase_ == 0 ? 0 : (mode == 3 ? 2 : (mode == 2 ? 3 : 1));
+  // 0 red raw, 1 green IA, 2 blue gpu_ia 3, 3 yellow gpu_ia 2, 4 cyan gpu_ia 4,
+  // 5 magenta gpu_ia 5.
+  int phase = 1;
+  if (ia_phase_ == 0) {
+    phase = 0;
+  } else if (mode == 2) {
+    phase = 3;
+  } else if (mode == 3) {
+    phase = 2;
+  } else if (mode == 4) {
+    phase = 4;
+  } else if (mode == 5) {
+    phase = 5;
+  }
   constexpr uint32_t kSide = 64, kPitch = 256;  // R10G10B10A2: 64 * 4 = 256 (aligned)
   if (!ia_marker_upload_) {
     ID3D12Device* device = GetD3D12Provider().GetDevice();
@@ -17772,11 +17788,13 @@ void D3D12CommandProcessor::IaSwapMarker(ID3D12Resource* guest_output) {
   }
   if (ia_marker_phase_ != phase) {
     // R10G10B10A2_UNORM: r | g << 10 | b << 20 | a << 30.
-    static const uint32_t kColors[4] = {
-        1023u | (3u << 30),                  // 0 red: raw (off)
-        (1023u << 10) | (3u << 30),          // 1 green: IA on
-        (1023u << 20) | (3u << 30),          // 2 blue: the hybrid (gpu_ia 3)
-        1023u | (1023u << 10) | (3u << 30),  // 3 yellow: raw memory through the IA (gpu_ia 2)
+    static const uint32_t kColors[6] = {
+        1023u | (3u << 30),                          // 0 red: raw (off)
+        (1023u << 10) | (3u << 30),                  // 1 green: IA on
+        (1023u << 20) | (3u << 30),                  // 2 blue: the hybrid (gpu_ia 3)
+        1023u | (1023u << 10) | (3u << 30),          // 3 yellow: raw memory through the IA (2)
+        (1023u << 10) | (1023u << 20) | (3u << 30),  // 4 cyan: the inverse hybrid (gpu_ia 4)
+        1023u | (1023u << 20) | (3u << 30),          // 5 magenta: every element raw (gpu_ia 5)
     };
     for (uint32_t y = 0; y < kSide; ++y) {
       uint32_t* row = reinterpret_cast<uint32_t*>(ia_marker_mapping_ + y * kPitch);
