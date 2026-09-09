@@ -17799,6 +17799,10 @@ void D3D12CommandProcessor::IaSwapMarker(ID3D12Resource* guest_output) {
   src.PlacedFootprint.Footprint.Height = kSide;
   src.PlacedFootprint.Footprint.Depth = 1;
   src.PlacedFootprint.Footprint.RowPitch = kPitch;
+  // The pending barriers first: the swap's own transition of the guest output
+  // into the internal state may be pending, and one ResourceBarrier call may
+  // not transition a subresource twice.
+  SubmitBarriers();
   PushTransitionBarrier(guest_output, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
                         D3D12_RESOURCE_STATE_COPY_DEST);
   SubmitBarriers();
