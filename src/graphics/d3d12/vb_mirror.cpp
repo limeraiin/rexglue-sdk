@@ -24,30 +24,22 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/vbm_fill_cs.h"
 }  // namespace shaders
 
-namespace {
-
-inline uint64_t EntryKey(uint32_t start, uint32_t length, uint32_t endian) {
-  return (uint64_t(start) << 32) | uint64_t(length & 0x3FFFFFFFu) | (uint64_t(endian & 3u) << 30);
-}
-
-}  // namespace
-
-VbMirror::VbMirror(D3D12CommandProcessor& command_processor, SharedMemory& shared_memory)
+VbMirror::VbMirror(D3D12CommandProcessor& command_processor, D3D12SharedMemory& shared_memory)
     : command_processor_(command_processor), shared_memory_(shared_memory) {}
 
 VbMirror::~VbMirror() { Shutdown(); }
 
-bool VbMirror::Initialize(uint32_t budget_mb, uint32_t chunk_mb) {
+bool VbMirror::Initialize(uint32_t budget_mb) {
   Shutdown();
-  chunk_mb = std::max<uint32_t>(chunk_mb, 16);
-  budget_mb = std::max<uint32_t>(budget_mb, chunk_mb);
-  chunk_bytes_ = chunk_mb << 20;
-  max_chunks_ = std::max<uint32_t>(budget_mb / chunk_mb, 1);
+  budget_bytes_ = uint64_t(std::max<uint32_t>(budget_mb, 64)) << 20;
+  page_size_log2_ = shared_memory_.GetPageSizeLog2();
+  page_count_ = SharedMemory::kBufferSize >> page_size_log2_;
+  valid_words_ = (page_count_ + 63) / 64;
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
-  // b0 = 4 constants, t0 = the shared memory (root SRV), u0 = the chunk (root UAV).
+  // b0 = 4 constants, t0 = the shared memory (root SRV), u0 = the shadow (root UAV).
   D3D12_ROOT_PARAMETER params[3] = {};
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   params[0].Constants.ShaderRegister = 0;
@@ -69,295 +61,270 @@ bool VbMirror::Initialize(uint32_t budget_mb, uint32_t chunk_mb) {
   *(fill_root_signature_.ReleaseAndGetAddressOf()) =
       ui::d3d12::util::CreateRootSignature(provider, rs_desc);
   if (!fill_root_signature_) {
-    REXGPU_WARN("[ia] mirror: fill root signature creation failed - off");
+    REXGPU_WARN("[ia] shadow: fill root signature creation failed - off");
     return false;
   }
   *(fill_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
       device, shaders::vbm_fill_cs, sizeof(shaders::vbm_fill_cs), fill_root_signature_.Get());
   if (!fill_pipeline_) {
-    REXGPU_WARN("[ia] mirror: fill pipeline creation failed - off");
+    REXGPU_WARN("[ia] shadow: fill pipeline creation failed - off");
     fill_root_signature_.Reset();
     return false;
   }
-  if (!CreateChunk()) {
+  // Every shadow up front: the global watch (another thread) reads their
+  // validity bitmaps, so none may appear later. A failure here = tiled
+  // resources unavailable = the raw path.
+  if (!EnsureShadow(1) || !EnsureShadow(2) || !EnsureShadow(3)) {
+    for (Shadow& s : shadows_) {
+      s.resource.Reset();
+      s.valid.reset();
+    }
     fill_pipeline_.Reset();
     fill_root_signature_.Reset();
     return false;
   }
+  global_watch_ = shared_memory_.RegisterGlobalWatch(&VbMirror::GlobalWatchCallback, this);
   initialized_ = true;
-  REXGPU_INFO("[ia] mirror: {} MB budget in {} MB chunks", budget_mb, chunk_mb);
+  REXGPU_INFO("[ia] shadow: {} MB budget, {} KB pages, {} MB regions", budget_mb,
+              1u << (page_size_log2_ - 10), 1u << (kRegionSizeLog2 - 20));
   return true;
 }
 
 void VbMirror::Shutdown() {
-  ClearCache();
-  chunks_.clear();
+  if (global_watch_) {
+    shared_memory_.UnregisterGlobalWatch(global_watch_);
+    global_watch_ = nullptr;
+  }
+  for (Shadow& s : shadows_) {
+    s.resource.Reset();
+    for (ID3D12Heap* heap : s.heaps) {
+      heap->Release();
+    }
+    s.heaps.clear();
+    std::memset(s.mapped, 0, sizeof(s.mapped));
+    s.valid.reset();
+    s.pending.clear();
+    s.gpu_address = 0;
+  }
+  pending_count_ = 0;
+  mapped_bytes_ = 0;
   fill_pipeline_.Reset();
   fill_root_signature_.Reset();
   initialized_ = false;
 }
 
 void VbMirror::ClearCache() {
-  for (auto& kv : entries_) {
-    Unwatch(*kv.second);
+  for (Shadow& s : shadows_) {
+    if (s.valid) {
+      for (uint32_t i = 0; i < valid_words_; ++i) {
+        s.valid[i].store(0, std::memory_order_relaxed);
+      }
+    }
+    s.pending.clear();
   }
-  entries_.clear();
-  pending_.clear();
-  lru_head_ = lru_tail_ = nullptr;
-  bytes_used_ = 0;
-  for (Chunk& c : chunks_) {
-    c.free_blocks.clear();
-    c.free_blocks.emplace(0, chunk_bytes_);
-  }
+  pending_count_ = 0;
 }
 
-bool VbMirror::CreateChunk() {
-  if (chunks_.size() >= max_chunks_) {
+bool VbMirror::EnsureShadow(uint32_t endian) {
+  if (endian == 0 || endian >= kShadowCount) {
     return false;
+  }
+  Shadow& s = shadows_[endian];
+  if (s.resource) {
+    return true;
   }
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   D3D12_RESOURCE_DESC desc;
-  ui::d3d12::util::FillBufferResourceDesc(desc, chunk_bytes_,
+  ui::d3d12::util::FillBufferResourceDesc(desc, SharedMemory::kBufferSize,
                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
-                                             D3D12_HEAP_FLAG_NONE, &desc, kSteadyState, nullptr,
-                                             IID_PPV_ARGS(&resource)))) {
-    REXGPU_WARN("[ia] mirror: chunk {} ({} MB) creation failed", chunks_.size(),
-                chunk_bytes_ >> 20);
+  if (FAILED(device->CreateReservedResource(&desc, kSteadyState, nullptr,
+                                            IID_PPV_ARGS(&resource)))) {
+    REXGPU_WARN("[ia] shadow {}: the {} MB reserved buffer failed (tiled resources?)", endian,
+                SharedMemory::kBufferSize >> 20);
     return false;
   }
-  Chunk& c = chunks_.emplace_back();
-  c.resource = std::move(resource);
-  c.gpu_address = c.resource->GetGPUVirtualAddress();
-  c.free_blocks.emplace(0, chunk_bytes_);
+  s.resource = std::move(resource);
+  s.gpu_address = s.resource->GetGPUVirtualAddress();
+  s.valid.reset(new std::atomic<uint64_t>[valid_words_]);
+  for (uint32_t i = 0; i < valid_words_; ++i) {
+    s.valid[i].store(0, std::memory_order_relaxed);
+  }
+  std::memset(s.mapped, 0, sizeof(s.mapped));
   return true;
 }
 
-bool VbMirror::AllocateBlock(uint32_t length, uint32_t* chunk, uint32_t* offset) {
-  for (uint32_t ci = 0; ci < uint32_t(chunks_.size()); ++ci) {
-    Chunk& c = chunks_[ci];
-    for (auto it = c.free_blocks.begin(); it != c.free_blocks.end(); ++it) {
-      if (it->second >= length) {
-        *chunk = ci;
-        *offset = it->first;
-        const uint32_t rest = it->second - length;
-        const uint32_t next_offset = it->first + length;
-        c.free_blocks.erase(it);
-        if (rest) {
-          c.free_blocks.emplace(next_offset, rest);
-        }
-        return true;
-      }
+bool VbMirror::MapRegions(Shadow& s, uint32_t region_first, uint32_t region_last) {
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+  for (uint32_t r = region_first; r <= region_last; ++r) {
+    if (s.mapped[r >> 6] & (uint64_t(1) << (r & 63))) {
+      continue;
+    }
+    const uint64_t region_bytes = uint64_t(1) << kRegionSizeLog2;
+    if (mapped_bytes_ + region_bytes > budget_bytes_) {
+      ++stats_.map_fail;
+      return false;
+    }
+    D3D12_HEAP_DESC heap_desc = {};
+    heap_desc.SizeInBytes = region_bytes;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | provider.GetHeapFlagCreateNotZeroed();
+    ID3D12Heap* heap;
+    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap)))) {
+      REXGPU_WARN("[ia] shadow: region heap creation failed");
+      ++stats_.map_fail;
+      return false;
+    }
+    s.heaps.push_back(heap);
+    D3D12_TILED_RESOURCE_COORDINATE start_coordinates;
+    start_coordinates.X = UINT((uint64_t(r) << kRegionSizeLog2) / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
+    start_coordinates.Y = 0;
+    start_coordinates.Z = 0;
+    start_coordinates.Subresource = 0;
+    D3D12_TILE_REGION_SIZE region_size;
+    region_size.NumTiles = UINT(region_bytes / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
+    region_size.UseBox = FALSE;
+    D3D12_TILE_RANGE_FLAGS range_flags = D3D12_TILE_RANGE_FLAG_NONE;
+    UINT heap_range_start_offset = 0;
+    direct_queue->UpdateTileMappings(s.resource.Get(), 1, &start_coordinates, &region_size, heap,
+                                     1, &range_flags, &heap_range_start_offset,
+                                     &region_size.NumTiles, D3D12_TILE_MAPPING_FLAG_NONE);
+    command_processor_.NotifyQueueOperationsDoneDirectly();
+    s.mapped[r >> 6] |= uint64_t(1) << (r & 63);
+    mapped_bytes_ += region_bytes;
+  }
+  return true;
+}
+
+void VbMirror::GlobalWatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                   void* context, uint32_t address_first, uint32_t address_last,
+                                   bool invalidated_by_gpu) {
+  VbMirror& self = *static_cast<VbMirror*>(context);
+  if (address_last < address_first) {
+    return;
+  }
+  const uint32_t page_first = address_first >> self.page_size_log2_;
+  const uint32_t page_last =
+      std::min<uint32_t>(address_last >> self.page_size_log2_, self.page_count_ - 1);
+  for (Shadow& s : self.shadows_) {
+    if (!s.valid) {
+      continue;
+    }
+    for (uint32_t w = page_first >> 6; w <= (page_last >> 6); ++w) {
+      const uint32_t lo = std::max(page_first, w << 6) & 63;
+      const uint32_t hi = std::min(page_last, (w << 6) | 63) & 63;
+      const uint64_t mask = (hi == 63 ? ~uint64_t(0) : ((uint64_t(1) << (hi + 1)) - 1)) &
+                            ~((uint64_t(1) << lo) - 1);
+      s.valid[w].fetch_and(~mask, std::memory_order_acq_rel);
     }
   }
-  return false;
+  self.stats_.stale_pages += page_last - page_first + 1;
 }
 
-void VbMirror::FreeBlock(uint32_t chunk, uint32_t offset, uint32_t length) {
-  Chunk& c = chunks_[chunk];
-  auto next = c.free_blocks.lower_bound(offset);
-  // Merge with the following block.
-  if (next != c.free_blocks.end() && next->first == offset + length) {
-    length += next->second;
-    next = c.free_blocks.erase(next);
-  }
-  // Merge with the preceding block.
-  if (next != c.free_blocks.begin()) {
-    auto prev = std::prev(next);
-    if (prev->first + prev->second == offset) {
-      prev->second += length;
-      return;
-    }
-  }
-  c.free_blocks.emplace(offset, length);
-}
-
-void VbMirror::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
-                             void* context, void* data, uint64_t argument,
-                             bool invalidated_by_gpu) {
-  Entry& e = *static_cast<Entry*>(data);
-  e.fired.store(true, std::memory_order_release);
-  e.stale.store(true, std::memory_order_release);
-}
-
-void VbMirror::Watch(Entry& e) {
-  e.fired.store(false, std::memory_order_release);
-  e.watch = shared_memory_.WatchMemoryRange(e.start, e.length, &VbMirror::WatchCallback, this, &e, 0);
-  if (!e.watch) {
-    e.fired.store(true, std::memory_order_release);
-  }
-}
-
-void VbMirror::Unwatch(Entry& e) {
-  if (e.watch && !e.fired.load(std::memory_order_acquire)) {
-    shared_memory_.UnwatchMemoryRange(e.watch);
-  }
-  e.watch = nullptr;
-  e.fired.store(true, std::memory_order_release);
-}
-
-void VbMirror::LruRemove(Entry& e) {
-  if (e.lru_prev) {
-    e.lru_prev->lru_next = e.lru_next;
-  } else if (lru_head_ == &e) {
-    lru_head_ = e.lru_next;
-  }
-  if (e.lru_next) {
-    e.lru_next->lru_prev = e.lru_prev;
-  } else if (lru_tail_ == &e) {
-    lru_tail_ = e.lru_prev;
-  }
-  e.lru_prev = e.lru_next = nullptr;
-}
-
-void VbMirror::LruPushBack(Entry& e) {
-  e.lru_prev = lru_tail_;
-  e.lru_next = nullptr;
-  if (lru_tail_) {
-    lru_tail_->lru_next = &e;
-  } else {
-    lru_head_ = &e;
-  }
-  lru_tail_ = &e;
-}
-
-void VbMirror::EvictEntry(Entry& e) {
-  Unwatch(e);
-  LruRemove(e);
-  if (e.queued) {
-    pending_.erase(std::remove(pending_.begin(), pending_.end(), &e), pending_.end());
-  }
-  const uint32_t block = (e.length + kBlockAlign - 1) & ~(kBlockAlign - 1);
-  FreeBlock(e.chunk, e.offset, block);
-  bytes_used_ -= block;
-  ++stats_.evicts;
-  entries_.erase(EntryKey(e.start, e.length, e.endian));
-}
-
-VbMirror::Entry* VbMirror::Acquire(uint32_t start, uint32_t length, uint32_t endian) {
+bool VbMirror::Acquire(uint32_t start, uint32_t length, uint32_t endian,
+                       D3D12_GPU_VIRTUAL_ADDRESS* out) {
   if (!initialized_ || !length) {
-    return nullptr;
+    return false;
   }
   ++stats_.acquires;
-  // 4-aligned outwards: the fill copies dwords; the caller adds start & 3.
-  const uint32_t aligned_start = start & ~3u;
-  const uint32_t aligned_end = (start + length + 3u) & ~3u;
-  const uint32_t aligned_length = aligned_end - aligned_start;
-  if (aligned_length > chunk_bytes_ || aligned_end < aligned_start) {
-    ++stats_.alloc_fail;
-    return nullptr;
+  const uint64_t end = uint64_t(start) + length;
+  if (end > SharedMemory::kBufferSize) {
+    return false;
   }
-  const uint64_t key = EntryKey(aligned_start, aligned_length, endian);
-  auto it = entries_.find(key);
-  Entry* e;
-  if (it != entries_.end()) {
-    e = it->second.get();
-    ++stats_.hits;
-    LruRemove(*e);
-  } else {
-    const uint32_t block = (aligned_length + kBlockAlign - 1) & ~(kBlockAlign - 1);
-    uint32_t chunk, offset;
-    if (!AllocateBlock(block, &chunk, &offset)) {
-      // A new chunk, then the LRU entries the GPU is done with, oldest first.
-      bool ok = CreateChunk() && AllocateBlock(block, &chunk, &offset);
-      while (!ok) {
-        Entry* victim = lru_head_;
-        while (victim && victim->last_use_submission > completed_submission_) {
-          victim = victim->lru_next;
-        }
-        if (!victim) {
-          break;
-        }
-        EvictEntry(*victim);
-        ok = AllocateBlock(block, &chunk, &offset);
+  if (endian == 0) {
+    // Already host order: the shared memory buffer itself.
+    ++stats_.direct;
+    *out = shared_memory_.GetGPUAddress() + start;
+    return true;
+  }
+  if (!EnsureShadow(endian)) {
+    return false;
+  }
+  Shadow& s = shadows_[endian];
+  if (!MapRegions(s, start >> kRegionSizeLog2, uint32_t((end - 1) >> kRegionSizeLog2))) {
+    return false;
+  }
+  *out = s.gpu_address + start;
+  return true;
+}
+
+void VbMirror::QueueFills(uint32_t start, uint32_t length, uint32_t endian) {
+  if (!initialized_ || !length || endian == 0 || endian >= kShadowCount) {
+    return;
+  }
+  Shadow& s = shadows_[endian];
+  if (!s.resource) {
+    return;
+  }
+  const uint64_t end = std::min<uint64_t>(uint64_t(start) + length, SharedMemory::kBufferSize);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = uint32_t((end - 1) >> page_size_log2_);
+  uint32_t run_first = UINT32_MAX;
+  for (uint32_t p = page_first; p <= page_last; ++p) {
+    const uint64_t bit = uint64_t(1) << (p & 63);
+    // Mark valid before the copy is recorded (see the header).
+    const bool was_valid = (s.valid[p >> 6].fetch_or(bit, std::memory_order_acq_rel) & bit) != 0;
+    if (!was_valid) {
+      if (run_first == UINT32_MAX) {
+        run_first = p;
       }
-      if (!ok) {
-        ++stats_.alloc_fail;
-        return nullptr;
-      }
+    } else if (run_first != UINT32_MAX) {
+      s.pending.push_back({run_first, p - run_first});
+      ++pending_count_;
+      run_first = UINT32_MAX;
     }
-    std::unique_ptr<Entry> owned = std::make_unique<Entry>();
-    e = owned.get();
-    e->start = aligned_start;
-    e->length = aligned_length;
-    e->endian = endian;
-    e->chunk = chunk;
-    e->offset = offset;
-    e->stale.store(true, std::memory_order_relaxed);
-    e->fired.store(true, std::memory_order_relaxed);
-    entries_.emplace(key, std::move(owned));
-    bytes_used_ += block;
-    ++stats_.allocs;
   }
-  e->last_use_frame = frame_;
-  e->last_use_submission = submission_;
-  LruPushBack(*e);
-  if (e->stale.load(std::memory_order_acquire) && !e->queued) {
-    e->queued = true;
-    pending_.push_back(e);
+  if (run_first != UINT32_MAX) {
+    s.pending.push_back({run_first, page_last + 1 - run_first});
+    ++pending_count_;
   }
-  return e;
-}
-
-D3D12_GPU_VIRTUAL_ADDRESS VbMirror::GpuAddress(const Entry& e) const {
-  return chunks_[e.chunk].gpu_address + e.offset;
-}
-
-void VbMirror::DropPendingFills() {
-  for (Entry* e : pending_) {
-    e->queued = false;
-  }
-  pending_.clear();
 }
 
 void VbMirror::EmitFills() {
-  if (pending_.empty()) {
+  if (!pending_count_) {
     return;
   }
   DeferredCommandList& list = command_processor_.GetDeferredCommandList();
-  for (Chunk& c : chunks_) {
-    c.touched = false;
-  }
-  for (Entry* e : pending_) {
-    Chunk& c = chunks_[e->chunk];
-    if (!c.touched) {
-      c.touched = true;
-      command_processor_.PushTransitionBarrier(c.resource.Get(), kSteadyState,
+  for (uint32_t endian = 1; endian < kShadowCount; ++endian) {
+    Shadow& s = shadows_[endian];
+    s.touched = !s.pending.empty();
+    if (s.touched) {
+      command_processor_.PushTransitionBarrier(s.resource.Get(), kSteadyState,
                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
   }
   command_processor_.SubmitBarriers();
   list.D3DSetComputeRootSignature(fill_root_signature_.Get());
   list.D3DSetPipelineState(fill_pipeline_.Get());
-  list.D3DSetComputeRootShaderResourceView(
-      1, static_cast<D3D12SharedMemory&>(shared_memory_).GetGPUAddress());
-  uint32_t bound_chunk = UINT32_MAX;
-  for (Entry* e : pending_) {
-    // The watch is (re)armed before the copy is taken: a write racing the
-    // fill leaves the entry stale again, never a stale copy marked fresh.
-    if (e->fired.load(std::memory_order_acquire)) {
-      Watch(*e);
+  list.D3DSetComputeRootShaderResourceView(1, shared_memory_.GetGPUAddress());
+  const uint32_t page_dwords = 1u << (page_size_log2_ - 2);
+  for (uint32_t endian = 1; endian < kShadowCount; ++endian) {
+    Shadow& s = shadows_[endian];
+    if (!s.touched) {
+      continue;
     }
-    e->stale.store(false, std::memory_order_release);
-    e->queued = false;
-    if (e->chunk != bound_chunk) {
-      bound_chunk = e->chunk;
-      list.D3DSetComputeRootUnorderedAccessView(2, chunks_[bound_chunk].gpu_address);
+    list.D3DSetComputeRootUnorderedAccessView(2, s.gpu_address);
+    for (const Run& run : s.pending) {
+      const uint32_t dword_first = run.page_first * page_dwords;
+      const uint32_t dword_count = run.page_count * page_dwords;
+      const uint32_t constants[4] = {dword_first, dword_first, dword_count, endian};
+      list.D3DSetComputeRoot32BitConstants(0, 4, constants, 0);
+      list.D3DDispatch((dword_count + 255) / 256, 1, 1);
+      ++stats_.fills;
+      stats_.fill_pages += run.page_count;
     }
-    const uint32_t constants[4] = {e->start >> 2, e->offset >> 2, e->length >> 2, e->endian};
-    list.D3DSetComputeRoot32BitConstants(0, 4, constants, 0);
-    list.D3DDispatch((e->length / 4 + 255) / 256, 1, 1);
-    ++stats_.fills;
-    stats_.fill_bytes += e->length;
+    s.pending.clear();
   }
-  pending_.clear();
+  pending_count_ = 0;
   ++stats_.fill_emits;
-  for (Chunk& c : chunks_) {
-    if (c.touched) {
-      command_processor_.PushTransitionBarrier(c.resource.Get(),
+  for (uint32_t endian = 1; endian < kShadowCount; ++endian) {
+    Shadow& s = shadows_[endian];
+    if (s.touched) {
+      command_processor_.PushTransitionBarrier(s.resource.Get(),
                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kSteadyState);
-      c.touched = false;
+      s.touched = false;
     }
   }
 }

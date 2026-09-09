@@ -38,6 +38,8 @@ class D3D12SharedMemory : public SharedMemory {
 
   ID3D12Resource* GetBuffer() const { return buffer_; }
   D3D12_GPU_VIRTUAL_ADDRESS GetGPUAddress() const { return buffer_gpu_address_; }
+  // [ia] the validity page of the host-order shadow.
+  uint32_t GetPageSizeLog2() const { return page_size_log2(); }
 
   void CompletedSubmissionUpdated();
   void BeginSubmission();
@@ -47,8 +49,10 @@ class D3D12SharedMemory : public SharedMemory {
 
   // Makes the buffer usable for vertices, indices and texture untiling.
   void UseForReading() {
-    // Vertex fetch is also allowed in pixel shaders.
+    // Vertex fetch is also allowed in pixel shaders. [ia] A host-order
+    // (endian "none") range is bound as a vertex buffer view directly.
     CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_INDEX_BUFFER |
+                                       D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
   }

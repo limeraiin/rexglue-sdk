@@ -393,8 +393,9 @@ REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
                      "(default).");
 REXCVAR_DEFINE_INT32(gpu_ia_cycle, 0, "GPU/D3D12",
                      "[ia] the in-place A/B: seconds per phase (on, then off); 0 = no cycling.");
-REXCVAR_DEFINE_UINT32(gpu_ia_mb, 256, "GPU/D3D12",
-                      "[ia] the host-order vertex/index mirror's budget in MB (64 MB chunks).");
+REXCVAR_DEFINE_UINT32(gpu_ia_mb, 512, "GPU/D3D12",
+                      "[ia] the host-order shadow's mapped-memory budget in MB (4 MB regions, "
+                      "mapped on first touch).");
 // [dcache] The per-draw IDENTITY cache of derived state (NEXT-AGENT.md, the
 // design pass after drive 853). A draw whose identity (everything the
 // derivation reads except the float constants) was seen before takes its
@@ -4614,7 +4615,8 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
   desc.pParameters = parameters;
   desc.NumStaticSamplers = 0;
   desc.pStaticSamplers = nullptr;
-  desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+  // [ia] the input-assembler variant's pipelines need the flag.
+  desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
   // Base parameters.
 
@@ -5499,7 +5501,8 @@ bool D3D12CommandProcessor::SetupContext() {
     root_signature_bindless_desc.pParameters = root_parameters_bindless;
     root_signature_bindless_desc.NumStaticSamplers = 0;
     root_signature_bindless_desc.pStaticSamplers = nullptr;
-    root_signature_bindless_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    // [ia] the input-assembler variant's pipelines need the flag.
+    root_signature_bindless_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     // Fetch constants.
     {
       auto& parameter = root_parameters_bindless[kRootParameter_Bindless_FetchConstants];
@@ -7309,7 +7312,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         }
       }
       ia_phase_ = ia_phase;
-      if (vb_mirror_) vb_mirror_->BeginFrame(uint32_t(g_pool_frame), submission_current_);
     }
     ++g_pool.frames;
     static PoolStats s_pp;
@@ -8921,12 +8923,13 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       pixel_shader->constant_register_map().float_count != 0 && g_pool_last_pred &&
       g_pool_frame - g_pool_last_pred->ps_delta_frame <= 1;
   // [ia] The input-assembler vertex path: decided before the modification
-  // is chosen. Every mirror entry (the vertex buffers and a kGuestDMA index
-  // buffer) is acquired now (no commands recorded); the fills are emitted
-  // after the residency loop, right before the draw's own barriers.
+  // is chosen. The shadow addresses of the vertex buffers and of a kGuestDMA
+  // index buffer are resolved now (regions mapped, no commands recorded);
+  // the page copies are queued and emitted after the residency loop, right
+  // before the draw's own barriers.
   bool ia_draw = false;
-  VbMirror::Entry* ia_vb_entries[8] = {};
-  VbMirror::Entry* ia_ib_entry = nullptr;
+  D3D12_GPU_VIRTUAL_ADDRESS ia_vb_va[8] = {};
+  D3D12_GPU_VIRTUAL_ADDRESS ia_ib_va = 0;
   ia_arg_dword2_ = 0;
   ia_arg_dword3_ = 0;
   {
@@ -8936,7 +8939,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     if (!ia_available_ || ia_phase_ == 0) {
       ++ia_acc_.ref_off;
     } else if (!vertex_shader->pos_path().ia_eligible || ia_bindings.empty() ||
-               ia_bindings.size() > rex::countof(ia_vb_entries)) {
+               ia_bindings.size() > rex::countof(ia_vb_va)) {
       ++ia_acc_.ref_shader;
     } else if (primitive_processing_result.host_vertex_shader_type !=
                Shader::HostVertexShaderType::kVertex) {
@@ -8950,7 +8953,6 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
       // A batch shares one base vertex: a nonzero offset stays raw there.
       ++ia_acc_.ref_pool;
     } else {
-      vb_mirror_->DropPendingFills();
       ia_draw = true;
       for (size_t b = 0; b < ia_bindings.size(); ++b) {
         const xenos::xe_gpu_vertex_fetch_t vf =
@@ -8960,31 +8962,26 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           ++ia_acc_.ref_fetch;
           break;
         }
-        VbMirror::Entry* e = vb_mirror_->Acquire(vf.address << 2, vf.size << 2, uint32_t(vf.endian));
-        if (!e) {
+        if (!vb_mirror_->Acquire(vf.address << 2, vf.size << 2, uint32_t(vf.endian),
+                                 &ia_vb_va[b])) {
           ia_draw = false;
           ++ia_acc_.ref_alloc;
           break;
         }
-        ia_vb_entries[b] = e;
       }
       if (ia_draw && primitive_processing_result.index_buffer_type ==
                          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
         const uint32_t ib_bytes =
             primitive_processing_result.host_draw_vertex_count *
             (primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4);
-        ia_ib_entry = vb_mirror_->Acquire(
-            primitive_processing_result.guest_index_base, ib_bytes,
-            uint32_t(primitive_processing_result.host_shader_index_endian));
-        if (!ia_ib_entry) {
+        if (!vb_mirror_->Acquire(primitive_processing_result.guest_index_base, ib_bytes,
+                                 uint32_t(primitive_processing_result.host_shader_index_endian),
+                                 &ia_ib_va)) {
           ia_draw = false;
           ++ia_acc_.ref_alloc;
         } else {
           ++ia_acc_.ib_mirror;
         }
-      }
-      if (!ia_draw) {
-        vb_mirror_->DropPendingFills();
       }
     }
     if (ia_draw) {
@@ -9631,16 +9628,29 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // latches reset wherever the topology latch does and with the sorter (a
   // sort window's segments may move, so the sorter's venue binds every draw).
   if (ia_draw) {
+    const std::vector<Shader::VertexBinding>& ia_bindings = vertex_shader->vertex_bindings();
+    // The copies of the ranges' invalid pages, now that the ranges are
+    // uploaded (a page marked valid here is copied by the dispatch below).
+    for (size_t b = 0; b < ia_bindings.size(); ++b) {
+      const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(ia_bindings[b].fetch_constant);
+      vb_mirror_->QueueFills(vf.address << 2, vf.size << 2, uint32_t(vf.endian));
+    }
+    if (ia_ib_va && primitive_processing_result.index_buffer_type ==
+                        PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+      vb_mirror_->QueueFills(
+          primitive_processing_result.guest_index_base,
+          primitive_processing_result.host_draw_vertex_count *
+              (primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4),
+          uint32_t(primitive_processing_result.host_shader_index_endian));
+    }
     if (vb_mirror_->HasPendingFills()) {
       shared_memory_->UseForReading();
       vb_mirror_->EmitFills();
     }
-    const std::vector<Shader::VertexBinding>& ia_bindings = vertex_shader->vertex_bindings();
     for (size_t b = 0; b < ia_bindings.size(); ++b) {
-      const VbMirror::Entry* e = ia_vb_entries[b];
       const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(ia_bindings[b].fetch_constant);
       D3D12_VERTEX_BUFFER_VIEW view;
-      view.BufferLocation = vb_mirror_->GpuAddress(*e) + ((vf.address << 2) - e->start);
+      view.BufferLocation = ia_vb_va[b];
       view.SizeInBytes = vf.size << 2;
       view.StrideInBytes = ia_bindings[b].stride_words * 4;
       IaVbLatch& l = ia_vb_latch_[b];
@@ -9895,12 +9905,10 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           PushTransitionBarrier(scratch_index_buffer, D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_INDEX_BUFFER);
           index_buffer_view.BufferLocation = scratch_index_buffer->GetGPUVirtualAddress();
-        } else if (ia_ib_entry) {
-          // [ia] the host-order copy (the entry starts 4-aligned below the base).
-          index_buffer_view.BufferLocation =
-              vb_mirror_->GpuAddress(*ia_ib_entry) +
-              (primitive_processing_result.guest_index_base - ia_ib_entry->start);
-          // [NR-SPR] a mirror address can be evicted: never replayable.
+        } else if (ia_ib_va) {
+          // [ia] the host-order shadow of the index buffer.
+          index_buffer_view.BufferLocation = ia_ib_va;
+          // [NR-SPR] a shadow page's validity is live state: never replayable.
           if (g_spr_open || g_tile_rec_open) {
             g_spr_cap.refused = true;
           }
@@ -11047,8 +11055,6 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   render_target_cache_->CompletedSubmissionUpdated();
 
   primitive_processor_->CompletedSubmissionUpdated();
-
-  if (vb_mirror_) vb_mirror_->CompletedSubmissionUpdated(submission_completed_);  // [ia]
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
 }
@@ -13749,7 +13755,6 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       OccBeginSubmission();
     }
     HizBeginSubmission();  // [hiz] no window may span a submission
-    if (vb_mirror_) vb_mirror_->BeginFrame(uint32_t(g_pool_frame), submission_current_);  // [ia]
     // [GPU-PRECORD] Phase 1a: count draws per submission (segment boundaries);
     // clear any segment streams (defensive — EndSubmission already drains them).
     parallel_record_counter_ = 0;
@@ -17625,9 +17630,9 @@ ID3D12CommandSignature* D3D12CommandProcessor::DrawCommandSignature(bool indexed
 bool D3D12CommandProcessor::InitializeIaResources() {
   ia_available_ = false;
   vb_mirror_ = std::make_unique<VbMirror>(*this, *shared_memory_);
-  if (!vb_mirror_->Initialize(REXCVAR_GET(gpu_ia_mb), 64)) {
+  if (!vb_mirror_->Initialize(REXCVAR_GET(gpu_ia_mb))) {
     vb_mirror_.reset();
-    REXGPU_WARN("[ia] off: the host-order mirror failed to initialize");
+    REXGPU_WARN("[ia] off: the host-order shadow failed to initialize");
     return false;
   }
   ia_available_ = true;
@@ -17657,17 +17662,16 @@ void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
   REXGPU_INFO(
       "[ia] phase={} draws/fr {:.0f} ia {:.1f}% | refuse/fr off/shader/type/memx/lloop/pool/fetch/"
       "alloc {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} | indxoff/fr {:.1f} clamp/fr "
-      "{:.1f} ibmirror/fr {:.0f} | vb binds/fr {:.0f} | mirror entries {} MB {:.1f}/{} chunks {} | "
-      "fills/s {:.0f} MB/s {:.2f} hits/s {:.0f} evict/s {:.0f} allocfail/s {:.0f}",
+      "{:.1f} ibmirror/fr {:.0f} | vb binds/fr {:.0f} | shadow mapped MB {}/{} | fills/s {:.0f} "
+      "pages/s {:.0f} stale pages/s {:.0f} direct/s {:.0f} mapfail/s {:.0f}",
       ia_phase_ ? "on" : "off", draws / fr, 100.0 * d(&IaAcc::ia) / draws, d(&IaAcc::ref_off) / fr,
       d(&IaAcc::ref_shader) / fr, d(&IaAcc::ref_type) / fr, d(&IaAcc::ref_memx) / fr,
       d(&IaAcc::ref_lloop) / fr, d(&IaAcc::ref_pool) / fr, d(&IaAcc::ref_fetch) / fr,
       d(&IaAcc::ref_alloc) / fr, d(&IaAcc::indxoff) / fr, d(&IaAcc::clamp) / fr,
-      d(&IaAcc::ib_mirror) / fr, d(&IaAcc::vb_binds) / fr, vb_mirror_->entry_count(),
-      double(vb_mirror_->bytes_used()) / double(1u << 20), vb_mirror_->bytes_budget() >> 20,
-      vb_mirror_->chunk_count(), md(&VbMirror::Stats::fills) / s,
-      md(&VbMirror::Stats::fill_bytes) / s / double(1u << 20), md(&VbMirror::Stats::hits) / s,
-      md(&VbMirror::Stats::evicts) / s, md(&VbMirror::Stats::alloc_fail) / s);
+      d(&IaAcc::ib_mirror) / fr, d(&IaAcc::vb_binds) / fr, vb_mirror_->mapped_bytes() >> 20,
+      vb_mirror_->budget_bytes() >> 20, md(&VbMirror::Stats::fills) / s,
+      md(&VbMirror::Stats::fill_pages) / s, md(&VbMirror::Stats::stale_pages) / s,
+      md(&VbMirror::Stats::direct) / s, md(&VbMirror::Stats::map_fail) / s);
   s_last = c;
   s_mlast = m;
 }
