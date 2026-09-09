@@ -9644,8 +9644,20 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           uint32_t(primitive_processing_result.host_shader_index_endian));
     }
     if (vb_mirror_->HasPendingFills()) {
+      // Run 862: the fill's compute pipeline REPLACES the draw's (one
+      // pipeline slot for both): rebind it after, as the Hi-Z checkpoint
+      // does, or the draw is issued with the compute pipeline (black frames).
+      void* saved_guest = current_guest_pipeline_;
+      auto saved_external = current_external_pipeline_;
       shared_memory_->UseForReading();
       vb_mirror_->EmitFills();
+      if (saved_external) {
+        SetExternalPipeline(saved_external);
+      } else if (saved_guest) {
+        deferred_command_list_.SetPipelineStateHandle(saved_guest);
+        current_guest_pipeline_ = saved_guest;
+        current_external_pipeline_ = nullptr;
+      }
     }
     for (size_t b = 0; b < ia_bindings.size(); ++b) {
       const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(ia_bindings[b].fetch_constant);
