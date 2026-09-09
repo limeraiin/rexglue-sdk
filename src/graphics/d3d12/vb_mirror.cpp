@@ -15,6 +15,7 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/logging.h>
+#include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
@@ -377,28 +378,49 @@ void VbMirror::QueueFills(uint32_t start, uint32_t length, uint32_t endian) {
   if (!s.resource) {
     return;
   }
+  ++stats_.queue_calls;
   const uint64_t end = std::min<uint64_t>(uint64_t(start) + length, SharedMemory::kBufferSize);
   const uint32_t page_first = start >> page_size_log2_;
   const uint32_t page_last = uint32_t((end - 1) >> page_size_log2_);
-  uint32_t run_first = UINT32_MAX;
-  for (uint32_t p = page_first; p <= page_last; ++p) {
-    const uint64_t bit = uint64_t(1) << (p & 63);
-    // Mark valid before the copy is recorded (see the header).
-    const bool was_valid = (s.valid[p >> 6].fetch_or(bit, std::memory_order_acq_rel) & bit) != 0;
-    if (!was_valid) {
-      if (run_first == UINT32_MAX) {
-        run_first = p;
-      }
-    } else if (run_first != UINT32_MAX) {
-      s.pending.push_back({run_first, p - run_first});
+  // One load per 64 pages; a word whose pages are all valid costs nothing
+  // more (the common case: a static range is queued by every draw that
+  // fetches it). Only a word holding an invalid page is marked with one
+  // atomic, and its newly valid pages become runs of contiguous pages.
+  uint32_t run_first = UINT32_MAX, run_end = 0;
+  auto flush = [&]() {
+    if (run_first != UINT32_MAX) {
+      s.pending.push_back({run_first, run_end - run_first});
       ++pending_count_;
       run_first = UINT32_MAX;
     }
+  };
+  for (uint32_t w = page_first >> 6; w <= (page_last >> 6); ++w) {
+    const uint32_t lo = std::max(page_first, w << 6) & 63;
+    const uint32_t hi = std::min(page_last, (w << 6) | 63) & 63;
+    const uint64_t mask =
+        (hi == 63 ? ~uint64_t(0) : ((uint64_t(1) << (hi + 1)) - 1)) & ~((uint64_t(1) << lo) - 1);
+    ++stats_.scan_words;
+    if (!(mask & ~s.valid[w].load(std::memory_order_acquire))) {
+      continue;
+    }
+    ++stats_.scan_rmw;
+    // Mark valid before the copy is recorded (see the header).
+    uint64_t invalid = mask & ~s.valid[w].fetch_or(mask, std::memory_order_acq_rel);
+    while (invalid) {
+      uint32_t bit;
+      rex::bit_scan_forward(invalid, &bit);
+      const uint32_t p = (w << 6) | bit;
+      if (run_first != UINT32_MAX && run_end == p) {
+        run_end = p + 1;
+      } else {
+        flush();
+        run_first = p;
+        run_end = p + 1;
+      }
+      invalid &= invalid - 1;
+    }
   }
-  if (run_first != UINT32_MAX) {
-    s.pending.push_back({run_first, page_last + 1 - run_first});
-    ++pending_count_;
-  }
+  flush();
 }
 
 void VbMirror::EmitFills() {

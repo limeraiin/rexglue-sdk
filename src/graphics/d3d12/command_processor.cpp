@@ -388,19 +388,11 @@ REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
 // vertex shaders read their attributes from host-order vertex buffer views
 // (the mirror) through the IA instead of the translated per-vertex shared
 // memory fetch; the index buffer is the mirror's too.
-REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
-                     "[ia] input-assembler vertex fetch: 0 off (the translated raw fetch), 1 on "
-                     "(default), 2 = the bisect: IA with the views bound to the RAW shared memory "
-                     "(no shadow, guest byte order: garbage geometry expected, black = the IA "
-                     "side), 3 = the HYBRID bisect: elements within words 0-2 through the IA, "
-                     "later elements through the raw fetch (drive 867: still black), 4 = the "
-                     "inverse hybrid (words 0-2 raw, later elements IA), 5 = every element raw "
-                     "inside the IA variant (only the index path, the shadow IB, "
-                     "BaseVertexLocation and the pipeline differ).");
-REXCVAR_DEFINE_UINT32(gpu_ia_dump, 0, "GPU/D3D12",
-                      "[ia-dump] log the runtime parameters (views, strides, attributes, index "
-                      "buffer, draw arguments) of the first N IA draws carrying an attribute past "
-                      "word 2.");
+REXCVAR_DEFINE_INT32(gpu_ia, -1, "GPU/D3D12",
+                     "[ia] input-assembler vertex fetch: -1 by vendor (default: Intel on, others "
+                     "off; drive 872 Intel 720p 19.6 -> 20.6 fps, GPU 51.2 -> 48.5 ms/fr; drive "
+                     "871 RTX 1440p 57.9 -> 55.0 fps, a CP cost, GPU equal), 0 off everywhere "
+                     "(the translated raw fetch), 1 on everywhere.");
 REXCVAR_DEFINE_UINT32(gpu_ia_verify, 0, "GPU/D3D12",
                       "[ia] shadow verify: pages per frame read back and compared with the "
                       "byte-swapped guest memory (0 = off, 16 max).");
@@ -7321,7 +7313,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               std::chrono::duration<double>(std::chrono::steady_clock::now() - s_ia_t0).count();
           ia_phase = (uint64_t(el / double(cyc)) & 1) ? 0 : 1;
         } else {
-          ia_phase = REXCVAR_GET(gpu_ia) != 0 ? 1 : 0;
+          const int32_t v = REXCVAR_GET(gpu_ia);
+          ia_phase = v < 0 ? (g_pool_intel_off ? 1 : 0) : (v != 0 ? 1 : 0);
         }
       }
       ia_phase_ = ia_phase;
@@ -9001,19 +8994,6 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           ++ia_acc_.ib_mirror;
         }
       }
-      // The bisect (gpu_ia 2): the raw shared memory through the IA, no
-      // shadow. The fills still run (harmless); the views are the guest's
-      // bytes as written, so a visible garbage world clears the IA side.
-      if (ia_draw && REXCVAR_GET(gpu_ia) == 2) {
-        for (size_t b = 0; b < ia_bindings.size(); ++b) {
-          const xenos::xe_gpu_vertex_fetch_t vf =
-              regs.GetVertexFetch(ia_bindings[b].fetch_constant);
-          ia_vb_va[b] = shared_memory_->GetGPUAddress() + (vf.address << 2);
-        }
-        if (ia_ib_va) {
-          ia_ib_va = shared_memory_->GetGPUAddress() + primitive_processing_result.guest_index_base;
-        }
-      }
     }
     if (ia_draw) {
       ++ia_acc_.ia;
@@ -9704,54 +9684,6 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         l.size = view.SizeInBytes;
         l.stride = view.StrideInBytes;
         ++ia_acc_.vb_binds;
-      }
-    }
-    // [ia-dump] gpu_ia_dump N: the runtime parameters of the first N IA draws
-    // carrying an attribute past word 2 (the class that draws black), one
-    // block per draw: what the GPU is given, against the model.
-    if (ia_dump_left_) {
-      bool past_word2 = false;
-      for (const Shader::VertexBinding& vb : ia_bindings) {
-        for (const Shader::VertexBinding::Attribute& a : vb.attributes) {
-          if (a.fetch_instr.attributes.offset >= 3) {
-            past_word2 = true;
-          }
-        }
-      }
-      if (past_word2) {
-        --ia_dump_left_;
-        REXGPU_INFO(
-            "[ia-dump] draw vs {:016X} ps {:016X} vsmod {:016X} prim {} ibtype {} ibfmt {} "
-            "ibendian {} ibbase {:08X} count {} indxoff {} pool {} inst {} hiz {} args2/3 {}/{} "
-            "ia_ib_va {:X}",
-            vertex_shader->ucode_data_hash(),
-            pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0),
-            vertex_shader_modification.value, uint32_t(primitive_type),
-            uint32_t(primitive_processing_result.index_buffer_type),
-            uint32_t(primitive_processing_result.host_index_format),
-            uint32_t(primitive_processing_result.host_shader_index_endian),
-            primitive_processing_result.guest_index_base,
-            primitive_processing_result.host_draw_vertex_count,
-            regs.Get<reg::VGT_INDX_OFFSET>().indx_offset, pool_open ? 1 : 0,
-            start_instanced ? 1 : 0, hiz_draw_.valid ? 1 : 0, ia_arg_dword2_, ia_arg_dword3_,
-            uint64_t(ia_ib_va));
-        for (size_t b = 0; b < ia_bindings.size(); ++b) {
-          const xenos::xe_gpu_vertex_fetch_t vf =
-              regs.GetVertexFetch(ia_bindings[b].fetch_constant);
-          std::string attrs;
-          for (const Shader::VertexBinding::Attribute& a : ia_bindings[b].attributes) {
-            attrs += fmt::format(" @{}:fmt{}{}", a.fetch_instr.attributes.offset,
-                                 uint32_t(a.fetch_instr.attributes.data_format),
-                                 a.fetch_instr.is_mini_fetch ? "m" : "");
-          }
-          REXGPU_INFO(
-              "[ia-dump]  b{} fc{} addr {:08X} size {} B endian {} stride {} dw -> view va {:X} "
-              "base {:X} size {} stride {} |{}",
-              b, ia_bindings[b].fetch_constant, uint32_t(vf.address) << 2,
-              uint32_t(vf.size) << 2, uint32_t(vf.endian), ia_bindings[b].stride_words,
-              uint64_t(ia_vb_va[b]), uint64_t(ia_vb_va[b]) - (uint64_t(vf.address) << 2),
-              uint32_t(vf.size) << 2, ia_bindings[b].stride_words * 4, attrs);
-        }
       }
     }
   }
@@ -17727,7 +17659,6 @@ bool D3D12CommandProcessor::InitializeIaResources() {
     return false;
   }
   vb_mirror_->SetVerify(memory_, std::min<uint32_t>(REXCVAR_GET(gpu_ia_verify), 16));
-  ia_dump_left_ = REXCVAR_GET(gpu_ia_dump);
   ia_available_ = true;
   return true;
 }
@@ -17749,24 +17680,11 @@ void D3D12CommandProcessor::ShutdownIaResources() {
 // or 3). Green = IA on, red = raw (the off phase), blue = the hybrid bisect
 // (gpu_ia 3), yellow = the raw memory through the IA (gpu_ia 2).
 void D3D12CommandProcessor::IaSwapMarker(ID3D12Resource* guest_output) {
-  const int32_t mode = REXCVAR_GET(gpu_ia);
-  if (!guest_output || (REXCVAR_GET(gpu_ia_cycle) == 0 && mode < 2)) {
+  if (!guest_output || REXCVAR_GET(gpu_ia_cycle) == 0) {
     return;
   }
-  // 0 red raw, 1 green IA, 2 blue gpu_ia 3, 3 yellow gpu_ia 2, 4 cyan gpu_ia 4,
-  // 5 magenta gpu_ia 5.
-  int phase = 1;
-  if (ia_phase_ == 0) {
-    phase = 0;
-  } else if (mode == 2) {
-    phase = 3;
-  } else if (mode == 3) {
-    phase = 2;
-  } else if (mode == 4) {
-    phase = 4;
-  } else if (mode == 5) {
-    phase = 5;
-  }
+  // 0 red raw, 1 green IA (the bisect modes 2-5 and their colours are gone).
+  const int phase = ia_phase_ == 0 ? 0 : 1;
   constexpr uint32_t kSide = 64, kPitch = 256;  // R10G10B10A2: 64 * 4 = 256 (aligned)
   if (!ia_marker_upload_) {
     ID3D12Device* device = GetD3D12Provider().GetDevice();
@@ -17847,7 +17765,8 @@ void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
       "[ia] phase={} draws/fr {:.0f} ia {:.1f}% | refuse/fr off/shader/type/memx/lloop/pool/fetch/"
       "alloc {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} | indxoff/fr {:.1f} clamp/fr "
       "{:.1f} ibmirror/fr {:.0f} | vb binds/fr {:.0f} | shadow mapped MB {}/{} | fills/s {:.0f} "
-      "pages/s {:.0f} stale pages/s {:.0f} direct/s {:.0f} mapfail/s {:.0f} | verify pages/s "
+      "pages/s {:.0f} stale pages/s {:.0f} direct/s {:.0f} mapfail/s {:.0f} | scan/fr calls "
+      "{:.0f} words {:.0f} rmw {:.0f} | verify pages/s "
       "{:.0f} bad/s {:.0f} dwords/s {:.0f} skip/s {:.0f}",
       ia_phase_ ? "on" : "off", draws / fr, 100.0 * d(&IaAcc::ia) / draws, d(&IaAcc::ref_off) / fr,
       d(&IaAcc::ref_shader) / fr, d(&IaAcc::ref_type) / fr, d(&IaAcc::ref_memx) / fr,
@@ -17857,7 +17776,8 @@ void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
       vb_mirror_->budget_bytes() >> 20, md(&VbMirror::Stats::fills) / s,
       md(&VbMirror::Stats::fill_pages) / s, md(&VbMirror::Stats::stale_pages) / s,
       md(&VbMirror::Stats::direct) / s, md(&VbMirror::Stats::map_fail) / s,
-      md(&VbMirror::Stats::verify_pages) / s, md(&VbMirror::Stats::verify_bad_pages) / s,
+      md(&VbMirror::Stats::queue_calls) / fr, md(&VbMirror::Stats::scan_words) / fr,
+      md(&VbMirror::Stats::scan_rmw) / fr, md(&VbMirror::Stats::verify_pages) / s, md(&VbMirror::Stats::verify_bad_pages) / s,
       md(&VbMirror::Stats::verify_bad_dwords) / s, md(&VbMirror::Stats::verify_skipped) / s);
   s_last = c;
   s_mlast = m;

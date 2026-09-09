@@ -49,6 +49,10 @@ class VbMirror {
   struct Stats {
     uint64_t acquires = 0, direct = 0, fills = 0, fill_pages = 0, stale_pages = 0,
              map_fail = 0, fill_emits = 0;
+    // QueueFills' scan: 64-page words examined (one load each) and the words
+    // that held an invalid page (one atomic each). Drive 870: the per-page
+    // atomic scan of every draw's range was a CP cost (4 MB VB = 1024 per draw).
+    uint64_t queue_calls = 0, scan_words = 0, scan_rmw = 0;
     // The verify: pages read back and compared with the byte-swapped guest
     // memory; a page invalidated between the copy and the compare is skipped.
     uint64_t verify_pages = 0, verify_bad_pages = 0, verify_bad_dwords = 0,
