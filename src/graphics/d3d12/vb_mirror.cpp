@@ -416,7 +416,12 @@ void VbMirror::EmitFills() {
   }
   command_processor_.SubmitBarriers();
   list.D3DSetComputeRootSignature(fill_root_signature_.Get());
-  list.D3DSetPipelineState(fill_pipeline_.Get());
+  // Through the command processor's tracker, never directly on the list: the
+  // draw's pipeline is bound with SetExternalPipeline (the native PSO bind),
+  // and the caller restores it with SetExternalPipeline too, which is a no-op
+  // unless the tracker saw this bind (drive 868: every IA draw with pending
+  // fills was issued with this compute pipeline - the black world).
+  command_processor_.SetExternalPipeline(fill_pipeline_.Get());
   list.D3DSetComputeRootShaderResourceView(1, shared_memory_.GetGPUAddress());
   const uint32_t page_dwords = 1u << (page_size_log2_ - 2);
   // The verify: a free slot takes up to the frame's remaining page budget
