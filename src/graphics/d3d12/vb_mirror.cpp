@@ -15,6 +15,7 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/logging.h>
+#include <rex/memory.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
 namespace rex::graphics::d3d12 {
@@ -90,7 +91,125 @@ bool VbMirror::Initialize(uint32_t budget_mb) {
   return true;
 }
 
+void VbMirror::SetVerify(memory::Memory* memory, uint32_t pages_per_frame) {
+  verify_memory_ = memory;
+  verify_pages_per_frame_ = std::min<uint32_t>(pages_per_frame, kVerifyPagesMax);
+  if (verify_readback_) {
+    verify_readback_->Unmap(0, nullptr);
+    verify_readback_.Reset();
+    verify_mapping_ = nullptr;
+  }
+  for (VerifySlot& slot : verify_slots_) {
+    slot.submission = 0;
+    slot.count = 0;
+  }
+  if (!verify_memory_ || !verify_pages_per_frame_ || !initialized_) {
+    verify_pages_per_frame_ = 0;
+    return;
+  }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  const uint64_t bytes = uint64_t(kVerifySlots) * kVerifyPagesMax * (uint64_t(1) << page_size_log2_);
+  D3D12_RESOURCE_DESC desc;
+  ui::d3d12::util::FillBufferResourceDesc(desc, bytes, D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                             D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&verify_readback_)))) {
+    REXGPU_WARN("[ia] verify: the readback buffer failed - verify off");
+    verify_pages_per_frame_ = 0;
+    return;
+  }
+  void* mapping = nullptr;
+  if (FAILED(verify_readback_->Map(0, nullptr, &mapping)) || !mapping) {
+    REXGPU_WARN("[ia] verify: the readback map failed - verify off");
+    verify_readback_.Reset();
+    verify_pages_per_frame_ = 0;
+    return;
+  }
+  verify_mapping_ = static_cast<const uint8_t*>(mapping);
+  REXGPU_INFO("[ia] verify: {} pages per frame", verify_pages_per_frame_);
+}
+
+void VbMirror::VerifyTick() {
+  verify_frame_pages_ = 0;
+  ++verify_frames_;
+  if (!verify_pages_per_frame_ || !verify_mapping_) {
+    return;
+  }
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  const uint32_t page_bytes = 1u << page_size_log2_;
+  const uint32_t page_dwords = page_bytes / 4;
+  for (uint32_t si = 0; si < kVerifySlots; ++si) {
+    VerifySlot& slot = verify_slots_[si];
+    if (!slot.submission || slot.submission > completed) {
+      continue;
+    }
+    for (uint32_t k = 0; k < slot.count; ++k) {
+      const uint32_t page = slot.page[k];
+      const uint32_t endian = slot.endian[k];
+      Shadow& s = shadows_[endian];
+      // Invalidated since the copy: the compare would be against newer bytes.
+      if (!(s.valid[page >> 6].load(std::memory_order_acquire) & (uint64_t(1) << (page & 63)))) {
+        ++stats_.verify_skipped;
+        continue;
+      }
+      const uint32_t* cpu =
+          verify_memory_->TranslatePhysical<const uint32_t*>(page << page_size_log2_);
+      const uint32_t* gpu = reinterpret_cast<const uint32_t*>(
+          verify_mapping_ + (size_t(si) * kVerifyPagesMax + k) * page_bytes);
+      if (!cpu) {
+        ++stats_.verify_skipped;
+        continue;
+      }
+      uint32_t bad = 0, first_bad = UINT32_MAX;
+      for (uint32_t d = 0; d < page_dwords; ++d) {
+        uint32_t v = cpu[d];
+        if (endian == 1 || endian == 2) {
+          v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+        }
+        if (endian == 2 || endian == 3) {
+          v = (v << 16) | (v >> 16);
+        }
+        if (v != gpu[d]) {
+          ++bad;
+          if (first_bad == UINT32_MAX) {
+            first_bad = d;
+          }
+        }
+      }
+      ++stats_.verify_pages;
+      if (bad) {
+        ++stats_.verify_bad_pages;
+        stats_.verify_bad_dwords += bad;
+        if (verify_frames_ - verify_last_warn_frame_ >= 60) {
+          verify_last_warn_frame_ = verify_frames_;
+          uint32_t expected = cpu[first_bad];
+          if (endian == 1 || endian == 2) {
+            expected = ((expected & 0x00FF00FFu) << 8) | ((expected >> 8) & 0x00FF00FFu);
+          }
+          if (endian == 2 || endian == 3) {
+            expected = (expected << 16) | (expected >> 16);
+          }
+          REXGPU_WARN(
+              "[ia] verify BAD page {:05X} (guest {:08X}) endian {}: {} of {} dwords differ, first "
+              "at dword {}: expected {:08X} (guest {:08X}) got {:08X}",
+              page, page << page_size_log2_, endian, bad, page_dwords, first_bad, expected,
+              cpu[first_bad], gpu[first_bad]);
+        }
+      }
+    }
+    slot.submission = 0;
+    slot.count = 0;
+  }
+}
+
 void VbMirror::Shutdown() {
+  if (verify_readback_) {
+    verify_readback_->Unmap(0, nullptr);
+    verify_readback_.Reset();
+    verify_mapping_ = nullptr;
+  }
+  verify_pages_per_frame_ = 0;
   if (global_watch_) {
     shared_memory_.UnregisterGlobalWatch(global_watch_);
     global_watch_ = nullptr;
@@ -300,6 +419,18 @@ void VbMirror::EmitFills() {
   list.D3DSetPipelineState(fill_pipeline_.Get());
   list.D3DSetComputeRootShaderResourceView(1, shared_memory_.GetGPUAddress());
   const uint32_t page_dwords = 1u << (page_size_log2_ - 2);
+  // The verify: a free slot takes up to the frame's remaining page budget
+  // from this emit's runs (the first pages of the runs, spread over shadows).
+  VerifySlot* verify_slot = nullptr;
+  if (verify_pages_per_frame_ && verify_mapping_ &&
+      verify_frame_pages_ < verify_pages_per_frame_) {
+    VerifySlot& candidate = verify_slots_[verify_slot_next_ % kVerifySlots];
+    if (candidate.submission == 0) {
+      verify_slot = &candidate;
+      verify_slot->count = 0;
+    }
+  }
+  bool verify_copies[kShadowCount] = {};
   for (uint32_t endian = 1; endian < kShadowCount; ++endian) {
     Shadow& s = shadows_[endian];
     if (!s.touched) {
@@ -314,11 +445,49 @@ void VbMirror::EmitFills() {
       list.D3DDispatch((dword_count + 255) / 256, 1, 1);
       ++stats_.fills;
       stats_.fill_pages += run.page_count;
+      if (verify_slot && verify_slot->count < kVerifyPagesMax &&
+          verify_frame_pages_ < verify_pages_per_frame_) {
+        verify_slot->page[verify_slot->count] = run.page_first;
+        verify_slot->endian[verify_slot->count] = endian;
+        ++verify_slot->count;
+        ++verify_frame_pages_;
+        verify_copies[endian] = true;
+      }
     }
     s.pending.clear();
   }
   pending_count_ = 0;
   ++stats_.fill_emits;
+  if (verify_slot && verify_slot->count) {
+    // The copies: the touched shadows with pages to read go through
+    // COPY_SOURCE on their way back to the steady state.
+    const uint32_t page_bytes = 1u << page_size_log2_;
+    for (uint32_t endian = 1; endian < kShadowCount; ++endian) {
+      if (verify_copies[endian]) {
+        command_processor_.PushTransitionBarrier(shadows_[endian].resource.Get(),
+                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
+      }
+    }
+    command_processor_.SubmitBarriers();
+    const uint32_t si = verify_slot_next_ % kVerifySlots;
+    for (uint32_t k = 0; k < verify_slot->count; ++k) {
+      list.D3DCopyBufferRegion(verify_readback_.Get(),
+                               (uint64_t(si) * kVerifyPagesMax + k) * page_bytes,
+                               shadows_[verify_slot->endian[k]].resource.Get(),
+                               uint64_t(verify_slot->page[k]) * page_bytes, page_bytes);
+    }
+    verify_slot->submission = command_processor_.GetCurrentSubmission();
+    ++verify_slot_next_;
+    for (uint32_t endian = 1; endian < kShadowCount; ++endian) {
+      Shadow& s = shadows_[endian];
+      if (verify_copies[endian]) {
+        command_processor_.PushTransitionBarrier(s.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                 kSteadyState);
+        s.touched = false;
+      }
+    }
+  }
   for (uint32_t endian = 1; endian < kShadowCount; ++endian) {
     Shadow& s = shadows_[endian];
     if (s.touched) {

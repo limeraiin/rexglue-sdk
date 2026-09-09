@@ -390,7 +390,12 @@ REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
 // memory fetch; the index buffer is the mirror's too.
 REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
                      "[ia] input-assembler vertex fetch: 0 off (the translated raw fetch), 1 on "
-                     "(default).");
+                     "(default), 2 = the bisect: IA with the views bound to the RAW shared memory "
+                     "(no shadow, guest byte order: garbage geometry expected, black = the IA "
+                     "side).");
+REXCVAR_DEFINE_UINT32(gpu_ia_verify, 0, "GPU/D3D12",
+                      "[ia] shadow verify: pages per frame read back and compared with the "
+                      "byte-swapped guest memory (0 = off, 16 max).");
 REXCVAR_DEFINE_INT32(gpu_ia_cycle, 0, "GPU/D3D12",
                      "[ia] the in-place A/B: seconds per phase (on, then off); 0 = no cycling.");
 REXCVAR_DEFINE_UINT32(gpu_ia_mb, 512, "GPU/D3D12",
@@ -7312,6 +7317,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         }
       }
       ia_phase_ = ia_phase;
+      if (vb_mirror_) vb_mirror_->VerifyTick();
     }
     ++g_pool.frames;
     static PoolStats s_pp;
@@ -8981,6 +8987,19 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           ++ia_acc_.ref_alloc;
         } else {
           ++ia_acc_.ib_mirror;
+        }
+      }
+      // The bisect (gpu_ia 2): the raw shared memory through the IA, no
+      // shadow. The fills still run (harmless); the views are the guest's
+      // bytes as written, so a visible garbage world clears the IA side.
+      if (ia_draw && REXCVAR_GET(gpu_ia) == 2) {
+        for (size_t b = 0; b < ia_bindings.size(); ++b) {
+          const xenos::xe_gpu_vertex_fetch_t vf =
+              regs.GetVertexFetch(ia_bindings[b].fetch_constant);
+          ia_vb_va[b] = shared_memory_->GetGPUAddress() + (vf.address << 2);
+        }
+        if (ia_ib_va) {
+          ia_ib_va = shared_memory_->GetGPUAddress() + primitive_processing_result.guest_index_base;
         }
       }
     }
@@ -17647,6 +17666,7 @@ bool D3D12CommandProcessor::InitializeIaResources() {
     REXGPU_WARN("[ia] off: the host-order shadow failed to initialize");
     return false;
   }
+  vb_mirror_->SetVerify(memory_, std::min<uint32_t>(REXCVAR_GET(gpu_ia_verify), 16));
   ia_available_ = true;
   return true;
 }
@@ -17675,7 +17695,8 @@ void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
       "[ia] phase={} draws/fr {:.0f} ia {:.1f}% | refuse/fr off/shader/type/memx/lloop/pool/fetch/"
       "alloc {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} | indxoff/fr {:.1f} clamp/fr "
       "{:.1f} ibmirror/fr {:.0f} | vb binds/fr {:.0f} | shadow mapped MB {}/{} | fills/s {:.0f} "
-      "pages/s {:.0f} stale pages/s {:.0f} direct/s {:.0f} mapfail/s {:.0f}",
+      "pages/s {:.0f} stale pages/s {:.0f} direct/s {:.0f} mapfail/s {:.0f} | verify pages/s "
+      "{:.0f} bad/s {:.0f} dwords/s {:.0f} skip/s {:.0f}",
       ia_phase_ ? "on" : "off", draws / fr, 100.0 * d(&IaAcc::ia) / draws, d(&IaAcc::ref_off) / fr,
       d(&IaAcc::ref_shader) / fr, d(&IaAcc::ref_type) / fr, d(&IaAcc::ref_memx) / fr,
       d(&IaAcc::ref_lloop) / fr, d(&IaAcc::ref_pool) / fr, d(&IaAcc::ref_fetch) / fr,
@@ -17683,7 +17704,9 @@ void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
       d(&IaAcc::ib_mirror) / fr, d(&IaAcc::vb_binds) / fr, vb_mirror_->mapped_bytes() >> 20,
       vb_mirror_->budget_bytes() >> 20, md(&VbMirror::Stats::fills) / s,
       md(&VbMirror::Stats::fill_pages) / s, md(&VbMirror::Stats::stale_pages) / s,
-      md(&VbMirror::Stats::direct) / s, md(&VbMirror::Stats::map_fail) / s);
+      md(&VbMirror::Stats::direct) / s, md(&VbMirror::Stats::map_fail) / s,
+      md(&VbMirror::Stats::verify_pages) / s, md(&VbMirror::Stats::verify_bad_pages) / s,
+      md(&VbMirror::Stats::verify_bad_dwords) / s, md(&VbMirror::Stats::verify_skipped) / s);
   s_last = c;
   s_mlast = m;
 }

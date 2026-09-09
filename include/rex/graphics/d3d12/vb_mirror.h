@@ -19,6 +19,10 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 
+namespace rex::memory {
+class Memory;
+}
+
 namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor;
@@ -45,7 +49,18 @@ class VbMirror {
   struct Stats {
     uint64_t acquires = 0, direct = 0, fills = 0, fill_pages = 0, stale_pages = 0,
              map_fail = 0, fill_emits = 0;
+    // The verify: pages read back and compared with the byte-swapped guest
+    // memory; a page invalidated between the copy and the compare is skipped.
+    uint64_t verify_pages = 0, verify_bad_pages = 0, verify_bad_dwords = 0,
+             verify_skipped = 0;
   };
+
+  // [ia] verify: up to `pages_per_frame` of each frame's filled pages are
+  // copied to a readback buffer and, once the submission completed, compared
+  // dword by dword with the guest memory swapped on the CPU. 0 = off.
+  void SetVerify(memory::Memory* memory, uint32_t pages_per_frame);
+  // Compares the readback slots whose submission completed; once per frame.
+  void VerifyTick();
 
   VbMirror(D3D12CommandProcessor& command_processor, D3D12SharedMemory& shared_memory);
   ~VbMirror();
@@ -117,6 +132,25 @@ class VbMirror {
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> fill_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fill_pipeline_;
+
+  // The verify ring: kVerifySlots frames in flight, kVerifyPagesMax pages each.
+  static constexpr uint32_t kVerifySlots = 4;
+  static constexpr uint32_t kVerifyPagesMax = 16;
+  struct VerifySlot {
+    uint64_t submission = 0;  // 0 = free
+    uint32_t count = 0;
+    uint32_t page[kVerifyPagesMax];
+    uint32_t endian[kVerifyPagesMax];
+  };
+  memory::Memory* verify_memory_ = nullptr;
+  uint32_t verify_pages_per_frame_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12Resource> verify_readback_;
+  const uint8_t* verify_mapping_ = nullptr;
+  VerifySlot verify_slots_[kVerifySlots];
+  uint32_t verify_slot_next_ = 0;
+  uint32_t verify_frame_pages_ = 0;  // pages copied this frame (reset by VerifyTick)
+  uint64_t verify_last_warn_frame_ = 0;
+  uint64_t verify_frames_ = 0;
 };
 
 }  // namespace rex::graphics::d3d12
