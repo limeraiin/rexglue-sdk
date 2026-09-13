@@ -281,6 +281,10 @@ class TextureCache {
   // [rtt-alias] The host wrote this texture's base level itself: clear the
   // outdated bits (re-arming the guest range watch) and mark it used.
   void MarkTextureUpToDateAfterHostWrite(Texture& texture);
+  // [rtt-alias] Drop a texture from the cache so the next request recreates
+  // it (the bindings are reset; the caller keeps the host resource alive
+  // until the GPU is done with it).
+  void EvictTextureForRecreation(Texture& texture);
 
   // Rules of data access in load shaders:
   // - Source reading (from the shared memory or the scaled resolve buffer):

@@ -179,6 +179,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool RttIsResolveDest(uint32_t start, uint32_t length) const;
   // A destination resolved for 2 s+ that no texture ever loaded from.
   bool RttDestUnread(uint32_t start, uint32_t length) const;
+  // Keeps a reference until the current submission has completed on the GPU.
+  void ReleaseResourceAfterCurrentSubmission(ID3D12Resource* resource);
   void GpuCensusPush(uint8_t cls) {
     if (!gpu_census_sub_active_) {
       return;

@@ -366,6 +366,16 @@ void TextureCache::MarkTextureUpToDateAfterHostWrite(Texture& texture) {
   texture.MarkAsUsed();
 }
 
+void TextureCache::EvictTextureForRecreation(Texture& texture) {
+  ResetTextureBindings();
+  ++nr_texture_destroy_generation_;  // [dcache]
+  auto found_texture_it = textures_.find(texture.key());
+  if (found_texture_it != textures_.end() && found_texture_it->second.get() == &texture) {
+    textures_.erase(found_texture_it);
+  }
+  COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+}
+
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
   uint32_t host_swizzle = 0;
   for (uint32_t i = 0; i < 4; ++i) {

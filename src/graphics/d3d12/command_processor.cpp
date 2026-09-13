@@ -18749,9 +18749,11 @@ void D3D12CommandProcessor::RttNoteResolve(uint32_t dest_base, uint32_t extent_s
                                            uint32_t height, uint32_t dest_format, bool is_depth,
                                            uint32_t src_msaa, uint32_t copy_shader, bool direct,
                                            uint32_t rt_key, bool clears, uint32_t alias) {
+  // Keyed by the written RANGE: a scratch base is reused for several shapes
+  // per frame (720p, 256x256, 128x128 at one base in this game).
   RttResolveRec* rec = nullptr;
   for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
-    if (rtt_resolves_[i].dest_base == dest_base) {
+    if (rtt_resolves_[i].start == extent_start && rtt_resolves_[i].length == extent_length) {
       rec = &rtt_resolves_[i];
       break;
     }
@@ -18816,13 +18818,23 @@ bool D3D12CommandProcessor::RttFindAliasKey(uint32_t start, uint32_t length, uin
 }
 
 bool D3D12CommandProcessor::RttIsResolveDest(uint32_t start, uint32_t length) const {
+  // Any resolve that started at this address, whatever its length: a
+  // texture over a scratch base gets the flag whichever shape came last.
   for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
     const RttResolveRec& r = rtt_resolves_[i];
-    if (r.start == start && r.length == length) {
+    if (r.start == start) {
       return true;
     }
   }
   return false;
+}
+
+void D3D12CommandProcessor::ReleaseResourceAfterCurrentSubmission(ID3D12Resource* resource) {
+  if (!resource) {
+    return;
+  }
+  resource->AddRef();
+  resources_for_deletion_.emplace_back(GetCurrentSubmission(), resource);
 }
 
 bool D3D12CommandProcessor::RttDestUnread(uint32_t start, uint32_t length) const {

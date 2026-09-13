@@ -1648,8 +1648,15 @@ ID3D12Resource* D3D12TextureCache::RttAliasBeginWrite(const TextureKey& key) {
   }
   auto* d3d12_texture = static_cast<D3D12Texture*>(texture);
   ID3D12Resource* resource = d3d12_texture->resource();
-  if (!resource ||
-      !(resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+  if (!resource) {
+    return nullptr;
+  }
+  if (!(resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+    // Created before its range was a known resolve destination: drop it so
+    // the next request (this frame's draw) recreates it with the flag; the
+    // resource itself lives until the GPU has finished the submission.
+    command_processor_.ReleaseResourceAfterCurrentSubmission(resource);
+    EvictTextureForRecreation(*texture);
     return nullptr;
   }
   command_processor_.PushTransitionBarrier(
