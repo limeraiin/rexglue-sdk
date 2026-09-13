@@ -382,6 +382,17 @@ REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
 // draw pool, rebuild every 800 received draws). 0 off (kill switch), 1
 // verify (draws kept, the GPU verdict judged against the [occ] query: WRONG
 // = hidden verdict with visible samples, must be 0), 2 skip.
+// [rtt-alias] The render-to-texture round trip (NEXT-AGENT.md 2026-09-13):
+// a resolve whose destination the census has seen sampled as exactly one
+// texture writes that texture directly and skips the guest write and the
+// reload; a destination nothing ever samples is skipped whole.
+REXCVAR_DEFINE_INT32(gpu_rtt, 1, "GPU/D3D12",
+                     "[rtt-alias] resolve into the sampled texture: 0 off (kill switch), 1 on.");
+REXCVAR_DEFINE_INT32(gpu_rtt_unread, 1, "GPU/D3D12",
+                     "[rtt-alias] skip resolves whose destination no texture ever loads: 0 off, 1 on.");
+REXCVAR_DEFINE_INT32(gpu_rtt_cycle, 0, "GPU/D3D12",
+                     "[rtt-alias] A/B: seconds per phase, alias on / off (0 = no cycling). The "
+                     "top-left marker shows the phase (green on, red off).");
 REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
                      "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
 // [ia] The input-assembler vertex path (NEXT-AGENT.md 2026-09-07): eligible
@@ -8154,7 +8165,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // [hiz-win] the cycle marker (user rule: the active phase visible at
         // the top-left in any test mode).
         // (SwapPhaseMarker(guest_output_resource, phase) is the marker every
-        // cycler must show at the top-left; no cycler is live.)
+        // cycler must show at the top-left.)
+        if (REXCVAR_GET(gpu_rtt_cycle) > 0) {
+          SwapPhaseMarker(guest_output_resource, rtt_alias_active_ ? 1 : 0);  // [rtt-alias]
+        }
 
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
@@ -18734,7 +18748,7 @@ void D3D12CommandProcessor::RttNoteResolve(uint32_t dest_base, uint32_t extent_s
                                            uint32_t extent_length, uint32_t width,
                                            uint32_t height, uint32_t dest_format, bool is_depth,
                                            uint32_t src_msaa, uint32_t copy_shader, bool direct,
-                                           uint32_t rt_key, bool clears) {
+                                           uint32_t rt_key, bool clears, uint32_t alias) {
   RttResolveRec* rec = nullptr;
   for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
     if (rtt_resolves_[i].dest_base == dest_base) {
@@ -18765,14 +18779,80 @@ void D3D12CommandProcessor::RttNoteResolve(uint32_t dest_base, uint32_t extent_s
   rec->last_frame = frame_current_;
   rec->last_seen_report = rtt_report_index_;
   ++rec->count;
+  ++rec->count_total;
   rec->bytes_kb += extent_length >> 10;
+  if (alias == 1) {
+    ++rec->aliased;
+  } else if (alias == 2) {
+    ++rec->skipped;
+  }
+}
+
+bool D3D12CommandProcessor::RttFindAliasKey(uint32_t start, uint32_t length, uint32_t width,
+                                            uint32_t height, uint32_t format,
+                                            TextureCache::TextureKey& key_out,
+                                            RttAliasOutcome& why_out) {
+  RttTexRec* found = nullptr;
+  for (uint32_t i = 0; i < rtt_tex_count_; ++i) {
+    RttTexRec& t = rtt_textures_[i];
+    if (t.base_address != start || t.base_size != length || t.width != width ||
+        t.height != height || t.format != format || t.scaled || t.mips || !t.ever_fed) {
+      continue;
+    }
+    if (found && found->key != t.key) {
+      why_out = kRttAliasMultiKey;
+      return false;
+    }
+    found = &t;
+  }
+  if (!found) {
+    why_out = kRttAliasNoKey;
+    return false;
+  }
+  // The alias keeps the record alive (no load refreshes it any more).
+  found->last_seen_report = rtt_report_index_;
+  key_out = found->key;
+  return true;
+}
+
+bool D3D12CommandProcessor::RttIsResolveDest(uint32_t start, uint32_t length) const {
+  for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
+    const RttResolveRec& r = rtt_resolves_[i];
+    if (r.start == start && r.length == length) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool D3D12CommandProcessor::RttDestUnread(uint32_t start, uint32_t length) const {
+  const RttResolveRec* rec = nullptr;
+  for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
+    const RttResolveRec& r = rtt_resolves_[i];
+    if (r.start == start && r.length == length) {
+      rec = &r;
+      break;
+    }
+  }
+  if (!rec || rec->count_total < 120 || rec->fed_total) {
+    return false;
+  }
+  const uint32_t end = start + length;
+  for (uint32_t i = 0; i < rtt_tex_count_; ++i) {
+    const RttTexRec& t = rtt_textures_[i];
+    if (t.base_address < end && start < t.base_address + t.base_size) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void D3D12CommandProcessor::RttNoteTextureLoad(uint32_t base_address, uint32_t base_size,
                                                uint32_t mip_address, uint32_t mip_size,
                                                bool load_base, bool load_mips, uint32_t width,
                                                uint32_t height, uint32_t format, bool tiled,
-                                               uint32_t mip_max_level, bool scaled) {
+                                               uint32_t mip_max_level, bool scaled,
+                                               const TextureCache::TextureKey& key) {
   RttTexRec* rec = nullptr;
   for (uint32_t i = 0; i < rtt_tex_count_; ++i) {
     RttTexRec& t = rtt_textures_[i];
@@ -18796,6 +18876,7 @@ void D3D12CommandProcessor::RttNoteTextureLoad(uint32_t base_address, uint32_t b
     rec->tiled = tiled ? 1 : 0;
     rec->scaled = scaled ? 1 : 0;
   }
+  rec->key = key;
   rec->base_size = base_size;
   rec->mips = uint8_t(mip_max_level);
   rec->last_seen_report = rtt_report_index_;
@@ -18828,8 +18909,10 @@ void D3D12CommandProcessor::RttNoteTextureLoad(uint32_t base_address, uint32_t b
   if (fed_by >= 0) {
     RttResolveRec& r = rtt_resolves_[fed_by];
     ++rec->fed;
+    ++rec->ever_fed;
     rec->fed_by = fed_by;
     ++r.fed_loads;
+    ++r.fed_total;
     r.fed_bytes_kb += base_size >> 10;
     if (base_address == r.start && base_size == r.length) {
       rec->range_rel = 1;
@@ -18852,6 +18935,20 @@ void D3D12CommandProcessor::RttNoteTextureLoad(uint32_t base_address, uint32_t b
 
 void D3D12CommandProcessor::RttReport1Hz() {
   ++rtt_report_index_;
+  // [rtt-alias] the phase for the next second.
+  const int32_t rtt_cycle = REXCVAR_GET(gpu_rtt_cycle);
+  if (rtt_cycle > 0 && ++rtt_cycle_seconds_ >= uint32_t(rtt_cycle)) {
+    rtt_cycle_seconds_ = 0;
+    rtt_cycle_on_ = !rtt_cycle_on_;
+  }
+  const bool rtt_alias_next =
+      REXCVAR_GET(gpu_rtt) != 0 && (rtt_cycle <= 0 || rtt_cycle_on_);
+  const char* rtt_phase = REXCVAR_GET(gpu_rtt) == 0 ? "kill" : rtt_alias_active_ ? "alias" : "off";
+  uint32_t aliased_total = 0, skipped_total = 0;
+  for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
+    aliased_total += rtt_resolves_[i].aliased;
+    skipped_total += rtt_resolves_[i].skipped;
+  }
   const uint64_t frames = frame_current_ > rtt_frame_last_report_
                               ? frame_current_ - rtt_frame_last_report_
                               : 1;
@@ -18891,14 +18988,23 @@ void D3D12CommandProcessor::RttReport1Hz() {
   }
   if (res_total || tex_loads || tex_mip_loads) {
     REXGPU_INFO(
-        "[rtt] fr {} | resolve/s {} ({:.1f}/fr, direct {}, {:.1f} MB/s) dests {} read-as-tex {} "
-        "unread {} | texup/s {} ({:.1f}/fr, {:.1f} MB/s, {} textures) FED by a resolve {} "
-        "({:.1f}/fr, {:.1f} MB/s) cold {} ({:.1f} MB/s) stale {} mips {} | overflow r{} t{}",
-        frames, res_total, double(res_total) * per_fr, res_direct, double(res_kb) / 1024.0, dests,
-        dests_read, dests_unread, tex_loads, double(tex_loads) * per_fr,
-        double(tex_kb) / 1024.0, tex_seen, fed_loads, double(fed_loads) * per_fr,
-        double(fed_kb) / 1024.0, rtt_loads_cold_, double(rtt_cold_bytes_kb_) / 1024.0,
-        rtt_loads_stale_, tex_mip_loads, rtt_resolve_overflow_, rtt_tex_overflow_);
+        "[rtt] fr {} phase={} | resolve/s {} ({:.1f}/fr, direct {}, {:.1f} MB/s) dests {} "
+        "read-as-tex {} unread {} | texup/s {} ({:.1f}/fr, {:.1f} MB/s, {} textures) FED by a "
+        "resolve {} ({:.1f}/fr, {:.1f} MB/s) cold {} ({:.1f} MB/s) stale {} mips {} | alias/s {} "
+        "({:.1f}/fr) unread-skip/s {} ({:.1f}/fr) decl "
+        "nokey/multi/fmt/endian/off/nouav/pipe/scaled/shape {}/{}/{}/{}/{}/{}/{}/{}/{} | "
+        "overflow r{} t{}",
+        frames, rtt_phase, res_total, double(res_total) * per_fr, res_direct,
+        double(res_kb) / 1024.0, dests, dests_read, dests_unread, tex_loads,
+        double(tex_loads) * per_fr, double(tex_kb) / 1024.0, tex_seen, fed_loads,
+        double(fed_loads) * per_fr, double(fed_kb) / 1024.0, rtt_loads_cold_,
+        double(rtt_cold_bytes_kb_) / 1024.0, rtt_loads_stale_, tex_mip_loads, aliased_total,
+        double(aliased_total) * per_fr, skipped_total, double(skipped_total) * per_fr,
+        rtt_alias_counts_[kRttAliasNoKey], rtt_alias_counts_[kRttAliasMultiKey],
+        rtt_alias_counts_[kRttAliasFormat], rtt_alias_counts_[kRttAliasEndian],
+        rtt_alias_counts_[kRttAliasOffset], rtt_alias_counts_[kRttAliasNoUav],
+        rtt_alias_counts_[kRttAliasPipeline], rtt_alias_counts_[kRttAliasScaled],
+        rtt_alias_counts_[kRttAliasShape], rtt_resolve_overflow_, rtt_tex_overflow_);
     // Per destination: the resolve's shape and the textures it fed.
     std::string keys;
     for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
@@ -18906,10 +19012,11 @@ void D3D12CommandProcessor::RttReport1Hz() {
       if (!r.count) {
         continue;
       }
-      keys += fmt::format(" | {:08X}+{:X} {}x{} {}f{} m{} sh{} d{}{} res {} ({:.1f}/fr) -> loads {}",
-                          r.start, r.length, r.width, r.height, r.is_depth ? "Z" : "C",
-                          r.dest_format, r.src_msaa, r.copy_shader, r.direct, r.clears ? " clr" : "",
-                          r.count, double(r.count) * per_fr, r.fed_loads);
+      keys += fmt::format(
+          " | {:08X}+{:X} {}x{} {}f{} m{} sh{} d{}{} res {} ({:.1f}/fr) a{} s{} -> loads {}",
+          r.start, r.length, r.width, r.height, r.is_depth ? "Z" : "C", r.dest_format, r.src_msaa,
+          r.copy_shader, r.direct, r.clears ? " clr" : "", r.count, double(r.count) * per_fr,
+          r.aliased, r.skipped, r.fed_loads);
       uint32_t listed = 0;
       for (uint32_t t = 0; t < rtt_tex_count_ && listed < 3; ++t) {
         const RttTexRec& x = rtt_textures_[t];
@@ -18958,6 +19065,8 @@ void D3D12CommandProcessor::RttReport1Hz() {
     r.bytes_kb = 0;
     r.fed_loads = 0;
     r.fed_bytes_kb = 0;
+    r.aliased = 0;
+    r.skipped = 0;
     if (w != i) {
       for (uint32_t t = 0; t < rtt_tex_count_; ++t) {
         if (rtt_textures_[t].fed_by == int32_t(i)) {
@@ -18986,6 +19095,9 @@ void D3D12CommandProcessor::RttReport1Hz() {
   rtt_loads_stale_ = 0;
   rtt_resolve_overflow_ = 0;
   rtt_tex_overflow_ = 0;
+  std::memset(rtt_alias_counts_, 0, sizeof(rtt_alias_counts_));
+  rtt_alias_active_ = rtt_alias_next;
+  rtt_unread_skip_active_ = rtt_alias_next && REXCVAR_GET(gpu_rtt_unread) != 0;
 }
 
 void D3D12CommandProcessor::GpuCensusReport1Hz() {

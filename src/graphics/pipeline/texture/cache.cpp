@@ -358,6 +358,14 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
+void TextureCache::MarkTextureUpToDateAfterHostWrite(Texture& texture) {
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    texture.MakeUpToDateAndWatch(global_lock);
+  }
+  texture.MarkAsUsed();
+}
+
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
   uint32_t host_swizzle = 0;
   for (uint32_t i = 0; i < 4; ++i) {

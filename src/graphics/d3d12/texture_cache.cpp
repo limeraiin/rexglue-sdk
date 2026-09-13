@@ -1615,6 +1615,17 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   // Untiling through a buffer instead of using unordered access because copying
   // is not done that often.
   desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  // [rtt-alias] A 2D RGBA8 / R8 texture over exactly a known resolve
+  // destination is the resolve's own output: the resolve writes it through a
+  // UAV (the resolve always precedes the first load, so the destination is
+  // already known here).
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 &&
+      desc.MipLevels == 1 && !key.scaled_resolve &&
+      (key.format == xenos::TextureFormat::k_8_8_8_8 || key.format == xenos::TextureFormat::k_8) &&
+      command_processor_.RttIsResolveDest(key.base_page << 12,
+                                          key.GetGuestLayout().base.level_data_extent_bytes)) {
+    desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  }
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   // Assuming untiling will be the next operation.
@@ -1626,6 +1637,33 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
     return nullptr;
   }
   return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+}
+
+// [rtt-alias]
+ID3D12Resource* D3D12TextureCache::RttAliasBeginWrite(const TextureKey& key) {
+  rtt_alias_texture_ = nullptr;
+  Texture* texture = FindOrCreateTexture(key);
+  if (!texture) {
+    return nullptr;
+  }
+  auto* d3d12_texture = static_cast<D3D12Texture*>(texture);
+  ID3D12Resource* resource = d3d12_texture->resource();
+  if (!resource ||
+      !(resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+    return nullptr;
+  }
+  command_processor_.PushTransitionBarrier(
+      resource, d3d12_texture->SetResourceState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  rtt_alias_texture_ = texture;
+  return resource;
+}
+
+void D3D12TextureCache::RttAliasWritten() {
+  if (rtt_alias_texture_) {
+    MarkTextureUpToDateAfterHostWrite(*rtt_alias_texture_);
+    rtt_alias_texture_ = nullptr;
+  }
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
@@ -1641,7 +1679,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       texture_key.base_page << 12, texture.GetGuestBaseSize(), texture_key.mip_page << 12,
       texture.GetGuestMipsSize(), load_base, load_mips, texture_key.GetWidth(),
       texture_key.GetHeight(), uint32_t(texture_key.format), texture_key.tiled != 0,
-      texture_key.mip_max_level, texture_key.scaled_resolve != 0);
+      texture_key.mip_max_level, texture_key.scaled_resolve != 0, texture_key);
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();

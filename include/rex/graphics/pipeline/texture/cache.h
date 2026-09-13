@@ -131,6 +131,8 @@ class TextureCache {
   }
 
  protected:
+  // [rtt] public: the command processor's census stores the exact key.
+ public:
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
     // constants so fewer bits can be used, while the maximum size (8192 for 2D)
@@ -193,6 +195,7 @@ class TextureCache {
     void LogAction(const char* action) const;
   };
 
+ protected:
   class Texture {
    public:
     Texture(const Texture& texture) = delete;
@@ -274,6 +277,10 @@ class TextureCache {
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
   };
+
+  // [rtt-alias] The host wrote this texture's base level itself: clear the
+  // outdated bits (re-arming the guest range watch) and mark it used.
+  void MarkTextureUpToDateAfterHostWrite(Texture& texture);
 
   // Rules of data access in load shaders:
   // - Source reading (from the shared memory or the scaled resolve buffer):

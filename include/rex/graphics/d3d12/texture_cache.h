@@ -38,6 +38,12 @@ class D3D12CommandProcessor;
 
 class D3D12TextureCache final : public TextureCache {
  public:
+  // [rtt-alias] The texture a resolve writes directly: FindOrCreate, its
+  // resource transitioned to UNORDERED_ACCESS (null when the resource has no
+  // UAV flag); then the mark after the write: up to date, watched, used.
+  ID3D12Resource* RttAliasBeginWrite(const TextureKey& key);
+  void RttAliasWritten();
+
   // Keys that can be stored for checking validity whether descriptors for host
   // shader bindings are up to date.
   struct TextureSRVKey {
@@ -489,6 +495,7 @@ class D3D12TextureCache final : public TextureCache {
   static const HostFormat host_formats_[64];
 
   D3D12CommandProcessor& command_processor_;
+  Texture* rtt_alias_texture_ = nullptr;  // [rtt-alias] between BeginWrite and Written
   bool bindless_resources_used_;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;

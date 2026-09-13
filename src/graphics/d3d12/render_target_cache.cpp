@@ -1608,7 +1608,28 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
   // Copying.
   bool copied = false;
-  if (resolve_info.copy_dest_extent_length) {
+  // [rtt-alias] A destination the census has watched for 2 s+ that no
+  // texture ever loaded from: nothing on the host can read the guest bytes
+  // (the CPU readback path is off), so the copy is skipped whole. The first
+  // texture that ever appears over it reads one stale frame, then the
+  // resolve writes again.
+  bool rtt_unread_skip = false;
+  if (resolve_info.copy_dest_extent_length && command_processor_.RttUnreadSkipActive() &&
+      command_processor_.RttDestUnread(resolve_info.copy_dest_extent_start,
+                                       resolve_info.copy_dest_extent_length)) {
+    rtt_unread_skip = true;
+    const draw_util::ResolveEdramInfo& rtt_edram = resolve_info.IsCopyingDepth()
+                                                       ? resolve_info.depth_edram_info
+                                                       : resolve_info.color_edram_info;
+    command_processor_.RttNoteResolve(
+        resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+        resolve_info.copy_dest_extent_length, uint32_t(resolve_info.coordinate_info.width_div_8) << 3,
+        resolve_info.height_div_8 << 3, uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        resolve_info.IsCopyingDepth(), uint32_t(rtt_edram.msaa_samples), 0, false, 0u,
+        resolve_info.IsClearingDepth() || resolve_info.IsClearingColor(), 2);
+  }
+  bool rtt_aliased = false;
+  if (resolve_info.copy_dest_extent_length && !rtt_unread_skip) {
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =
@@ -1628,6 +1649,13 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
             ++direct_resolve_success_count_;
+            // [rtt-alias] the resolve written straight into the texture the
+            // guest samples from this range; the guest write, the watch and
+            // the reload are skipped below.
+            if (command_processor_.RttAliasActive() && !dres_verify_pending_length_ &&
+                !REXCVAR_GET(gpu_nr_direct_resolve_verify)) {
+              rtt_aliased = TryAliasResolve(resolve_info, texture_cache);
+            }
             if (REXCVAR_GET(gpu_nr_direct_resolve_verify) && !dres_verify_pending_length_) {
               const auto dres_now = std::chrono::steady_clock::now();
               if (dres_now - dres_verify_last_ >= std::chrono::seconds(1)) {
@@ -1725,7 +1753,26 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
       // Make sure there is memory to write to.
       bool copy_dest_committed;
-      if (draw_resolution_scaled) {
+      if (rtt_aliased) {
+        // [rtt-alias] The texture holds the result; the guest bytes are not
+        // written, so no range is marked resolved (the texture stays up to
+        // date and watched). Counted by the census as an aliased resolve.
+        copy_dest_committed = false;
+        const draw_util::ResolveEdramInfo& rtt_edram = resolve_info.IsCopyingDepth()
+                                                           ? resolve_info.depth_edram_info
+                                                           : resolve_info.color_edram_info;
+        command_processor_.RttNoteResolve(
+            resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+            resolve_info.copy_dest_extent_length,
+            uint32_t(resolve_info.coordinate_info.width_div_8) << 3, resolve_info.height_div_8 << 3,
+            uint32_t(resolve_info.copy_dest_info.copy_dest_format), resolve_info.IsCopyingDepth(),
+            uint32_t(rtt_edram.msaa_samples), uint32_t(copy_shader), true,
+            direct_resolve_plan_.render_target ? direct_resolve_plan_.render_target->key().key : 0u,
+            resolve_info.IsClearingDepth() || resolve_info.IsClearingColor(), 1);
+        written_address_out = resolve_info.copy_dest_extent_start;
+        written_length_out = resolve_info.copy_dest_extent_length;
+        copied = true;
+      } else if (draw_resolution_scaled) {
         // Committing starting with the beginning of the potentially written
         // extent, but making the buffer containing the base current as the
         // beginning of the bound buffer is the base.
@@ -1895,10 +1942,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                 direct_resolved && direct_resolve_plan_.render_target
                     ? direct_resolve_plan_.render_target->key().key
                     : 0u,
-                resolve_info.IsClearingDepth() || resolve_info.IsClearingColor());
+                resolve_info.IsClearingDepth() || resolve_info.IsClearingColor(), 0);
           }
         }
-      } else {
+      } else if (!rtt_aliased) {
         REXGPU_ERROR(
             "D3D12RenderTargetCache: Failed to obtain the resolve destination "
             "memory region");
@@ -6721,7 +6768,16 @@ cbuffer XeDrConstants : register(b0) {
   uint xe_dr_bias_bits;    // full only: float bits of exp_bias * (1/count)
   uint xe_dr_fill;         // half-pixel-offset fill: x | y<<8 (0 unscaled)
 };
+#if XE_DR_TEX_OUT
+// [rtt-alias] the output is the texture the guest samples, not guest bytes.
+#if XE_DR_BPP8
+RWTexture2D<unorm float> xe_dr_dest_tex : register(u0);
+#else
+RWTexture2D<unorm float4> xe_dr_dest_tex : register(u0);
+#endif
+#else
 RWBuffer<uint> xe_dr_dest : register(u0);
+#endif
 #if XE_DR_SRC_MS
 Texture2DMS<float4> xe_dr_source : register(t0);
 #else
@@ -6862,12 +6918,20 @@ void main(uint3 xe_dr_thread : SV_DispatchThreadID) {
     }
     float4 c8 = acc8 * asfloat(xe_dr_bias_bits);
     float red8 = ((xe_dr_dest_info & (1u << 24u)) != 0u) ? c8.b : c8.r;
+#if XE_DR_TEX_OUT
+    if (p4.x + pi < size.x) {
+      xe_dr_dest_tex[uint2(p4.x + pi, p4.y)] = saturate(red8);
+    }
+#else
     dest_bytes |= uint(saturate(red8) * 255.0f + 0.5f) << (pi * 8u);
+#endif
   }
+#if !XE_DR_TEX_OUT
   uint2 dp4 = p4 + (((uint2(xe_dr_dest_coord >> 20u, xe_dr_dest_coord >> 24u) & 0xFu) << 3u) *
                     uint2(XE_DR_SCALE_X, XE_DR_SCALE_Y));
   uint addr8 = xe_dr_dest_base + XeDrDestAddress(dp4, xe_dr_dest_coord & 0x3FFu, 0u);
   xe_dr_dest[addr8 >> 2u] = dest_bytes;
+#endif
 #else
   if (xe_dr_thread.x >= size.x || xe_dr_thread.y >= size.y) {
     return;
@@ -6962,10 +7026,16 @@ void main(uint3 xe_dr_thread : SV_DispatchThreadID) {
   packed = q.x | (q.y << 8u) | (q.z << 16u) | (q.w << 24u);
 #endif
 #endif
+#if XE_DR_TEX_OUT && !XE_DR_DEPTH
+  // The 8888 texel the load shader would have produced from packed (the
+  // dest endian and the texture endian are equal by the caller's check).
+  xe_dr_dest_tex[p] = saturate(c);
+#else
   uint2 dp = p + (((uint2(xe_dr_dest_coord >> 20u, xe_dr_dest_coord >> 24u) & 0xFu) << 3u) *
                   uint2(XE_DR_SCALE_X, XE_DR_SCALE_Y));
   uint addr = xe_dr_dest_base + XeDrDestAddress(dp, xe_dr_dest_coord & 0x3FFu, 2u);
   xe_dr_dest[addr >> 2u] = XeDrEndianSwap32(packed, xe_dr_dest_info & 7u);
+#endif
 #endif
 }
 )nrdres";
@@ -6986,9 +7056,10 @@ static PFN_NrD3DCompile NrGetD3DCompile() {
 }
 
 ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDirectResolvePipeline(
-    DumpPipelineKey key, bool full, uint32_t pack_class, bool src_gamma16) {
+    DumpPipelineKey key, bool full, uint32_t pack_class, bool src_gamma16, bool tex_out) {
   DumpPipelineKey map_key = key;
-  map_key.key |= (full ? 1u : 0u) << 16 | (pack_class & 7u) << 17 | (src_gamma16 ? 1u : 0u) << 20;
+  map_key.key |= (full ? 1u : 0u) << 16 | (pack_class & 7u) << 17 | (src_gamma16 ? 1u : 0u) << 20 |
+                 (tex_out ? 1u : 0u) << 21;
   auto pipeline_it = direct_resolve_pipelines_.find(map_key);
   if (pipeline_it != direct_resolve_pipelines_.end()) {
     return pipeline_it->second;
@@ -7041,13 +7112,15 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDirectResolvePipeline(
       char define_scale_x[2], define_scale_y[2];
       std::snprintf(define_scale_x, sizeof(define_scale_x), "%u", draw_resolution_scale_x());
       std::snprintf(define_scale_y, sizeof(define_scale_y), "%u", draw_resolution_scale_y());
+      char define_tex_out[2];
+      std::snprintf(define_tex_out, sizeof(define_tex_out), "%u", tex_out ? 1u : 0u);
       const D3D_SHADER_MACRO defines[] = {
           {"XE_DR_SRC_MS", define_ms},         {"XE_DR_DEPTH", define_depth},
           {"XE_DR_DEPTH_FLOAT", define_depth_float}, {"XE_DR_F24_ROUND", define_round},
           {"XE_DR_COLOR_FMT", define_fmt},     {"XE_DR_FULL", define_full},
           {"XE_DR_PACK", define_pack},         {"XE_DR_SRC_GAMMA16", define_gamma16},
           {"XE_DR_BPP8", define_bpp8},         {"XE_DR_SCALE_X", define_scale_x},
-          {"XE_DR_SCALE_Y", define_scale_y},
+          {"XE_DR_SCALE_Y", define_scale_y},   {"XE_DR_TEX_OUT", define_tex_out},
           {nullptr, nullptr},
       };
       ID3DBlob* code = nullptr;
@@ -7060,7 +7133,9 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDirectResolvePipeline(
             command_processor_.GetD3D12Provider().GetDevice(), code->GetBufferPointer(),
             code->GetBufferSize(), root_signature);
         if (pipeline) {
-          pipeline->SetName(key.is_depth ? L"NR Direct Resolve Depth" : L"NR Direct Resolve Color");
+          pipeline->SetName(key.is_depth ? L"NR Direct Resolve Depth"
+                            : tex_out    ? L"NR Direct Resolve Color To Texture"
+                                         : L"NR Direct Resolve Color");
         }
       } else {
         REXGPU_WARN("[nr-dres] shader compile failed for key {:08X}: {}", key.key,
@@ -7332,6 +7407,10 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
   direct_resolve_plan_.scaled = draw_resolution_scaled;
   direct_resolve_plan_.dest_base_guest = resolve_info.copy_dest_base;
   direct_resolve_plan_.bpp_log2 = class_full8 ? 0 : 2;
+  direct_resolve_plan_.pipeline_key = pipeline_key;
+  direct_resolve_plan_.full = class_full;
+  direct_resolve_plan_.src_gamma16 = src_gamma16;
+  direct_resolve_plan_.pack_class = pack_class;
   direct_resolve_plan_.constants[0] = resolve_info.copy_dest_info.value;
   direct_resolve_plan_.constants[1] = resolve_info.copy_dest_coordinate_info.packed;
   // Scaled dests are windowed at the range made current, so addresses are
@@ -7347,6 +7426,102 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
   direct_resolve_plan_.group_count_x =
       class_full8 ? (width_pixels + 31) >> 5 : (width_pixels + 7) >> 3;
   direct_resolve_plan_.group_count_y = (height_pixels + 7) >> 3;
+  return true;
+}
+
+// [rtt-alias] The resolve written straight into the learned texture. The
+// plan (TryResolveCopyDirectly) is reused whole: same source RT, samples,
+// bias, origin, group counts; only the pipeline variant (XE_DR_TEX_OUT) and
+// the u0 view differ. Every decline is counted by reason in [rtt].
+bool D3D12RenderTargetCache::TryAliasResolve(const draw_util::ResolveInfo& resolve_info,
+                                             D3D12TextureCache& texture_cache) {
+  using Outcome = D3D12CommandProcessor::RttAliasOutcome;
+  const DirectResolvePlan& plan = direct_resolve_plan_;
+  if (!plan.pipeline || !plan.render_target || plan.is_depth) {
+    return false;
+  }
+  auto decline = [this](Outcome why) {
+    command_processor_.RttNoteAlias(why);
+    return false;
+  };
+  if (plan.scaled) {
+    return decline(Outcome::kRttAliasScaled);
+  }
+  const bool bpp8 = plan.bpp_log2 == 0;
+  const uint32_t dest_format = uint32_t(resolve_info.copy_dest_info.copy_dest_format);
+  // Only the identity packs: k_8 bytes into an R8 texture, k_8_8_8_8 into an
+  // RGBA8 texture. Everything else keeps the guest path.
+  if (bpp8 ? dest_format != uint32_t(xenos::ColorFormat::k_8)
+           : (plan.pack_class != 0 || dest_format != uint32_t(xenos::ColorFormat::k_8_8_8_8))) {
+    return decline(Outcome::kRttAliasFormat);
+  }
+  if (resolve_info.copy_dest_coordinate_info.offset_x_div_8 ||
+      resolve_info.copy_dest_coordinate_info.offset_y_div_8 ||
+      resolve_info.copy_dest_base != resolve_info.copy_dest_extent_start) {
+    return decline(Outcome::kRttAliasOffset);
+  }
+  const uint32_t width = plan.constants[3] & 0xFFFFu;
+  const uint32_t height = plan.constants[3] >> 16;
+  TextureCache::TextureKey key;
+  Outcome why = Outcome::kRttAliasNoKey;
+  if (!command_processor_.RttFindAliasKey(
+          resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length, width,
+          height,
+          bpp8 ? uint32_t(xenos::TextureFormat::k_8) : uint32_t(xenos::TextureFormat::k_8_8_8_8),
+          key, why)) {
+    return decline(why);
+  }
+  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.depth_or_array_size_minus_1 ||
+      key.mip_max_level || key.signed_separate || key.scaled_resolve) {
+    return decline(Outcome::kRttAliasShape);
+  }
+  // The guest bytes would be endian-swapped by the resolve and un-swapped by
+  // the load: an identity only when both sides agree (8bpp swaps nothing).
+  const uint32_t dest_endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
+  if (bpp8 ? (key.endianness != xenos::Endian::kNone)
+           : (dest_endian != uint32_t(key.endianness))) {
+    return decline(Outcome::kRttAliasEndian);
+  }
+  ID3D12PipelineState* pipeline = GetOrCreateDirectResolvePipeline(
+      plan.pipeline_key, plan.full, plan.pack_class, plan.src_gamma16, true);
+  if (!pipeline) {
+    return decline(Outcome::kRttAliasPipeline);
+  }
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(2, descriptors)) {
+    return decline(Outcome::kRttAliasPipeline);
+  }
+  ID3D12Resource* texture_resource = texture_cache.RttAliasBeginWrite(key);
+  if (!texture_resource) {
+    return decline(Outcome::kRttAliasNoUav);
+  }
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+  uav_desc.Format = bpp8 ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+  uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  uav_desc.Texture2D.MipSlice = 0;
+  uav_desc.Texture2D.PlaneSlice = 0;
+  device->CreateUnorderedAccessView(texture_resource, nullptr, &uav_desc, descriptors[0].first);
+  auto& d3d12_rt = *plan.render_target;
+  device->CopyDescriptorsSimple(1, descriptors[1].first, d3d12_rt.descriptor_srv().GetHandle(),
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+  command_processor_.PushTransitionBarrier(
+      d3d12_rt.resource(),
+      d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  command_list.D3DSetComputeRootSignature(direct_resolve_root_signature_color_);
+  command_list.D3DSetComputeRoot32BitConstants(0, 8, plan.constants, 0);
+  command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+  command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
+  command_processor_.SetExternalPipeline(pipeline);
+  command_processor_.SubmitBarriers();
+  command_list.D3DDispatch(plan.group_count_x, plan.group_count_y, 1);
+  texture_cache.RttAliasWritten();
+  command_processor_.RttNoteAlias(Outcome::kRttAliasDone);
   return true;
 }
 

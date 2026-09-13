@@ -143,12 +143,42 @@ class D3D12CommandProcessor : public CommandProcessor {
   void RttNoteResolve(uint32_t dest_base, uint32_t extent_start, uint32_t extent_length,
                       uint32_t width, uint32_t height, uint32_t dest_format, bool is_depth,
                       uint32_t src_msaa, uint32_t copy_shader, bool direct, uint32_t rt_key,
-                      bool clears);
+                      bool clears, uint32_t alias);  // alias: 0 guest write, 1 aliased, 2 skipped
   void RttNoteTextureLoad(uint32_t base_address, uint32_t base_size, uint32_t mip_address,
                           uint32_t mip_size, bool load_base, bool load_mips, uint32_t width,
                           uint32_t height, uint32_t format, bool tiled, uint32_t mip_max_level,
-                          bool scaled);
+                          bool scaled, const TextureCache::TextureKey& key);
   void RttReport1Hz();
+  // [rtt-alias] The lever: a resolve whose destination the census has seen
+  // sampled as exactly one texture key (same range, shape, format) writes
+  // that texture's host resource directly and skips the guest write and the
+  // reload; a destination nothing ever sampled is skipped whole. Cvars
+  // gpu_rtt (kill switch), gpu_rtt_unread, gpu_rtt_cycle (the A/B, marker
+  // at the top-left). Decided at the 1 Hz report.
+  bool RttAliasActive() const { return rtt_alias_active_; }
+  bool RttUnreadSkipActive() const { return rtt_unread_skip_active_; }
+  enum RttAliasOutcome : uint32_t {
+    kRttAliasDone,
+    kRttAliasNoKey,
+    kRttAliasMultiKey,
+    kRttAliasFormat,
+    kRttAliasEndian,
+    kRttAliasOffset,
+    kRttAliasNoUav,
+    kRttAliasPipeline,
+    kRttAliasScaled,
+    kRttAliasShape,
+    kRttAliasOutcomeCount
+  };
+  void RttNoteAlias(RttAliasOutcome outcome) { ++rtt_alias_counts_[outcome]; }
+  // The one learned texture key over exactly this range and shape.
+  bool RttFindAliasKey(uint32_t start, uint32_t length, uint32_t width, uint32_t height,
+                       uint32_t format, TextureCache::TextureKey& key_out,
+                       RttAliasOutcome& why_out);
+  // A texture over exactly a known resolve destination gets the UAV flag.
+  bool RttIsResolveDest(uint32_t start, uint32_t length) const;
+  // A destination resolved for 2 s+ that no texture ever loaded from.
+  bool RttDestUnread(uint32_t start, uint32_t length) const;
   void GpuCensusPush(uint8_t cls) {
     if (!gpu_census_sub_active_) {
       return;
@@ -1238,8 +1268,11 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t rt_key = 0;
     uint64_t last_frame = 0;
     uint64_t last_seen_report = 0;
+    // For the run: resolves, loads fed (0 = nothing ever samples it).
+    uint32_t count_total = 0, fed_total = 0;
     // This second.
     uint32_t count = 0, bytes_kb = 0, fed_loads = 0, fed_bytes_kb = 0;
+    uint32_t aliased = 0, skipped = 0;
   };
   struct RttTexRec {
     uint32_t base_address = 0, base_size = 0;
@@ -1251,6 +1284,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t loads = 0, fed = 0, bytes_kb = 0, mip_loads = 0;
     int32_t fed_by = -1;  // index into rtt_resolves_ of the last feeding resolve
     uint8_t range_rel = 0;  // 0 none, 1 equal, 2 texture inside dest, 3 dest inside texture, 4 partial
+    uint32_t ever_fed = 0;
+    TextureCache::TextureKey key;  // the exact key, for the alias
   };
   static constexpr uint32_t kRttResolveCap = 96;
   static constexpr uint32_t kRttTexCap = 384;
@@ -1262,6 +1297,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t rtt_loads_cold_ = 0, rtt_cold_bytes_kb_ = 0, rtt_loads_stale_ = 0;
   uint64_t rtt_report_index_ = 0;
   uint64_t rtt_frame_last_report_ = 0;
+  // [rtt-alias]
+  bool rtt_alias_active_ = false;
+  bool rtt_unread_skip_active_ = false;
+  bool rtt_cycle_on_ = true;
+  uint32_t rtt_cycle_seconds_ = 0;
+  uint32_t rtt_alias_counts_[kRttAliasOutcomeCount] = {};
 
   // [occ] census state: two query heaps (pipeline statistics + occlusion)
   // indexed by the same ring slot, one slot per issued draw.

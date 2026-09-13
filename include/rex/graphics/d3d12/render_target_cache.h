@@ -631,7 +631,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     // when scaled) and the dest bytes-per-block log2 (2, or 0 for 8bpp).
     uint32_t dest_base_guest = 0;
     uint32_t bpp_log2 = 2;
+    // [rtt-alias] the pipeline variant inputs, to build the texture-output twin.
+    DumpPipelineKey pipeline_key;
+    bool full = false;
+    bool src_gamma16 = false;
+    uint32_t pack_class = 0;
   };
+  // [rtt-alias] The resolve written straight into the learned texture.
+  bool TryAliasResolve(const draw_util::ResolveInfo& resolve_info,
+                       D3D12TextureCache& texture_cache);
   enum class DirectResolveDecline : uint32_t {
     kScaled,         // resolution-scaled (not in increment 1)
     kShaderClass,    // not a fast-32bpp copy shader
@@ -690,7 +698,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // full-class (averaging/format-converting) shaders; the map key packs them
   // into the DumpPipelineKey's spare upper bits.
   ID3D12PipelineState* GetOrCreateDirectResolvePipeline(DumpPipelineKey key, bool full,
-                                                        uint32_t pack_class, bool src_gamma16);
+                                                        uint32_t pack_class, bool src_gamma16,
+                                                        bool tex_out = false);
   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                               draw_util::ResolveCopyShaderIndex copy_shader,
                               bool draw_resolution_scaled);
