@@ -1330,10 +1330,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     }
   }
   void IaReport1Hz(double secs, double frames);
-  void IaSwapMarker(ID3D12Resource* guest_output);  // the cycle marker at swap
-  Microsoft::WRL::ComPtr<ID3D12Resource> ia_marker_upload_;
-  uint8_t* ia_marker_mapping_ = nullptr;
-  int ia_marker_phase_ = -1;
   std::unique_ptr<VbMirror> vb_mirror_;
   bool ia_available_ = false;
   uint32_t ia_phase_ = 0;  // latched per frame: 1 IA, 0 raw

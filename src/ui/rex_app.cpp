@@ -259,7 +259,9 @@ bool ReXApp::SetupEnvironment() {
   auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path_);
   auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
                                         log_level_str, category_levels);
-  if (log_file_cvar.empty()) {
+  // log_level off = zero logs: no logs/ directory and no file sink at all
+  // (a shipping build); the loggers themselves drop every record at should_log.
+  if (log_file_cvar.empty() && log_level_str != "off") {
     log_config.app_name = std::string(GetName());
     log_config.log_dir = (exe_dir / "logs").string();
   }

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/system/xam/content_install.h>
 
 // clang-format off
@@ -203,6 +204,9 @@ uint32_t DetectGameTitleId(const std::wstring& game_data_dir) {
     return 0;
   }
   std::filesystem::path dir(game_data_dir);
+  if (dir.is_relative()) {
+    dir = rex::filesystem::GetExecutableFolder() / dir;  // the package layout
+  }
   uint32_t title_id = 0;
 
   std::error_code ec;
@@ -507,6 +511,13 @@ void BuildControls(HWND hwnd, DialogState* st) {
   SendMessageW(st->combo_display, CB_SETCURSEL, display_sel, 0);
 
   std::wstring data_dir = Widen(rex::cvar::GetFlagByName("game_data_root"));
+  if (data_dir.empty()) {
+    // A self-contained package: GameData next to the exe is the default.
+    std::error_code ec;
+    if (std::filesystem::is_directory(rex::filesystem::GetExecutableFolder() / "GameData", ec)) {
+      data_dir = L"GameData";
+    }
+  }
   SetWindowTextW(st->edit_data, data_dir.c_str());
 
   SendMessageW(st->check_skip_launcher, BM_SETCHECK,
@@ -531,7 +542,12 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
                 MB_OK | MB_ICONWARNING);
     return false;
   }
-  DWORD attr = GetFileAttributesW(data.c_str());
+  // A relative folder is relative to the exe (the package layout), not the cwd.
+  std::filesystem::path data_path(data);
+  if (data_path.is_relative()) {
+    data_path = rex::filesystem::GetExecutableFolder() / data_path;
+  }
+  DWORD attr = GetFileAttributesW(data_path.c_str());
   if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
     MessageBoxW(hwnd, L"That game data folder does not exist.", L"Invalid folder",
                 MB_OK | MB_ICONWARNING);

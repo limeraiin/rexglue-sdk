@@ -388,16 +388,15 @@ REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
 // vertex shaders read their attributes from host-order vertex buffer views
 // (the mirror) through the IA instead of the translated per-vertex shared
 // memory fetch; the index buffer is the mirror's too.
-REXCVAR_DEFINE_INT32(gpu_ia, -1, "GPU/D3D12",
-                     "[ia] input-assembler vertex fetch: -1 by vendor (default: Intel on, others "
-                     "off; drive 872 Intel 720p 19.6 -> 20.6 fps, GPU 51.2 -> 48.5 ms/fr; drive "
-                     "871 RTX 1440p 57.9 -> 55.0 fps, a CP cost, GPU equal), 0 off everywhere "
-                     "(the translated raw fetch), 1 on everywhere.");
+// Shipped ON everywhere (2026-09-13): Intel 720p 19.6 -> 20.6 fps (drive
+// 872); RTX 1440p neutral within noise (drives 871 -2.9, 874 +1.2, IssueDraw
+// equal). 0 = the kill switch (the translated raw fetch).
+REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
+                     "[ia] input-assembler vertex fetch: 1 on (default), 0 off (the "
+                     "translated raw fetch).");
 REXCVAR_DEFINE_UINT32(gpu_ia_verify, 0, "GPU/D3D12",
                       "[ia] shadow verify: pages per frame read back and compared with the "
                       "byte-swapped guest memory (0 = off, 16 max).");
-REXCVAR_DEFINE_INT32(gpu_ia_cycle, 0, "GPU/D3D12",
-                     "[ia] the in-place A/B: seconds per phase (on, then off); 0 = no cycling.");
 REXCVAR_DEFINE_UINT32(gpu_ia_mb, 512, "GPU/D3D12",
                       "[ia] the host-order shadow's mapped-memory budget in MB (4 MB regions, "
                       "mapped on first touch).");
@@ -7303,21 +7302,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       const int32_t dm = REXCVAR_GET(gpu_dcache);
       g_dc_mode = (dm >= 0 && dm <= 2) ? dm : 0;
     }
-    {  // [ia] per-frame phase latch: the cycler (seconds per phase) or the cvar.
-      uint32_t ia_phase = 0;
-      if (ia_available_) {
-        const int32_t cyc = REXCVAR_GET(gpu_ia_cycle);
-        if (cyc > 0) {
-          static const auto s_ia_t0 = std::chrono::steady_clock::now();
-          const double el =
-              std::chrono::duration<double>(std::chrono::steady_clock::now() - s_ia_t0).count();
-          ia_phase = (uint64_t(el / double(cyc)) & 1) ? 0 : 1;
-        } else {
-          const int32_t v = REXCVAR_GET(gpu_ia);
-          ia_phase = v < 0 ? (g_pool_intel_off ? 1 : 0) : (v != 0 ? 1 : 0);
-        }
-      }
-      ia_phase_ = ia_phase;
+    {  // [ia] per-frame phase latch (on everywhere; 0 = the kill switch).
+      ia_phase_ = (ia_available_ && REXCVAR_GET(gpu_ia) != 0) ? 1 : 0;
       if (vb_mirror_) vb_mirror_->VerifyTick();
     }
     ++g_pool.frames;
@@ -8119,10 +8105,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           PushTransitionBarrier(apply_gamma_dest, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                 apply_gamma_dest_initial_state);
         }
-
-        // [ia] The cycle marker (user rule: the active phase must be visible
-        // at the top-left in any test mode).
-        IaSwapMarker(guest_output_resource);
 
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
@@ -17667,84 +17649,6 @@ void D3D12CommandProcessor::ShutdownIaResources() {
   ia_available_ = false;
   ia_phase_ = 0;
   vb_mirror_.reset();
-  if (ia_marker_upload_) {
-    ia_marker_upload_->Unmap(0, nullptr);
-    ia_marker_upload_.Reset();
-    ia_marker_mapping_ = nullptr;
-  }
-  ia_marker_phase_ = -1;
-}
-
-// [ia] The cycle marker: a 64x64 block copied into the top-left of the guest
-// output at swap, drawn only while a test mode is active (a cycler, gpu_ia 2
-// or 3). Green = IA on, red = raw (the off phase), blue = the hybrid bisect
-// (gpu_ia 3), yellow = the raw memory through the IA (gpu_ia 2).
-void D3D12CommandProcessor::IaSwapMarker(ID3D12Resource* guest_output) {
-  if (!guest_output || REXCVAR_GET(gpu_ia_cycle) == 0) {
-    return;
-  }
-  // 0 red raw, 1 green IA (the bisect modes 2-5 and their colours are gone).
-  const int phase = ia_phase_ == 0 ? 0 : 1;
-  constexpr uint32_t kSide = 64, kPitch = 256;  // R10G10B10A2: 64 * 4 = 256 (aligned)
-  if (!ia_marker_upload_) {
-    ID3D12Device* device = GetD3D12Provider().GetDevice();
-    D3D12_RESOURCE_DESC desc;
-    ui::d3d12::util::FillBufferResourceDesc(desc, kSide * kPitch, D3D12_RESOURCE_FLAG_NONE);
-    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload,
-                                               D3D12_HEAP_FLAG_NONE, &desc,
-                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(&ia_marker_upload_)))) {
-      return;
-    }
-    void* mapping = nullptr;
-    if (FAILED(ia_marker_upload_->Map(0, nullptr, &mapping)) || !mapping) {
-      ia_marker_upload_.Reset();
-      return;
-    }
-    ia_marker_mapping_ = static_cast<uint8_t*>(mapping);
-    ia_marker_phase_ = -1;
-  }
-  if (ia_marker_phase_ != phase) {
-    // R10G10B10A2_UNORM: r | g << 10 | b << 20 | a << 30.
-    static const uint32_t kColors[6] = {
-        1023u | (3u << 30),                          // 0 red: raw (off)
-        (1023u << 10) | (3u << 30),                  // 1 green: IA on
-        (1023u << 20) | (3u << 30),                  // 2 blue: the hybrid (gpu_ia 3)
-        1023u | (1023u << 10) | (3u << 30),          // 3 yellow: raw memory through the IA (2)
-        (1023u << 10) | (1023u << 20) | (3u << 30),  // 4 cyan: the inverse hybrid (gpu_ia 4)
-        1023u | (1023u << 20) | (3u << 30),          // 5 magenta: every element raw (gpu_ia 5)
-    };
-    for (uint32_t y = 0; y < kSide; ++y) {
-      uint32_t* row = reinterpret_cast<uint32_t*>(ia_marker_mapping_ + y * kPitch);
-      for (uint32_t x = 0; x < kSide; ++x) {
-        row[x] = kColors[phase];
-      }
-    }
-    ia_marker_phase_ = phase;
-  }
-  D3D12_TEXTURE_COPY_LOCATION dst;
-  dst.pResource = guest_output;
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dst.SubresourceIndex = 0;
-  D3D12_TEXTURE_COPY_LOCATION src;
-  src.pResource = ia_marker_upload_.Get();
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint.Offset = 0;
-  src.PlacedFootprint.Footprint.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
-  src.PlacedFootprint.Footprint.Width = kSide;
-  src.PlacedFootprint.Footprint.Height = kSide;
-  src.PlacedFootprint.Footprint.Depth = 1;
-  src.PlacedFootprint.Footprint.RowPitch = kPitch;
-  // The pending barriers first: the swap's own transition of the guest output
-  // into the internal state may be pending, and one ResourceBarrier call may
-  // not transition a subresource twice.
-  SubmitBarriers();
-  PushTransitionBarrier(guest_output, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
-                        D3D12_RESOURCE_STATE_COPY_DEST);
-  SubmitBarriers();
-  deferred_command_list_.D3DCopyTextureRegion(&dst, 16, 16, 0, &src, nullptr);
-  PushTransitionBarrier(guest_output, D3D12_RESOURCE_STATE_COPY_DEST,
-                        ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
 }
 
 void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
