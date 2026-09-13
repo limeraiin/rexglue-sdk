@@ -1346,6 +1346,21 @@ class D3D12CommandProcessor : public CommandProcessor {
              vb_binds = 0, ib_mirror = 0;
   } ia_acc_;
   uint32_t hiz_phase_ = 0, hiz_k_ = 300, hiz_rebuild_ = 800;  // latched at frame end
+  // [hiz-win] the checkpoint schedule: 0 ship (a window lives to its cap
+  // or a close; the countdown is read only at a checkpoint), 1 fit (an open
+  // window closes the moment the countdown expires, so a build lands every
+  // hiz_rb_eff_ received draws), 2 fit with a doubled countdown.
+  uint32_t hiz_sched_ = 0, hiz_rb_eff_ = 800;
+  uint64_t hiz_frame_draw0_ = 0;  // hiz_draws_seen_ at the frame boundary
+  std::string hiz_win_str_, hiz_win_str_last_;  // the frame's window sequence
+  // Per slot: bits 0-1 the window class at append (0 invalid Hi-Z, 1 built
+  // at its checkpoint, 2 stale-valid), bits 2-3 the Hi-Z age bucket of the
+  // entry (received draws since the build: <256, <512, <1024, more).
+  std::vector<uint8_t> hiz_slot_cls_;
+  void SwapPhaseMarker(ID3D12Resource* guest_output, int phase);  // a cycler's top-left block
+  Microsoft::WRL::ComPtr<ID3D12Resource> marker_upload_;
+  uint8_t* marker_mapping_ = nullptr;
+  int marker_phase_ = -1;
   uint32_t hiz_slot_next_ = 0, hiz_sub_first_slot_ = 0, hiz_frame_slots_ = 0;
   // The last Hi-Z build: its depth target, the transfer epoch it saw and the
   // received-draw count at that point; a checkpoint within hiz_rebuild_
@@ -1365,6 +1380,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t submission = 0, transfer_epoch = 0;
     uint32_t count = 0, cap = 0;
     uint8_t dir = 0;  // 1 reversed (GEQUAL/GREATER), 2 normal (LESS/LEQUAL)
+    uint8_t cls = 0;  // [hiz-win] 0 invalid (hides nothing), 1 built here, 2 stale-valid
+    uint64_t open_draw = 0;  // [hiz-win] hiz_draws_seen_ at the checkpoint
     uint32_t* header = nullptr;
     uint8_t* entries = nullptr;
     uint8_t* runs = nullptr;  // [hiz-pool] after the entries
@@ -1392,6 +1409,14 @@ class D3D12CommandProcessor : public CommandProcessor {
     // [hiz-pool] per-instance batches opened, instances appended (tested
     // ones among them), hits refused because the batch's window had closed.
     uint64_t pool_open = 0, pool_inst = 0, pool_inst_tested = 0, pool_miss = 0;
+    // [hiz-win] per window class (0 invalid, 1 built, 2 stale): tested
+    // entries, hidden, and the verify readback's MISSES (visible per the
+    // Hi-Z, zero samples passed = the hides a fresher or better test could
+    // win); per age bucket the same for classes 1-2.
+    uint64_t windows = 0, ent[3] = {}, ent_idx[3] = {}, hid[3] = {}, hid_idx[3] = {},
+             vfy_n[3] = {}, miss[3] = {}, miss_idx[3] = {}, age_n[4] = {}, age_idx[4] = {},
+             age_hid[4] = {}, age_hid_idx[4] = {}, age_vfy[4] = {}, age_miss[4] = {},
+             age_miss_idx[4] = {};
   } hiz_acc_;
   uint32_t occ_ring_next_ = 0, occ_sub_start_ = 0, occ_sub_count_ = 0;
   std::deque<OccPending> occ_pending_;

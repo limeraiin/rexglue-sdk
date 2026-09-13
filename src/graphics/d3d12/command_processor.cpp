@@ -435,6 +435,14 @@ REXCVAR_DEFINE_INT32(gpu_sort, -1, "GPU/D3D12",
                      "(Intel on), 0 off, 1 on.");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
+REXCVAR_DEFINE_INT32(gpu_hiz_sched, 0, "GPU/D3D12",
+                     "[hiz-win] the checkpoint schedule: 0 ship (the countdown is read only at "
+                     "a checkpoint: a window lives to its cap or a close), 1 fit (the open "
+                     "window closes when the countdown expires, so a build lands every "
+                     "gpu_hiz_rebuild received draws), 2 fit with the countdown doubled.");
+REXCVAR_DEFINE_INT32(gpu_hiz_sched_cycle, 0, "GPU/D3D12",
+                     "[hiz-win] N > 0: cycle gpu_hiz_sched 0 / 1 / 2 every N seconds in place "
+                     "(the top-left marker: red ship, green fit, blue fit x2).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
                      "[hiz] received draws after the last build or invalidation before the Hi-Z "
                      "is (re)built; until then checkpoints test against the stale Hi-Z (still "
@@ -7285,6 +7293,28 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         hiz_k_ = k1;
         hiz_rebuild_ = hrb;
       }
+      {  // [hiz-win] the schedule latch: the cycler (seconds per phase) or the cvar.
+        uint32_t sp;
+        const int32_t cyc = REXCVAR_GET(gpu_hiz_sched_cycle);
+        if (cyc > 0) {
+          static const auto s_sched_t0 = std::chrono::steady_clock::now();
+          const double el =
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - s_sched_t0)
+                  .count();
+          sp = uint32_t(uint64_t(el / double(cyc)) % 3);
+        } else {
+          sp = uint32_t(std::clamp<int32_t>(REXCVAR_GET(gpu_hiz_sched), 0, 2));
+        }
+        const uint32_t rbe = sp == 2 ? hiz_rebuild_ * 2 : hiz_rebuild_;
+        if (sp != hiz_sched_ || rbe != hiz_rb_eff_) {
+          if (hiz_window_.open) HizWindowClose(5);
+          hiz_sched_ = sp;
+          hiz_rb_eff_ = rbe;
+        }
+        hiz_frame_draw0_ = hiz_draws_seen_;
+        if (!hiz_win_str_.empty()) hiz_win_str_last_ = std::move(hiz_win_str_);
+        hiz_win_str_.clear();
+      }
       hiz_frame_slots_ = 0;
     }
     {  // [sort] latch: by vendor (drive 847 Intel win, drive 848 RTX loss)
@@ -7497,6 +7527,35 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               h.wrong_vs[worst_vs], h.close[0], h.close[1], h.close[2], h.close[3], h.close[4],
               h.close[5], h.close[6], h.close[7], double(h.pool_open) / fr,
               double(h.pool_inst) / fr, double(h.pool_inst_tested) / fr, double(h.pool_miss) / fr);
+          {  // [hiz-win] the window schedule census
+            auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
+            static const char* kSched[3] = {"ship", "fit", "fit2"};
+            REXGPU_INFO(
+                "[hiz-win] sched={} rb={} win/fr {:.1f} | ent/fr m0 {:.0f} B {:.0f} S {:.0f} (idx "
+                "{:.0f}/{:.0f}/{:.0f}k) | hid/fr B {:.0f} ({:.1f}% idx {:.1f}%) S {:.0f} ({:.1f}% "
+                "idx {:.1f}%) | age <256/<512/<1024/more: n {:.0f}/{:.0f}/{:.0f}/{:.0f} hid "
+                "{:.1f}/{:.1f}/{:.1f}/{:.1f}% idx {:.1f}/{:.1f}/{:.1f}/{:.1f}% | vfy n m0/B/S "
+                "{}/{}/{} MISS {}/{}/{} ({:.1f}/{:.1f}/{:.1f}% idx {:.0f}/{:.0f}/{:.0f}k) age miss "
+                "{}/{}/{}/{} of {}/{}/{}/{} (idx {:.0f}/{:.0f}/{:.0f}/{:.0f}k) | frame: {}",
+                kSched[hiz_sched_ < 3 ? hiz_sched_ : 0], hiz_rb_eff_, double(h.windows) / fr,
+                double(h.ent[0]) / fr, double(h.ent[1]) / fr, double(h.ent[2]) / fr,
+                double(h.ent_idx[0]) / fr / 1000.0, double(h.ent_idx[1]) / fr / 1000.0,
+                double(h.ent_idx[2]) / fr / 1000.0, double(h.hid[1]) / fr, pct(h.hid[1], h.ent[1]),
+                pct(h.hid_idx[1], h.ent_idx[1]), double(h.hid[2]) / fr, pct(h.hid[2], h.ent[2]),
+                pct(h.hid_idx[2], h.ent_idx[2]), double(h.age_n[0]) / fr, double(h.age_n[1]) / fr,
+                double(h.age_n[2]) / fr, double(h.age_n[3]) / fr, pct(h.age_hid[0], h.age_n[0]),
+                pct(h.age_hid[1], h.age_n[1]), pct(h.age_hid[2], h.age_n[2]),
+                pct(h.age_hid[3], h.age_n[3]), pct(h.age_hid_idx[0], h.age_idx[0]),
+                pct(h.age_hid_idx[1], h.age_idx[1]), pct(h.age_hid_idx[2], h.age_idx[2]),
+                pct(h.age_hid_idx[3], h.age_idx[3]), h.vfy_n[0], h.vfy_n[1], h.vfy_n[2], h.miss[0],
+                h.miss[1], h.miss[2], pct(h.miss[0], h.vfy_n[0]), pct(h.miss[1], h.vfy_n[1]),
+                pct(h.miss[2], h.vfy_n[2]), double(h.miss_idx[0]) / 1000.0,
+                double(h.miss_idx[1]) / 1000.0, double(h.miss_idx[2]) / 1000.0, h.age_miss[0],
+                h.age_miss[1], h.age_miss[2], h.age_miss[3], h.age_vfy[0], h.age_vfy[1],
+                h.age_vfy[2], h.age_vfy[3], double(h.age_miss_idx[0]) / 1000.0,
+                double(h.age_miss_idx[1]) / 1000.0, double(h.age_miss_idx[2]) / 1000.0,
+                double(h.age_miss_idx[3]) / 1000.0, hiz_win_str_last_);
+          }
           hiz_acc_ = HizAcc{};
         }
       }
@@ -8106,6 +8165,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                 apply_gamma_dest_initial_state);
         }
 
+        // [hiz-win] the cycle marker (user rule: the active phase visible at
+        // the top-left in any test mode).
+        if (REXCVAR_GET(gpu_hiz_sched_cycle) > 0) {
+          SwapPhaseMarker(guest_output_resource, int(hiz_sched_));
+        }
+
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue.
@@ -8420,6 +8485,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                                   : (f == xenos::CompareFunction::kLess ||
                                      f == xenos::CompareFunction::kLessEqual));
         if (!mono) HizWindowClose(3);
+      }
+      // [hiz-win] fit: the countdown expired under the open window; close it
+      // (benign) so the next eligible draw checkpoints and rebuilds.
+      if (hiz_window_.open && hiz_sched_ != 0 &&
+          hiz_draws_seen_ - hiz_build_draws_ >= uint64_t(hiz_rb_eff_)) {
+        HizWindowClose(0);
       }
     }
   }
@@ -17551,6 +17622,20 @@ void D3D12CommandProcessor::OccConsumeCompleted() {
             h.wrong_smp += smp;
             ++h.wrong_vs[t.vs_slot & 4095];
           }
+          if (t.kind == 0) {  // [hiz-win] a plain draw: the miss by window class / age
+            const uint8_t sc = hiz_slot_cls_[(t.hiz - 1) & (kHizRing - 1)];
+            const uint32_t cls = sc & 3u, age = sc >> 2;
+            ++h.vfy_n[cls];
+            if (cls) ++h.age_vfy[age];
+            if (!verdict && smp == 0) {
+              ++h.miss[cls];
+              h.miss_idx[cls] += t.idx;
+              if (cls) {
+                ++h.age_miss[age];
+                h.age_miss_idx[age] += t.idx;
+              }
+            }
+          }
         }
       }
       if (!t.smp) {
@@ -17790,6 +17875,7 @@ bool D3D12CommandProcessor::InitializeHizResources() {
     hiz_verdict_mapping_ = reinterpret_cast<const uint32_t*>(mapping);
   }
   hiz_slot_idx_.assign(kHizRing, 0u);
+  hiz_slot_cls_.assign(kHizRing, 0u);  // [hiz-win]
   hiz_available_ = true;
   REXGPU_INFO("[hiz] on: {} argument slots, {} per frame, k={}", kHizRing, kHizMaxPerFrame,
               REXCVAR_GET(gpu_hiz_k));
@@ -17813,6 +17899,80 @@ void D3D12CommandProcessor::ShutdownHizResources() {
   hiz_root_signature_.Reset();
   hiz_cmdsig_[0].clear();
   hiz_cmdsig_[1].clear();
+  if (marker_upload_) {
+    marker_upload_->Unmap(0, nullptr);
+    marker_upload_.Reset();
+    marker_mapping_ = nullptr;
+  }
+  marker_phase_ = -1;
+}
+
+// A cycler's marker: a 64x64 block copied into the top-left of the guest
+// output at swap (user rule: the active phase visible in any test mode).
+// Phase colours: 0 red, 1 green, 2 blue, 3 yellow.
+void D3D12CommandProcessor::SwapPhaseMarker(ID3D12Resource* guest_output, int phase) {
+  if (!guest_output) {
+    return;
+  }
+  phase = std::clamp(phase, 0, 3);
+  constexpr uint32_t kSide = 64, kPitch = 256;  // R10G10B10A2: 64 * 4 = 256 (aligned)
+  if (!marker_upload_) {
+    ID3D12Device* device = GetD3D12Provider().GetDevice();
+    D3D12_RESOURCE_DESC desc;
+    ui::d3d12::util::FillBufferResourceDesc(desc, kSide * kPitch, D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload,
+                                               D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&marker_upload_)))) {
+      return;
+    }
+    void* mapping = nullptr;
+    if (FAILED(marker_upload_->Map(0, nullptr, &mapping)) || !mapping) {
+      marker_upload_.Reset();
+      return;
+    }
+    marker_mapping_ = static_cast<uint8_t*>(mapping);
+    marker_phase_ = -1;
+  }
+  if (marker_phase_ != phase) {
+    // R10G10B10A2_UNORM: r | g << 10 | b << 20 | a << 30.
+    static const uint32_t kColors[4] = {
+        1023u | (3u << 30),                  // 0 red
+        (1023u << 10) | (3u << 30),          // 1 green
+        (1023u << 20) | (3u << 30),          // 2 blue
+        1023u | (1023u << 10) | (3u << 30),  // 3 yellow
+    };
+    for (uint32_t y = 0; y < kSide; ++y) {
+      uint32_t* row = reinterpret_cast<uint32_t*>(marker_mapping_ + y * kPitch);
+      for (uint32_t x = 0; x < kSide; ++x) {
+        row[x] = kColors[phase];
+      }
+    }
+    marker_phase_ = phase;
+  }
+  D3D12_TEXTURE_COPY_LOCATION dst;
+  dst.pResource = guest_output;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION src;
+  src.pResource = marker_upload_.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src.PlacedFootprint.Offset = 0;
+  src.PlacedFootprint.Footprint.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  src.PlacedFootprint.Footprint.Width = kSide;
+  src.PlacedFootprint.Footprint.Height = kSide;
+  src.PlacedFootprint.Footprint.Depth = 1;
+  src.PlacedFootprint.Footprint.RowPitch = kPitch;
+  // The pending barriers first: the swap's own transition of the guest output
+  // into the internal state may be pending, and one ResourceBarrier call may
+  // not transition a subresource twice.
+  SubmitBarriers();
+  PushTransitionBarrier(guest_output, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyTextureRegion(&dst, 16, 16, 0, &src, nullptr);
+  PushTransitionBarrier(guest_output, D3D12_RESOURCE_STATE_COPY_DEST,
+                        ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
 }
 
 void D3D12CommandProcessor::HizBeginSubmission() {
@@ -17828,6 +17988,13 @@ void D3D12CommandProcessor::HizBeginSubmission() {
         if (hiz_verdict_mapping_[slot] && hiz_slot_idx_[slot]) {
           ++hiz_acc_.hidden;
           hiz_acc_.hidden_idx += hiz_slot_idx_[slot];
+          const uint8_t sc = hiz_slot_cls_[slot];  // [hiz-win]
+          ++hiz_acc_.hid[sc & 3u];
+          hiz_acc_.hid_idx[sc & 3u] += hiz_slot_idx_[slot];
+          if (sc & 3u) {
+            ++hiz_acc_.age_hid[sc >> 2];
+            hiz_acc_.age_hid_idx[sc >> 2] += hiz_slot_idx_[slot];
+          }
         }
       }
     }
@@ -17880,6 +18047,14 @@ void D3D12CommandProcessor::HizWindowClose(uint32_t reason) {
     return;
   }
   ++hiz_acc_.close[reason & 7];
+  if (hiz_win_str_.size() < 400) {  // [hiz-win] "@open n<entries> <class> <close>"
+    static const char* kCls[3] = {"m0", "B", "S"};
+    static const char* kClose[8] = {"cap", "pass", "copy", "zw", "dir", "sub", "xfer", "rt"};
+    hiz_win_str_ += fmt::format("@{} n{} {} {} | ",
+                                int64_t(hiz_window_.open_draw) - int64_t(hiz_frame_draw0_),
+                                hiz_window_.count, kCls[hiz_window_.cls < 3 ? hiz_window_.cls : 0],
+                                kClose[reason & 7]);
+  }
   // cap (0) and submission / phase (5) leave the depth as the last build
   // saw it (or nearer); everything else may have moved it farther: the
   // Hi-Z is invalid (checkpoints hide nothing) and the rebuild countdown
@@ -18035,9 +18210,11 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
     hiz_build_resource_ = depth;
     hiz_build_epoch_ = epoch;
   }
-  const bool rebuild = hiz_draws_seen_ - hiz_build_draws_ >= uint64_t(hiz_rebuild_);
+  const bool rebuild = hiz_draws_seen_ - hiz_build_draws_ >= uint64_t(hiz_rb_eff_);
   ++hiz_acc_.checkpoints;
   if (rebuild) ++hiz_acc_.builds;
+  ++hiz_acc_.windows;  // [hiz-win]
+  const uint8_t window_cls = rebuild ? 1 : (hiz_valid_ ? 2 : 0);
   // Priced as three classes: the depth target's transitions (hizd: the
   // driver's decompress), the build CS (hiz), the test CS with the
   // argument-buffer barriers (hizt), so a drive names which one the ~1.3 ms
@@ -18069,7 +18246,8 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
       5, hiz_verdict_->GetGPUVirtualAddress());
   if (rebuild) {
     SetExternalPipeline(hiz_build_pipelines_[samples == 4 ? 2 : samples == 2 ? 1 : 0].Get());
-    deferred_command_list_.D3DDispatch(tiles_x, tiles_y, 1);
+    // One group per 2x2 tiles (hiz.cs.hlsl: a 2x2 quad per thread).
+    deferred_command_list_.D3DDispatch((tiles_x + 1) / 2, (tiles_y + 1) / 2, 1);
     PushUAVBarrier(hiz_buffer_.Get());
     SubmitBarriers();
     hiz_build_draws_ = hiz_draws_seen_;
@@ -18102,6 +18280,8 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
   hiz_window_.count = 0;
   hiz_window_.cap = cap;
   hiz_window_.dir = dir;
+  hiz_window_.cls = window_cls;  // [hiz-win]
+  hiz_window_.open_draw = hiz_draws_seen_;
   hiz_window_.header = reinterpret_cast<uint32_t*>(mapping);
   hiz_window_.entries = mapping + kHizHeaderBytes;
   hiz_window_.runs = hiz_window_.entries + size_t(cap) * kHizEntryBytes;  // [hiz-pool]
@@ -18152,6 +18332,19 @@ bool D3D12CommandProcessor::HizWindowEnsure(uint8_t dir) {
 void D3D12CommandProcessor::HizAppend(uint32_t slot, const HizDrawPending* d, uint32_t inst,
                                       uint32_t host_count, bool plain_layout) {
   hiz_slot_idx_[slot] = host_count;
+  {  // [hiz-win] the window class and the entry's Hi-Z age, read at the verdict
+    const uint64_t age = hiz_draws_seen_ - hiz_build_draws_;
+    const uint8_t ab = hiz_window_.cls == 0 ? 0 : age < 256 ? 0 : age < 512 ? 1 : age < 1024 ? 2 : 3;
+    hiz_slot_cls_[slot] = uint8_t((hiz_window_.cls & 3u) | (ab << 2));
+    if (d) {
+      ++hiz_acc_.ent[hiz_window_.cls & 3u];
+      hiz_acc_.ent_idx[hiz_window_.cls & 3u] += host_count;
+      if (hiz_window_.cls) {
+        ++hiz_acc_.age_n[ab];
+        hiz_acc_.age_idx[ab] += host_count;
+      }
+    }
+  }
   uint32_t* e = reinterpret_cast<uint32_t*>(hiz_window_.entries +
                                             size_t(hiz_window_.count) * kHizEntryBytes);
   if (d) {
