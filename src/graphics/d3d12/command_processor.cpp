@@ -435,14 +435,6 @@ REXCVAR_DEFINE_INT32(gpu_sort, -1, "GPU/D3D12",
                      "(Intel on), 0 off, 1 on.");
 REXCVAR_DEFINE_INT32(gpu_hiz_k, 1024, "GPU/D3D12",
                      "[hiz] draws tested per checkpoint (window size, 1..1024).");
-REXCVAR_DEFINE_INT32(gpu_hiz_sched, 0, "GPU/D3D12",
-                     "[hiz-win] the checkpoint schedule: 0 ship (the countdown is read only at "
-                     "a checkpoint: a window lives to its cap or a close), 1 fit (the open "
-                     "window closes when the countdown expires, so a build lands every "
-                     "gpu_hiz_rebuild received draws), 2 fit with the countdown doubled.");
-REXCVAR_DEFINE_INT32(gpu_hiz_sched_cycle, 0, "GPU/D3D12",
-                     "[hiz-win] N > 0: cycle gpu_hiz_sched 0 / 1 / 2 every N seconds in place "
-                     "(the top-left marker: red ship, green fit, blue fit x2).");
 REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
                      "[hiz] received draws after the last build or invalidation before the Hi-Z "
                      "is (re)built; until then checkpoints test against the stale Hi-Z (still "
@@ -7293,25 +7285,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         hiz_k_ = k1;
         hiz_rebuild_ = hrb;
       }
-      {  // [hiz-win] the schedule latch: the cycler (seconds per phase) or the cvar.
-        uint32_t sp;
-        const int32_t cyc = REXCVAR_GET(gpu_hiz_sched_cycle);
-        if (cyc > 0) {
-          static const auto s_sched_t0 = std::chrono::steady_clock::now();
-          const double el =
-              std::chrono::duration<double>(std::chrono::steady_clock::now() - s_sched_t0)
-                  .count();
-          sp = uint32_t(uint64_t(el / double(cyc)) % 3);
-        } else {
-          sp = uint32_t(std::clamp<int32_t>(REXCVAR_GET(gpu_hiz_sched), 0, 2));
-        }
-        const uint32_t rbe = sp == 2 ? hiz_rebuild_ * 2 : hiz_rebuild_;
-        if (sp != hiz_sched_ || rbe != hiz_rb_eff_) {
-          if (hiz_window_.open) HizWindowClose(5);
-          hiz_sched_ = sp;
-          hiz_rb_eff_ = rbe;
-        }
+      {  // [hiz-win] the frame boundary of the window census.
         hiz_frame_draw0_ = hiz_draws_seen_;
+        hiz_frame_windows_ = 0;
         if (!hiz_win_str_.empty()) hiz_win_str_last_ = std::move(hiz_win_str_);
         hiz_win_str_.clear();
       }
@@ -7529,15 +7505,25 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               double(h.pool_inst) / fr, double(h.pool_inst_tested) / fr, double(h.pool_miss) / fr);
           {  // [hiz-win] the window schedule census
             auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
-            static const char* kSched[3] = {"ship", "fit", "fit2"};
+            static const char* kForm[1] = {"ship"};
+            std::string ords;
+            for (uint32_t o = 0; o < 8; ++o) {
+              if (!h.ord_n[o]) continue;
+              ords += fmt::format("{}:n{:.0f} h{:.1f} i{:.0f}k/{:.0f}k m{:.1f} ", o,
+                                  double(h.ord_n[o]) / fr, pct(h.ord_hid[o], h.ord_n[o]),
+                                  double(h.ord_idx[o]) / fr / 1000.0,
+                                  double(h.ord_hid_idx[o]) / fr / 1000.0,
+                                  pct(h.ord_miss[o], h.ord_vfy[o]));
+            }
             REXGPU_INFO(
-                "[hiz-win] sched={} rb={} win/fr {:.1f} | ent/fr m0 {:.0f} B {:.0f} S {:.0f} (idx "
+                "[hiz-win] form={} rb={} win/fr {:.1f} | ent/fr m0 {:.0f} B {:.0f} S {:.0f} (idx "
                 "{:.0f}/{:.0f}/{:.0f}k) | hid/fr B {:.0f} ({:.1f}% idx {:.1f}%) S {:.0f} ({:.1f}% "
                 "idx {:.1f}%) | age <256/<512/<1024/more: n {:.0f}/{:.0f}/{:.0f}/{:.0f} hid "
                 "{:.1f}/{:.1f}/{:.1f}/{:.1f}% idx {:.1f}/{:.1f}/{:.1f}/{:.1f}% | vfy n m0/B/S "
                 "{}/{}/{} MISS {}/{}/{} ({:.1f}/{:.1f}/{:.1f}% idx {:.0f}/{:.0f}/{:.0f}k) age miss "
-                "{}/{}/{}/{} of {}/{}/{}/{} (idx {:.0f}/{:.0f}/{:.0f}/{:.0f}k) | frame: {}",
-                kSched[hiz_sched_ < 3 ? hiz_sched_ : 0], hiz_rb_eff_, double(h.windows) / fr,
+                "{}/{}/{}/{} of {}/{}/{}/{} (idx {:.0f}/{:.0f}/{:.0f}/{:.0f}k) | frame: {}|| ord "
+                "{}",
+                kForm[0], hiz_rebuild_, double(h.windows) / fr,
                 double(h.ent[0]) / fr, double(h.ent[1]) / fr, double(h.ent[2]) / fr,
                 double(h.ent_idx[0]) / fr / 1000.0, double(h.ent_idx[1]) / fr / 1000.0,
                 double(h.ent_idx[2]) / fr / 1000.0, double(h.hid[1]) / fr, pct(h.hid[1], h.ent[1]),
@@ -7554,7 +7540,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                 h.age_miss[1], h.age_miss[2], h.age_miss[3], h.age_vfy[0], h.age_vfy[1],
                 h.age_vfy[2], h.age_vfy[3], double(h.age_miss_idx[0]) / 1000.0,
                 double(h.age_miss_idx[1]) / 1000.0, double(h.age_miss_idx[2]) / 1000.0,
-                double(h.age_miss_idx[3]) / 1000.0, hiz_win_str_last_);
+                double(h.age_miss_idx[3]) / 1000.0, hiz_win_str_last_, ords);
           }
           hiz_acc_ = HizAcc{};
         }
@@ -8167,9 +8153,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
         // [hiz-win] the cycle marker (user rule: the active phase visible at
         // the top-left in any test mode).
-        if (REXCVAR_GET(gpu_hiz_sched_cycle) > 0) {
-          SwapPhaseMarker(guest_output_resource, int(hiz_sched_));
-        }
+        // (SwapPhaseMarker(guest_output_resource, phase) is the marker every
+        // cycler must show at the top-left; no cycler is live.)
 
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
@@ -8485,12 +8470,6 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
                                   : (f == xenos::CompareFunction::kLess ||
                                      f == xenos::CompareFunction::kLessEqual));
         if (!mono) HizWindowClose(3);
-      }
-      // [hiz-win] fit: the countdown expired under the open window; close it
-      // (benign) so the next eligible draw checkpoints and rebuilds.
-      if (hiz_window_.open && hiz_sched_ != 0 &&
-          hiz_draws_seen_ - hiz_build_draws_ >= uint64_t(hiz_rb_eff_)) {
-        HizWindowClose(0);
       }
     }
   }
@@ -17624,11 +17603,13 @@ void D3D12CommandProcessor::OccConsumeCompleted() {
           }
           if (t.kind == 0) {  // [hiz-win] a plain draw: the miss by window class / age
             const uint8_t sc = hiz_slot_cls_[(t.hiz - 1) & (kHizRing - 1)];
-            const uint32_t cls = sc & 3u, age = sc >> 2;
+            const uint32_t cls = sc & 3u, age = (sc >> 2) & 3u, ord = sc >> 4;
             ++h.vfy_n[cls];
+            ++h.ord_vfy[ord];
             if (cls) ++h.age_vfy[age];
             if (!verdict && smp == 0) {
               ++h.miss[cls];
+              ++h.ord_miss[ord];
               h.miss_idx[cls] += t.idx;
               if (cls) {
                 ++h.age_miss[age];
@@ -17991,9 +17972,11 @@ void D3D12CommandProcessor::HizBeginSubmission() {
           const uint8_t sc = hiz_slot_cls_[slot];  // [hiz-win]
           ++hiz_acc_.hid[sc & 3u];
           hiz_acc_.hid_idx[sc & 3u] += hiz_slot_idx_[slot];
-          if (sc & 3u) {
-            ++hiz_acc_.age_hid[sc >> 2];
-            hiz_acc_.age_hid_idx[sc >> 2] += hiz_slot_idx_[slot];
+          ++hiz_acc_.ord_hid[sc >> 4];
+          hiz_acc_.ord_hid_idx[sc >> 4] += hiz_slot_idx_[slot];
+          if (sc & 3u) {  // bits 2-3 the age, 4-7 the ordinal
+            ++hiz_acc_.age_hid[(sc >> 2) & 3u];
+            hiz_acc_.age_hid_idx[(sc >> 2) & 3u] += hiz_slot_idx_[slot];
           }
         }
       }
@@ -18210,11 +18193,18 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
     hiz_build_resource_ = depth;
     hiz_build_epoch_ = epoch;
   }
-  const bool rebuild = hiz_draws_seen_ - hiz_build_draws_ >= uint64_t(hiz_rb_eff_);
+  // Drive 877 (Intel 720p, [hiz-win] schedules): a build right after every
+  // invalidation + one every 800 draws hid 31% of the frame's indices
+  // instead of 21% and bought 0.9 ms of draw class for 4.9 ms of builds:
+  // what the Hi-Z can still hide is cheap geometry. The countdown stays.
+  // Drive 878: the ExecuteIndirect form itself costs the Intel nothing (the
+  // form with nothing hidden = direct draws, 20.6 vs 20.7 fps).
+  const bool rebuild = hiz_draws_seen_ - hiz_build_draws_ >= uint64_t(hiz_rebuild_);
   ++hiz_acc_.checkpoints;
   if (rebuild) ++hiz_acc_.builds;
   ++hiz_acc_.windows;  // [hiz-win]
   const uint8_t window_cls = rebuild ? 1 : (hiz_valid_ ? 2 : 0);
+  const uint8_t window_ord = uint8_t(std::min<uint32_t>(hiz_frame_windows_++, 7));
   // Priced as three classes: the depth target's transitions (hizd: the
   // driver's decompress), the build CS (hiz), the test CS with the
   // argument-buffer barriers (hizt), so a drive names which one the ~1.3 ms
@@ -18281,6 +18271,7 @@ bool D3D12CommandProcessor::HizCheckpoint(uint8_t dir) {
   hiz_window_.cap = cap;
   hiz_window_.dir = dir;
   hiz_window_.cls = window_cls;  // [hiz-win]
+  hiz_window_.ord = window_ord;
   hiz_window_.open_draw = hiz_draws_seen_;
   hiz_window_.header = reinterpret_cast<uint32_t*>(mapping);
   hiz_window_.entries = mapping + kHizHeaderBytes;
@@ -18335,10 +18326,12 @@ void D3D12CommandProcessor::HizAppend(uint32_t slot, const HizDrawPending* d, ui
   {  // [hiz-win] the window class and the entry's Hi-Z age, read at the verdict
     const uint64_t age = hiz_draws_seen_ - hiz_build_draws_;
     const uint8_t ab = hiz_window_.cls == 0 ? 0 : age < 256 ? 0 : age < 512 ? 1 : age < 1024 ? 2 : 3;
-    hiz_slot_cls_[slot] = uint8_t((hiz_window_.cls & 3u) | (ab << 2));
+    hiz_slot_cls_[slot] = uint8_t((hiz_window_.cls & 3u) | (ab << 2) | (hiz_window_.ord << 4));
     if (d) {
       ++hiz_acc_.ent[hiz_window_.cls & 3u];
       hiz_acc_.ent_idx[hiz_window_.cls & 3u] += host_count;
+      ++hiz_acc_.ord_n[hiz_window_.ord & 7u];
+      hiz_acc_.ord_idx[hiz_window_.ord & 7u] += host_count;
       if (hiz_window_.cls) {
         ++hiz_acc_.age_n[ab];
         hiz_acc_.age_idx[ab] += host_count;

@@ -1346,11 +1346,7 @@ class D3D12CommandProcessor : public CommandProcessor {
              vb_binds = 0, ib_mirror = 0;
   } ia_acc_;
   uint32_t hiz_phase_ = 0, hiz_k_ = 300, hiz_rebuild_ = 800;  // latched at frame end
-  // [hiz-win] the checkpoint schedule: 0 ship (a window lives to its cap
-  // or a close; the countdown is read only at a checkpoint), 1 fit (an open
-  // window closes the moment the countdown expires, so a build lands every
-  // hiz_rb_eff_ received draws), 2 fit with a doubled countdown.
-  uint32_t hiz_sched_ = 0, hiz_rb_eff_ = 800;
+  uint32_t hiz_frame_windows_ = 0;
   uint64_t hiz_frame_draw0_ = 0;  // hiz_draws_seen_ at the frame boundary
   std::string hiz_win_str_, hiz_win_str_last_;  // the frame's window sequence
   // Per slot: bits 0-1 the window class at append (0 invalid Hi-Z, 1 built
@@ -1381,6 +1377,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t count = 0, cap = 0;
     uint8_t dir = 0;  // 1 reversed (GEQUAL/GREATER), 2 normal (LESS/LEQUAL)
     uint8_t cls = 0;  // [hiz-win] 0 invalid (hides nothing), 1 built here, 2 stale-valid
+    uint8_t ord = 0;  // [hiz-win] the window's ordinal in the frame (7 = 7 or more)
     uint64_t open_draw = 0;  // [hiz-win] hiz_draws_seen_ at the checkpoint
     uint32_t* header = nullptr;
     uint8_t* entries = nullptr;
@@ -1417,6 +1414,9 @@ class D3D12CommandProcessor : public CommandProcessor {
              vfy_n[3] = {}, miss[3] = {}, miss_idx[3] = {}, age_n[4] = {}, age_idx[4] = {},
              age_hid[4] = {}, age_hid_idx[4] = {}, age_vfy[4] = {}, age_miss[4] = {},
              age_miss_idx[4] = {};
+    // [hiz-win] per window ordinal in the frame (0..6, 7 = the rest).
+    uint64_t ord_n[8] = {}, ord_idx[8] = {}, ord_hid[8] = {}, ord_hid_idx[8] = {}, ord_vfy[8] = {},
+             ord_miss[8] = {};
   } hiz_acc_;
   uint32_t occ_ring_next_ = 0, occ_sub_start_ = 0, occ_sub_count_ = 0;
   std::deque<OccPending> occ_pending_;

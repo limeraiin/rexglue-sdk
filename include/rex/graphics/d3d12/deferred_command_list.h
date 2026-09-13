@@ -211,6 +211,10 @@ class DeferredCommandList {
     uint32_t runs = 0, sorted = 0, brk = 0, post = 0, sw_before = 0, sw_after = 0;
     size_t elems = 0;
   };
+  // Drive 879 (Intel 720p): a nearest-first order inside the windows (8 /
+  // 32 / 1024 depth bins, the pipeline as the tie-break) left the draw
+  // class at 36 ms in every phase: the fill is not overdraw inside the
+  // windows. Deleted; by pipeline only.
   bool SortWindow(const SortSegIn* segs, size_t n, SortStats* st);
   const uintmax_t* stream_data() const { return command_stream_.data(); }
   void SortReplaceRange(size_t begin, size_t end, const uintmax_t* data, size_t len) {

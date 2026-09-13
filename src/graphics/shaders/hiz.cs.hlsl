@@ -1,11 +1,10 @@
 // [hiz] ISSUEDRAW increment 3: the Hi-Z checkpoint (see command_processor.cpp
 // "[hiz]"). Two compute entry points sharing one root signature:
 //
-//   hiz_build: one 8x8 thread group per 16x16-pixel block (2x2 tiles) of the
-//   bound host depth buffer, a 2x2 pixel quad per thread; every sample of
-//   every pixel of a tile is read and the tile's (min, max) depth lands in
-//   the Hi-Z buffer. The tile covers every sample it contains, so a rect
-//   test against it is conservative.
+//   hiz_build: one 8x8 thread group per 8x8-pixel tile of the bound host
+//   depth buffer; every sample of every pixel of the tile is read and the
+//   tile's (min, max) depth lands in the Hi-Z buffer. The tile covers every
+//   sample it contains, so a rect test against it is conservative.
 //
 //   hiz_test: one thread per table entry (a cull-eligible draw recorded after
 //   the checkpoint): its screen rect in pixels, its nearest host depth and
@@ -48,55 +47,38 @@ RWByteAddressBuffer hiz_verdict : register(u2);          // 4 B per slot, 1 = hi
 groupshared float hiz_gs_min[64];
 groupshared float hiz_gs_max[64];
 
-// One 8x8 thread group per 16x16-pixel block = 2x2 tiles: each thread reads
-// a 2x2 pixel quad (every sample of each pixel) and the 16 threads of a tile
-// reduce it in four rounds (the one-tile-per-group form read 1.05 ms per
-// 720p build on the Intel UHD: 14400 groups, six rounds, one texel per
-// thread). Out-of-range pixels contribute the identity, so an edge tile's
-// (min, max) still covers every sample it holds.
 [numthreads(8, 8, 1)]
-void hiz_build(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID) {
-  uint2 tile_in = thread_id.xy >> 2u;  // the tile within the block (0..1)
-  uint2 quad_in = thread_id.xy & 3u;   // the quad within the tile (0..3)
-  uint2 tile = group_id.xy * 2u + tile_in;
-  uint2 pixel = tile * 8u + quad_in * 2u;
+void hiz_build(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID,
+               uint group_index : SV_GroupIndex) {
+  uint2 pixel = group_id.xy * 8u + thread_id.xy;
   float mn = 2.0f, mx = -1.0f;
-  [unroll]
-  for (uint qy = 0u; qy < 2u; ++qy) {
-    [unroll]
-    for (uint qx = 0u; qx < 2u; ++qx) {
-      uint2 p = pixel + uint2(qx, qy);
-      if (p.x < hiz_depth_w && p.y < hiz_depth_h) {
+  if (pixel.x < hiz_depth_w && pixel.y < hiz_depth_h) {
 #if HIZ_SAMPLES > 1
-        [unroll]
-        for (uint s = 0u; s < HIZ_SAMPLES; ++s) {
-          float d = hiz_depth.Load(int2(p), int(s));
-          mn = min(mn, d);
-          mx = max(mx, d);
-        }
-#else
-        float d = hiz_depth.Load(int3(int2(p), 0));
-        mn = min(mn, d);
-        mx = max(mx, d);
-#endif
-      }
+    [unroll]
+    for (uint s = 0; s < HIZ_SAMPLES; ++s) {
+      float d = hiz_depth.Load(int2(pixel), int(s));
+      mn = min(mn, d);
+      mx = max(mx, d);
     }
+#else
+    float d = hiz_depth.Load(int3(int2(pixel), 0));
+    mn = d;
+    mx = d;
+#endif
   }
-  uint lane = quad_in.y * 4u + quad_in.x;
-  uint gi = (tile_in.y * 2u + tile_in.x) * 16u + lane;
-  hiz_gs_min[gi] = mn;
-  hiz_gs_max[gi] = mx;
+  hiz_gs_min[group_index] = mn;
+  hiz_gs_max[group_index] = mx;
   GroupMemoryBarrierWithGroupSync();
   [unroll]
-  for (uint stride = 8u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) {
-      hiz_gs_min[gi] = min(hiz_gs_min[gi], hiz_gs_min[gi + stride]);
-      hiz_gs_max[gi] = max(hiz_gs_max[gi], hiz_gs_max[gi + stride]);
+  for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    if (group_index < stride) {
+      hiz_gs_min[group_index] = min(hiz_gs_min[group_index], hiz_gs_min[group_index + stride]);
+      hiz_gs_max[group_index] = max(hiz_gs_max[group_index], hiz_gs_max[group_index + stride]);
     }
     GroupMemoryBarrierWithGroupSync();
   }
-  if (lane == 0u && tile.x < hiz_tiles_x && tile.y < hiz_tiles_y) {
-    hiz_buffer[tile.y * hiz_tiles_x + tile.x] = float2(hiz_gs_min[gi], hiz_gs_max[gi]);
+  if (group_index == 0u && group_id.x < hiz_tiles_x && group_id.y < hiz_tiles_y) {
+    hiz_buffer[group_id.y * hiz_tiles_x + group_id.x] = float2(hiz_gs_min[0], hiz_gs_max[0]);
   }
 }
 

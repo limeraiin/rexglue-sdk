@@ -669,7 +669,12 @@ void DeferredCommandList::NrDspCompareSpan(const uintmax_t* prev, size_t prev_le
 namespace {
 enum : uint32_t {
   kSkPipe = 0, kSkRs, kSkIb, kSkTopo, kSkVp, kSkSc, kSkBlend, kSkSref, kSkSample,
-  kSkRoot0 = 16, kSkKeys = 48
+  // [ia] one key per vertex-buffer slot: under the sorter every draw emits
+  // each slot it uses (one IASetVertexBuffers per slot), so a segment's own
+  // set is its whole effective state for that slot. Missing before
+  // 2026-09-13: the IA path's per-draw set classified as a BREAK and the
+  // sorter rewrote ~3 windows/frame (sw 91->91) since [ia] shipped.
+  kSkVb0 = 9, kSkRoot0 = 24, kSkKeys = 56
 };
 constexpr uint32_t kSkAction = 0xFFFFFFFFu;
 constexpr uint32_t kSkBreak = 0xFFFFFFFEu;
@@ -683,6 +688,11 @@ uint32_t DeferredCommandList::SortClassify(const uintmax_t* cmd) const {
     case Command::kSetPipelineStateHandle: return kSkPipe;
     case Command::kD3DSetGraphicsRootSignature: return kSkRs;
     case Command::kD3DIASetIndexBuffer: return kSkIb;
+    case Command::kD3DIASetVertexBuffers: {
+      const auto& v = *reinterpret_cast<const D3DIASetVertexBuffersHeader*>(a);
+      return v.num_views == 1 && v.start_slot < kSkRoot0 - kSkVb0 ? kSkVb0 + v.start_slot
+                                                                    : kSkBreak;
+    }
     case Command::kD3DIASetPrimitiveTopology: return kSkTopo;
     case Command::kRSSetViewport: return kSkVp;
     case Command::kRSSetScissorRect: return kSkSc;
