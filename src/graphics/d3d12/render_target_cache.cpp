@@ -1879,6 +1879,24 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
+          // [rtt] the census: this resolve's destination range and shape.
+          {
+            const draw_util::ResolveEdramInfo& rtt_edram = resolve_info.IsCopyingDepth()
+                                                               ? resolve_info.depth_edram_info
+                                                               : resolve_info.color_edram_info;
+            command_processor_.RttNoteResolve(
+                resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+                resolve_info.copy_dest_extent_length,
+                uint32_t(resolve_info.coordinate_info.width_div_8) << 3,
+                resolve_info.height_div_8 << 3,
+                uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+                resolve_info.IsCopyingDepth(), uint32_t(rtt_edram.msaa_samples),
+                uint32_t(copy_shader), direct_resolved,
+                direct_resolved && direct_resolve_plan_.render_target
+                    ? direct_resolve_plan_.render_target->key().key
+                    : 0u,
+                resolve_info.IsClearingDepth() || resolve_info.IsClearingColor());
+          }
         }
       } else {
         REXGPU_ERROR(

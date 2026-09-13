@@ -134,6 +134,21 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Overflowing configs fall back to the generic draw bucket. desc is only
   // read the first time a config is seen (the RT cache formats it).
   void GpuCensusSetDrawConfig(const uint32_t rt_keys[5], const char* desc);
+  // [rtt] The render-to-texture round-trip census (always on, 1 Hz): every
+  // resolve's guest destination and every texture (re)load, matched by guest
+  // range, so the report names which uploads are a resolve's own bytes coming
+  // back through the texture cache (the console's EDRAM -> memory -> texture
+  // trip; a PC engine samples the render target). Both hooks run on the CP
+  // thread, so the tables need no lock.
+  void RttNoteResolve(uint32_t dest_base, uint32_t extent_start, uint32_t extent_length,
+                      uint32_t width, uint32_t height, uint32_t dest_format, bool is_depth,
+                      uint32_t src_msaa, uint32_t copy_shader, bool direct, uint32_t rt_key,
+                      bool clears);
+  void RttNoteTextureLoad(uint32_t base_address, uint32_t base_size, uint32_t mip_address,
+                          uint32_t mip_size, bool load_base, bool load_mips, uint32_t width,
+                          uint32_t height, uint32_t format, bool tiled, uint32_t mip_max_level,
+                          bool scaled);
+  void RttReport1Hz();
   void GpuCensusPush(uint8_t cls) {
     if (!gpu_census_sub_active_) {
       return;
@@ -1212,6 +1227,41 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t gpu_census_draw_config_count_ = 0;
   uint32_t gpu_census_last_rt_keys_[5] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
                                           UINT32_MAX};
+
+  // [rtt] state. One record per resolve destination base (stable for the
+  // run, compacted when unseen for 5 s) and one per texture guest range
+  // (base address + shape); per-second counters reset at the report.
+  struct RttResolveRec {
+    uint32_t dest_base = 0, start = 0, length = 0;
+    uint16_t width = 0, height = 0;
+    uint8_t dest_format = 0, is_depth = 0, src_msaa = 0, copy_shader = 0, direct = 0, clears = 0;
+    uint32_t rt_key = 0;
+    uint64_t last_frame = 0;
+    uint64_t last_seen_report = 0;
+    // This second.
+    uint32_t count = 0, bytes_kb = 0, fed_loads = 0, fed_bytes_kb = 0;
+  };
+  struct RttTexRec {
+    uint32_t base_address = 0, base_size = 0;
+    uint16_t width = 0, height = 0;
+    uint8_t format = 0, tiled = 0, mips = 0, scaled = 0;
+    uint64_t last_load_frame = 0;
+    uint64_t last_seen_report = 0;
+    // This second.
+    uint32_t loads = 0, fed = 0, bytes_kb = 0, mip_loads = 0;
+    int32_t fed_by = -1;  // index into rtt_resolves_ of the last feeding resolve
+    uint8_t range_rel = 0;  // 0 none, 1 equal, 2 texture inside dest, 3 dest inside texture, 4 partial
+  };
+  static constexpr uint32_t kRttResolveCap = 96;
+  static constexpr uint32_t kRttTexCap = 384;
+  RttResolveRec rtt_resolves_[kRttResolveCap];
+  uint32_t rtt_resolve_count_ = 0;
+  RttTexRec rtt_textures_[kRttTexCap];
+  uint32_t rtt_tex_count_ = 0;
+  uint32_t rtt_resolve_overflow_ = 0, rtt_tex_overflow_ = 0;
+  uint32_t rtt_loads_cold_ = 0, rtt_cold_bytes_kb_ = 0, rtt_loads_stale_ = 0;
+  uint64_t rtt_report_index_ = 0;
+  uint64_t rtt_frame_last_report_ = 0;
 
   // [occ] census state: two query heaps (pipeline statistics + occlusion)
   // indexed by the same ring slot, one slot per issued draw.

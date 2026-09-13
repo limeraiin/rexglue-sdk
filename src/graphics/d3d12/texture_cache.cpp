@@ -1636,6 +1636,12 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                                          D3D12CommandProcessor::kGpuCensusTexUp);
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
+  // [rtt] the census: a texture (re)load, matched to the resolve that wrote it.
+  command_processor_.RttNoteTextureLoad(
+      texture_key.base_page << 12, texture.GetGuestBaseSize(), texture_key.mip_page << 12,
+      texture.GetGuestMipsSize(), load_base, load_mips, texture_key.GetWidth(),
+      texture_key.GetHeight(), uint32_t(texture_key.format), texture_key.tiled != 0,
+      texture_key.mip_max_level, texture_key.scaled_resolve != 0);
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();

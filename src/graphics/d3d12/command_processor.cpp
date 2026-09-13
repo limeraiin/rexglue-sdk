@@ -14067,6 +14067,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         }
         // [gpu-census] same 1 Hz window: what the GPU spent the second on.
         GpuCensusReport1Hz();
+        RttReport1Hz();  // [rtt]
         OccReport1Hz();  // [occ]
       }
     }
@@ -18726,6 +18727,265 @@ void D3D12CommandProcessor::GpuCensusSetDrawConfig(const uint32_t rt_keys[5], co
        gpu_census_class_ >= kGpuCensusClassCount)) {
     GpuCensusSetClass(new_class);
   }
+}
+
+// [rtt] The render-to-texture round-trip census. See the header.
+void D3D12CommandProcessor::RttNoteResolve(uint32_t dest_base, uint32_t extent_start,
+                                           uint32_t extent_length, uint32_t width,
+                                           uint32_t height, uint32_t dest_format, bool is_depth,
+                                           uint32_t src_msaa, uint32_t copy_shader, bool direct,
+                                           uint32_t rt_key, bool clears) {
+  RttResolveRec* rec = nullptr;
+  for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
+    if (rtt_resolves_[i].dest_base == dest_base) {
+      rec = &rtt_resolves_[i];
+      break;
+    }
+  }
+  if (!rec) {
+    if (rtt_resolve_count_ >= kRttResolveCap) {
+      ++rtt_resolve_overflow_;
+      return;
+    }
+    rec = &rtt_resolves_[rtt_resolve_count_++];
+    *rec = RttResolveRec();
+    rec->dest_base = dest_base;
+  }
+  rec->start = extent_start;
+  rec->length = extent_length;
+  rec->width = uint16_t(std::min<uint32_t>(width, 0xFFFF));
+  rec->height = uint16_t(std::min<uint32_t>(height, 0xFFFF));
+  rec->dest_format = uint8_t(dest_format);
+  rec->is_depth = is_depth ? 1 : 0;
+  rec->src_msaa = uint8_t(src_msaa);
+  rec->copy_shader = uint8_t(copy_shader);
+  rec->direct = direct ? 1 : 0;
+  rec->clears = clears ? 1 : 0;
+  rec->rt_key = rt_key;
+  rec->last_frame = frame_current_;
+  rec->last_seen_report = rtt_report_index_;
+  ++rec->count;
+  rec->bytes_kb += extent_length >> 10;
+}
+
+void D3D12CommandProcessor::RttNoteTextureLoad(uint32_t base_address, uint32_t base_size,
+                                               uint32_t mip_address, uint32_t mip_size,
+                                               bool load_base, bool load_mips, uint32_t width,
+                                               uint32_t height, uint32_t format, bool tiled,
+                                               uint32_t mip_max_level, bool scaled) {
+  RttTexRec* rec = nullptr;
+  for (uint32_t i = 0; i < rtt_tex_count_; ++i) {
+    RttTexRec& t = rtt_textures_[i];
+    if (t.base_address == base_address && t.width == width && t.height == height &&
+        t.format == format && t.tiled == (tiled ? 1 : 0) && t.scaled == (scaled ? 1 : 0)) {
+      rec = &t;
+      break;
+    }
+  }
+  if (!rec) {
+    if (rtt_tex_count_ >= kRttTexCap) {
+      ++rtt_tex_overflow_;
+      return;
+    }
+    rec = &rtt_textures_[rtt_tex_count_++];
+    *rec = RttTexRec();
+    rec->base_address = base_address;
+    rec->width = uint16_t(std::min<uint32_t>(width, 0xFFFF));
+    rec->height = uint16_t(std::min<uint32_t>(height, 0xFFFF));
+    rec->format = uint8_t(format);
+    rec->tiled = tiled ? 1 : 0;
+    rec->scaled = scaled ? 1 : 0;
+  }
+  rec->base_size = base_size;
+  rec->mips = uint8_t(mip_max_level);
+  rec->last_seen_report = rtt_report_index_;
+  if (load_mips) {
+    ++rec->mip_loads;
+    rec->bytes_kb += mip_size >> 10;
+  }
+  if (!load_base) {
+    return;
+  }
+  ++rec->loads;
+  rec->bytes_kb += base_size >> 10;
+  // Which resolve wrote these bytes? Overlap of the texture's base range with
+  // a resolve destination that ran since this texture was last loaded.
+  const uint32_t tex_end = base_address + base_size;
+  int32_t fed_by = -1;
+  int32_t stale_by = -1;
+  for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
+    const RttResolveRec& r = rtt_resolves_[i];
+    if (r.start < tex_end && base_address < r.start + r.length) {
+      if (r.last_frame >= rec->last_load_frame) {
+        fed_by = int32_t(i);
+        break;
+      }
+      stale_by = int32_t(i);
+    }
+  }
+  const uint64_t prev_load_frame = rec->last_load_frame;
+  rec->last_load_frame = frame_current_;
+  if (fed_by >= 0) {
+    RttResolveRec& r = rtt_resolves_[fed_by];
+    ++rec->fed;
+    rec->fed_by = fed_by;
+    ++r.fed_loads;
+    r.fed_bytes_kb += base_size >> 10;
+    if (base_address == r.start && base_size == r.length) {
+      rec->range_rel = 1;
+    } else if (base_address >= r.start && tex_end <= r.start + r.length) {
+      rec->range_rel = 2;
+    } else if (r.start >= base_address && r.start + r.length <= tex_end) {
+      rec->range_rel = 3;
+    } else {
+      rec->range_rel = 4;
+    }
+  } else if (stale_by >= 0 && prev_load_frame) {
+    // Overlaps a resolve destination, but no resolve since the last load:
+    // something else (a CPU write, a cache eviction) invalidated it.
+    ++rtt_loads_stale_;
+  } else {
+    ++rtt_loads_cold_;
+    rtt_cold_bytes_kb_ += base_size >> 10;
+  }
+}
+
+void D3D12CommandProcessor::RttReport1Hz() {
+  ++rtt_report_index_;
+  const uint64_t frames = frame_current_ > rtt_frame_last_report_
+                              ? frame_current_ - rtt_frame_last_report_
+                              : 1;
+  rtt_frame_last_report_ = frame_current_;
+  const double per_fr = 1.0 / double(frames);
+  uint32_t res_total = 0, res_direct = 0, res_kb = 0, dests = 0, dests_read = 0, dests_unread = 0;
+  uint32_t fed_loads = 0, fed_kb = 0;
+  for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
+    const RttResolveRec& r = rtt_resolves_[i];
+    if (!r.count) {
+      continue;
+    }
+    ++dests;
+    res_total += r.count;
+    res_kb += r.bytes_kb;
+    if (r.direct) {
+      res_direct += r.count;
+    }
+    if (r.fed_loads) {
+      ++dests_read;
+    } else {
+      ++dests_unread;
+    }
+    fed_loads += r.fed_loads;
+    fed_kb += r.fed_bytes_kb;
+  }
+  uint32_t tex_loads = 0, tex_kb = 0, tex_mip_loads = 0, tex_seen = 0;
+  for (uint32_t i = 0; i < rtt_tex_count_; ++i) {
+    const RttTexRec& t = rtt_textures_[i];
+    if (!t.loads && !t.mip_loads) {
+      continue;
+    }
+    ++tex_seen;
+    tex_loads += t.loads;
+    tex_mip_loads += t.mip_loads;
+    tex_kb += t.bytes_kb;
+  }
+  if (res_total || tex_loads || tex_mip_loads) {
+    REXGPU_INFO(
+        "[rtt] fr {} | resolve/s {} ({:.1f}/fr, direct {}, {:.1f} MB/s) dests {} read-as-tex {} "
+        "unread {} | texup/s {} ({:.1f}/fr, {:.1f} MB/s, {} textures) FED by a resolve {} "
+        "({:.1f}/fr, {:.1f} MB/s) cold {} ({:.1f} MB/s) stale {} mips {} | overflow r{} t{}",
+        frames, res_total, double(res_total) * per_fr, res_direct, double(res_kb) / 1024.0, dests,
+        dests_read, dests_unread, tex_loads, double(tex_loads) * per_fr,
+        double(tex_kb) / 1024.0, tex_seen, fed_loads, double(fed_loads) * per_fr,
+        double(fed_kb) / 1024.0, rtt_loads_cold_, double(rtt_cold_bytes_kb_) / 1024.0,
+        rtt_loads_stale_, tex_mip_loads, rtt_resolve_overflow_, rtt_tex_overflow_);
+    // Per destination: the resolve's shape and the textures it fed.
+    std::string keys;
+    for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
+      const RttResolveRec& r = rtt_resolves_[i];
+      if (!r.count) {
+        continue;
+      }
+      keys += fmt::format(" | {:08X}+{:X} {}x{} {}f{} m{} sh{} d{}{} res {} ({:.1f}/fr) -> loads {}",
+                          r.start, r.length, r.width, r.height, r.is_depth ? "Z" : "C",
+                          r.dest_format, r.src_msaa, r.copy_shader, r.direct, r.clears ? " clr" : "",
+                          r.count, double(r.count) * per_fr, r.fed_loads);
+      uint32_t listed = 0;
+      for (uint32_t t = 0; t < rtt_tex_count_ && listed < 3; ++t) {
+        const RttTexRec& x = rtt_textures_[t];
+        if (x.fed_by != int32_t(i) || !x.fed) {
+          continue;
+        }
+        static const char* const kRel[] = {"?", "eq", "in", "over", "part"};
+        keys += fmt::format(" [{:08X} {}x{} f{} {}{} mip{} {} x{}]", x.base_address, x.width,
+                            x.height, x.format, x.tiled ? "t" : "l", x.scaled ? "s" : "",
+                            x.mips, kRel[x.range_rel], x.fed);
+        ++listed;
+      }
+    }
+    if (!keys.empty()) {
+      REXGPU_INFO("[rtt-key]{}", keys);
+    }
+    // Cold loads by texture (streaming / first use): the first few.
+    std::string cold;
+    uint32_t cold_listed = 0;
+    for (uint32_t t = 0; t < rtt_tex_count_ && cold_listed < 6; ++t) {
+      const RttTexRec& x = rtt_textures_[t];
+      if (!x.loads || x.fed) {
+        continue;
+      }
+      cold += fmt::format(" | {:08X} {}x{} f{} {} mip{} x{} {}kb", x.base_address, x.width,
+                          x.height, x.format, x.tiled ? "t" : "l", x.mips, x.loads, x.bytes_kb);
+      ++cold_listed;
+    }
+    if (!cold.empty()) {
+      REXGPU_INFO("[rtt-cold]{}", cold);
+    }
+  }
+  // Reset the second's counters; compact records unseen for 5 reports.
+  uint32_t w = 0;
+  for (uint32_t i = 0; i < rtt_resolve_count_; ++i) {
+    RttResolveRec r = rtt_resolves_[i];
+    if (rtt_report_index_ - r.last_seen_report > 5) {
+      for (uint32_t t = 0; t < rtt_tex_count_; ++t) {
+        if (rtt_textures_[t].fed_by == int32_t(i)) {
+          rtt_textures_[t].fed_by = -1;
+        }
+      }
+      continue;
+    }
+    r.count = 0;
+    r.bytes_kb = 0;
+    r.fed_loads = 0;
+    r.fed_bytes_kb = 0;
+    if (w != i) {
+      for (uint32_t t = 0; t < rtt_tex_count_; ++t) {
+        if (rtt_textures_[t].fed_by == int32_t(i)) {
+          rtt_textures_[t].fed_by = int32_t(w);
+        }
+      }
+    }
+    rtt_resolves_[w++] = r;
+  }
+  rtt_resolve_count_ = w;
+  w = 0;
+  for (uint32_t i = 0; i < rtt_tex_count_; ++i) {
+    RttTexRec t = rtt_textures_[i];
+    if (rtt_report_index_ - t.last_seen_report > 5) {
+      continue;
+    }
+    t.loads = 0;
+    t.fed = 0;
+    t.bytes_kb = 0;
+    t.mip_loads = 0;
+    rtt_textures_[w++] = t;
+  }
+  rtt_tex_count_ = w;
+  rtt_loads_cold_ = 0;
+  rtt_cold_bytes_kb_ = 0;
+  rtt_loads_stale_ = 0;
+  rtt_resolve_overflow_ = 0;
+  rtt_tex_overflow_ = 0;
 }
 
 void D3D12CommandProcessor::GpuCensusReport1Hz() {
