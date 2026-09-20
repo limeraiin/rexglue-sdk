@@ -369,8 +369,19 @@ extern uint64_t g_tile_n_opost;
 // issued, the verdict tagged into the [occ] query and contradicted by the
 // clipper count), 2 skip, 3 cycle off / skip / verify 10 s each. Drive 805
 // verified skip (0 visible samples in 107767 out verdicts): default 2.
-REXCVAR_DEFINE_INT32(gpu_cull, 2, "GPU/D3D12",
-                     "[cull] bounds frustum culling: 0 off (kill switch), 1 verify, 2 skip.");
+// [nv-cull] Drive 890 (RTX 1440p, CP-bound): the cull block is 6.6% of the
+// CP's samples (HizPrepare 2.44, GetBounds 1.99, FrustumOutside 1.16,
+// PosPath::Evaluate 1.03) and drive 827 read the Hi-Z off FASTER than skip on
+// the RTX (49.3 vs 47.5 fps) while the GPU was the wall there; the GPU is not
+// the wall on the RTX any more (10.6 ms/fr at 1440p), the CP is. So both
+// levers are VENDOR-KEYED like the pool and the sorter: -1 = Intel skip (the
+// Intel win, drives 813/844), every other vendor off. Drive 897 (RTX 1440p
+// --no-vsync, parked, 98 city windows, same scene): on 58.12 fps / GPU 10.0
+// / draw class 6.2 ms/fr vs off 63.69 / 7.8 / 4.8: SHIPPED, the cycler
+// deleted (2026-09-20).
+REXCVAR_DEFINE_INT32(gpu_cull, -1, "GPU/D3D12",
+                     "[cull] bounds frustum culling: -1 by vendor (Intel skip, others off; "
+                     "default), 0 off (kill switch), 1 verify, 2 skip.");
 // [hiz] increment 3: the Hi-Z cull. Every cull-eligible plain draw in the
 // frustum becomes an ExecuteIndirect whose arguments a checkpoint compute
 // pass writes: the checkpoint reads the bound depth buffer into a per-tile
@@ -393,8 +404,9 @@ REXCVAR_DEFINE_INT32(gpu_rtt_unread, 1, "GPU/D3D12",
 REXCVAR_DEFINE_INT32(gpu_rtt_cycle, 0, "GPU/D3D12",
                      "[rtt-alias] A/B: seconds per phase, alias on / off (0 = no cycling). The "
                      "top-left marker shows the phase (green on, red off).");
-REXCVAR_DEFINE_INT32(gpu_hiz, 2, "GPU/D3D12",
-                     "[hiz] Hi-Z occlusion culling: 0 off, 1 verify, 2 skip (default).");
+REXCVAR_DEFINE_INT32(gpu_hiz, -1, "GPU/D3D12",
+                     "[hiz] Hi-Z occlusion culling: -1 by vendor (Intel skip, others off; "
+                     "default), 0 off, 1 verify, 2 skip.");
 // [ia] The input-assembler vertex path (NEXT-AGENT.md 2026-09-07): eligible
 // vertex shaders read their attributes from host-order vertex buffer views
 // (the mirror) through the IA instead of the translated per-vertex shared
@@ -7276,11 +7288,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   {
     // [cull] phase latch (the cycle mode is deleted: the skip is shipped).
     {
+      // [nv-cull] the vendor default (Intel skip, others off; drive 897:
+      // the block costs the RTX 5.6 fps at 1440p); an explicit 0/1/2 wins.
+      const uint32_t vendor_mode = g_pool_intel_off ? 2u : 0u;
       const int32_t cv = REXCVAR_GET(gpu_cull);
-      cull_phase_ = cv < 0 || cv > 2 ? 0 : uint32_t(cv);
+      cull_phase_ = cv < 0 || cv > 2 ? vendor_mode : uint32_t(cv);
       // [hiz] the same latch shape; a phase change closes the open window
       // (its checkpoint carried the old mode).
-      const int32_t hv = hiz_available_ ? REXCVAR_GET(gpu_hiz) : 0;
+      int32_t hv = hiz_available_ ? REXCVAR_GET(gpu_hiz) : 0;
+      if (hv < 0 || hv > 2) hv = hiz_available_ ? int32_t(vendor_mode) : 0;
       const uint32_t k1 = uint32_t(std::clamp<int32_t>(REXCVAR_GET(gpu_hiz_k), 1, kHizMaxK));
       // Drive 815: rebuild 250 / 400 / 800 = 13.9 / 14.2 / 14.8 fps at the
       // heavy city (a build is ~1.3 ms, hidden 30.8 / 29.7 / 28.4%): 800.
