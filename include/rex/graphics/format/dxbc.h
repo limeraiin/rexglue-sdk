@@ -1384,6 +1384,7 @@ enum class Opcode : uint32_t {
   kRSq = 68,
   kSampleL = 72,
   kSampleD = 73,
+  kSampleB = 74,
   kSqRt = 75,
   kSwitch = 76,
   kSinCos = 77,
@@ -1819,6 +1820,33 @@ class Assembler {
     lod.Write(code_, false, 0b0000);
     ++stat_.instruction_count;
     ++stat_.texture_normal_instructions;
+  }
+  // [pcsh] sample_b: the same operand layout as sample_l, the scalar is the
+  // LOD bias applied to the hardware-computed LOD.
+  void OpSampleB(const Dest& dest, const Src& address, uint32_t address_components,
+                 const Src& resource, const Src& sampler, const Src& bias, int32_t aoffimmi_u = 0,
+                 int32_t aoffimmi_v = 0, int32_t aoffimmi_w = 0) {
+    uint32_t dest_write_mask = dest.GetMask();
+    uint32_t sample_controls = 0;
+    if (aoffimmi_u || aoffimmi_v || aoffimmi_w) {
+      sample_controls = SampleControlsExtendedOpcodeToken(aoffimmi_u, aoffimmi_v, aoffimmi_w);
+    }
+    uint32_t address_mask = (1 << address_components) - 1;
+    uint32_t operands_length = dest.GetLength() + address.GetLength(address_mask) +
+                               resource.GetLength(dest_write_mask, true) +
+                               sampler.GetLength(0b0000) + bias.GetLength(0b0000);
+    code_.reserve(code_.size() + 1 + (sample_controls ? 1 : 0) + operands_length);
+    code_.push_back(OpcodeToken(Opcode::kSampleB, operands_length, false, sample_controls ? 1 : 0));
+    if (sample_controls) {
+      code_.push_back(sample_controls);
+    }
+    dest.Write(code_);
+    address.Write(code_, false, address_mask);
+    resource.Write(code_, false, dest_write_mask, true);
+    sampler.Write(code_, false, 0b0000);
+    bias.Write(code_, false, 0b0000);
+    ++stat_.instruction_count;
+    ++stat_.texture_bias_instructions;
   }
   void OpSampleD(const Dest& dest, const Src& address, uint32_t address_components,
                  const Src& resource, const Src& sampler, const Src& x_derivatives,

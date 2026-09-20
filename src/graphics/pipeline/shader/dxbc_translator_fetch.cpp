@@ -1465,6 +1465,10 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       // Will be allocated for computed LOD only, and if not using basemap mip
       // filter.
       uint32_t grad_v_temp = UINT32_MAX;
+      // [pcsh] sample_b with lod_src as the bias instead of sample_d with the
+      // derivatives scaled by exp2(lod_src): the hardware LOD plus a bias is
+      // the same LOD, and the sampler runs the plain message.
+      bool use_sample_bias = false;
       if (instr.attributes.mip_filter != xenos::TextureFilter::kBaseMap) {
         grad_h_lod_temp = PushSystemTemp();
         lod_src = dxbc::Src::R(grad_h_lod_temp, dxbc::Src::kWWWW);
@@ -1493,7 +1497,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
             a_.OpMul(lod_dest, lod_src, dxbc::Src::LF(1.0f / 32.0f));
           }
         }
-        if (use_computed_lod) {
+        if (use_computed_lod && UsePcLod() && !instr.attributes.use_register_gradients) {
+          use_sample_bias = true;
+        } else if (use_computed_lod) {
           grad_v_temp = PushSystemTemp();
           switch (instr.dimension) {
             case xenos::FetchOpDimension::k1D:
@@ -1898,7 +1904,10 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                                      texture_bindless_descriptor_index >> 2)
                            .Select(texture_bindless_descriptor_index & 3));
             }
-            if (grad_v_temp != UINT32_MAX) {
+            if (use_sample_bias) {  // [pcsh]
+              a_.OpSampleB(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
+                           dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler, lod_src);
+            } else if (grad_v_temp != UINT32_MAX) {
               assert_not_zero(grad_component_count);
               a_.OpSampleD(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
                            dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler,
@@ -1928,7 +1937,10 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                                      texture_bindless_descriptor_index >> 2)
                            .Select(texture_bindless_descriptor_index & 3));
             }
-            if (grad_v_temp != UINT32_MAX) {
+            if (use_sample_bias) {  // [pcsh]
+              a_.OpSampleB(dxbc::Dest::R(signed_temp, used_result_nonzero_components),
+                           dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler, lod_src);
+            } else if (grad_v_temp != UINT32_MAX) {
               assert_not_zero(grad_component_count);
               a_.OpSampleD(dxbc::Dest::R(signed_temp, used_result_nonzero_components),
                            dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler,
