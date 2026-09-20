@@ -114,7 +114,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260920;  // [pcsh] PC arithmetic + sample_b
+    static constexpr uint32_t kVersion = 0x20260921;  // [vtl] direct load form changed (drive 905 entries stale)
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -175,6 +175,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // draw binds a host-order index buffer and BaseVertexLocation). Only
       // honoured for a shader whose PosPath::ia_eligible is set.
       uint32_t ia_fetch : 1;
+      // [vtl] Direct texture loads in the vertex shader: a 1D tfetch without
+      // gradients becomes a texel index (coordinate * width + offset, clamped
+      // to the edge) and one `ld` from the unsigned SRV, no sampler, no sign
+      // switches, no LOD or exponent math. The draw sets it only when every
+      // 1D fetch constant the shader reads is unsigned, single-mip, point
+      // filtered, with no exponent bias and not resolution-scaled. The value
+      // is the fetch constant's size packing: 1 = 1D (24-bit width), 2 = 2D
+      // (13-bit width, 13-bit height; Jade declares the bone palette so).
+      uint32_t tex_direct : 2;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -737,6 +746,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
            GetDxbcShaderModification().pixel.depth_stencil_mode ==
                Modification::DepthStencilMode::kEarlyHint &&
            current_shader().implicit_early_z_write_allowed();
+  }
+
+  // [vtl]
+  uint32_t UseVsTexDirect() const {
+    return is_vertex_shader() ? GetDxbcShaderModification().vertex.tex_direct : 0;
   }
 
   uint32_t GetModificationInterpolatorMask() const {

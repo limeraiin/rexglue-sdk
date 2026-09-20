@@ -1426,6 +1426,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<VbMirror> vb_mirror_;
   bool ia_available_ = false;
   uint32_t ia_phase_ = 0;  // latched per frame: 1 IA, 0 raw
+  struct VtlAcc {  // [vtl] the census (refusals at every granularity)
+    uint64_t draws = 0, idx = 0, vs_tex_draws = 0, vs_tex_idx = 0, direct_draws = 0,
+             direct_idx = 0, note_dim = 0, note_clamp = 0;
+    uint64_t ref[8] = {};
+  } vtl_acc_;
+  void VtlReport1Hz(double frames);
   uint32_t ia_arg_dword2_ = 0;
   uint32_t ia_arg_dword3_ = 0;
   struct IaVbLatch {

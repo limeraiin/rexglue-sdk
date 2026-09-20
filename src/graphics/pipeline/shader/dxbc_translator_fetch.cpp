@@ -832,6 +832,116 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   }
   dxbc::Src offsets_src(dxbc::Src::LF(offsets[0], offsets[1], offsets[2], 0.0f));
 
+  // [vtl] The direct load: a vertex-shader 1D fetch (the skinned family's
+  // bone-matrix rows in this game) as a texel index and one `ld`.
+  if (instr.opcode == FetchOpcode::kTextureFetch && UseVsTexDirect() != 0 &&
+      instr.dimension == xenos::FetchOpDimension::k1D && !use_computed_lod &&
+      !instr.attributes.use_register_gradients &&
+      (instr.attributes.mag_filter == xenos::TextureFilter::kPoint ||
+       instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst) &&
+      (instr.attributes.min_filter == xenos::TextureFilter::kPoint ||
+       instr.attributes.min_filter == xenos::TextureFilter::kUseFetchConst)) {
+    // addr_temp: x = texel index, y = width - 1 (uint), z, w = 0 (layer, mip).
+    uint32_t addr_temp = PushSystemTemp();
+    // srv_temp.x = the bindless descriptor index of the unsigned SRV.
+    uint32_t srv_temp = PushSystemTemp();
+    bool coord_operand_temp_pushed = false;
+    dxbc::Src coord_operand =
+        LoadOperand(instr.operands[0], 0b0001, coord_operand_temp_pushed);
+    dxbc::Src coord_x = coord_operand.SelectFromSwizzled(0);
+    dxbc::Dest addr_x(dxbc::Dest::R(addr_temp, 0b0001));
+    a_.OpUBFE(dxbc::Dest::R(addr_temp, 0b0010), dxbc::Src::LU(UseVsTexDirect() == 2 ? 13 : 24),
+              dxbc::Src::LU(0), RequestTextureFetchConstantWord(tfetch_index, 2));
+    if (instr.attributes.unnormalized_coordinates) {
+      if (offsets[0]) {
+        a_.OpAdd(addr_x, coord_x, dxbc::Src::LF(offsets[0]));
+      } else {
+        a_.OpMov(addr_x, coord_x);
+      }
+    } else {
+      a_.OpIAdd(addr_x, dxbc::Src::R(addr_temp, dxbc::Src::kYYYY), dxbc::Src::LU(1));
+      a_.OpUToF(addr_x, dxbc::Src::R(addr_temp, dxbc::Src::kXXXX));
+      if (offsets[0]) {
+        a_.OpMAd(addr_x, coord_x, dxbc::Src::R(addr_temp, dxbc::Src::kXXXX),
+                 dxbc::Src::LF(offsets[0]));
+      } else {
+        a_.OpMul(addr_x, coord_x, dxbc::Src::R(addr_temp, dxbc::Src::kXXXX));
+      }
+    }
+    if (coord_operand_temp_pushed) {
+      PopSystemTemp();
+    }
+    // Clamp to the edge: max(x, 0) (NaN -> 0), to uint (saturating), min(width - 1).
+    a_.OpMax(addr_x, dxbc::Src::R(addr_temp, dxbc::Src::kXXXX), dxbc::Src::LF(0.0f));
+    a_.OpFToU(addr_x, dxbc::Src::R(addr_temp, dxbc::Src::kXXXX));
+    a_.OpUMin(addr_x, dxbc::Src::R(addr_temp, dxbc::Src::kXXXX),
+              dxbc::Src::R(addr_temp, dxbc::Src::kYYYY));
+    a_.OpMov(dxbc::Dest::R(addr_temp, 0b1110), dxbc::Src::LU(0));
+    // The binding LAYOUT is the shader's, taken from whichever translation
+    // ran first (DxbcShader::bindings_setup_entered_), so every variant must
+    // register the same bindings in the same order: the generic path registers
+    // the sampler, then the unsigned and the signed texture. The sampler is
+    // registered here too (unused by the load) so the descriptor slots agree.
+    FindOrAddSamplerBinding(tfetch_index, instr.attributes.mag_filter,
+                            instr.attributes.min_filter, instr.attributes.mip_filter,
+                            xenos::AnisoFilter::kDisabled);
+    // The SRV: the unsigned texture unless every component is signed (the
+    // cache loads only the signed texture then; the direct gate admits a
+    // signed fetch only on a float format, where the data is the same).
+    uint32_t texture_binding_unsigned =
+        FindOrAddTextureBinding(tfetch_index, xenos::FetchOpDimension::k1D, false);
+    uint32_t texture_binding_signed =
+        FindOrAddTextureBinding(tfetch_index, xenos::FetchOpDimension::k1D, true);
+    MarkSystemConstantUsed(SystemConstants::Index::kTextureSwizzledSigns);
+    a_.OpUBFE(dxbc::Dest::R(srv_temp, 0b0001), dxbc::Src::LU(8),
+              dxbc::Src::LU((tfetch_index & 3) * 8),
+              GetSystemConstantSrc(offsetof(SystemConstants, texture_swizzled_signs) +
+                                       sizeof(uint32_t) * (tfetch_index >> 2),
+                                   dxbc::Src::kXXXX));
+    a_.OpINE(dxbc::Dest::R(srv_temp, 0b0001), dxbc::Src::R(srv_temp, dxbc::Src::kXXXX),
+             dxbc::Src::LU(uint32_t(xenos::TextureSign::kSigned) * 0b01010101));
+    dxbc::Dest ld_dest(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components));
+    if (bindless_resources_used_) {
+      if (cbuffer_index_descriptor_indices_ == kBindingIndexUnallocated) {
+        cbuffer_index_descriptor_indices_ = cbuffer_count_++;
+      }
+      uint32_t di_u = texture_bindings_[texture_binding_unsigned].bindless_descriptor_index;
+      uint32_t di_s = texture_bindings_[texture_binding_signed].bindless_descriptor_index;
+      a_.OpMovC(dxbc::Dest::R(srv_temp, 0b0001), dxbc::Src::R(srv_temp, dxbc::Src::kXXXX),
+                dxbc::Src::CB(cbuffer_index_descriptor_indices_,
+                              uint32_t(CbufferRegister::kDescriptorIndices), di_u >> 2)
+                    .Select(di_u & 3),
+                dxbc::Src::CB(cbuffer_index_descriptor_indices_,
+                              uint32_t(CbufferRegister::kDescriptorIndices), di_s >> 2)
+                    .Select(di_s & 3));
+      if (srv_index_bindless_textures_2d_ == kBindingIndexUnallocated) {
+        srv_index_bindless_textures_2d_ = srv_count_++;
+      }
+      a_.OpLd(ld_dest, dxbc::Src::R(addr_temp), 0b1111,
+              dxbc::Src::T(srv_index_bindless_textures_2d_, dxbc::Index(srv_temp, 0)));
+    } else {
+      a_.OpIf(true, dxbc::Src::R(srv_temp, dxbc::Src::kXXXX));
+      a_.OpLd(ld_dest, dxbc::Src::R(addr_temp), 0b1111,
+              dxbc::Src::T(texture_bindings_[texture_binding_unsigned].bindful_srv_index,
+                           uint32_t(SRVMainRegister::kBindfulTexturesStart) +
+                               texture_binding_unsigned));
+      a_.OpElse();
+      a_.OpLd(ld_dest, dxbc::Src::R(addr_temp), 0b1111,
+              dxbc::Src::T(texture_bindings_[texture_binding_signed].bindful_srv_index,
+                           uint32_t(SRVMainRegister::kBindfulTexturesStart) +
+                               texture_binding_signed));
+      a_.OpEndIf();
+    }
+    // Release srv_temp and addr_temp.
+    PopSystemTemp(2);
+    uint32_t direct_zero_components = used_result_components & ~used_result_nonzero_components;
+    if (direct_zero_components) {
+      a_.OpMov(dxbc::Dest::R(system_temp_result_, direct_zero_components), dxbc::Src::LF(0.0f));
+    }
+    StoreResult(instr.result, dxbc::Src::R(system_temp_result_));
+    return;
+  }
+
   // Load the texture size if needed.
   // 1D: X - width.
   // 2D, cube: X - width, Y - height (cube maps probably can be only square, but

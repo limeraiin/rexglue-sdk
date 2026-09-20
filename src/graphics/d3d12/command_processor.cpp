@@ -25,6 +25,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/hitch_probe.h>
@@ -417,6 +418,30 @@ REXCVAR_DEFINE_INT32(gpu_hiz, -1, "GPU/D3D12",
 REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
                      "[ia] input-assembler vertex fetch: 1 on (default), 0 off (the "
                      "translated raw fetch).");
+// [vtl] the sign gate: every component kUnsigned, or kSigned only on a float
+// format (no separate signed host texture; the switches that would run are
+// the biased/gamma ones, excluded here).
+static bool VtlSignsOk(const rex::graphics::xenos::xe_gpu_texture_fetch_t& tf) {
+  const uint8_t signs = rex::graphics::texture_util::SwizzleSigns(tf);
+  if (signs == 0) return true;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t sg = (signs >> (i * 2)) & 3;
+    if (sg != uint32_t(rex::graphics::xenos::TextureSign::kUnsigned) && sg != uint32_t(rex::graphics::xenos::TextureSign::kSigned)) {
+      return false;
+    }
+  }
+  switch (tf.format) {
+    case rex::graphics::xenos::TextureFormat::k_16_FLOAT:
+    case rex::graphics::xenos::TextureFormat::k_16_16_FLOAT:
+    case rex::graphics::xenos::TextureFormat::k_16_16_16_16_FLOAT:
+    case rex::graphics::xenos::TextureFormat::k_32_FLOAT:
+    case rex::graphics::xenos::TextureFormat::k_32_32_FLOAT:
+    case rex::graphics::xenos::TextureFormat::k_32_32_32_32_FLOAT:
+      return true;
+    default:
+      return false;
+  }
+}
 REXCVAR_DEFINE_UINT32(gpu_ia_verify, 0, "GPU/D3D12",
                       "[ia] shadow verify: pages per frame read back and compared with the "
                       "byte-swapped guest memory (0 = off, 16 max).");
@@ -7383,6 +7408,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                 cd(Cmd::kD3DCopyTextureRegion),
             cd(Cmd::kD3DBeginQuery) + cd(Cmd::kD3DEndQuery));
         IaReport1Hz(secs, frames);  // [ia]
+        VtlReport1Hz(frames);  // [vtl]
         {  // [sort] the state-sorting census (windows of the reorder class) and the sorter.
           static SortAcc s_sort;
           const SortAcc& c = g_sort;
@@ -9004,6 +9030,69 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // index buffer are resolved now (regions mapped, no commands recorded);
   // the page copies are queued and emitted after the residency loop, right
   // before the draw's own barriers.
+  // [vtl] The direct vertex texture load gate: every 1D fetch constant the
+  // vertex shader reads must be a texture, unsigned in every component,
+  // single-mip, point filtered (where the instruction defers to the fetch
+  // constant), with no exponent bias and not resolution-scaled. Counted at
+  // every granularity: draws with vertex fetches, their indices, the refusals.
+  bool vtl_draw = false;
+  uint32_t vtl_pack = 0;  // the size packing every admitted fetch constant shares
+  {
+    const uint32_t vtl_idx = primitive_processing_result.host_draw_vertex_count;
+    ++vtl_acc_.draws;
+    vtl_acc_.idx += vtl_idx;
+    const std::vector<Shader::TextureBinding>& vtl_tbs = vertex_shader->texture_bindings();
+    if (!vtl_tbs.empty()) {
+      ++vtl_acc_.vs_tex_draws;
+      vtl_acc_.vs_tex_idx += vtl_idx;
+      {
+        vtl_draw = true;
+        uint32_t why = 0;
+        vtl_pack = 0;
+        for (const Shader::TextureBinding& tb : vtl_tbs) {
+          if (tb.fetch_instr.dimension != xenos::FetchOpDimension::k1D) {
+            ++vtl_acc_.note_dim;
+            continue;
+          }
+          const xenos::xe_gpu_texture_fetch_t tf = regs.GetTextureFetch(tb.fetch_constant);
+          const uint32_t pack =
+              tf.dimension == xenos::DataDimension::k1D ? 1u
+              : tf.dimension == xenos::DataDimension::k2DOrStacked ? 2u : 0u;
+          if (tf.type != xenos::FetchConstantType::kTexture) {
+            why = 1;
+          } else if (pack == 0 || (vtl_pack != 0 && vtl_pack != pack)) {
+            why = 7;  // 3D or cube, or mixed packings in one shader
+          } else if (!VtlSignsOk(tf)) {
+            // Every component unsigned, or signed on a float format (the
+            // signed and unsigned host textures are the same data there).
+            why = 2;
+          } else if (tf.mip_min_level != 0 || tf.mip_max_level != 0) {
+            why = 3;
+          } else if (tf.exp_adjust != 0) {
+            why = 4;
+          } else if ((tb.fetch_instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst &&
+                      tf.mag_filter != xenos::TextureFilter::kPoint) ||
+                     (tb.fetch_instr.attributes.min_filter == xenos::TextureFilter::kUseFetchConst &&
+                      tf.min_filter != xenos::TextureFilter::kPoint)) {
+            why = 5;
+          } else if (texture_cache_->IsActiveTextureResolutionScaled(tb.fetch_constant)) {
+            why = 6;
+          }
+          if (why) break;
+          vtl_pack = pack;
+          if (tf.clamp_x != xenos::ClampMode::kClampToEdge) ++vtl_acc_.note_clamp;
+        }
+        if (!why && vtl_pack == 0) why = 7;  // no 1D fetch at all
+        if (why) {
+          vtl_draw = false;
+          ++vtl_acc_.ref[why];
+        } else {
+          ++vtl_acc_.direct_draws;
+          vtl_acc_.direct_idx += vtl_idx;
+        }
+      }
+    }
+  }
   bool ia_draw = false;
   D3D12_GPU_VIRTUAL_ADDRESS ia_vb_va[8] = {};
   D3D12_GPU_VIRTUAL_ADDRESS ia_ib_va = 0;
@@ -9109,6 +9198,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
           start_instanced || pool_open);
   vertex_shader_modification.vertex.ia_fetch = ia_draw ? 1 : 0;  // [ia]
+  vertex_shader_modification.vertex.tex_direct = vtl_draw ? vtl_pack : 0;  // [vtl]
   DxbcShaderTranslator::Modification pixel_shader_modification =
       pixel_shader
           ? pipeline_cache_->GetCurrentPixelShaderModification(
@@ -17750,6 +17840,26 @@ void D3D12CommandProcessor::ShutdownIaResources() {
   ia_available_ = false;
   ia_phase_ = 0;
   vb_mirror_.reset();
+}
+
+void D3D12CommandProcessor::VtlReport1Hz(double frames) {  // [vtl]
+  static VtlAcc s_last;
+  const VtlAcc& c = vtl_acc_;
+  auto d = [&](uint64_t VtlAcc::*f) { return double(c.*f - s_last.*f); };
+  const double fr = std::max(frames, 1.0);
+  const double idx = d(&VtlAcc::idx);
+  REXGPU_INFO(
+      "[vtl] draws/fr {:.0f} idx/fr {:.0f} | vs-tex draws/fr {:.0f} idx/fr {:.0f} ({:.1f}% of idx) "
+      "| direct draws/fr {:.0f} idx/fr {:.0f} | refuse/fr type/signs/mips/exp/filter/scaled/dim "
+      "{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} | note/fr dim {:.0f} nonclamp {:.0f}",
+      d(&VtlAcc::draws) / fr, idx / fr, d(&VtlAcc::vs_tex_draws) / fr, d(&VtlAcc::vs_tex_idx) / fr,
+      100.0 * d(&VtlAcc::vs_tex_idx) / std::max(idx, 1.0), d(&VtlAcc::direct_draws) / fr,
+      d(&VtlAcc::direct_idx) / fr, double(c.ref[1] - s_last.ref[1]) / fr,
+      double(c.ref[2] - s_last.ref[2]) / fr, double(c.ref[3] - s_last.ref[3]) / fr,
+      double(c.ref[4] - s_last.ref[4]) / fr, double(c.ref[5] - s_last.ref[5]) / fr,
+      double(c.ref[6] - s_last.ref[6]) / fr, double(c.ref[7] - s_last.ref[7]) / fr,
+      d(&VtlAcc::note_dim) / fr, d(&VtlAcc::note_clamp) / fr);
+  s_last = c;
 }
 
 void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
