@@ -417,17 +417,6 @@ REXCVAR_DEFINE_INT32(gpu_hiz, -1, "GPU/D3D12",
 REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
                      "[ia] input-assembler vertex fetch: 1 on (default), 0 off (the "
                      "translated raw fetch).");
-// [pcsh] PC shader translation (the probe after run 898's shader dump: a
-// city vertex shader of 46 ucode ALU ops was 1637 DXBC instructions).
-// 0 = the Xenos-faithful translation, 1 = PC arithmetic (mad/dp3/dp4, no
-// zero-times-anything fixup), 2 = 1 plus sample_b instead of sample_d.
-// Drive 901 (Intel 720p parked city, 115 windows): off 23.6 fps / GPU 42.1
-// ms/fr, alu 27.9 / 35.9, alu+lod 28.7-29.5 per second / 36.0. Default 2.
-REXCVAR_DEFINE_INT32(gpu_pcsh, 2, "GPU/D3D12",
-                     "[pcsh] PC shader translation: 2 arithmetic + LOD (default), 1 arithmetic, "
-                     "0 off (the Xenos-faithful translation).");
-REXCVAR_DEFINE_INT32(gpu_pcsh_cycle, 0, "GPU/D3D12",
-                     "[pcsh] A/B: seconds per phase, cycling 0 -> 1 -> 2 (marker red/green/blue).");
 REXCVAR_DEFINE_UINT32(gpu_ia_verify, 0, "GPU/D3D12",
                       "[ia] shadow verify: pages per frame read back and compared with the "
                       "byte-swapped guest memory (0 = off, 16 max).");
@@ -3073,7 +3062,6 @@ struct DcEntry {
   uint8_t valid = 0, pool_open = 0, ps_inst = 0, ib_dma = 0, tex_count = 0;
   uint8_t smp_n_v = 0, smp_n_p = 0, di_n_v = 0, di_n_p = 0;
   uint8_t ia = 0;  // [ia] recorded under the input-assembler variant
-  uint8_t pcsh = 0;  // [pcsh] the translation phase the entry was recorded under
   // Drive 858: a stage with no texture and no sampler bindings never dirties
   // or recomposes its pack (the derive gates are texture_count / sampler
   // count), so its pack mirror and layout uids are whatever the last bound
@@ -7355,18 +7343,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       ia_phase_ = (ia_available_ && REXCVAR_GET(gpu_ia) != 0) ? 1 : 0;
       if (vb_mirror_) vb_mirror_->VerifyTick();
     }
-    {  // [pcsh] per-frame phase latch: the cycler (seconds per phase, 3 phases) or the cvar.
-      const int32_t cyc = REXCVAR_GET(gpu_pcsh_cycle);
-      if (cyc > 0) {
-        static const auto s_pcsh_t0 = std::chrono::steady_clock::now();
-        const double el =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_pcsh_t0).count();
-        pcsh_phase_ = uint32_t(uint64_t(el / double(cyc)) % 3);
-      } else {
-        const int32_t v = REXCVAR_GET(gpu_pcsh);
-        pcsh_phase_ = (v >= 0 && v <= 2) ? uint32_t(v) : 0;
-      }
-    }
     ++g_pool.frames;
     static PoolStats s_pp;
     static auto s_pp_last = std::chrono::steady_clock::now();
@@ -8212,8 +8188,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // cycler must show at the top-left.)
         if (REXCVAR_GET(gpu_rtt_cycle) > 0) {
           SwapPhaseMarker(guest_output_resource, rtt_alias_active_ ? 1 : 0);  // [rtt-alias]
-        } else if (REXCVAR_GET(gpu_pcsh_cycle) > 0) {
-          SwapPhaseMarker(guest_output_resource, int(pcsh_phase_));  // [pcsh] red 0 green 1 blue 2
         }
 
         // Need to submit all the commands before giving the image back to the
@@ -9112,7 +9086,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // (Process is idempotent). [ia] the IA variant is another pipeline too.
   if ((dc_consume || dc_verify) &&
       ((dc->pool_open != 0) != pool_open || (dc->ps_inst != 0) != pool_ps_inst ||
-       (dc->ia != 0) != ia_draw || dc->pcsh != pcsh_phase_)) {  // [pcsh]
+       (dc->ia != 0) != ia_draw)) {
     ++g_dc.ref_variant;
     if (dc_consume && !primitive_processor_->Process(primitive_processing_result)) {
       return false;
@@ -9135,16 +9109,11 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
           *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
           start_instanced || pool_open);
   vertex_shader_modification.vertex.ia_fetch = ia_draw ? 1 : 0;  // [ia]
-  vertex_shader_modification.vertex.pc_alu = pcsh_phase_ >= 1 ? 1 : 0;  // [pcsh]
   DxbcShaderTranslator::Modification pixel_shader_modification =
       pixel_shader
           ? pipeline_cache_->GetCurrentPixelShaderModification(
                 *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
           : DxbcShaderTranslator::Modification(0);
-  if (pixel_shader) {  // [pcsh]
-    pixel_shader_modification.pixel.pc_alu = pcsh_phase_ >= 1 ? 1 : 0;
-    pixel_shader_modification.pixel.pc_lod = pcsh_phase_ >= 2 ? 1 : 0;
-  }
   // Rung 1b-2: the per-instance-constants pixel shader, paired with the
   // instancing vertex shader (pool_open implies it).
   if (pool_ps_inst) pixel_shader_modification.pixel.instanced = 1;
@@ -10150,7 +10119,6 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         e->pool_open = pool_open ? 1 : 0;
         e->ps_inst = pool_ps_inst ? 1 : 0;
         e->ia = ia_draw ? 1 : 0;  // [ia]
-        e->pcsh = uint8_t(pcsh_phase_);  // [pcsh]
         e->pso = pipeline_handle;
         e->rootsig = root_signature;
         e->npso = nr_native_pipeline;
@@ -17798,7 +17766,6 @@ void D3D12CommandProcessor::IaReport1Hz(double secs, double frames) {
   auto md = [&](uint64_t VbMirror::Stats::*f) { return double(m.*f - s_mlast.*f); };
   const double fr = std::max(frames, 1.0);
   const double s = std::max(secs, 1e-3);
-  REXGPU_INFO("[pcsh] phase={}", pcsh_phase_);  // [pcsh] the A/B reader keys on this
   REXGPU_INFO(
       "[ia] phase={} draws/fr {:.0f} ia {:.1f}% | refuse/fr off/shader/type/memx/lloop/pool/fetch/"
       "alloc {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} | indxoff/fr {:.1f} clamp/fr "

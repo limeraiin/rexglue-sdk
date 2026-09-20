@@ -1426,7 +1426,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<VbMirror> vb_mirror_;
   bool ia_available_ = false;
   uint32_t ia_phase_ = 0;  // latched per frame: 1 IA, 0 raw
-  uint32_t pcsh_phase_ = 0;  // [pcsh] latched per frame: 0 off, 1 arithmetic, 2 + LOD
   uint32_t ia_arg_dword2_ = 0;
   uint32_t ia_arg_dword3_ = 0;
   struct IaVbLatch {

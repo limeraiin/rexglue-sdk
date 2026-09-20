@@ -114,7 +114,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260226;
+    static constexpr uint32_t kVersion = 0x20260920;  // [pcsh] PC arithmetic + sample_b
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -175,10 +175,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // draw binds a host-order index buffer and BaseVertexLocation). Only
       // honoured for a shader whose PosPath::ia_eligible is set.
       uint32_t ia_fetch : 1;
-      // [pcsh] PC arithmetic: mul/mad/dp emitted as the DXBC ops (mad, dp3,
-      // dp4) without the Shader Model 3 "zero times anything is zero"
-      // min/eq/movc fixup after every multiply.
-      uint32_t pc_alu : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -205,12 +201,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // and does NOT use dynamic float addressing; must be paired with an
       // instancing vertex shader (the input has to be provided).
       uint32_t instanced : 1;
-      // [pcsh] PC arithmetic (see vertex.pc_alu).
-      uint32_t pc_alu : 1;
-      // [pcsh] PC LOD: a computed-LOD texture fetch samples with sample_b
-      // (the fetch constant's LOD bias as the bias) instead of coarse
-      // screen-space derivatives scaled by exp2(bias) fed to sample_d.
-      uint32_t pc_lod : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -747,15 +737,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
            GetDxbcShaderModification().pixel.depth_stencil_mode ==
                Modification::DepthStencilMode::kEarlyHint &&
            current_shader().implicit_early_z_write_allowed();
-  }
-
-  // [pcsh]
-  bool UsePcAlu() const {
-    Modification modification = GetDxbcShaderModification();
-    return is_vertex_shader() ? modification.vertex.pc_alu != 0 : modification.pixel.pc_alu != 0;
-  }
-  bool UsePcLod() const {
-    return is_pixel_shader() && GetDxbcShaderModification().pixel.pc_lod != 0;
   }
 
   uint32_t GetModificationInterpolatorMask() const {

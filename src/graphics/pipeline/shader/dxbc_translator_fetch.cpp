@@ -1467,7 +1467,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       uint32_t grad_v_temp = UINT32_MAX;
       // [pcsh] sample_b with lod_src as the bias instead of sample_d with the
       // derivatives scaled by exp2(lod_src): the hardware LOD plus a bias is
-      // the same LOD, and the sampler runs the plain message.
+      // the same LOD, and the sampler runs the plain message (drive 901).
       bool use_sample_bias = false;
       if (instr.attributes.mip_filter != xenos::TextureFilter::kBaseMap) {
         grad_h_lod_temp = PushSystemTemp();
@@ -1497,7 +1497,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
             a_.OpMul(lod_dest, lod_src, dxbc::Src::LF(1.0f / 32.0f));
           }
         }
-        if (use_computed_lod && UsePcLod() && !instr.attributes.use_register_gradients) {
+        if (use_computed_lod && !instr.attributes.use_register_gradients) {
           use_sample_bias = true;
         } else if (use_computed_lod) {
           grad_v_temp = PushSystemTemp();
