@@ -421,8 +421,11 @@ REXCVAR_DEFINE_INT32(gpu_ia, 1, "GPU/D3D12",
 // city vertex shader of 46 ucode ALU ops was 1637 DXBC instructions).
 // 0 = the Xenos-faithful translation, 1 = PC arithmetic (mad/dp3/dp4, no
 // zero-times-anything fixup), 2 = 1 plus sample_b instead of sample_d.
-REXCVAR_DEFINE_INT32(gpu_pcsh, 0, "GPU/D3D12",
-                     "[pcsh] PC shader translation: 0 off, 1 arithmetic, 2 arithmetic + LOD.");
+// Drive 901 (Intel 720p parked city, 115 windows): off 23.6 fps / GPU 42.1
+// ms/fr, alu 27.9 / 35.9, alu+lod 28.7-29.5 per second / 36.0. Default 2.
+REXCVAR_DEFINE_INT32(gpu_pcsh, 2, "GPU/D3D12",
+                     "[pcsh] PC shader translation: 2 arithmetic + LOD (default), 1 arithmetic, "
+                     "0 off (the Xenos-faithful translation).");
 REXCVAR_DEFINE_INT32(gpu_pcsh_cycle, 0, "GPU/D3D12",
                      "[pcsh] A/B: seconds per phase, cycling 0 -> 1 -> 2 (marker red/green/blue).");
 REXCVAR_DEFINE_UINT32(gpu_ia_verify, 0, "GPU/D3D12",
