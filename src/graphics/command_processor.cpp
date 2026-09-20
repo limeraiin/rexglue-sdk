@@ -33,6 +33,7 @@
 #include <rex/graphics/nr_context.h>
 #include <rex/graphics/nr_detile.h>
 #include <rex/graphics/nr_draw_cache.h>
+#include <rex/graphics/nr_lifecycle_trace.h>
 #include <rex/graphics/nr_state_walk.h>
 #include <rex/graphics/nr_draw_registry.h>
 #include <rex/graphics/nr_regfile.h>
@@ -8401,7 +8402,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
-void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count, uint32_t ring_index) {
+  nr::LifecycleReplayScope lifecycle_scope(ptr, count, ring_index);
   SCOPE_profile_cpu_f("gpu");
   // [N7] one bracket per indirect buffer (~5.8k/s at city). Subtracting the
   // skip path's own buf total leaves the buffers that DECLINED the skip.
@@ -11226,11 +11228,16 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
   // indirect buffer dispatch
+  // Exact primary packet slot, including a header at the final ring dword.
+  // Nested skip-walk dispatches use the default unknown slot instead.
+  const uint32_t ring_index = reader->buffer() == memory_->TranslatePhysical(primary_buffer_ptr_)
+      ? ((reader->read_offset() + reader->capacity() - 4) % reader->capacity()) / 4
+      : UINT32_MAX;
   uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
-  ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
+  ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length, ring_index);
   return true;
 }
 

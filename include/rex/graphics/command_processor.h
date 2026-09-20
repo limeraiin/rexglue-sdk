@@ -410,7 +410,7 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
-  void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
+  void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length, uint32_t ring_index = UINT32_MAX);
   // [NR-SKP] Phase 5-4-2: backend veto for the skip mode (precord capture and
   // non-D3D12 backends refuse). Base default false keeps every backend that
   // has not opted in on the executor path.

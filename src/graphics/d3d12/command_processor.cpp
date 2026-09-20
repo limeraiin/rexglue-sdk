@@ -3182,11 +3182,15 @@ DcEntry* DcLookup(const DcId& id) {
   uint32_t i = DcHome(id.h1);
   for (uint32_t p = 0; p < kDcProbe; ++p) {
     DcSlot& s = g_dc_slots[i];
-    if (s.idx == UINT32_MAX) return nullptr;
-    if (s.h1 == id.h1) {
+    // Clock eviction may clear a slot before another identity's displaced
+    // entry. Search the whole bounded probe run, including across holes.
+    if (s.idx != UINT32_MAX && s.h1 == id.h1) {
       DcEntry& e = g_dc_entries[s.idx];
       if (e.h2 == id.h2) {
         s.frame = g_dc_frame;
+        // Local replacement uses the slot stamp; clock replacement uses
+        // the entry stamp. Both must reflect hits, not just recordings.
+        e.frame = g_dc_frame;
         return &e;
       }
     }

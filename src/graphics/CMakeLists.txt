@@ -20,6 +20,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     command_processor.cpp
     nr_draw_registry.cpp
     nr_draw_cache.cpp
+    nr_lifecycle_trace.cpp
     nr_cull.cpp
     nr_buffer_cache.cpp
     nr_state_walk.cpp
@@ -168,4 +169,3 @@ if(REXGLUE_USE_D3D12)
     )
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_D3D12=1)
 endif()
-
