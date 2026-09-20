@@ -114,7 +114,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260921;  // [vtl] direct load form changed (drive 905 entries stale)
+    static constexpr uint32_t kVersion = 0x20260922;  // [intel-grad] explicit gradients on Intel
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -210,6 +210,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // and does NOT use dynamic float addressing; must be paired with an
       // instancing vertex shader (the input has to be provided).
       uint32_t instanced : 1;
+      // [psf] PC pixel fetch: a 2D tfetch with computed LOD, normalized
+      // coordinates and no offsets is one `sample` after a 3-op SRV select,
+      // no sign switches, no gamma bodies, no LOD-bias or exponent math. The
+      // draw sets it only when every fetch constant the shader reads is
+      // unsigned (or signed on a float format), with exponent bias 0 and
+      // LOD bias 0.
+      uint32_t tex_direct : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -749,6 +756,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
   }
 
   // [vtl]
+  bool UsePsTexDirect() const {  // [psf]
+    return is_pixel_shader() && GetDxbcShaderModification().pixel.tex_direct != 0;
+  }
   uint32_t UseVsTexDirect() const {
     return is_vertex_shader() ? GetDxbcShaderModification().vertex.tex_direct : 0;
   }

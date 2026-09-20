@@ -7408,7 +7408,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                 cd(Cmd::kD3DCopyTextureRegion),
             cd(Cmd::kD3DBeginQuery) + cd(Cmd::kD3DEndQuery));
         IaReport1Hz(secs, frames);  // [ia]
-        VtlReport1Hz(frames);  // [vtl]
         {  // [sort] the state-sorting census (windows of the reorder class) and the sorter.
           static SortAcc s_sort;
           const SortAcc& c = g_sort;
@@ -9207,6 +9206,54 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // Rung 1b-2: the per-instance-constants pixel shader, paired with the
   // instancing vertex shader (pool_open implies it).
   if (pool_ps_inst) pixel_shader_modification.pixel.instanced = 1;
+  // [psf] The PC pixel fetch gate: every 2D fetch constant the pixel shader
+  // reads must be a texture, unsigned or signed on a float format (no
+  // biased, no gamma), with exponent bias 0 and LOD bias 0.
+  bool psf_draw = false;
+  if (pixel_shader) {
+    const uint32_t psf_idx = primitive_processing_result.host_draw_vertex_count;
+    ++psf_acc_.draws;
+    psf_acc_.idx += psf_idx;
+    const std::vector<Shader::TextureBinding>& psf_tbs = pixel_shader->texture_bindings();
+    if (!psf_tbs.empty()) {
+      ++psf_acc_.ps_tex_draws;
+      psf_acc_.ps_tex_idx += psf_idx;
+      {
+        psf_draw = true;
+        uint32_t why = 0;
+        for (const Shader::TextureBinding& tb : psf_tbs) {
+          if (tb.fetch_instr.dimension != xenos::FetchOpDimension::k2D) {
+            ++psf_acc_.note_dim;
+            continue;
+          }
+          const xenos::xe_gpu_texture_fetch_t tf = regs.GetTextureFetch(tb.fetch_constant);
+          if (tf.type != xenos::FetchConstantType::kTexture) {
+            why = 1;
+          } else if (!VtlSignsOk(tf)) {
+            const uint8_t sg = rex::graphics::texture_util::SwizzleSigns(tf);
+            bool gamma = false;
+            for (uint32_t i = 0; i < 4; ++i) {
+              gamma |= ((sg >> (i * 2)) & 3) == uint32_t(xenos::TextureSign::kGamma);
+            }
+            why = gamma ? 3 : 2;
+          } else if (tf.exp_adjust != 0) {
+            why = 4;
+          } else if (tf.lod_bias != 0) {
+            why = 5;
+          }
+          if (why) break;
+        }
+        if (why) {
+          psf_draw = false;
+          ++psf_acc_.ref[why];
+        } else {
+          ++psf_acc_.direct_draws;
+          psf_acc_.direct_idx += psf_idx;
+        }
+      }
+    }
+    pixel_shader_modification.pixel.tex_direct = psf_draw ? 1 : 0;
+  }
 
   // Set up the render targets - this may perform dispatches and draws.
   uint32_t normalized_color_mask =
@@ -11276,7 +11323,7 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
       REXGPU_ERROR("DRED breadcrumb: completed {} of {} ops", *node->pLastBreadcrumbValue,
                    node->BreadcrumbCount);
       uint32_t last = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
-      uint32_t start = last > 3 ? last - 3 : 0;
+      uint32_t start = last > 24 ? last - 24 : 0;
       uint32_t end = std::min(last + 1, node->BreadcrumbCount);
       for (uint32_t i = start; i < end; i++) {
         REXGPU_ERROR("  [{}] op type {}{}", i, static_cast<int>(node->pCommandHistory[i]),
@@ -11288,6 +11335,21 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
   if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) && page_fault.PageFaultVA != 0) {
     REXGPU_ERROR("DRED page fault at VA 0x{:016X}", page_fault.PageFaultVA);
+    // The allocations that contain or contained the faulting address: the
+    // resource names (SetName) tell which buffer the GPU read past or after
+    // its release.
+    uint32_t n = 0;
+    for (const D3D12_DRED_ALLOCATION_NODE* node = page_fault.pHeadExistingAllocationNode;
+         node && n < 16; node = node->pNext, ++n) {
+      REXGPU_ERROR("  existing allocation: type {} name {}", int(node->AllocationType),
+                   node->ObjectNameA ? node->ObjectNameA : "(unnamed)");
+    }
+    n = 0;
+    for (const D3D12_DRED_ALLOCATION_NODE* node = page_fault.pHeadRecentFreedAllocationNode;
+         node && n < 16; node = node->pNext, ++n) {
+      REXGPU_ERROR("  recently freed allocation: type {} name {}", int(node->AllocationType),
+                   node->ObjectNameA ? node->ObjectNameA : "(unnamed)");
+    }
   }
 }
 
@@ -17840,6 +17902,25 @@ void D3D12CommandProcessor::ShutdownIaResources() {
   ia_available_ = false;
   ia_phase_ = 0;
   vb_mirror_.reset();
+}
+
+void D3D12CommandProcessor::PsfReport1Hz(double frames) {  // [psf]
+  static PsfAcc s_last;
+  const PsfAcc& c = psf_acc_;
+  auto d = [&](uint64_t PsfAcc::*f) { return double(c.*f - s_last.*f); };
+  const double fr = std::max(frames, 1.0);
+  const double idx = d(&PsfAcc::idx);
+  REXGPU_INFO(
+      "[psf] draws/fr {:.0f} | ps-tex draws/fr {:.0f} idx/fr {:.0f} ({:.1f}% of idx) | direct "
+      "draws/fr {:.0f} idx/fr {:.0f} | refuse/fr type/signs/gamma/exp/lod "
+      "{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} | note/fr dim {:.0f}",
+      d(&PsfAcc::draws) / fr, d(&PsfAcc::ps_tex_draws) / fr, d(&PsfAcc::ps_tex_idx) / fr,
+      100.0 * d(&PsfAcc::ps_tex_idx) / std::max(idx, 1.0), d(&PsfAcc::direct_draws) / fr,
+      d(&PsfAcc::direct_idx) / fr, double(c.ref[1] - s_last.ref[1]) / fr,
+      double(c.ref[2] - s_last.ref[2]) / fr, double(c.ref[3] - s_last.ref[3]) / fr,
+      double(c.ref[4] - s_last.ref[4]) / fr, double(c.ref[5] - s_last.ref[5]) / fr,
+      d(&PsfAcc::note_dim) / fr);
+  s_last = c;
 }
 
 void D3D12CommandProcessor::VtlReport1Hz(double frames) {  // [vtl]

@@ -942,6 +942,96 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     return;
   }
 
+  // [psf] The PC pixel fetch: one `sample` through the same sampler and SRV
+  // bindings the generic path registers (same order: the shader's binding
+  // layout is the first translation's).
+  if (instr.opcode == FetchOpcode::kTextureFetch && UsePsTexDirect() &&
+      instr.dimension == xenos::FetchOpDimension::k2D && use_computed_lod &&
+      !instr.attributes.use_register_gradients && !instr.attributes.use_register_lod &&
+      !instr.attributes.unnormalized_coordinates && instr.attributes.offset_x == 0.0f &&
+      instr.attributes.offset_y == 0.0f) {
+    // coord_temp: xy = the coordinates, z = 0 (2D array layer), w = the
+    // bindless sampler index. srv_temp.x = the bindless SRV index.
+    uint32_t coord_temp = PushSystemTemp();
+    uint32_t srv_temp = PushSystemTemp();
+    bool coord_operand_temp_pushed = false;
+    dxbc::Src coord_operand = LoadOperand(instr.operands[0], 0b0011, coord_operand_temp_pushed);
+    a_.OpMov(dxbc::Dest::R(coord_temp, 0b0011), coord_operand);
+    if (coord_operand_temp_pushed) {
+      PopSystemTemp();
+    }
+    a_.OpMov(dxbc::Dest::R(coord_temp, 0b0100), dxbc::Src::LF(0.0f));
+    uint32_t sampler_binding_index = FindOrAddSamplerBinding(
+        tfetch_index, instr.attributes.mag_filter, instr.attributes.min_filter,
+        instr.attributes.mip_filter, instr.attributes.aniso_filter);
+    dxbc::Src sampler(dxbc::Src::S(sampler_binding_index, sampler_binding_index));
+    if (bindless_resources_used_) {
+      if (cbuffer_index_descriptor_indices_ == kBindingIndexUnallocated) {
+        cbuffer_index_descriptor_indices_ = cbuffer_count_++;
+      }
+      uint32_t sampler_bindless_descriptor_index =
+          sampler_bindings_[sampler_binding_index].bindless_descriptor_index;
+      a_.OpMov(dxbc::Dest::R(coord_temp, 0b1000),
+               dxbc::Src::CB(cbuffer_index_descriptor_indices_,
+                             uint32_t(CbufferRegister::kDescriptorIndices),
+                             sampler_bindless_descriptor_index >> 2)
+                   .Select(sampler_bindless_descriptor_index & 3));
+      sampler = dxbc::Src::S(0, dxbc::Index(coord_temp, 3));
+    }
+    uint32_t texture_binding_unsigned =
+        FindOrAddTextureBinding(tfetch_index, xenos::FetchOpDimension::k2D, false);
+    uint32_t texture_binding_signed =
+        FindOrAddTextureBinding(tfetch_index, xenos::FetchOpDimension::k2D, true);
+    MarkSystemConstantUsed(SystemConstants::Index::kTextureSwizzledSigns);
+    a_.OpUBFE(dxbc::Dest::R(srv_temp, 0b0001), dxbc::Src::LU(8),
+              dxbc::Src::LU((tfetch_index & 3) * 8),
+              GetSystemConstantSrc(offsetof(SystemConstants, texture_swizzled_signs) +
+                                       sizeof(uint32_t) * (tfetch_index >> 2),
+                                   dxbc::Src::kXXXX));
+    a_.OpINE(dxbc::Dest::R(srv_temp, 0b0001), dxbc::Src::R(srv_temp, dxbc::Src::kXXXX),
+             dxbc::Src::LU(uint32_t(xenos::TextureSign::kSigned) * 0b01010101));
+    dxbc::Dest sample_dest(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components));
+    // (Run 924 tried explicit coarse gradients + sample_d here for the Intel
+    // device hangs: same hangs, 5 fps less in Versus. The hang is a page
+    // fault on a Hi-Z ExecuteIndirect (run 925), not the sampling form.)
+    auto psf_sample = [&](const dxbc::Src& srv) {
+      a_.OpSample(sample_dest, dxbc::Src::R(coord_temp), 3, srv, sampler);
+    };
+    if (bindless_resources_used_) {
+      uint32_t di_u = texture_bindings_[texture_binding_unsigned].bindless_descriptor_index;
+      uint32_t di_s = texture_bindings_[texture_binding_signed].bindless_descriptor_index;
+      a_.OpMovC(dxbc::Dest::R(srv_temp, 0b0001), dxbc::Src::R(srv_temp, dxbc::Src::kXXXX),
+                dxbc::Src::CB(cbuffer_index_descriptor_indices_,
+                              uint32_t(CbufferRegister::kDescriptorIndices), di_u >> 2)
+                    .Select(di_u & 3),
+                dxbc::Src::CB(cbuffer_index_descriptor_indices_,
+                              uint32_t(CbufferRegister::kDescriptorIndices), di_s >> 2)
+                    .Select(di_s & 3));
+      if (srv_index_bindless_textures_2d_ == kBindingIndexUnallocated) {
+        srv_index_bindless_textures_2d_ = srv_count_++;
+      }
+      psf_sample(dxbc::Src::T(srv_index_bindless_textures_2d_, dxbc::Index(srv_temp, 0)));
+    } else {
+      a_.OpIf(true, dxbc::Src::R(srv_temp, dxbc::Src::kXXXX));
+      psf_sample(dxbc::Src::T(texture_bindings_[texture_binding_unsigned].bindful_srv_index,
+                              uint32_t(SRVMainRegister::kBindfulTexturesStart) +
+                                  texture_binding_unsigned));
+      a_.OpElse();
+      psf_sample(dxbc::Src::T(texture_bindings_[texture_binding_signed].bindful_srv_index,
+                              uint32_t(SRVMainRegister::kBindfulTexturesStart) +
+                                  texture_binding_signed));
+      a_.OpEndIf();
+    }
+    // Release srv_temp and coord_temp.
+    PopSystemTemp(2);
+    uint32_t psf_zero_components = used_result_components & ~used_result_nonzero_components;
+    if (psf_zero_components) {
+      a_.OpMov(dxbc::Dest::R(system_temp_result_, psf_zero_components), dxbc::Src::LF(0.0f));
+    }
+    StoreResult(instr.result, dxbc::Src::R(system_temp_result_));
+    return;
+  }
+
   // Load the texture size if needed.
   // 1D: X - width.
   // 2D, cube: X - width, Y - height (cube maps probably can be only square, but

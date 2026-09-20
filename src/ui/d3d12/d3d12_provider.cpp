@@ -27,6 +27,9 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(d3d12_dred, true, "UI/D3D12",
+                    "Device Removed Extended Data (breadcrumbs + page faults) for hang diagnosis")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
                     "Break on Direct3D 12 validation errors");
@@ -233,18 +236,19 @@ bool D3D12Provider::Initialize() {
       debug = false;
     }
 
-    // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes.
-    {
-      Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
-      if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
-        dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
-      } else {
-        REXLOG_WARN(
-            "Failed to enable DRED - device removal diagnostics will be "
-            "limited");
-      }
+  }
+  // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes:
+  // always on (d3d12_dred), the breadcrumbs name the op a device hang stops at.
+  if (REXCVAR_GET(d3d12_dred)) {
+    Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
+    if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
+      dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
+    } else {
+      REXLOG_WARN(
+          "Failed to enable DRED - device removal diagnostics will be "
+          "limited");
     }
   }
   // Create the DXGI factory.
