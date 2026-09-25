@@ -36,6 +36,7 @@
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/shader_progress.h>
 #include <rex/ui/startup_config_dialog.h>
 #include <rex/version.h>
 
@@ -510,7 +511,15 @@ void ReXApp::LaunchModule() {
       uint32_t title_id = runtime_->kernel_state()->title_id();
       if (title_id != 0) {
         REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
+        // A small native "preparing shaders" window (own thread) while the
+        // blocking boot pass translates the stored shaders and builds their
+        // pipelines; only appears when the pass takes more than a moment.
+        auto progress = rex::ui::StartShaderProgressWindow(
+            GetDisplayName(), [graphics_system](uint32_t* phase, uint32_t* done, uint32_t* total) {
+              return graphics_system->GetShaderStorageProgress(phase, done, total);
+            });
         graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+        progress.reset();
       }
     }
 

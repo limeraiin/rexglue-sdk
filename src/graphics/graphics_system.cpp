@@ -375,6 +375,21 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
   }
 }
 
+bool GraphicsSystem::GetShaderStorageProgress(uint32_t* phase, uint32_t* done,
+                                              uint32_t* total) {
+  if (!command_processor_) {
+    return false;
+  }
+  CommandProcessor::ShaderStorageProgress p;
+  if (!command_processor_->GetShaderStorageProgress(&p)) {
+    return false;
+  }
+  *phase = p.phase;
+  *done = p.done;
+  *total = p.total;
+  return true;
+}
+
 void GraphicsSystem::RequestFrameTrace() {
   command_processor_->RequestFrameTrace(REXCVAR_GET(trace_gpu_prefix));
 }

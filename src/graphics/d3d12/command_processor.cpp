@@ -4490,6 +4490,13 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
 
+bool D3D12CommandProcessor::GetShaderStorageProgress(ShaderStorageProgress* out) {
+  if (!pipeline_cache_) {
+    return false;
+  }
+  return pipeline_cache_->GetBootProgress(&out->phase, &out->done, &out->total);
+}
+
 void D3D12CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
   // Capture with PIX if attached.
   if (GetD3D12Provider().GetGraphicsAnalysis() != nullptr) {

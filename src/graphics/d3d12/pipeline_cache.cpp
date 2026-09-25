@@ -326,6 +326,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   // shaders/local/, not shareable/. Must be up before the boot creation pass
   // below so the stored pipelines load instead of compiling.
   InitializePipelineLibrary(shader_storage_root / "local", title_id, edram_rov_used);
+  boot_phase_.store(1, std::memory_order_relaxed);
+  boot_processed_.store(0, std::memory_order_relaxed);
+  boot_total_.store(0, std::memory_order_relaxed);
 
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
@@ -631,8 +634,11 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     }
 
     size_t pipelines_created = 0;
+    boot_total_.store(uint32_t(pipeline_stored_descriptions.size()), std::memory_order_relaxed);
+    boot_phase_.store(2, std::memory_order_relaxed);
     for (const PipelineStoredDescription& pipeline_stored_description :
          pipeline_stored_descriptions) {
+      boot_processed_.fetch_add(1, std::memory_order_relaxed);
       const PipelineDescription& pipeline_description = pipeline_stored_description.description;
       // TODO(Triang3l): On Vulkan, skip pipelines requiring unsupported device
       // features (to keep the cache files mostly shareable across devices).
@@ -775,6 +781,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     }
 
     pipeline_library_boot_pass_ = false;
+    boot_phase_.store(0, std::memory_order_relaxed);
     REXGPU_INFO(
         "Created {} graphics pipelines (not including reading the "
         "descriptions) from the storage in {} milliseconds",
@@ -791,6 +798,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         uint64_t(sizeof(pipeline_storage_file_header) +
                  sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
   } else {
+    boot_phase_.store(0, std::memory_order_relaxed);
     rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
     pipeline_storage_file_header.magic = pipeline_storage_magic;
     pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
@@ -4272,6 +4280,23 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
     pipeline->root_signature.store(root_signature, std::memory_order_release);
   }
 
+  return true;
+}
+
+bool PipelineCache::GetBootProgress(uint32_t* phase, uint32_t* done, uint32_t* total) {
+  uint32_t ph = boot_phase_.load(std::memory_order_relaxed);
+  if (ph == 0) {
+    return false;
+  }
+  *phase = ph;
+  *total = boot_total_.load(std::memory_order_relaxed);
+  uint32_t processed = boot_processed_.load(std::memory_order_relaxed);
+  size_t in_flight = 0;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    in_flight = creation_queue_.size() + creation_threads_busy_;
+  }
+  *done = processed > in_flight ? uint32_t(processed - in_flight) : 0;
   return true;
 }
 

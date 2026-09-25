@@ -62,6 +62,8 @@ class PipelineCache {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking);
   void ShutdownShaderStorage();
+  // Boot pass progress (see CommandProcessor::GetShaderStorageProgress).
+  bool GetBootProgress(uint32_t* phase, uint32_t* done, uint32_t* total);
 
   void EndSubmission();
   bool IsCreatingPipelines();
@@ -501,6 +503,11 @@ class PipelineCache {
 
   // Currently open shader storage path.
   std::filesystem::path shader_storage_cache_root_;
+  // Boot pass progress: phase 0 idle / 1 shaders / 2 pipelines; processed =
+  // descriptions consumed by the boot loop (in-flight ones subtracted at read).
+  std::atomic<uint32_t> boot_phase_{0};
+  std::atomic<uint32_t> boot_processed_{0};
+  std::atomic<uint32_t> boot_total_{0};
   uint32_t shader_storage_title_id_ = 0;
 
   // Shader storage output stream, for preload in the next emulator runs.

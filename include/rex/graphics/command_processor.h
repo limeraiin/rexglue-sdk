@@ -195,6 +195,20 @@ class CommandProcessor {
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                        bool blocking);
 
+  // Progress of a running InitializeShaderStorage boot pass, for a "preparing
+  // shaders" indicator on first launch. phase 0 = idle, 1 = loading and
+  // translating shaders (total unknown), 2 = creating pipelines (done/total).
+  // Safe to call from any thread. Returns false when no pass is running.
+  struct ShaderStorageProgress {
+    uint32_t phase = 0;
+    uint32_t done = 0;
+    uint32_t total = 0;
+  };
+  virtual bool GetShaderStorageProgress(ShaderStorageProgress* out) {
+    (void)out;
+    return false;
+  }
+
   virtual void RequestFrameTrace(const std::filesystem::path& root_path);
   virtual void BeginTracing(const std::filesystem::path& root_path);
   virtual void EndTracing();
