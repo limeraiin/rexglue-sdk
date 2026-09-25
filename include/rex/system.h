@@ -37,4 +37,9 @@ enum class SimpleMessageBoxType {
 // This is expected to block the caller until the message box is closed.
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message);
 
+// User-facing product name (message box titles, audio session name, ...). The
+// app sets it from its display name during setup; defaults to "Game".
+void SetProductName(std::string_view name);
+std::string_view ProductName();
+
 }  // namespace rex

@@ -47,6 +47,10 @@ set(REXSYSTEM_SOURCES
 )
 
 add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
+if(REXGLUE_SHIP)
+    # Playtest packages ship a neutral runtime file name.
+    set_target_properties(rexruntime PROPERTIES OUTPUT_NAME "nrn_core")
+endif()
 add_library(rex::runtime ALIAS rexruntime)
 add_library(rex::system ALIAS rexruntime)
 add_library(rex::kernel ALIAS rexruntime)

@@ -324,6 +324,13 @@ inline bool ParseDouble(std::string_view s, double& out) {
 // create a cycle). Slower than REXCVAR_GET; prefer REXCVAR_GET when possible.
 #define REXCVAR_QUERY(type, name) (::rex::cvar::Query<type>(#name))
 
+// Ship flavor: cvar help strings are not compiled into the binary.
+#ifdef REXGLUE_SHIP
+#define REX_CVAR_DESC_(d) ""
+#else
+#define REX_CVAR_DESC_(d) d
+#endif
+
 // Define cvars (use in one .cpp file per cvar)
 // The FlagRegistrar registers the flag in its destructor, allowing method chaining.
 #define REXCVAR_DEFINE_BOOL(name, default_val, category, desc)                                   \
@@ -335,7 +342,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
       ::rex::cvar::FlagRegistrar({#name,                                                         \
                                   ::rex::cvar::FlagType::Boolean,                                \
                                   category,                                                      \
-                                  desc,                                                          \
+                                  REX_CVAR_DESC_(desc),                                          \
                                   [](std::string_view v) {                                       \
                                     bool val = (v == "true" || v == "1" || v == "yes");          \
                                     FLAGS_##name##_storage_() = val;                             \
@@ -357,7 +364,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
       ::rex::cvar::FlagRegistrar({#name,                                                      \
                                   ::rex::cvar::FlagType::Int32,                               \
                                   category,                                                   \
-                                  desc,                                                       \
+                                  REX_CVAR_DESC_(desc),                                       \
                                   [](std::string_view v) {                                    \
                                     int32_t val = 0;                                          \
                                     auto [ptr, ec] =                                          \
@@ -383,7 +390,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
       ::rex::cvar::FlagRegistrar({#name,                                                      \
                                   ::rex::cvar::FlagType::Int64,                               \
                                   category,                                                   \
-                                  desc,                                                       \
+                                  REX_CVAR_DESC_(desc),                                       \
                                   [](std::string_view v) {                                    \
                                     int64_t val = 0;                                          \
                                     auto [ptr, ec] =                                          \
@@ -409,7 +416,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
       ::rex::cvar::FlagRegistrar({#name,                                                      \
                                   ::rex::cvar::FlagType::Uint32,                              \
                                   category,                                                   \
-                                  desc,                                                       \
+                                  REX_CVAR_DESC_(desc),                                       \
                                   [](std::string_view v) {                                    \
                                     uint32_t val = 0;                                         \
                                     auto [ptr, ec] =                                          \
@@ -435,7 +442,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
       ::rex::cvar::FlagRegistrar({#name,                                                      \
                                   ::rex::cvar::FlagType::Uint64,                              \
                                   category,                                                   \
-                                  desc,                                                       \
+                                  REX_CVAR_DESC_(desc),                                       \
                                   [](std::string_view v) {                                    \
                                     uint64_t val = 0;                                         \
                                     auto [ptr, ec] =                                          \
@@ -461,7 +468,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
       ::rex::cvar::FlagRegistrar({#name,                                                      \
                                   ::rex::cvar::FlagType::Double,                              \
                                   category,                                                   \
-                                  desc,                                                       \
+                                  REX_CVAR_DESC_(desc),                                       \
                                   [](std::string_view v) {                                    \
                                     double val = 0;                                           \
                                     if (!::rex::cvar::ParseDouble(v, val))                    \
@@ -485,7 +492,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
       ::rex::cvar::FlagRegistrar({#name,                                        \
                                   ::rex::cvar::FlagType::String,                \
                                   category,                                     \
-                                  desc,                                         \
+                                  REX_CVAR_DESC_(desc),                         \
                                   [](std::string_view v) {                      \
                                     FLAGS_##name##_storage_() = std::string(v); \
                                     return true;                                \
@@ -506,7 +513,7 @@ inline bool ParseDouble(std::string_view s, double& out) {
       ::rex::cvar::FlagRegistrar({#name,                                  \
                                   ::rex::cvar::FlagType::Command,         \
                                   category,                               \
-                                  desc,                                   \
+                                  REX_CVAR_DESC_(desc),                   \
                                   [](std::string_view) { return false; }, \
                                   []() { return "<command>"; },           \
                                   callback,                               \

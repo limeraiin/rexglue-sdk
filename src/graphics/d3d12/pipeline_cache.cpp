@@ -3830,6 +3830,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         iq->ClearStoredMessages();
         iq->Release();
       }
+#ifndef REXGLUE_SHIP
       if (n < 8) {
         std::error_code ec;
         std::filesystem::create_directories("psofail", ec);
@@ -3846,6 +3847,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         dump(runtime_description.vertex_shader, "vs");
         dump(runtime_description.pixel_shader, "ps");
       }
+#endif
     }
     return nullptr;
   }

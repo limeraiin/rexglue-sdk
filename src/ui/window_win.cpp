@@ -156,7 +156,7 @@ bool Win32Window::OpenImpl() {
     // Matches the black background color of the presenter's painting.
     wcex.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wcex.lpszMenuName = nullptr;
-    wcex.lpszClassName = L"RexWindowClass";
+    wcex.lpszClassName = L"MainWindowClass";
     if (!RegisterClassExW(&wcex)) {
       REXLOG_ERROR("RegisterClassEx failed");
       return false;
@@ -198,7 +198,7 @@ bool Win32Window::OpenImpl() {
   // instance.
   auto wide_title = rex::string::to_utf16(GetTitle());
   hwnd_ = CreateWindowExW(
-      window_ex_style, L"RexWindowClass", reinterpret_cast<LPCWSTR>(wide_title.c_str()),
+      window_ex_style, L"MainWindowClass", reinterpret_cast<LPCWSTR>(wide_title.c_str()),
       window_style, CW_USEDEFAULT, CW_USEDEFAULT, window_size_rect.right - window_size_rect.left,
       window_size_rect.bottom - window_size_rect.top, nullptr, nullptr, hinstance, this);
   if (!hwnd_) {

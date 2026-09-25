@@ -20,6 +20,9 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <string>
+
+#include <rex/system.h>
 #include <rex/perf/counter.h>
 #include <SDL3/SDL.h>
 
@@ -43,7 +46,8 @@ bool SDLAudioDriver::Initialize() {
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 
   // Set app name for audio device identification
-  SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
+  SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING,
+                             std::string(rex::ProductName()).c_str());
 
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
     REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());

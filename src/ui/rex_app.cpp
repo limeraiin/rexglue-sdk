@@ -176,6 +176,7 @@ std::string ReXApp::GetDisplayName() const {
 }
 
 bool ReXApp::SetupEnvironment() {
+  rex::SetProductName(GetDisplayName());
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
   // Native pre-launch configuration dialog (graphics backend, vsync, resolution,

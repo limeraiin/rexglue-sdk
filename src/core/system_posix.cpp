@@ -8,9 +8,21 @@
 
 #include <cstdio>
 
+#include <string>
+
 #include <rex/system.h>
 
 namespace rex {
+
+namespace {
+std::string& ProductNameStorage() {
+  static std::string name = "Game";
+  return name;
+}
+}  // namespace
+
+void SetProductName(std::string_view name) { ProductNameStorage().assign(name); }
+std::string_view ProductName() { return ProductNameStorage(); }
 
 // TODO(tomc): add linux support for showing a native message box
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {

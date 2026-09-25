@@ -77,6 +77,17 @@
             "inherits": "windows-base"
         },
         {
+            "name": "win-amd64-ship",
+            "displayName": "Windows AMD64 Ship (playtest, stripped strings)",
+            "description": "win-amd64 with REXGLUE_SHIP=ON and no Tracy; separate build and install prefix",
+            "inherits": "windows-base",
+            "cacheVariables": {
+                "REXGLUE_SHIP": "ON",
+                "REXGLUE_ENABLE_TRACY": "OFF",
+                "REXGLUE_ENABLE_PERF_COUNTERS": "OFF"
+            }
+        },
+        {
             "name": "win-arm64",
             "displayName": "Windows ARM64",
             "description": "Multi-config build for Windows ARM64 using Clang",
@@ -96,6 +107,11 @@
         }
     ],
     "buildPresets": [
+        {
+            "name": "win-amd64-ship-release",
+            "configurePreset": "win-amd64-ship",
+            "configuration": "Release"
+        },
         {
             "name": "win-amd64-debug",
             "configurePreset": "win-amd64",

@@ -18,6 +18,13 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+# Ship flavor (playtest packages): diagnostic strings below warn, cvar help
+# text, source locations and the psofail bytecode dump are compiled out. The
+# consumer must define REXGLUE_SHIP too (the macros live in installed headers).
+option(REXGLUE_SHIP                        "Ship flavor: strip diagnostic strings" OFF)
+if(REXGLUE_SHIP)
+    add_compile_definitions(REXGLUE_SHIP=1)
+endif()
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)

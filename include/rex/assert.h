@@ -53,6 +53,12 @@ namespace rex {
   std::abort();
 }
 
+#ifdef REXGLUE_SHIP
+#define REX_ASSERT_FILE_ ""
+#else
+#define REX_ASSERT_FILE_ __FILE__
+#endif
+
 #define assert_always(...) rex_assert(false)
 
 #define assert_true(...) __REX_MACRO_DISPATCH(assert_true, __VA_ARGS__)(__VA_ARGS__)
@@ -60,7 +66,7 @@ namespace rex {
 #define assert_true2(expr, message)                        \
   do {                                                     \
     if (!(expr)) {                                         \
-      rex_assert_fail(__FILE__, __LINE__, #expr, message); \
+      rex_assert_fail(REX_ASSERT_FILE_, __LINE__, #expr, message); \
     }                                                      \
   } while (0)
 
@@ -69,7 +75,7 @@ namespace rex {
 #define assert_false2(expr, message)                                \
   do {                                                              \
     if (!!(expr)) {                                                 \
-      rex_assert_fail(__FILE__, __LINE__, "!(" #expr ")", message); \
+      rex_assert_fail(REX_ASSERT_FILE_, __LINE__, "!(" #expr ")", message); \
     }                                                               \
   } while (0)
 
@@ -78,7 +84,7 @@ namespace rex {
 #define assert_zero2(expr, message)                                     \
   do {                                                                  \
     if ((expr) != 0) {                                                  \
-      rex_assert_fail(__FILE__, __LINE__, "(" #expr ") == 0", message); \
+      rex_assert_fail(REX_ASSERT_FILE_, __LINE__, "(" #expr ") == 0", message); \
     }                                                                   \
   } while (0)
 
@@ -87,7 +93,7 @@ namespace rex {
 #define assert_not_zero2(expr, message)                                 \
   do {                                                                  \
     if ((expr) == 0) {                                                  \
-      rex_assert_fail(__FILE__, __LINE__, "(" #expr ") != 0", message); \
+      rex_assert_fail(REX_ASSERT_FILE_, __LINE__, "(" #expr ") != 0", message); \
     }                                                                   \
   } while (0)
 
@@ -96,7 +102,7 @@ namespace rex {
 #define assert_null2(expr, message)                                           \
   do {                                                                        \
     if ((expr) != nullptr) {                                                  \
-      rex_assert_fail(__FILE__, __LINE__, "(" #expr ") == nullptr", message); \
+      rex_assert_fail(REX_ASSERT_FILE_, __LINE__, "(" #expr ") == nullptr", message); \
     }                                                                         \
   } while (0)
 
@@ -105,7 +111,7 @@ namespace rex {
 #define assert_not_null2(expr, message)                                       \
   do {                                                                        \
     if ((expr) == nullptr) {                                                  \
-      rex_assert_fail(__FILE__, __LINE__, "(" #expr ") != nullptr", message); \
+      rex_assert_fail(REX_ASSERT_FILE_, __LINE__, "(" #expr ") != nullptr", message); \
     }                                                                         \
   } while (0)
 

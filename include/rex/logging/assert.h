@@ -41,7 +41,7 @@
 /** Log a critical error with function name and abort. */
 #define REX_FATAL_FN(fmt, ...)                                                    \
   do {                                                                            \
-    REXLOG_CRITICAL("[FATAL] {}: " fmt, __FUNCTION__ __VA_OPT__(, ) __VA_ARGS__); \
+    REXLOG_CRITICAL("[FATAL] {}: " fmt, REX_LOG_FN_ __VA_OPT__(, ) __VA_ARGS__); \
     if (auto _l = ::rex::GetLogger())                                             \
       _l->flush();                                                                \
     std::abort();                                                                 \
@@ -52,7 +52,7 @@
   do {                                                              \
     if (!(cond)) {                                                  \
       REXLOG_CRITICAL("[FATAL] {}: check failed: " #cond " - " fmt, \
-                      __FUNCTION__ __VA_OPT__(, ) __VA_ARGS__);     \
+                      REX_LOG_FN_ __VA_OPT__(, ) __VA_ARGS__);     \
       if (auto _l = ::rex::GetLogger())                             \
         _l->flush();                                                \
       std::abort();                                                 \

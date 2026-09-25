@@ -27,6 +27,7 @@
 #include <windows.h>
 #include <shlobj.h>   // SHBrowseForFolderW, SHGetPathFromIDListW
 #include <commdlg.h>  // GetOpenFileNameW (DLC file picker)
+#include <commctrl.h>  // tab control
 // clang-format on
 
 namespace rex::ui {
@@ -45,7 +46,8 @@ constexpr int IDC_DLC_LIST = 1009;
 constexpr int IDC_DLC_INSTALL = 1010;
 constexpr int IDC_SKIP_LAUNCHER = 1011;
 constexpr int IDC_DLC_UNINSTALL = 1012;
-constexpr int IDC_GPU_INSTANCE = 1013;
+// (IDC_GPU_INSTANCE 1013 retired: the option was removed 2026-09-25.)
+constexpr int IDC_TAB = 1014;
 
 struct GpuOption {
   const wchar_t* label;
@@ -100,13 +102,15 @@ struct DialogState {
   HWND combo_res = nullptr;
   HWND combo_internal_res = nullptr;
   HWND check_exp_60fps = nullptr;
-  HWND check_gpu_instance = nullptr;
   HWND combo_display = nullptr;
   HWND edit_data = nullptr;
   HWND list_dlc = nullptr;
   HWND check_skip_launcher = nullptr;
+  HWND tab = nullptr;
+  std::vector<HWND> settings_ctls;  // shown on the Settings tab
+  std::vector<HWND> credits_ctls;   // shown on the Credits tab
   HFONT font = nullptr;
-  HFONT font_small = nullptr;  // smaller font for the bottom-left credits line
+  HFONT font_small = nullptr;  // smaller font for the notes
 
   // Installed-DLC panel state. `content_root` is the user data root the runtime
   // will use; empty means the panel is unavailable (the caller didn't supply
@@ -391,75 +395,106 @@ HWND MakeControl(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD sty
   return ctl;
 }
 
+void ShowGroup(const std::vector<HWND>& group, bool show) {
+  for (HWND h : group) ShowWindow(h, show ? SW_SHOW : SW_HIDE);
+}
+
+void SelectTab(DialogState* st, int index) {
+  ShowGroup(st->settings_ctls, index == 0);
+  ShowGroup(st->credits_ctls, index == 1);
+}
+
+// Credits tab text. Names only, in Patreon order.
+const wchar_t kCreditsText[] =
+    L"Special thanks to\r\n\r\n"
+    L"Simeon, Armin Suljovikj, ObsoleteSponge, Kalarot, Dante Smith, cody russell, "
+    L"Hailnate13x, ctrlalt3l1t3, Rafa Jesus, Austin_Toonz, Hollywood D\u1D09or, Mark_Rampage, "
+    L"P E L I O D A S, Sega The Hedgehog, Jesus Cantu, Enel, Chris Parnell, eddie, YueOrigin, "
+    L"pimp the heartless, Hollywood Akeem, ha ios, LateNightMARK, Straw Hat Shadow, Fl4uW, "
+    L"ShinobiHunter93, Lemontine, Silver and Cyphr"
+    L"\r\n\r\nfor their Patreon support.";
+
 void BuildControls(HWND hwnd, DialogState* st) {
   HFONT font = st->font;
 
-  MakeControl(hwnd, L"STATIC", L"Graphics renderer:", SS_LEFT, 16, 18, 150, 20, -1, font);
-  st->combo_renderer = MakeControl(hwnd, L"COMBOBOX", nullptr,
-                                   CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 16, 260, 220,
-                                   IDC_RENDERER, font);
+  // Tab strip first, then the page controls as siblings inside its display area.
+  // The strip is pushed to the bottom of the z-order at the end so the pages
+  // paint over it.
+  st->tab = MakeControl(hwnd, WC_TABCONTROLW, nullptr, WS_TABSTOP | WS_CLIPSIBLINGS, 8, 8, 784,
+                        372, IDC_TAB, font);
+  TCITEMW item{};
+  item.mask = TCIF_TEXT;
+  item.pszText = const_cast<wchar_t*>(L"Settings");
+  TabCtrl_InsertItem(st->tab, 0, &item);
+  item.pszText = const_cast<wchar_t*>(L"Credits");
+  TabCtrl_InsertItem(st->tab, 1, &item);
 
-  MakeControl(hwnd, L"STATIC", L"Window resolution:", SS_LEFT, 16, 52, 150, 20, -1, font);
-  st->combo_res = MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
-                              172, 50, 260, 220, IDC_RES, font);
+  auto S = [st](HWND h) {
+    st->settings_ctls.push_back(h);
+    return h;
+  };
+  auto C = [st](HWND h) {
+    st->credits_ctls.push_back(h);
+    return h;
+  };
 
-  MakeControl(hwnd, L"STATIC", L"Internal resolution:", SS_LEFT, 16, 86, 150, 20, -1, font);
+  // --- Settings tab: left column ---
+  S(MakeControl(hwnd, L"STATIC", L"Graphics renderer:", SS_LEFT, 16, 44, 150, 20, -1, font));
+  st->combo_renderer = S(MakeControl(hwnd, L"COMBOBOX", nullptr,
+                                     CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 42, 260,
+                                     220, IDC_RENDERER, font));
+
+  S(MakeControl(hwnd, L"STATIC", L"Window resolution:", SS_LEFT, 16, 78, 150, 20, -1, font));
+  st->combo_res = S(MakeControl(hwnd, L"COMBOBOX", nullptr,
+                                CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 76, 260, 220,
+                                IDC_RES, font));
+
+  S(MakeControl(hwnd, L"STATIC", L"Internal resolution:", SS_LEFT, 16, 112, 150, 20, -1, font));
   st->combo_internal_res =
-      MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 84,
-                  260, 220, IDC_INTERNAL_RES, font);
+      S(MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172,
+                    110, 260, 220, IDC_INTERNAL_RES, font));
 
-  MakeControl(hwnd, L"STATIC", L"Display mode:", SS_LEFT, 16, 120, 150, 20, -1, font);
+  S(MakeControl(hwnd, L"STATIC", L"Display mode:", SS_LEFT, 16, 146, 150, 20, -1, font));
   st->combo_display =
-      MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 118,
-                  260, 220, IDC_DISPLAY_MODE, font);
+      S(MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172,
+                    144, 260, 220, IDC_DISPLAY_MODE, font));
 
   // Vsync is always on (no dialog control; forced true in ApplyAndSave).
   st->check_exp_60fps =
-      MakeControl(hwnd, L"BUTTON", L"60 FPS overworld (EXPERIMENTAL)", BS_AUTOCHECKBOX | WS_TABSTOP,
-                  172, 154, 300, 22, IDC_EXP_60FPS, font);
+      S(MakeControl(hwnd, L"BUTTON", L"60 FPS overworld (EXPERIMENTAL)",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 172, 180, 300, 22, IDC_EXP_60FPS, font));
 
-  st->check_gpu_instance =
-      MakeControl(hwnd, L"BUTTON", L"GPU draw instancing (EXPERIMENTAL)",
-                  BS_AUTOCHECKBOX | WS_TABSTOP, 172, 180, 300, 22, IDC_GPU_INSTANCE, font);
-  MakeControl(hwnd, L"STATIC",
-              L"Direct3D 12 only. Turn this off if you get a black screen or flashing.",
-              SS_LEFT, 190, 204, 282, 48, -1, st->font_small ? st->font_small : font);
+  S(MakeControl(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 212, 200, 20, -1, font));
+  st->edit_data = S(MakeControl(hwnd, L"EDIT", nullptr, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
+                                16, 234, 330, 24, IDC_DATA, font));
+  S(MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 233, 80, 26, IDC_BROWSE, font));
 
-  MakeControl(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 258, 200, 20, -1, font);
-  st->edit_data = MakeControl(hwnd, L"EDIT", nullptr,
-                              WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, 280, 330, 24, IDC_DATA,
-                              font);
-  MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 279, 80, 26, IDC_BROWSE, font);
+  // --- Settings tab: right column, installed DLC ---
+  S(MakeControl(hwnd, L"STATIC", L"Installed DLC:", SS_LEFT, 456, 44, 200, 20, -1, font));
+  st->list_dlc = S(MakeControl(hwnd, L"LISTBOX", nullptr,
+                               WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY, 456, 66, 328,
+                               200, IDC_DLC_LIST, font));
+  S(MakeControl(hwnd, L"BUTTON", L"Install DLC...", WS_TABSTOP, 456, 274, 156, 28,
+                IDC_DLC_INSTALL, font));
+  S(MakeControl(hwnd, L"BUTTON", L"Uninstall", WS_TABSTOP, 628, 274, 156, 28, IDC_DLC_UNINSTALL,
+                font));
+  S(MakeControl(hwnd, L"STATIC",
+                L"Voice and audio packs work. Character packs are not supported.", SS_LEFT, 456,
+                308, 328, 40, -1, st->font_small ? st->font_small : font));
 
-  // --- Right-hand panel: installed DLC ---
-  MakeControl(hwnd, L"STATIC", L"Installed DLC:", SS_LEFT, 456, 18, 200, 20, -1, font);
-  st->list_dlc = MakeControl(hwnd, L"LISTBOX", nullptr,
-                             WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY, 456, 40, 328, 216,
-                             IDC_DLC_LIST, font);
-  MakeControl(hwnd, L"BUTTON", L"Install DLC...", WS_TABSTOP, 456, 264, 156, 28, IDC_DLC_INSTALL,
-              font);
-  MakeControl(hwnd, L"BUTTON", L"Uninstall", WS_TABSTOP, 628, 264, 156, 28, IDC_DLC_UNINSTALL, font);
-  MakeControl(hwnd, L"STATIC",
-              L"Voice and audio packs work. Character packs are not supported.",
-              SS_LEFT, 456, 298, 328, 60, -1, st->font_small ? st->font_small : font);
+  // --- Credits tab ---
+  C(MakeControl(hwnd, L"STATIC", kCreditsText, SS_LEFT, 24, 48, 752, 300, -1, font));
 
-  // Skip this dialog on future launches (persists to the skip_config_dialog
-  // cvar). Bottom-left, aligned with the Play/Quit buttons.
+  // --- Always visible, under the tab strip ---
   st->check_skip_launcher =
-      MakeControl(hwnd, L"BUTTON", L"Skip launcher next time", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 338,
-                  228, 22, IDC_SKIP_LAUNCHER, font);
+      MakeControl(hwnd, L"BUTTON", L"Skip launcher next time", BS_AUTOCHECKBOX | WS_TABSTOP, 16,
+                  392, 228, 22, IDC_SKIP_LAUNCHER, font);
+  MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 388, 84, 30, IDOK,
+              font);
+  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 388, 84, 30, IDCANCEL, font);
 
-  MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 332, 84, 30, IDOK, font);
-  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 332, 84, 30, IDCANCEL, font);
-
-  // Bottom credits line, drawn in a smaller font. Spans the full client width so
-  // it can wrap if the system font is large.
-  MakeControl(hwnd, L"STATIC",
-              L"Special thanks to Simeon, Armin Suljovikj, ObsoleteSponge, Kalarot, Dante Smith, "
-              L"Vexil Megga, cody russell, Hailnate13x, GUARD, ctrlalt3l1t3, Austin_Toonz, "
-              L"Mark_Rampage, PELIODAS(Bubu), Sega The Hedgehog, Jesus Cantu, Enel, Chris Parnell "
-              L"and eddie for their Patreon support.",
-              SS_LEFT, 16, 374, 768, 60, -1, st->font_small ? st->font_small : font);
+  SetWindowPos(st->tab, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+  SelectTab(st, 0);
 
   // --- Populate from current cvar values ---
   std::string gpu = rex::cvar::GetFlagByName("gpu");
@@ -493,13 +528,6 @@ void BuildControls(HWND hwnd, DialogState* st) {
                rex::cvar::GetFlagByName("experimental_60fps") == "true" ? BST_CHECKED
                                                                         : BST_UNCHECKED,
                0);
-
-  // gpu_instance lives in the D3D12 command processor; addressing it by name means
-  // the dialog doesn't care which module defines it. Persisting it from here also
-  // stops SaveConfig from silently dropping a hand-written `gpu_instance = false`
-  // (SerializeToTOML only writes values that differ from the default).
-  SendMessageW(st->check_gpu_instance, BM_SETCHECK,
-               rex::cvar::GetFlagByName("gpu_instance") == "true" ? BST_CHECKED : BST_UNCHECKED, 0);
 
   bool cur_fullscreen = rex::cvar::GetFlagByName("fullscreen") == "true";
   int display_sel = 0;
@@ -576,10 +604,10 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
                                ? "true"
                                : "false");
 
-  rex::cvar::SetFlagByName("gpu_instance",
-                           SendMessageW(st->check_gpu_instance, BM_GETCHECK, 0, 0) == BST_CHECKED
-                               ? "true"
-                               : "false");
+  // GPU draw instancing: the launcher option was removed (dead lever, correlated
+  // with the tester black-screen flashing). Force it off on every save so a stale
+  // pin in the toml cannot re-enable it.
+  rex::cvar::SetFlagByName("gpu_instance", "false");
 
   int display_sel = int(SendMessageW(st->combo_display, CB_GETCURSEL, 0, 0));
   if (display_sel < 0 || display_sel >= int(std::size(kDisplayModes))) display_sel = 0;
@@ -663,6 +691,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       }
       break;
     }
+    case WM_NOTIFY: {
+      auto* nm = reinterpret_cast<NMHDR*>(lparam);
+      if (st && nm && nm->idFrom == IDC_TAB && nm->code == TCN_SELCHANGE) {
+        SelectTab(st, TabCtrl_GetCurSel(st->tab));
+        return 0;
+      }
+      break;
+    }
     case WM_CLOSE:
       if (st) {
         st->play = false;
@@ -687,7 +723,10 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
                             const std::filesystem::path& content_root) {
   HINSTANCE hinstance = GetModuleHandleW(nullptr);
 
-  const wchar_t* kClassName = L"RexStartupConfigDialog";
+  INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_TAB_CLASSES};
+  InitCommonControlsEx(&icc);
+
+  const wchar_t* kClassName = L"StartupConfigDialog";
   WNDCLASSEXW wc{};
   wc.cbSize = sizeof(wc);
   wc.lpfnWndProc = WndProc;
@@ -708,7 +747,7 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
   ncm.cbSize = sizeof(ncm);
   if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
     state.font = CreateFontIndirectW(&ncm.lfMessageFont);
-    // A slightly smaller flavour of the message font for the credits line.
+    // A slightly smaller flavour of the message font for the notes.
     // NB: can't name this `small` — <rpcndr.h> does `#define small char`.
     LOGFONTW small_lf = ncm.lfMessageFont;
     LONG h = small_lf.lfHeight < 0 ? -small_lf.lfHeight : small_lf.lfHeight;
@@ -719,10 +758,11 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
 
   g_config_path = &config_path;
 
-  // Client area 800 x 444: settings column on the left (x 16..472), installed-DLC
-  // panel on the right (x 456..784), credits strip along the bottom.
+  // Client area 800 x 430: a Settings / Credits tab strip (8..792 x 8..380) with
+  // the settings column on the left (x 16..472) and the installed-DLC panel on
+  // the right (x 456..784); Play / Quit under the strip.
   const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-  RECT rc{0, 0, 800, 444};
+  RECT rc{0, 0, 800, 430};
   AdjustWindowRectEx(&rc, style, FALSE, 0);
   int win_w = rc.right - rc.left;
   int win_h = rc.bottom - rc.top;
