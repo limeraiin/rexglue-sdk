@@ -422,12 +422,14 @@ void BuildControls(HWND hwnd, DialogState* st) {
   // paint over it.
   st->tab = MakeControl(hwnd, WC_TABCONTROLW, nullptr, WS_TABSTOP | WS_CLIPSIBLINGS, 8, 8, 784,
                         372, IDC_TAB, font);
+  // UNICODE is not defined in this file, so the TabCtrl_InsertItem macro would
+  // send the ANSI message and show only the first character of a wide label.
   TCITEMW item{};
   item.mask = TCIF_TEXT;
   item.pszText = const_cast<wchar_t*>(L"Settings");
-  TabCtrl_InsertItem(st->tab, 0, &item);
+  SendMessageW(st->tab, TCM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
   item.pszText = const_cast<wchar_t*>(L"Credits");
-  TabCtrl_InsertItem(st->tab, 1, &item);
+  SendMessageW(st->tab, TCM_INSERTITEMW, 1, reinterpret_cast<LPARAM>(&item));
 
   auto S = [st](HWND h) {
     st->settings_ctls.push_back(h);
