@@ -34,6 +34,7 @@
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/nr_cpu_readback.h>
 #include <rex/graphics/format/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/trace_writer.h>
@@ -1614,7 +1615,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   // texture that ever appears over it reads one stale frame, then the
   // resolve writes again.
   bool rtt_unread_skip = false;
-  if (resolve_info.copy_dest_extent_length && command_processor_.RttUnreadSkipActive() &&
+  const bool cpu_consumer = nr::GetCpuReadbackRequest().Contains(
+      resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length);
+  if (!cpu_consumer && resolve_info.copy_dest_extent_length && command_processor_.RttUnreadSkipActive() &&
       command_processor_.RttDestUnread(resolve_info.copy_dest_extent_start,
                                        resolve_info.copy_dest_extent_length)) {
     rtt_unread_skip = true;
@@ -1652,7 +1655,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             // [rtt-alias] the resolve written straight into the texture the
             // guest samples from this range; the guest write, the watch and
             // the reload are skipped below.
-            if (command_processor_.RttAliasActive() && !dres_verify_pending_length_ &&
+            if (!cpu_consumer && command_processor_.RttAliasActive() && !dres_verify_pending_length_ &&
                 !REXCVAR_GET(gpu_nr_direct_resolve_verify)) {
               rtt_aliased = TryAliasResolve(resolve_info, texture_cache);
             }

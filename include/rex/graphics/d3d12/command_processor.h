@@ -759,7 +759,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool NrUpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                         ID3D12RootSignature* root_signature, bool shared_memory_is_uav,
                         bool* refused_out);
-  bool IssueCopy_ReadbackResolvePath();
+  bool IssueCopy_ReadbackResolvePath(bool cpu_consumer = false);
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 

@@ -33,6 +33,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
 #include <rex/graphics/nr_draw_cache.h>  // [GKEY] rung-2 census join
+#include <rex/graphics/nr_cpu_readback.h>
 
 // [SKC] the rung-2 skip census tracker lives in command_processor.cpp (global scope).
 extern bool g_skc_on;
@@ -10952,15 +10953,20 @@ bool D3D12CommandProcessor::IssueCopy() {
   // as resolve work; resolve clears re-class themselves to xfer inside.
   GpuCensusScope gpu_census_scope(*this, kGpuCensusResolve);
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  const auto cpu_request = nr::GetCpuReadbackRequest();
+  const bool cpu_consumer = cpu_request.Contains(
+      GetActiveDrawRegisterFile()[XE_GPU_REG_RB_COPY_DEST_BASE], 1);
+  if (readback_mode == ReadbackResolveMode::kDisabled && !cpu_consumer) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
   }
-  return IssueCopy_ReadbackResolvePath();
+  return IssueCopy_ReadbackResolvePath(cpu_consumer);
 }
 
-bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(bool cpu_consumer) {
+  const auto cpu_request = cpu_consumer ? nr::GetCpuReadbackRequest()
+                                      : nr::CpuReadbackRequest{};
   uint32_t written_address, written_length;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
                                      written_length)) {
@@ -10968,6 +10974,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   if (!written_length) {
+    return true;
+  }
+
+  // A CPU consumer owns only this allocation, never adjacent resolve padding.
+  if (cpu_consumer && !cpu_request.Contains(written_address, written_length)) {
+    REXGPU_WARN("[cpu-readback] refused out-of-range resolve {:08X}+{:X}",
+                written_address, written_length);
     return true;
   }
 
@@ -11149,6 +11162,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  if (cpu_consumer) readback_mode = ReadbackResolveMode::kFull;
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
@@ -11173,7 +11187,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       rb.mapped_data[read_index]) {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
-      std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+      if (cpu_consumer) {
+        nr::CommitCpuReadback(cpu_request, written_address,
+            written_length, destination, rb.mapped_data[read_index]);
+      } else {
+        std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+      }
     }
   }
 
