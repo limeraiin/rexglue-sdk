@@ -109,16 +109,20 @@ REXCVAR_DEFINE_BOOL(gpu_nr_dump_probe, false, "GPU",
                     "of each, once per second.");
 
 // [xfer] SHIPPED 2026-09-05 (drive 833, RTX 1440p no-vsync heavy city):
-// NO ownership transfer is performed. The transfers were the EDRAM aliasing
-// emulation (every rebind of a host render target over tiles another one
-// last wrote copied those tiles across); Jade creates every temporary render
-// target at the same EDRAM offset on purpose and never reads aliased content
-// (city census: 0 of 152k transfers read before a write). Each host render
-// target keeps its own contents; ownership is still tracked so resolves find
-// their source. 45.0 -> 52.7 fps, GPU 20.9 -> 10.5 ms/frame, no visual change.
+// Large-target ownership transfers are normally skipped. Rebinding a host
+// render target over tiles another one last wrote used to copy those tiles
+// across. Jade reuses the same offset for its temporary targets. The original
+// city census counted any draw as a write, not proof of full coverage.
+// October 5 correction: the offscreen shadow passes need depth-to-color and
+// MSAA-to-single-sample conversions. Preserve these small-color dependencies
+// from the first frame, before the learned-pair / forwarded-clear shortcuts.
+// Do not restore arbitrary color reuse between different shadow-map pitches:
+// that carries previous caster data into the next map as detached silhouettes.
+// Larger host render targets keep their contents, except learned dependencies;
+// ownership is tracked so resolves find their source. The original skip gave
+// 45.0 -> 52.7 fps, GPU 20.9 -> 10.5 ms/frame, but missed this shadow regression.
 // The cycler (seconds per phase, skip then all) stays only for the Intel
-// re-gate and the menu / battle / cutscene look; 0 = the shipped no-transfer
-// behaviour. Delete it, and then the transfer machinery, when those decide.
+// re-gate and the menu / battle / cutscene look; 0 = the selective skip.
 REXCVAR_DEFINE_INT32(gpu_xfer_cycle, 0, "GPU/D3D12",
                      "[xfer] A/B: seconds per phase, no transfers / all transfers (0 = shipped, none).");
 
@@ -4665,10 +4669,9 @@ void D3D12RenderTargetCache::XferUseFinalize(RenderTargetKey key, uint32_t start
       if (outcome == kXferUseReadDraw || outcome == kXferUseReadResolve) {
         // [xfer-live] a skipped transfer that was read. Same-kind pairs (c2c,
         // d2d) carry data: learn the pair, execute it from now on. Cross-kind
-        // pairs (depth bits read as color or color bits as depth) were garbage
-        // on the console as well: never executed, named once. Drive 839: the
-        // d2c pair C0t/p4/m2 <- Z0t/p4/m2 (a partial write mask) cost the
-        // Intel 5 ms/frame for nothing visible.
+        // pairs are not learned by this legacy heuristic. Shadow depth-to-color
+        // dependencies are preserved explicitly in PerformTransfersAndResolveClears;
+        // the original census missed their effect on character silhouettes.
         const uint64_t pair = (uint64_t(r.dest.key) << 32) | r.source.key;
         const bool cross_kind = r.cls == 1 || r.cls == 2;
         auto& set = cross_kind ? xfer_ignored_pairs_ : xfer_live_pairs_;
@@ -4680,7 +4683,7 @@ void D3D12RenderTargetCache::XferUseFinalize(RenderTargetKey key, uint32_t start
               r.start_tiles, r.end_tiles, outcome == kXferUseReadDraw ? "rd" : "rres",
               (reason >> 0) & 1, (reason >> 1) & 1, (reason >> 2) & 1, (reason >> 3) & 1,
               r.from_cleared ? 1 : 0, r.src_clear_start, r.src_clear_end,
-              cross_kind ? "cross-kind, never executed" : "executed from now on");
+              cross_kind ? "cross-kind, explicit preservation policy" : "executed from now on");
         }
       }
       auto& by_key = xfer_use_by_key_[r.dest.key];
@@ -5000,7 +5003,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     D3D12_RECT rects[Transfer::kMaxRectanglesWithCutout];
   };
   std::vector<XferForward> xfer_forwards;
-  // [xfer-live] the transfers kept (executed) in the skip phase: learned pairs.
+  // Transfers kept in the skip phase: small color targets and learned pairs.
   std::vector<Transfer> xfer_kept[1 + xenos::kMaxColorRenderTargets];
   {
     const int32_t cycle_seconds = REXCVAR_GET(gpu_xfer_cycle);
@@ -5029,6 +5032,28 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             // The forwarded clear (see XferFindCleared).
             const RenderTargetKey source_key =
                 transfer.source ? transfer.source->key() : RenderTargetKey();
+            // Naruto's offscreen shadow passes need depth-to-color and small
+            // MSAA-to-single-sample dependencies, even after a partial draw.
+            // Preserve the real conversion before considering forwarded clear
+            // bits (a depth clear value is not a color clear value).
+            // Width includes guest tile padding and is independent of host
+            // resolution scale. The bound covers the observed 128/256 maps
+            // without changing the existing full-screen transfer policy.
+            // In particular, do not restore arbitrary MSAA color-to-color
+            // reuse: repacking a previous map at another pitch introduces
+            // detached miniature silhouettes around the next caster.
+            const bool preserve_shadow_contents =
+                !dest_key.is_depth && dest_key.GetWidth() <= 512 &&
+                (source_key.is_depth ||
+                 (source_key.GetWidth() <= 512 &&
+                  source_key.msaa_samples != xenos::MsaaSamples::k1X &&
+                  dest_key.msaa_samples == xenos::MsaaSamples::k1X));
+            if (preserve_shadow_contents) {
+              assert_true(i < 1 + xenos::kMaxColorRenderTargets);
+              xfer_kept[i].push_back(transfer);
+              ++xfer_use_executed_;
+              continue;
+            }
             const XferClearedRange* cleared =
                 XferFindCleared(source_key, transfer.start_tiles, transfer.end_tiles);
             if (!cleared &&
@@ -5071,7 +5096,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       }
       if (xfer_cycle_phase_) {
         assert_true(render_target_count <= 1 + xenos::kMaxColorRenderTargets);
-        render_target_transfers = xfer_kept;  // empty but for the learned live pairs
+        render_target_transfers = xfer_kept;
       }
     }
     if (render_target_resolve_clear_values && resolve_clear_rectangle) {
