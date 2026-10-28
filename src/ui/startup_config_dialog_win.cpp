@@ -12,6 +12,9 @@
 
 #include <rex/ui/startup_config_dialog.h>
 
+#include <algorithm>
+#include <array>
+#include <rex/ui/keybinds.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,8 +29,14 @@
 // clang-format off
 #include <windows.h>
 #include <shlobj.h>   // SHBrowseForFolderW, SHGetPathFromIDListW
+#include <commctrl.h>
+#include <wincodec.h>
 #include <commdlg.h>  // GetOpenFileNameW (DLC file picker)
 // clang-format on
+
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "msimg32.lib")
 
 namespace rex::ui {
 
@@ -45,7 +54,9 @@ constexpr int IDC_DLC_LIST = 1009;
 constexpr int IDC_DLC_INSTALL = 1010;
 constexpr int IDC_SKIP_LAUNCHER = 1011;
 constexpr int IDC_DLC_UNINSTALL = 1012;
-constexpr int IDC_GPU_INSTANCE = 1013;
+constexpr int IDC_PORTABLE_SAVES = 1015;
+constexpr int IDC_TEXT_LANGUAGE = 1016;
+// (1013 retired: the draw-coalescing checkbox is gone, option is dead.)
 
 struct GpuOption {
   const wchar_t* label;
@@ -63,7 +74,7 @@ struct ResPreset {
   const wchar_t* label;
 };
 const ResPreset kResPresets[] = {
-    {1280, 720, L"1280 x 720 (720p)"},   {1600, 900, L"1600 x 900"},
+    {1280, 720, L"1280 x 720 (720p)"},    {1600, 900, L"1600 x 900"},
     {1920, 1080, L"1920 x 1080 (1080p)"}, {2560, 1440, L"2560 x 1440 (1440p)"},
     {3840, 2160, L"3840 x 2160 (4K)"},
 };
@@ -93,20 +104,42 @@ const DisplayModeOption kDisplayModes[] = {
     {true, L"Borderless Fullscreen"},
 };
 
+// Languages included in the Naruto USA/Europe release. Store Xbox language IDs,
+// not combo indices (French and German use IDs 4 and 3 respectively).
+struct TextLanguageOption {
+  const wchar_t* label;
+  int id;
+};
+constexpr TextLanguageOption kTextLanguages[] = {
+    {L"English", 1}, {L"French", 4}, {L"German", 3},
+    {L"Italian", 6}, {L"Spanish", 5},
+};
+
+#include "startup_keyboard_controls.inc"
+
+constexpr int IDC_TAB = 1200, IDC_MNK = 1201, IDC_DEFAULTS = 1204;
+enum Tab { kTabOptions, kTabControls, kTabCredits, kTabCount };
+
 struct DialogState {
+  KeyboardSettings keyboard;
+  HWND tab = nullptr, pages[kTabCount] = {}, mnk_check = nullptr;
+  HWND defaults_btn = nullptr, hint = nullptr;
+  UINT dpi = 96;
+  HFONT font_bold = nullptr;
   bool done = false;
   bool play = false;
   HWND combo_renderer = nullptr;
   HWND combo_res = nullptr;
   HWND combo_internal_res = nullptr;
   HWND check_exp_60fps = nullptr;
-  HWND check_gpu_instance = nullptr;
   HWND combo_display = nullptr;
+  HWND combo_text_language = nullptr;
   HWND edit_data = nullptr;
   HWND list_dlc = nullptr;
   HWND check_skip_launcher = nullptr;
+  HWND check_portable_saves = nullptr;
   HFONT font = nullptr;
-  HFONT font_small = nullptr;  // smaller font for the bottom-left credits line
+  HFONT font_small = nullptr;
 
   // Installed-DLC panel state. `content_root` is the user data root the runtime
   // will use; empty means the panel is unavailable (the caller didn't supply
@@ -117,7 +150,8 @@ struct DialogState {
 };
 
 std::wstring Widen(const std::string& s) {
-  if (s.empty()) return {};
+  if (s.empty())
+    return {};
   int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
   std::wstring w(size_t(n), L'\0');
   MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
@@ -125,7 +159,8 @@ std::wstring Widen(const std::string& s) {
 }
 
 std::string Narrow(const std::wstring& w) {
-  if (w.empty()) return {};
+  if (w.empty())
+    return {};
   int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
   std::string s(size_t(n), '\0');
   WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr);
@@ -134,7 +169,8 @@ std::string Narrow(const std::wstring& w) {
 
 std::wstring GetEditText(HWND edit) {
   int len = GetWindowTextLengthW(edit);
-  if (len <= 0) return {};
+  if (len <= 0)
+    return {};
   std::wstring text(size_t(len) + 1, L'\0');
   GetWindowTextW(edit, text.data(), len + 1);
   text.resize(size_t(len));
@@ -259,10 +295,12 @@ void ClearPendingInstallFor(DialogState* st, const std::string& file_name) {
 }
 
 void UpdateDlcButtons(HWND hwnd, DialogState* st) {
+  // DLC controls now live on the Options page, not directly on the main window.
+  if (st->list_dlc)
+    hwnd = GetParent(st->list_dlc);
   bool have_root = !st->content_root.empty();
   int sel = st->list_dlc ? int(SendMessageW(st->list_dlc, LB_GETCURSEL, 0, 0)) : LB_ERR;
-  bool can_uninstall =
-      have_root && sel != LB_ERR && sel >= 0 && sel < int(st->dlc_entries.size());
+  bool can_uninstall = have_root && sel != LB_ERR && sel >= 0 && sel < int(st->dlc_entries.size());
   if (HWND btn = GetDlgItem(hwnd, IDC_DLC_UNINSTALL)) {
     EnableWindow(btn, can_uninstall ? TRUE : FALSE);
   }
@@ -329,7 +367,7 @@ void DoInstallDlc(HWND hwnd, DialogState* st) {
 
   const uint32_t game_title = DetectGameTitleId(GetEditText(st->edit_data));
   auto result = rex::system::xam::InstallContentPackage(package, st->content_root, game_title,
-                                                       /*allow_guest_module=*/false);
+                                                        /*allow_guest_module=*/false);
 
   if (result == rex::system::xam::ContentInstallResult::kSuccess ||
       result == rex::system::xam::ContentInstallResult::kAlreadyInstalled) {
@@ -391,75 +429,70 @@ HWND MakeControl(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD sty
   return ctl;
 }
 
-void BuildControls(HWND hwnd, DialogState* st) {
+void BuildOptions(HWND hwnd, DialogState* st) {
   HFONT font = st->font;
+  auto make = [st](HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y,
+                   int w, int h, int id, HFONT f) {
+    return MakeControl(parent, cls, text, style, Scale(x, st->dpi), Scale(y, st->dpi),
+                       Scale(w, st->dpi), Scale(h, st->dpi), id, f);
+  };
 
-  MakeControl(hwnd, L"STATIC", L"Graphics renderer:", SS_LEFT, 16, 18, 150, 20, -1, font);
-  st->combo_renderer = MakeControl(hwnd, L"COMBOBOX", nullptr,
-                                   CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 16, 260, 220,
-                                   IDC_RENDERER, font);
+  make(hwnd, L"STATIC", L"Graphics renderer:", SS_LEFT, 16, 18, 150, 20, -1, font);
+  st->combo_renderer = make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+                            172, 16, 260, 220, IDC_RENDERER, font);
 
-  MakeControl(hwnd, L"STATIC", L"Window resolution:", SS_LEFT, 16, 52, 150, 20, -1, font);
-  st->combo_res = MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
-                              172, 50, 260, 220, IDC_RES, font);
+  make(hwnd, L"STATIC", L"Window resolution:", SS_LEFT, 16, 52, 150, 20, -1, font);
+  st->combo_res = make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172,
+                       50, 260, 220, IDC_RES, font);
 
-  MakeControl(hwnd, L"STATIC", L"Internal resolution:", SS_LEFT, 16, 86, 150, 20, -1, font);
+  make(hwnd, L"STATIC", L"Internal resolution:", SS_LEFT, 16, 86, 150, 20, -1, font);
   st->combo_internal_res =
-      MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 84,
-                  260, 220, IDC_INTERNAL_RES, font);
+      make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 84, 260,
+           220, IDC_INTERNAL_RES, font);
 
-  MakeControl(hwnd, L"STATIC", L"Display mode:", SS_LEFT, 16, 120, 150, 20, -1, font);
-  st->combo_display =
-      MakeControl(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 118,
-                  260, 220, IDC_DISPLAY_MODE, font);
+  make(hwnd, L"STATIC", L"Display mode:", SS_LEFT, 16, 120, 150, 20, -1, font);
+  st->combo_display = make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+                           172, 118, 260, 220, IDC_DISPLAY_MODE, font);
 
   // Vsync is always on (no dialog control; forced true in ApplyAndSave).
-  st->check_exp_60fps =
-      MakeControl(hwnd, L"BUTTON", L"60 FPS overworld (EXPERIMENTAL)", BS_AUTOCHECKBOX | WS_TABSTOP,
-                  172, 154, 300, 22, IDC_EXP_60FPS, font);
+  st->check_exp_60fps = make(hwnd, L"BUTTON", L"60 FPS open world", BS_AUTOCHECKBOX | WS_TABSTOP,
+                             172, 154, 300, 22, IDC_EXP_60FPS, font);
 
-  st->check_gpu_instance =
-      MakeControl(hwnd, L"BUTTON", L"GPU draw instancing (EXPERIMENTAL)",
-                  BS_AUTOCHECKBOX | WS_TABSTOP, 172, 180, 300, 22, IDC_GPU_INSTANCE, font);
-  MakeControl(hwnd, L"STATIC",
-              L"Direct3D 12 only. Turn this off if you get a black screen or flashing.",
-              SS_LEFT, 190, 204, 282, 48, -1, st->font_small ? st->font_small : font);
+  make(hwnd, L"STATIC", L"Text language:", SS_LEFT, 16, 190, 150, 20, -1, font);
+  st->combo_text_language =
+      make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+           172, 188, 260, 180, IDC_TEXT_LANGUAGE, font);
 
-  MakeControl(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 258, 200, 20, -1, font);
-  st->edit_data = MakeControl(hwnd, L"EDIT", nullptr,
-                              WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, 280, 330, 24, IDC_DATA,
-                              font);
-  MakeControl(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 279, 80, 26, IDC_BROWSE, font);
+  make(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 228, 200, 20, -1, font);
+  st->edit_data = make(hwnd, L"EDIT", nullptr, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, 250,
+                       330, 24, IDC_DATA, font);
+  make(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 249, 80, 26, IDC_BROWSE, font);
+
+  st->check_portable_saves =
+      make(hwnd, L"BUTTON", L"Save files beside game (portable)", BS_AUTOCHECKBOX | WS_TABSTOP, 16,
+           302, 416, 24, IDC_PORTABLE_SAVES, font);
+  make(hwnd, L"STATIC", L"Default: Documents\\naruto. Portable: UserData beside Game.", SS_LEFT, 16,
+       334, 416, 32, -1, st->font_small);
+  const auto portable_root =
+      (rex::filesystem::GetExecutableFolder() / "../UserData").lexically_normal();
+  SendMessageW(st->check_portable_saves, BM_SETCHECK,
+               st->content_root.lexically_normal() == portable_root ? BST_CHECKED : BST_UNCHECKED,
+               0);
 
   // --- Right-hand panel: installed DLC ---
-  MakeControl(hwnd, L"STATIC", L"Installed DLC:", SS_LEFT, 456, 18, 200, 20, -1, font);
-  st->list_dlc = MakeControl(hwnd, L"LISTBOX", nullptr,
-                             WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY, 456, 40, 328, 216,
-                             IDC_DLC_LIST, font);
-  MakeControl(hwnd, L"BUTTON", L"Install DLC...", WS_TABSTOP, 456, 264, 156, 28, IDC_DLC_INSTALL,
-              font);
-  MakeControl(hwnd, L"BUTTON", L"Uninstall", WS_TABSTOP, 628, 264, 156, 28, IDC_DLC_UNINSTALL, font);
-  MakeControl(hwnd, L"STATIC",
-              L"Voice and audio packs work. Character packs are not supported.",
-              SS_LEFT, 456, 298, 328, 60, -1, st->font_small ? st->font_small : font);
+  make(hwnd, L"STATIC", L"Installed DLC:", SS_LEFT, 440, 18, 200, 20, -1, font);
+  st->list_dlc = make(hwnd, L"LISTBOX", nullptr, WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY,
+                      440, 40, 312, 216, IDC_DLC_LIST, font);
+  make(hwnd, L"BUTTON", L"Install DLC...", WS_TABSTOP, 440, 264, 148, 28, IDC_DLC_INSTALL, font);
+  make(hwnd, L"BUTTON", L"Uninstall", WS_TABSTOP, 604, 264, 148, 28, IDC_DLC_UNINSTALL, font);
+  make(hwnd, L"STATIC", L"Voice and audio packs work. Character packs are not supported.", SS_LEFT,
+       440, 298, 312, 60, -1, st->font_small ? st->font_small : font);
 
   // Skip this dialog on future launches (persists to the skip_config_dialog
   // cvar). Bottom-left, aligned with the Play/Quit buttons.
   st->check_skip_launcher =
-      MakeControl(hwnd, L"BUTTON", L"Skip launcher next time", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 338,
-                  228, 22, IDC_SKIP_LAUNCHER, font);
-
-  MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 256, 332, 84, 30, IDOK, font);
-  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, 348, 332, 84, 30, IDCANCEL, font);
-
-  // Bottom credits line, drawn in a smaller font. Spans the full client width so
-  // it can wrap if the system font is large.
-  MakeControl(hwnd, L"STATIC",
-              L"Special thanks to Simeon, Armin Suljovikj, ObsoleteSponge, Kalarot, Dante Smith, "
-              L"Vexil Megga, cody russell, Hailnate13x, GUARD, ctrlalt3l1t3, Austin_Toonz, "
-              L"Mark_Rampage, PELIODAS(Bubu), Sega The Hedgehog, Jesus Cantu, Enel, Chris Parnell "
-              L"and eddie for their Patreon support.",
-              SS_LEFT, 16, 374, 768, 60, -1, st->font_small ? st->font_small : font);
+      make(hwnd, L"BUTTON", L"Skip launcher next time", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 376, 228,
+           22, IDC_SKIP_LAUNCHER, font);
 
   // --- Populate from current cvar values ---
   std::string gpu = rex::cvar::GetFlagByName("gpu");
@@ -467,7 +500,8 @@ void BuildControls(HWND hwnd, DialogState* st) {
   for (int i = 0; i < int(std::size(kGpuOptions)); ++i) {
     SendMessageW(st->combo_renderer, CB_ADDSTRING, 0,
                  reinterpret_cast<LPARAM>(kGpuOptions[i].label));
-    if (gpu == kGpuOptions[i].value) gpu_sel = i;
+    if (gpu == kGpuOptions[i].value)
+      gpu_sel = i;
   }
   SendMessageW(st->combo_renderer, CB_SETCURSEL, gpu_sel, 0);
 
@@ -476,7 +510,8 @@ void BuildControls(HWND hwnd, DialogState* st) {
   int res_sel = 0;
   for (int i = 0; i < int(std::size(kResPresets)); ++i) {
     SendMessageW(st->combo_res, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(kResPresets[i].label));
-    if (cur_w == kResPresets[i].width && cur_h == kResPresets[i].height) res_sel = i;
+    if (cur_w == kResPresets[i].width && cur_h == kResPresets[i].height)
+      res_sel = i;
   }
   SendMessageW(st->combo_res, CB_SETCURSEL, res_sel, 0);
 
@@ -485,30 +520,34 @@ void BuildControls(HWND hwnd, DialogState* st) {
   for (int i = 0; i < int(std::size(kInternalResOptions)); ++i) {
     SendMessageW(st->combo_internal_res, CB_ADDSTRING, 0,
                  reinterpret_cast<LPARAM>(kInternalResOptions[i].label));
-    if (cur_scale == kInternalResOptions[i].scale) internal_sel = i;
+    if (cur_scale == kInternalResOptions[i].scale)
+      internal_sel = i;
   }
   SendMessageW(st->combo_internal_res, CB_SETCURSEL, internal_sel, 0);
 
   SendMessageW(st->check_exp_60fps, BM_SETCHECK,
-               rex::cvar::GetFlagByName("experimental_60fps") == "true" ? BST_CHECKED
-                                                                        : BST_UNCHECKED,
+               rex::cvar::GetFlagByName("open_world_60fps") == "true" ? BST_CHECKED : BST_UNCHECKED,
                0);
-
-  // gpu_instance lives in the D3D12 command processor; addressing it by name means
-  // the dialog doesn't care which module defines it. Persisting it from here also
-  // stops SaveConfig from silently dropping a hand-written `gpu_instance = false`
-  // (SerializeToTOML only writes values that differ from the default).
-  SendMessageW(st->check_gpu_instance, BM_SETCHECK,
-               rex::cvar::GetFlagByName("gpu_instance") == "true" ? BST_CHECKED : BST_UNCHECKED, 0);
 
   bool cur_fullscreen = rex::cvar::GetFlagByName("fullscreen") == "true";
   int display_sel = 0;
   for (int i = 0; i < int(std::size(kDisplayModes)); ++i) {
     SendMessageW(st->combo_display, CB_ADDSTRING, 0,
                  reinterpret_cast<LPARAM>(kDisplayModes[i].label));
-    if (cur_fullscreen == kDisplayModes[i].fullscreen) display_sel = i;
+    if (cur_fullscreen == kDisplayModes[i].fullscreen)
+      display_sel = i;
   }
   SendMessageW(st->combo_display, CB_SETCURSEL, display_sel, 0);
+
+  const int language = std::atoi(rex::cvar::GetFlagByName("user_language").c_str());
+  int language_sel = 0;  // Missing or unsupported values fall back to English.
+  for (int i = 0; i < int(std::size(kTextLanguages)); ++i) {
+    SendMessageW(st->combo_text_language, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(kTextLanguages[i].label));
+    if (language == kTextLanguages[i].id)
+      language_sel = i;
+  }
+  SendMessageW(st->combo_text_language, CB_SETCURSEL, language_sel, 0);
 
   std::wstring data_dir = Widen(rex::cvar::GetFlagByName("game_data_root"));
   if (data_dir.empty()) {
@@ -520,14 +559,79 @@ void BuildControls(HWND hwnd, DialogState* st) {
   }
   SetWindowTextW(st->edit_data, data_dir.c_str());
 
-  SendMessageW(st->check_skip_launcher, BM_SETCHECK,
-               rex::cvar::GetFlagByName("skip_config_dialog") == "true" ? BST_CHECKED
-                                                                        : BST_UNCHECKED,
-               0);
+  SendMessageW(
+      st->check_skip_launcher, BM_SETCHECK,
+      rex::cvar::GetFlagByName("skip_config_dialog") == "true" ? BST_CHECKED : BST_UNCHECKED, 0);
 
   // Needs edit_data populated first: the list marks entries belonging to another
   // game, which is decided by the title id of the selected game data folder.
   RefreshDlcList(hwnd, st);
+}
+
+void SelectTab(DialogState* st, int index) {
+  for (int i = 0; i < kTabCount; ++i)
+    ShowWindow(st->pages[i], i == index ? SW_SHOW : SW_HIDE);
+  ShowWindow(st->defaults_btn, index == kTabControls ? SW_SHOW : SW_HIDE);
+  if (index != kTabControls)
+    CancelCapture(&st->keyboard);
+}
+
+void BuildControls(HWND hwnd, DialogState* st) {
+  auto S = [st](int v) { return Scale(v, st->dpi); };
+  auto make = [&](HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y,
+                  int w, int h, int id, HFONT font) {
+    return MakeControl(parent, cls, text, style, S(x), S(y), S(w), S(h), id, font);
+  };
+  const int margin = S(8), bottom = S(556), btnW = S(84), gap = S(8);
+  st->tab = MakeControl(hwnd, WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPSIBLINGS | TCS_TABS, margin,
+                        margin, S(784), bottom - S(16), IDC_TAB, st->font);
+  const wchar_t* names[] = {L"Options", L"Controls", L"Credits"};
+  for (int i = 0; i < kTabCount; ++i) {
+    TCITEMW item{};
+    item.mask = TCIF_TEXT;
+    item.pszText = const_cast<wchar_t*>(names[i]);
+    SendMessageW(st->tab, TCM_INSERTITEMW, i, reinterpret_cast<LPARAM>(&item));
+  }
+  RECT page{};
+  GetClientRect(st->tab, &page);
+  SendMessageW(st->tab, TCM_ADJUSTRECT, FALSE, reinterpret_cast<LPARAM>(&page));
+  MapWindowPoints(st->tab, hwnd, reinterpret_cast<POINT*>(&page), 2);
+  const int pageW = page.right - page.left, pageH = page.bottom - page.top;
+  for (auto& p : st->pages)
+    p = CreateWindowExW(WS_EX_CONTROLPARENT, kPageClass, L"",
+                        WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, page.left, page.top, pageW,
+                        pageH, hwnd, nullptr, st->keyboard.hinst, nullptr);
+  SetWindowPos(st->tab, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+  BuildOptions(st->pages[kTabOptions], st);
+  HWND p = st->pages[kTabControls];
+  st->mnk_check =
+      make(p, L"BUTTON", L"Enable keyboard controls for Player 1",
+           BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 14, 10, 360, 22, IDC_MNK, st->font_bold);
+  SendMessageW(st->mnk_check, BM_SETCHECK, st->keyboard.mnk ? BST_CHECKED : BST_UNCHECKED, 0);
+  st->hint = MakeControl(
+      p, L"STATIC", L"Click a key box, then press the key you want for that button. Esc cancels.",
+      SS_LEFT, S(36), S(34), pageW - S(50), S(18), -1, st->font_small);
+  st->keyboard.canvas =
+      CreateWindowExW(0, kCanvasClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, S(54),
+                      pageW, pageH - S(54), p, nullptr, st->keyboard.hinst, &st->keyboard);
+  MakeControl(st->pages[kTabCredits], L"EDIT",
+              L"Special thanks to Simeon, Armin Suljovikj, ObsoleteSponge, Kalarot, Dante Smith, "
+              L"Vexil Megga, cody russell, Hailnate13x, GUARD, ctrlalt3l1t3, Austin_Toonz, "
+              L"Mark_Rampage, PELIODAS(Bubu), Sega The Hedgehog, Jesus Cantu, Enel, Chris Parnell "
+              L"and eddie for their Patreon support.",
+              ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, S(16), S(16), pageW - S(32),
+              pageH - S(32), -1, st->font);
+  int x = S(800) - margin - btnW;
+  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, x, bottom, btnW, S(28), IDCANCEL, st->font);
+  x -= btnW + gap;
+  HWND play = MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP | WS_GROUP, x,
+                          bottom, btnW, S(28), IDOK, st->font);
+  x -= btnW + gap;
+  st->defaults_btn = MakeControl(hwnd, L"BUTTON", L"Defaults", WS_TABSTOP, x, bottom, btnW, S(28),
+                                 IDC_DEFAULTS, st->font);
+  SendMessageW(st->tab, TCM_SETCURSEL, kTabOptions, 0);
+  SelectTab(st, kTabOptions);
+  SetFocus(play);
 }
 
 // Applies the dialog selections to cvars and persists them. Returns false (with
@@ -555,35 +659,37 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
   }
 
   int gpu_sel = int(SendMessageW(st->combo_renderer, CB_GETCURSEL, 0, 0));
-  if (gpu_sel < 0 || gpu_sel >= int(std::size(kGpuOptions))) gpu_sel = 0;
+  if (gpu_sel < 0 || gpu_sel >= int(std::size(kGpuOptions)))
+    gpu_sel = 0;
   rex::cvar::SetFlagByName("gpu", kGpuOptions[gpu_sel].value);
 
   int res_sel = int(SendMessageW(st->combo_res, CB_GETCURSEL, 0, 0));
-  if (res_sel < 0 || res_sel >= int(std::size(kResPresets))) res_sel = 0;
+  if (res_sel < 0 || res_sel >= int(std::size(kResPresets)))
+    res_sel = 0;
   rex::cvar::SetFlagByName("video_mode_width", std::to_string(kResPresets[res_sel].width));
   rex::cvar::SetFlagByName("video_mode_height", std::to_string(kResPresets[res_sel].height));
 
   int internal_sel = int(SendMessageW(st->combo_internal_res, CB_GETCURSEL, 0, 0));
-  if (internal_sel < 0 || internal_sel >= int(std::size(kInternalResOptions))) internal_sel = 0;
+  if (internal_sel < 0 || internal_sel >= int(std::size(kInternalResOptions)))
+    internal_sel = 0;
   rex::cvar::SetFlagByName("resolution_scale",
                            std::to_string(kInternalResOptions[internal_sel].scale));
 
   // Vsync is always on (no dialog control) — force it true on every save.
   rex::cvar::SetFlagByName("vsync", "true");
 
-  rex::cvar::SetFlagByName("experimental_60fps",
-                           SendMessageW(st->check_exp_60fps, BM_GETCHECK, 0, 0) == BST_CHECKED
-                               ? "true"
-                               : "false");
-
-  rex::cvar::SetFlagByName("gpu_instance",
-                           SendMessageW(st->check_gpu_instance, BM_GETCHECK, 0, 0) == BST_CHECKED
-                               ? "true"
-                               : "false");
+  rex::cvar::SetFlagByName(
+      "open_world_60fps",
+      SendMessageW(st->check_exp_60fps, BM_GETCHECK, 0, 0) == BST_CHECKED ? "true" : "false");
 
   int display_sel = int(SendMessageW(st->combo_display, CB_GETCURSEL, 0, 0));
-  if (display_sel < 0 || display_sel >= int(std::size(kDisplayModes))) display_sel = 0;
+  if (display_sel < 0 || display_sel >= int(std::size(kDisplayModes)))
+    display_sel = 0;
   rex::cvar::SetFlagByName("fullscreen", kDisplayModes[display_sel].fullscreen ? "true" : "false");
+  int language_sel = int(SendMessageW(st->combo_text_language, CB_GETCURSEL, 0, 0));
+  if (language_sel < 0 || language_sel >= int(std::size(kTextLanguages)))
+    language_sel = 0;
+  rex::cvar::SetFlagByName("user_language", std::to_string(kTextLanguages[language_sel].id));
   rex::cvar::SetFlagByName("game_data_root", Narrow(data));
 
   // NB: `install_content` is deliberately left alone here. DLC is installed and
@@ -593,11 +699,19 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
   // Persist the "skip launcher next time" choice. If set, the next launch boots
   // straight into the game; clear skip_config_dialog in naruto.toml to get the
   // dialog back.
-  rex::cvar::SetFlagByName("skip_config_dialog",
-                           SendMessageW(st->check_skip_launcher, BM_GETCHECK, 0, 0) == BST_CHECKED
-                               ? "true"
-                               : "false");
+  rex::cvar::SetFlagByName(
+      "skip_config_dialog",
+      SendMessageW(st->check_skip_launcher, BM_GETCHECK, 0, 0) == BST_CHECKED ? "true" : "false");
 
+  rex::cvar::SetFlagByName("mnk_mode", st->keyboard.mnk ? "true" : "false");
+  rex::cvar::SetFlagByName("user_data_root",
+                           SendMessageW(st->check_portable_saves, BM_GETCHECK, 0, 0) == BST_CHECKED
+                               ? "../UserData"
+                               : "");
+  rex::cvar::SetFlagByName("mnk_user_index", "0");
+  rex::cvar::SetFlagByName("mnk_mouse_look", "false");
+  for (int i = 0; i < kBindCount; ++i)
+    rex::cvar::SetFlagByName(kBinds[i].cvar, st->keyboard.binds[i]);
   rex::cvar::SaveConfig(config_path);
   return true;
 }
@@ -615,8 +729,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       return 0;
     }
     case WM_COMMAND: {
-      if (!st) break;
+      if (!st)
+        break;
       int id = LOWORD(wparam);
+      if (id == IDC_PORTABLE_SAVES) {
+        st->content_root =
+            SendMessageW(st->check_portable_saves, BM_GETCHECK, 0, 0) == BST_CHECKED
+                ? (rex::filesystem::GetExecutableFolder() / "../UserData").lexically_normal()
+                : rex::filesystem::GetUserFolder() / "naruto";
+        RefreshDlcList(hwnd, st);
+        return 0;
+      }
+      if (id == IDC_MNK) {
+        st->keyboard.mnk = SendMessageW(st->mnk_check, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        st->keyboard.status.clear();
+        CancelCapture(&st->keyboard);
+        InvalidateRect(st->keyboard.canvas, nullptr, FALSE);
+        return 0;
+      }
+      if (id == IDC_DEFAULTS) {
+        for (int i = 0; i < kBindCount; ++i)
+          st->keyboard.binds[i] = kBinds[i].default_key;
+        st->keyboard.status = L"Default keys restored.";
+        CancelCapture(&st->keyboard);
+        InvalidateRect(st->keyboard.canvas, nullptr, FALSE);
+        return 0;
+      }
       if (id == IDC_BROWSE) {
         std::wstring picked = BrowseForFolder(hwnd, GetEditText(st->edit_data));
         if (!picked.empty()) {
@@ -663,6 +801,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       }
       break;
     }
+    case WM_NOTIFY: {
+      auto* hdr = reinterpret_cast<NMHDR*>(lparam);
+      if (st && hdr && hdr->hwndFrom == st->tab && hdr->code == TCN_SELCHANGE) {
+        SelectTab(st, int(SendMessageW(st->tab, TCM_GETCURSEL, 0, 0)));
+        return 0;
+      }
+      break;
+    }
+    case WM_CTLCOLORSTATIC: {
+      HDC dc = reinterpret_cast<HDC>(wparam);
+      SetBkMode(dc, TRANSPARENT);
+      SetBkColor(dc, RGB(255, 255, 255));
+      if (st && reinterpret_cast<HWND>(lparam) == st->hint)
+        SetTextColor(dc, RGB(90, 90, 90));
+      return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+    }
     case WM_CLOSE:
       if (st) {
         st->play = false;
@@ -684,7 +838,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 }  // namespace
 
 bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::path& config_path,
-                            const std::filesystem::path& content_root) {
+                             const std::filesystem::path& content_root) {
   HINSTANCE hinstance = GetModuleHandleW(nullptr);
 
   const wchar_t* kClassName = L"RexStartupConfigDialog";
@@ -703,26 +857,45 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
 
   DialogState state;
   state.content_root = content_root;
+  if (state.content_root.is_relative() && !state.content_root.empty())
+    state.content_root = rex::filesystem::GetExecutableFolder() / state.content_root;
   state.config_path = config_path;
-  NONCLIENTMETRICSW ncm{};
-  ncm.cbSize = sizeof(ncm);
-  if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-    state.font = CreateFontIndirectW(&ncm.lfMessageFont);
-    // A slightly smaller flavour of the message font for the credits line.
-    // NB: can't name this `small` — <rpcndr.h> does `#define small char`.
-    LOGFONTW small_lf = ncm.lfMessageFont;
-    LONG h = small_lf.lfHeight < 0 ? -small_lf.lfHeight : small_lf.lfHeight;
-    h = (h * 5) / 6;  // ~83% of the message-font size
-    small_lf.lfHeight = small_lf.lfHeight < 0 ? -h : h;
-    state.font_small = CreateFontIndirectW(&small_lf);
-  }
+  state.dpi = GetDpiForSystem();
+  auto font = [&](int size, int weight) {
+    return CreateFontW(-MulDiv(size, int(state.dpi), 72), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                       DEFAULT_PITCH, L"Segoe UI");
+  };
+  state.font = font(10, FW_NORMAL);
+  state.font_bold = font(10, FW_BOLD);
+  state.font_small = font(8, FW_NORMAL);
+  state.keyboard.dpi = state.dpi;
+  state.keyboard.hinst = hinstance;
+  state.keyboard.font = state.font;
+  state.keyboard.font_bold = state.font_bold;
+  state.keyboard.font_small = state.font_small;
+  state.keyboard.mnk = rex::cvar::GetFlagByName("mnk_mode") == "true";
+  for (int i = 0; i < kBindCount; ++i)
+    state.keyboard.binds[i] = rex::cvar::GetFlagByName(kBinds[i].cvar);
+  INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_TAB_CLASSES | ICC_STANDARD_CLASSES};
+  InitCommonControlsEx(&icc);
+  WNDCLASSW page{};
+  page.hInstance = hinstance;
+  page.lpfnWndProc = PageProc;
+  page.lpszClassName = kPageClass;
+  page.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  page.hbrBackground = static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+  RegisterClassW(&page);
+  page.lpfnWndProc = CanvasProc;
+  page.lpszClassName = kCanvasClass;
+  page.hbrBackground = nullptr;
+  RegisterClassW(&page);
 
   g_config_path = &config_path;
 
-  // Client area 800 x 444: settings column on the left (x 16..472), installed-DLC
-  // panel on the right (x 456..784), credits strip along the bottom.
+  // Same 800 x 600 DPI-scaled tabbed layout as the SVR11 launcher.
   const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-  RECT rc{0, 0, 800, 444};
+  RECT rc{0, 0, Scale(800, state.dpi), Scale(600, state.dpi)};
   AdjustWindowRectEx(&rc, style, FALSE, 0);
   int win_w = rc.right - rc.left;
   int win_h = rc.bottom - rc.top;
@@ -734,15 +907,19 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
   HWND hwnd = CreateWindowExW(0, kClassName, title.c_str(), style, x, y, win_w, win_h, nullptr,
                               nullptr, hinstance, &state);
   if (!hwnd) {
-    if (state.font) DeleteObject(state.font);
-    if (state.font_small) DeleteObject(state.font_small);
+    if (state.font_bold)
+      DeleteObject(state.font_bold);
+    if (state.font)
+      DeleteObject(state.font);
+    if (state.font_small)
+      DeleteObject(state.font_small);
     g_config_path = nullptr;
     return true;  // Don't block launch if the dialog can't be created.
   }
 
   ShowWindow(hwnd, SW_SHOW);
   SetForegroundWindow(hwnd);
-  if (state.combo_renderer) SetFocus(state.combo_renderer);
+  SetFocus(GetDlgItem(hwnd, IDOK));
 
   // Local modal message loop until the user picks Play/Quit (state.done).
   // Driven by the done flag — NOT by WM_QUIT — so we never post WM_QUIT into
@@ -751,14 +928,28 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
   // before blocking in GetMessage again.
   MSG msg;
   while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    if (state.keyboard.capture >= 0 && msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST &&
+        msg.hwnd == state.keyboard.canvas) {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+      continue;
+    }
     if (!IsDialogMessageW(hwnd, &msg)) {
       TranslateMessage(&msg);
       DispatchMessageW(&msg);
     }
   }
 
-  if (state.font) DeleteObject(state.font);
-  if (state.font_small) DeleteObject(state.font_small);
+  if (state.keyboard.pad_normal)
+    DeleteObject(state.keyboard.pad_normal);
+  if (state.keyboard.pad_grey)
+    DeleteObject(state.keyboard.pad_grey);
+  if (state.font_bold)
+    DeleteObject(state.font_bold);
+  if (state.font)
+    DeleteObject(state.font);
+  if (state.font_small)
+    DeleteObject(state.font_small);
   g_config_path = nullptr;
   return state.play;
 }

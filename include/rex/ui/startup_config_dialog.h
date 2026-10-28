@@ -3,9 +3,9 @@
  * @brief       Native pre-launch configuration dialog.
  *
  * Shows a modal, native configuration window before the game window/graphics
- * are created, letting the user pick the graphics backend, vsync, resolution,
- * fullscreen and the game data folder. Values are read from and written back to
- * the cvar registry by name (so it works regardless of which module defines a
+ * are created, with Options, Controls and Credits tabs. VSync stays enabled.
+ * Graphics, fullscreen, text language, game data and keyboard values are read
+ * from and written back to the cvar registry by name (regardless of which module defines a
  * given cvar) and persisted to the consumer's config file.
  *
  * @copyright   Copyright (c) 2026 Tom Clay
