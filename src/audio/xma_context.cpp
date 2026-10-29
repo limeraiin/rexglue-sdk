@@ -119,6 +119,12 @@ bool XmaContext::Work() {
     }
     Consume(&output_rb, &data);
     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+
+    // [XMA-CANARY 7e98ae6de] Consume wrote at least one block, so a ring whose
+    // write offset caught up with the read offset is full: tell the title.
+    if (output_rb.empty()) {
+      data.output_buffer_valid = 0;
+    }
     StoreContextMerged(data, initial_data, context_ptr);
     return true;
   }
@@ -135,17 +141,44 @@ bool XmaContext::Work() {
   }
 
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+    const uint32_t pre_decode_offset = data.input_buffer_read_offset;
+    const uint8_t pre_current_buffer = data.current_buffer;
+    const uint8_t pre_remaining_subframes = current_frame_remaining_subframes_;
+
     Decode(&data);
     Consume(&output_rb, &data);
 
-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+    // [XMA-CANARY 6bef1fbed] Do not abandon a partly consumed frame. Consume
+    // hands over at most subframe_decode_count blocks per pass, so the pass
+    // that exhausts the input usually leaves the rest of the frame
+    // undelivered; is_enabled_ is already clear and only XMAEnableContext
+    // sets it again, so a title polling for the remainder would wait for a
+    // kick that never comes. Keep draining until the frame is out.
+    if ((!data.IsAnyInputBufferValid() || data.error_status == 4) &&
+        current_frame_remaining_subframes_ == 0) {
+      break;
+    }
+
+    // [XMA-CANARY ade7e610b] Decode neither advanced the read offset nor
+    // produced a frame: no progress is possible, so leave instead of spinning
+    // on this context, which held the worker and every guest thread waiting
+    // on it. Checked only when no subframes were pending: with subframes
+    // remaining, Decode skips on purpose while Consume drains the frame. A
+    // buffer swap at the same offset is progress too (local addition).
+    if (pre_remaining_subframes == 0 && data.input_buffer_read_offset == pre_decode_offset &&
+        data.current_buffer == pre_current_buffer && current_frame_remaining_subframes_ == 0) {
       break;
     }
   }
 
   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 
-  if (output_rb.empty()) {
+  // [XMA-CANARY 505697f98] Signal the title that the output ring is full. An
+  // empty ring alone is ambiguous (nothing written, or exactly full), so
+  // invalidating on it stopped the decoder after a pass that wrote nothing.
+  // Not taken from 09dbe2cd3: rewinding the write offset to the read offset
+  // when starved on input, which discards output the title has not played.
+  if (remaining_subframe_blocks_in_output_buffer_ == 0 && output_rb.empty()) {
     data.output_buffer_valid = 0;
   }
 
@@ -348,7 +381,16 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
     if (packet_frame_offset <= kMaxFrameSizeinBits) {
       return (next_packet_index * kBitsPerPacket) + packet_frame_offset;
     }
-    next_packet_index++;
+
+    // [XMA-CANARY 7015473a7] No frame starts in this packet: it only continues
+    // a frame split across the packet boundary. Follow this packet's own skip
+    // count to the next packet of the same sub-stream; the sequential next
+    // packet may belong to another sub-stream of an interleaved buffer.
+    const uint8_t next_skip = xma::GetPacketSkipCount(next_packet);
+    if (next_skip == 0xFF) {
+      break;
+    }
+    next_packet_index += next_skip + 1;
   }
 
   return kBitsPerPacketHeader;
@@ -391,6 +433,24 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
 
   while (true) {
     if (stream.BitsRemaining() < kBitsPerFrameHeader) {
+      // [XMA-CANARY aee0871dd] We only get here after a frame whose trailer
+      // bit said another frame follows (or at the packet's declared first
+      // frame), so a frame starts in the last 1..14 bits of this packet with
+      // its 15-bit length header straddling the packet boundary. Real
+      // hardware decodes it; the stock walk stopped here, which made the
+      // previous frame look like the packet's last one and the advance to
+      // the next packet's first frame skipped this frame entirely (Broken
+      // Bond lost 3 of 360 frames of its English intro line that way). Count
+      // it; size 0 selects the split-header path in Decode(), which splices
+      // the next packet when it is present and otherwise releases the
+      // buffer as before.
+      if (stream.BitsRemaining() > 0) {
+        if (stream.offset_bits() == frame_offset) {
+          packet_info.current_frame_ = packet_info.frame_count_;
+          packet_info.current_frame_size_ = 0;
+        }
+        packet_info.frame_count_++;
+      }
       break;
     }
 
