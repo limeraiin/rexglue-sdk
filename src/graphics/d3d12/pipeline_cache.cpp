@@ -735,6 +735,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       } else {
         new_pipeline->state.store(CreateD3D12Pipeline(pipeline_runtime_description),
                                   std::memory_order_release);
+        new_pipeline->creation.Complete();
       }
       ++pipelines_created;
     }
@@ -1127,8 +1128,7 @@ bool PipelineCache::ConfigurePipeline(
   if (current_pipeline_ != nullptr && !std::memcmp(&current_pipeline_->description.description,
                                                    &description, sizeof(description))) {
     *pipeline_handle_out = current_pipeline_;
-    *root_signature_out = current_pipeline_->root_signature.load(std::memory_order_acquire);
-    return true;
+    return ResolvePipelineForDraw(current_pipeline_, root_signature_out);
   }
 
   // Find an existing pipeline in the cache.
@@ -1140,8 +1140,7 @@ bool PipelineCache::ConfigurePipeline(
       PROFILE_PIPELINE_CACHE_HIT();
       current_pipeline_ = found_pipeline;
       *pipeline_handle_out = found_pipeline;
-      *root_signature_out = found_pipeline->root_signature.load(std::memory_order_acquire);
-      return true;
+      return ResolvePipelineForDraw(found_pipeline, root_signature_out);
     }
   }
   PROFILE_PIPELINE_CACHE_MISS();
@@ -1171,6 +1170,7 @@ bool PipelineCache::ConfigurePipeline(
     creation_request_cond_.notify_one();
   } else {
     new_pipeline->state.store(CreateD3D12Pipeline(runtime_description), std::memory_order_release);
+    new_pipeline->creation.Complete();
   }
 
   if (pipeline_storage_file_) {
@@ -1188,8 +1188,7 @@ bool PipelineCache::ConfigurePipeline(
 
   current_pipeline_ = new_pipeline;
   *pipeline_handle_out = new_pipeline;
-  *root_signature_out = new_pipeline->root_signature.load(std::memory_order_acquire);
-  return true;
+  return ResolvePipelineForDraw(new_pipeline, root_signature_out);
 }
 
 bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
@@ -4273,6 +4272,35 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
   return true;
 }
 
+void PipelineCache::CompletePipelineCreation(Pipeline* pipeline) {
+  PipelineRuntimeDescription runtime_description;
+  ID3D12PipelineState* state = nullptr;
+  if (PrepareRuntimeDescriptionForQueuedCreation(pipeline, runtime_description)) {
+    state = CreateD3D12Pipeline(runtime_description);
+  }
+  pipeline->state.store(state, std::memory_order_release);
+  // Null is a terminal failure, not an endless wait.
+  pipeline->creation.Complete();
+}
+
+bool PipelineCache::ResolvePipelineForDraw(Pipeline* pipeline,
+                                          ID3D12RootSignature** root_signature_out) {
+  auto* state = pipeline->state.load(std::memory_order_acquire);
+  if (!state) {
+    if (pipeline->creation.TryClaim()) {
+      // Demand wins over queued work. Its queue entry becomes a tombstone.
+      CompletePipelineCreation(pipeline);
+    } else {
+      // Wait only for this PSO, never drain unrelated speculative work.
+      pipeline->creation.Wait();
+    }
+    state = pipeline->state.load(std::memory_order_acquire);
+  }
+  // Deferred translation may replace the provisional root signature.
+  *root_signature_out = pipeline->root_signature.load(std::memory_order_acquire);
+  return state != nullptr && *root_signature_out != nullptr;
+}
+
 void PipelineCache::CreationThread(size_t thread_index) {
   while (true) {
     Pipeline* pipeline_to_create = nullptr;
@@ -4299,16 +4327,11 @@ void PipelineCache::CreationThread(size_t thread_index) {
       // fully created (rather than just started creating).
       pipeline_to_create = creation_queue_.top();
       creation_queue_.pop();
+      if (!pipeline_to_create->creation.TryClaim()) continue;
       ++creation_threads_busy_;
     }
 
-    PipelineRuntimeDescription runtime_description;
-    if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
-      pipeline_to_create->state.store(nullptr, std::memory_order_release);
-    } else {
-      pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
-                                      std::memory_order_release);
-    }
+    CompletePipelineCreation(pipeline_to_create);
 
     // Pipeline created - the thread is not busy anymore, safe to set the
     // completion event if needed (at the next iteration, or in some other
@@ -4332,13 +4355,9 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       pipeline_to_create = creation_queue_.top();
       creation_queue_.pop();
     }
-    PipelineRuntimeDescription runtime_description;
-    if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
-      pipeline_to_create->state.store(nullptr, std::memory_order_release);
-      continue;
+    if (pipeline_to_create->creation.TryClaim()) {
+      CompletePipelineCreation(pipeline_to_create);
     }
-    pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
-                                    std::memory_order_release);
   }
 }
 

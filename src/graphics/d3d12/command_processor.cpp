@@ -9401,7 +9401,8 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
             &pipeline_handle, &root_signature);
   }
   if (g_draw_prof) g_draw_ns[2] += prof_ns_since(_dp_pso0);
-  if (!_dp_pso_ok) {
+  if (!_dp_pso_ok ||
+      !pipeline_cache_->ResolvePipelineForDraw(pipeline_handle, &root_signature)) {
     return false;
   }
   if (dc_verify && (dc->pso != pipeline_handle || dc->rootsig != root_signature)) {
@@ -9413,14 +9414,6 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // release + used-texture-mask derivation).
   auto _dp_pret0 = g_draw_prof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-  if (!dc_consume && REXCVAR_GET(async_shader_compilation) &&
-      pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    if (g_draw_prof) {
-      g_draw_ns[22] += prof_ns_since(_dp_pret0);
-      ++g_draw_ret[5];
-    }
-    return true;
-  }
 
   // [GPU-PRECORD] Phase 1b-1c Inc 4: pipeline configured -> release the pipeline lock
   // before the texture-request / binding / draw-record tail (which touches no shared

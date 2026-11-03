@@ -27,6 +27,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
+#include <rex/graphics/d3d12/pipeline_creation.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
@@ -97,6 +98,11 @@ class PipelineCache {
                          const uint32_t* bound_depth_and_color_render_targets_formats,
                          void** pipeline_handle_out, ID3D12RootSignature** root_signature_out);
 
+  // Resolve cached handles before bindings; deferred translation may change the root signature.
+  bool ResolvePipelineForDraw(void* handle, ID3D12RootSignature** root_signature_out) {
+    return handle && ResolvePipelineForDraw(static_cast<Pipeline*>(handle), root_signature_out);
+  }
+
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
@@ -118,7 +124,7 @@ class PipelineCache {
   // own shader binaries (5-2's), created by us, cached by us. Returns null
   // when this draw cannot have one, always with a counted reason; the caller
   // then binds the emulated pipeline. Called from the draw path AFTER the
-  // async-creation check, so the root signature handed in is final and both
+  // demand resolution, so the root signature handed in is final and both
   // translations exist.
   ID3D12PipelineState* NrNativePipeline(void* pipeline_handle,
                                         ID3D12RootSignature* root_signature);
@@ -476,6 +482,7 @@ class PipelineCache {
   std::vector<uint8_t> depth_only_pixel_shader_;
 
   struct Pipeline {
+    PipelineCreation creation;
     // nullptr if creation has failed.
     std::atomic<ID3D12PipelineState*> state{nullptr};
     std::atomic<ID3D12RootSignature*> root_signature{nullptr};
@@ -550,6 +557,8 @@ class PipelineCache {
 
   // Pipeline creation threads.
   void CreationThread(size_t thread_index);
+  void CompletePipelineCreation(Pipeline* pipeline);
+  bool ResolvePipelineForDraw(Pipeline* pipeline, ID3D12RootSignature** root_signature_out);
   void CreateQueuedPipelinesOnProcessorThread();
   std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;
