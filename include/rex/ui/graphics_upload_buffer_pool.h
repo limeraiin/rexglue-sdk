@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -19,6 +20,20 @@ namespace rex {
 namespace ui {
 
 using namespace rex::literals;
+
+// [ftrace] upload-pool page creations across every pool and backend: the
+// count and the host ticks inside CreatePageImplementation (the committed
+// resource create and map). Cumulative, never reset; the per-frame trace
+// takes deltas. Relaxed atomics because the presenter's own pool runs on
+// another thread; the creation path is already a driver call, so the two
+// clock reads are noise. Timed only while `timed` is set (the frame trace
+// sets it at its start for mode 3).
+struct UploadPoolTrace {
+  bool timed = false;
+  std::atomic<uint64_t> creates{0};
+  std::atomic<uint64_t> create_ticks{0};
+};
+extern UploadPoolTrace g_upload_pool_trace;
 
 // Submission index is the fence value or a value derived from it (if reclaiming
 // less often than once per fence value, for instance).

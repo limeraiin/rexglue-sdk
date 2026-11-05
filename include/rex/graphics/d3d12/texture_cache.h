@@ -213,6 +213,7 @@ class D3D12TextureCache final : public TextureCache {
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
   void NrTexCaptureImpl(uint32_t slot, NrTexSnap& s) override;
   void NrTexRestoreImpl(uint32_t slot, const NrTexSnap& s) override;
+  bool NrTexRestoreImplEqual(uint32_t slot, const NrTexSnap& s) const override;
 
  private:
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;

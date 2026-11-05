@@ -1418,12 +1418,15 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
   // theoretically. For safety, check whether the window exists unconditionally.
   assert_not_null(window_);
   assert_not_null(surface_);
+  // Coalesce window invalidations, not frame-arrival notifications. A pending
+  // paint (for example while occluded) still needs to keep the UI clock awake
+  // and the redundant display-driver waiter asleep.
+  if (force_ui_thread_paint_tick) {
+    ForceUIThreadPaintTick();
+  }
   if (ui_thread_paint_requested_.exchange(true, std::memory_order_relaxed)) {
     // Invalidation pending already, no need to do it twice.
     return false;
-  }
-  if (force_ui_thread_paint_tick) {
-    ForceUIThreadPaintTick();
   }
   window_->RequestPaint();
   return true;
@@ -1606,8 +1609,8 @@ void Presenter::WaitForUITickFromUIThread() {
       // 120 Hz). Only fall back to vblank-driven UI ticks once the guest has
       // been idle longer than kGuestActiveUITickIdleTimeout, so the UI keeps
       // animating on static screens (menus, paused guest output, etc.).
-      // The vblank thread keeps signaling every vblank, so a guest frame that
-      // forces a tick while we wait here is still picked up promptly.
+      // ForceUIThreadPaintTick signals this wait directly. The vblank worker
+      // sleeps while guest frames are arriving and resumes for the idle UI.
       constexpr std::chrono::milliseconds kGuestActiveUITickIdleTimeout{100};
       bool guest_recently_presented =
           (std::chrono::steady_clock::now() - dxgi_ui_tick_last_force_time_) <
@@ -1632,6 +1635,10 @@ void Presenter::ForceUIThreadPaintTick() {
   // Remember when the guest output last forced a tick so WaitForUITick can pace
   // the UI to the guest frame rate while the guest is actively presenting.
   dxgi_ui_tick_last_force_time_ = std::chrono::steady_clock::now();
+  // A guest frame is itself a paint tick. Wake the UI directly rather than
+  // making it wait for the independent monitor-vblank worker to signal it.
+  dxgi_ui_tick_signal_condition_.notify_all();
+  dxgi_ui_tick_control_condition_.notify_all();
 #endif  // XE_PLATFORM
 }
 
@@ -1664,16 +1671,32 @@ void Presenter::DXGIUITickThread() {
       dxgi_ui_tick_control_condition_.wait(dxgi_ui_tick_lock);
       continue;
     }
+    // WaitForUITick already uses guest frame arrivals while the guest is
+    // active. Do not also wait on the display driver for unused vblank ticks:
+    // on hybrid laptops that driver wait can consume an entire CPU core.
+    // Keep the existing 100 ms idle fallback for UI-only animation. This wait
+    // releases the lock, and both guest frames and shutdown interrupt it.
+    const auto guest_idle_at = dxgi_ui_tick_last_force_time_ +
+                               std::chrono::milliseconds(100);
+    if (std::chrono::steady_clock::now() < guest_idle_at) {
+      dxgi_ui_tick_control_condition_.wait_until(dxgi_ui_tick_lock, guest_idle_at);
+      continue;
+    }
     // Wait for vertical blank, with the mutex unlocked (holding a new reference
     // to the current output while it's happening) so subscribers can still do
     // early-out checks.
     bool wait_succeeded;
+    Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
     {
-      Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
       dxgi_ui_tick_lock.unlock();
-      wait_succeeded = SUCCEEDED(dxgi_ui_tick_output_->WaitForVBlank());
+      wait_succeeded = SUCCEEDED(dxgi_output->WaitForVBlank());
     }
     dxgi_ui_tick_lock.lock();
+    // The UI may replace the output while its old vblank wait is in flight.
+    // Neither count its tick nor clear the replacement if the old wait failed.
+    if (dxgi_ui_tick_output_.Get() != dxgi_output.Get()) {
+      continue;
+    }
     if (wait_succeeded) {
       ++dxgi_ui_tick_last_vblank_;
     } else {

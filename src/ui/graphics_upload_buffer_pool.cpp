@@ -12,11 +12,14 @@
 #include <algorithm>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/math.h>
 #include <rex/ui/graphics_upload_buffer_pool.h>
 
 namespace rex {
 namespace ui {
+
+UploadPoolTrace g_upload_pool_trace;  // [ftrace]
 
 GraphicsUploadBufferPool::~GraphicsUploadBufferPool() {
   ClearCache();
@@ -121,8 +124,20 @@ GraphicsUploadBufferPool::Page* GraphicsUploadBufferPool::Request(uint64_t submi
       }
     }
     if (!writable_first_) {
-      // Create a new page if none available.
-      writable_first_ = CreatePageImplementation();
+      // Create a new page if none available. The pool never releases a page
+      // (no trim, no age policy): a page created here lives until
+      // ClearCache or the destructor, so this runs only while the pool is
+      // still growing to its high-water mark.
+      // [ftrace] the one site every backend's page creation goes through.
+      if (g_upload_pool_trace.timed) {
+        const uint64_t t0 = rex::chrono::Clock::QueryHostTickCount();
+        writable_first_ = CreatePageImplementation();
+        g_upload_pool_trace.create_ticks.fetch_add(
+            rex::chrono::Clock::QueryHostTickCount() - t0, std::memory_order_relaxed);
+        g_upload_pool_trace.creates.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        writable_first_ = CreatePageImplementation();
+      }
       if (!writable_first_) {
         // Failed to create.
         return nullptr;

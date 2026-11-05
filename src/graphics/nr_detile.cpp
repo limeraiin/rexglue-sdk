@@ -11,6 +11,7 @@
  */
 
 #include <rex/graphics/nr_detile.h>
+#include <rex/graphics/nr_direct_env.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -131,6 +132,7 @@ inline bool BandIsWellFormed(const DetileRegs& r) {
 }  // namespace
 
 void DetileSetEnabled(bool enabled) {
+  if (enabled != g_st.enabled) NrDirectEnvBump();  // the widen's enable input
   if (!enabled && g_st.enabled) {
     const DetileStats keep = g_st.stats;
     g_st = State{};
@@ -184,12 +186,14 @@ void DetileObserve(const DetileRegs& r, bool is_resolve, uint32_t copy_dest_base
         const uint32_t delta = copy_dest_base - g_st.band0_dest[k];
         if (!bands_in || !delta || (delta % bands_in) != 0) {
           g_st.guard_tripped = true;
+          NrDirectEnvBump();  // the widen answers 0 for the rest of the frame
         } else {
           const uint32_t per_band = delta / bands_in;
           if (!g_st.stride_per_band) {
             g_st.stride_per_band = per_band;
           } else if (g_st.stride_per_band != per_band) {
             g_st.guard_tripped = true;
+            NrDirectEnvBump();  // the widen answers 0 for the rest of the frame
           }
         }
       }
@@ -254,6 +258,12 @@ DetileFrameVerdict DetileFrameEnd() {
   }
   const bool ok = g_st.obs_saw_band && g_st.obs_consistent && !g_st.guard_tripped &&
                   g_st.obs_band_rows && g_st.obs_full_height > g_st.obs_band_rows;
+  // The widen's armed state, pass signature and full height: a change moves
+  // the direct submission environment stamp (baked scissors re-derive).
+  if (ok != g_st.armed ||
+      (ok && (g_st.sig != g_st.obs_sig || g_st.full_height != g_st.obs_full_height))) {
+    NrDirectEnvBump();
+  }
   if (ok) {
     g_st.armed = true;
     g_st.sig = g_st.obs_sig;
@@ -290,7 +300,22 @@ void DetileCountExtendedResolve() { ++g_st.stats.resolves_extended; }
 
 void DetileSetTapFilter(int32_t tap) { g_st.tap_filter = tap; }
 
-void DetileSetWidenSegLimit(int32_t seg) { g_st.widen_seg_limit = seg; }
+void DetileSetWidenSegLimit(int32_t seg) {
+  if (seg != g_st.widen_seg_limit) NrDirectEnvBump();  // the widen's segment input
+  g_st.widen_seg_limit = seg;
+}
+
+bool DetileWidenSegLimited() { return g_st.widen_seg_limit >= 0; }
+
+uint64_t DetileWidenStamp() {
+  const uint32_t flags = (g_st.enabled ? 1u : 0u) | (g_st.armed ? 2u : 0u) |
+                         (g_st.guard_tripped ? 4u : 0u);
+  const uint32_t low = (flags & 0xFFu) | ((uint32_t(g_st.widen_seg_limit) & 0xFFu) << 8) |
+                       ((g_st.full_height & 0xFFFFu) << 16);
+  const uint32_t sig = g_st.sig.surface_info ^ (g_st.sig.color_info * 0x9E3779B1u) ^
+                       (g_st.sig.depth_info * 0x85EBCA77u);
+  return (uint64_t(sig) << 32) | low;
+}
 
 uint32_t DetileBand0Taps() { return g_st.band0_taps; }
 

@@ -26,6 +26,7 @@
 #include <rex/platform/exceptions.h>
 #include <rex/runtime.h>
 #include <rex/stream.h>
+#include <rex/system/cpu_pin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
@@ -35,6 +36,11 @@
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+
+#if REX_PLATFORM_WIN32
+#include <windows.h>  // [cpu-pin] topology query and thread affinity
+#include <vector>
+#endif
 
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
@@ -51,6 +57,76 @@ const uint32_t XAPC::kDummyRundownRoutine;
 using namespace rex::literals;
 
 uint32_t next_xthread_id_ = 0;
+
+// [cpu-pin] runtime side of include/rex/system/cpu_pin.h.
+namespace cpu_pin {
+namespace {
+std::atomic<bool> g_active{false};
+uint64_t g_guest_mask = 0;  // written before g_active, read after
+}  // namespace
+
+bool active() { return g_active.load(std::memory_order_acquire); }
+uint64_t guest_mask() { return g_guest_mask; }
+
+bool Enable(KernelState* kernel_state, int mode) {
+#if REX_PLATFORM_WIN32
+  if (active()) {
+    return true;
+  }
+  DWORD len = 0;
+  GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+  std::vector<uint8_t> buf(len ? len : 1);
+  auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+  if (!len || !GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
+    REXSYS_WARN("[cpu-pin] off: processor topology query failed ({})", GetLastError());
+    return false;
+  }
+  // One entry per physical core, each a variable-size record; group 0 only.
+  uint64_t cores[64];
+  size_t count = 0;
+  // Records are variable size (Size), shorter than sizeof the union struct;
+  // the last record must not be dropped (run 976 saw 5 of 6 cores).
+  for (DWORD off = 0; off + 8 <= len;) {
+    auto* p = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+    if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount >= 1 &&
+        p->Processor.GroupMask[0].Group == 0 && count < 64) {
+      cores[count++] = uint64_t(p->Processor.GroupMask[0].Mask);
+    }
+    if (!p->Size) {
+      break;
+    }
+    off += p->Size;
+  }
+  Plan plan;
+  if (!PlanFromCores(cores, count, &plan, mode >= 2)) {
+    REXSYS_WARN("[cpu-pin] off: {} cores, {} logical processors (need 2 cores, 4 logical)",
+                count, rex::thread::logical_processor_count());
+    return false;
+  }
+  HANDLE self = GetCurrentThread();
+  if (!SetThreadAffinityMask(self, DWORD_PTR(plan.cp_mask))) {
+    REXSYS_WARN("[cpu-pin] off: SetThreadAffinityMask({:#x}) failed ({})", plan.cp_mask,
+                GetLastError());
+    return false;
+  }
+  SetThreadIdealProcessor(self, plan.cp_ideal);
+  g_guest_mask = plan.guest_mask;
+  g_active.store(true, std::memory_order_release);
+  const uint32_t pinned = kernel_state ? kernel_state->PinGuestThreads(plan.guest_mask) : 0;
+  REXSYS_INFO(
+      "[cpu-pin] on: mode {} CP thread mask {:#x} ideal {} | guest mask {:#x} ({} existing "
+      "guest threads, later ones at creation) | {} cores, {} logical processors",
+      mode, plan.cp_mask, plan.cp_ideal, plan.guest_mask, pinned, plan.cores, plan.logical);
+  return true;
+#else
+  (void)kernel_state;
+  (void)mode;
+  REXSYS_WARN("[cpu-pin] off: Windows only");
+  return false;
+#endif
+}
+
+}  // namespace cpu_pin
 
 XThread::XThread(KernelState* kernel_state)
     : XObject(kernel_state, kObjectType), guest_thread_(true) {}
@@ -876,7 +952,13 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
     pcr.prcb_data.current_cpu = cpu_index;
   }
 
-  if (rex::thread::logical_processor_count() >= 6) {
+  if (cpu_pin::active()) {
+    // [cpu-pin] guest threads share the cores the CP thread does not own;
+    // the fake-cpu pin below never applies while the pin is on.
+    if (guest_thread_ && thread_) {
+      thread_->set_affinity_mask(cpu_pin::guest_mask());
+    }
+  } else if (rex::thread::logical_processor_count() >= 6) {
     if (!REXCVAR_GET(ignore_thread_affinities)) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }

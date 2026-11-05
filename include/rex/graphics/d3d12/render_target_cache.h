@@ -70,8 +70,30 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void InvalidateCommandListRenderTargets() {
     are_current_command_list_render_targets_valid_ = false;
   }
+  // Diagnostic snapshot of identities actually latched for OM binding.
+  bool NrBoundRenderTargetIdentities(uintptr_t* out) const {
+    if (!are_current_command_list_render_targets_valid_) return false;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i)
+      out[i] = reinterpret_cast<uintptr_t>(current_command_list_render_targets_[i]);
+    return true;
+  }
 
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
+
+  // [NR-NATIVE-R2] direct submission: the per-draw half of Update for a draw
+  // whose inputs are proven unchanged since the last Update (the fast
+  // executor's nr_update_serial latch): the [xfer] read census note per used
+  // target from a baked verdict (FastXferVerdict), then the latched command
+  // list binding (a new submission or a state change rebinds; equal targets
+  // cost the pointer compare). Skipped: the base body and its fingerprint,
+  // the empty transfer pass and the verdict derivation.
+  void NrDirectUpdateTail(uint32_t reads_mask, const uint8_t* reasons) {
+    RenderTarget* const* used = last_update_used_render_targets();
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (used[i]) XferUseNoteDraw(used[i]->key(), ((reads_mask >> i) & 1u) != 0u, reasons[i]);
+    }
+    SetCommandListRenderTargets(last_update_accumulated_render_targets());
+  }
 
   void WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void WriteEdramRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);

@@ -63,6 +63,8 @@ class PipelineCache {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking);
   void ShutdownShaderStorage();
+  // Boot pass progress (see CommandProcessor::GetShaderStorageProgress).
+  bool GetBootProgress(uint32_t* phase, uint32_t* done, uint32_t* total);
 
   void EndSubmission();
   bool IsCreatingPipelines();
@@ -128,6 +130,8 @@ class PipelineCache {
   // translations exist.
   ID3D12PipelineState* NrNativePipeline(void* pipeline_handle,
                                         ID3D12RootSignature* root_signature);
+  // Copy the selected pipeline's semantic key for native comparison diagnostics.
+  bool NrCopyPipelineDescription(void* pipeline_handle, uint32_t* out16) const;
   // [NR-NPSO] Phase 5-3a: emit the native-pipeline verdict once a second.
   void NrNativePsoReportIfDue();
 
@@ -508,6 +512,11 @@ class PipelineCache {
 
   // Currently open shader storage path.
   std::filesystem::path shader_storage_cache_root_;
+  // Boot pass progress: phase 0 idle / 1 shaders / 2 pipelines; processed =
+  // descriptions consumed by the boot loop (in-flight ones subtracted at read).
+  std::atomic<uint32_t> boot_phase_{0};
+  std::atomic<uint32_t> boot_processed_{0};
+  std::atomic<uint32_t> boot_total_{0};
   uint32_t shader_storage_title_id_ = 0;
 
   // Shader storage output stream, for preload in the next emulator runs.

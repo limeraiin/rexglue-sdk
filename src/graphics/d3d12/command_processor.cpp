@@ -10,11 +10,14 @@
  */
 
 #include <algorithm>
+#include <bit>  // [NR-NATIVE-R2] std::bit_cast
 #include <cfloat>
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
+#include <new>  // [NR-NATIVE-R2] v2 placement blobs
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -29,10 +32,12 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/hitch_probe.h>
+#include <rex/graphics/frame_trace_scope.h>  // [ftrace] v3 exec split
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/nr_bindings.h>
 #include <rex/graphics/nr_draw_cache.h>  // [GKEY] rung-2 census join
+#include <rex/graphics/nr_draw_observer.h>
 #include <rex/graphics/nr_cpu_readback.h>
 
 // [SKC] the rung-2 skip census tracker lives in command_processor.cpp (global scope).
@@ -56,6 +61,7 @@ void NrCtxShaderRef(int which, uint32_t* addr, uint32_t* ndw, uint8_t* immediate
 }  // namespace rex::graphics
 #include <rex/graphics/nr_descriptors.h>
 #include <rex/graphics/nr_detile.h>
+#include <rex/graphics/nr_direct_env.h>  // [NR-NATIVE-R2] N4 step 4
 #include <rex/graphics/nr_residency.h>
 #include <rex/graphics/nr_sys_constants.h>
 #include <rex/graphics/nr_native_pso.h>
@@ -488,13 +494,15 @@ REXCVAR_DEFINE_INT32(gpu_hiz_rebuild, 800, "GPU/D3D12",
                      "[hiz] received draws after the last build or invalidation before the Hi-Z "
                      "is (re)built; until then checkpoints test against the stale Hi-Z (still "
                      "conservative) or, when invalid, hide nothing.");
-REXCVAR_DEFINE_INT32(gpu_occ_census, 2, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(gpu_native_phase_marker, false, "GPU/D3D12",
+                    "DEV: show the native renderer phase square (default off).");
+REXCVAR_DEFINE_INT32(gpu_occ_census, 0, "GPU/D3D12",
                      "[occ] per-draw pipeline-statistics + occlusion query census: 0 off, 1 "
                      "always (halves the Intel fps), 2 only in a verify phase of [cull]/[hiz].");
 // [gpu-census] N-10c: the naruto_636 iGPU drive proved the Intel city wall
 // is the GPU (700-775 ms/s submission-fence blocking); this names what the
 // GPU second is spent on before anything is designed against it.
-REXCVAR_DEFINE_BOOL(d3d12_gpu_census, true, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(d3d12_gpu_census, false, "GPU/D3D12",
                     "[gpu-census] N-10c: price the GPU second by work class with "
                     "timestamp queries (draw / RTC transfer / resolve / texture upload / "
                     "shared-memory upload / swap), reported once a second. A few hundred "
@@ -3108,6 +3116,9 @@ struct DcEntry {
   uint32_t smp_v[kDcSmpMax] = {}, smp_p[kDcSmpMax] = {};
   uint32_t si_v[kDcSmpMax] = {}, si_p[kDcSmpMax] = {};
   uint32_t di_v[kDcDiMax] = {}, di_p[kDcDiMax] = {};
+  // [NR-NATIVE-R2] N4 step 2: XXH3 of di_v[0..di_n_v) / di_p[0..di_n_p),
+  // the direct descriptor-indices latch key (NrDirectLatch::di_hash).
+  uint64_t di_hash_v = 0, di_hash_p = 0;
   TextureCache::NrTexSnap tex[kDcTexMax] = {};
 };
 struct DcSlot {
@@ -3129,6 +3140,7 @@ int32_t g_dc_mode = 0;        // per-frame latch of gpu_dcache: 0 off, 1 verify,
 // compare against (verify).
 const DcEntry* g_dc_bind = nullptr;
 const DcEntry* g_dc_bind_verify = nullptr;
+bool g_dc_bind_direct = false;  // [NR-NATIVE-R2] N4 step 2: the direct bind of g_dc_bind
 bool g_dc_bind_ne = false;  // verify: the bindings half found a mismatch
 // The descriptor-indices packs as currently bound (bytes + dword count;
 // UINT32_MAX = unknown, e.g. after the emulated fallback composed its own).
@@ -4438,6 +4450,8 @@ void D3D12CommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
+  ++nr_fast_gen_;  // [NR-NATIVE-R2] v2: every fast table entry is stale
+  nr::NrDirectEnvBump();  // [NR-NATIVE-R2] N4 step 4: and every baked head
 }
 
 void D3D12CommandProcessor::InvalidateGpuMemory() {
@@ -4489,6 +4503,12 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
                                                     uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
+  ++nr_fast_gen_;  // [NR-NATIVE-R2] v2: every fast table entry is stale
+}
+
+bool D3D12CommandProcessor::GetShaderStorageProgress(ShaderStorageProgress* out) {
+  if (!pipeline_cache_) return false;
+  return pipeline_cache_->GetBootProgress(&out->phase, &out->done, &out->total);
 }
 
 void D3D12CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
@@ -6199,6 +6219,7 @@ bool D3D12CommandProcessor::SetupContext() {
   pix_capturing_ = false;
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
   InitializeGpuCensusResources();
+  InitializeFtraceGpuResources();  // [ftrace] mode 2 only
   InitializeOccCensusResources();
   nr_cull_.Initialize(memory_, shared_memory_.get());  // [cull]
   InitializeHizResources();                             // [hiz]
@@ -6218,6 +6239,10 @@ void D3D12CommandProcessor::ShutdownContext() {
   // while the parse thread is blocked inside PrecordFlush).
   PrecordWorkerShutdown();
   AwaitAllQueueOperationsCompletion();
+  // [ftrace] every submission is complete now: harvest the last timestamp
+  // pairs into their frames, then write the CSV beside the log.
+  ShutdownFtraceGpuResources();
+  ftrace::DumpAtShutdown();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
   ShutdownGpuCensusResources();
@@ -6330,6 +6355,7 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   render_target_cache_.reset();
 
+  NrFastShutdown();  // [NR-NATIVE-R2] the fast executor's global watch
   shared_memory_.reset();
 
   deferred_command_list_.Reset();
@@ -6930,6 +6956,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   // [NR-NPSO] Phase 5-3a: latch the two cvars once a frame, so the per-draw
   // path reads a plain bool. Binding implies building.
+  if (g_nr_native_pso_bind != REXCVAR_GET(gpu_nr_native_pso_bind)) {
+    nr::NrDirectEnvBump();  // [NR-NATIVE-R2] N4 step 4: a baked head input
+  }
   g_nr_native_pso_bind = REXCVAR_GET(gpu_nr_native_pso_bind);
   g_nr_native_pso = REXCVAR_GET(gpu_nr_native_pso) || g_nr_native_pso_bind;
   // [NR-VERIFY] inc 2: master verify latch. On a rising edge the mirrors
@@ -8215,6 +8244,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         if (REXCVAR_GET(gpu_rtt_cycle) > 0) {
           SwapPhaseMarker(guest_output_resource, rtt_alias_active_ ? 1 : 0);  // [rtt-alias]
         }
+        // [NR-NATIVE-R2] the producer's installed phase (-1 = no marker).
+        if (const int nat_phase = nr_native::NrNativePhase();
+            REXCVAR_GET(gpu_native_phase_marker) && nat_phase >= 0) {
+          SwapPhaseMarker(guest_output_resource, std::clamp(nat_phase, 0, 3));
+        }
 
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
@@ -8377,9 +8411,460 @@ bool D3D12CommandProcessor::NrSubmitDraw(const NrDrawInput& input) {
   return draw_succeeded;
 }
 
+// [NR-NATIVE-R2] WP1: the delegate path for one native record. The record is
+// overlaid onto the LIVE register file through the full virtual
+// WriteRegister, not a raw value store: the cbuffer up_to_date flags, the
+// texture cache fetch-constant notifications and the vertex residency all
+// hang off WriteRegister, so a raw store would draw with stale constants and
+// leave this draw's upload bound for the next retail draw. The draw goes
+// through IssueDrawImpl, so the render target, texture and pipeline caches
+// and the bindings derive from the overlaid file; the deferred list binds
+// through its tracker. The saved values are written back the same way, in
+// reverse order, so a duplicate index restores the original. Nothing below
+// 0x2000 is ever written. Accounting: markers = drawn + verified + every
+// refused_* except refused_predicated and refused_precord (a subset of
+// refused_draw) + skipped_band + skipped_viz; refused_predicated counts
+// markers that never reached this function.
+// v2: this is NrNativeExecuteV1, run by the gpu_native_exec dispatcher
+// (nr_native_fast.cpp, NrNativeExecute) in mode 0 and for every fast-path
+// fallback reached before its overlay; the overlay/draw/restore half is
+// NrNativeDelegateBody, which the fast path also runs after undoing its own
+// raw overlay.
+void D3D12CommandProcessor::NrNativeExecuteV1(uint32_t slot_sequence) {
+  using namespace nr_native;
+  NrNativeBump(&NrNativeCounters::markers);
+  NrNativeDrawRecord& rec = nr_native_rec_;
+  bool torn = false;
+  switch (NrNativeAcquireForDraw(slot_sequence, &rec, &torn, NrNativeDrawBandAllowed())) {
+    case NrNativeVerdict::kOk:
+      break;
+    case NrNativeVerdict::kNoRing:
+      NrNativeBump(&NrNativeCounters::refused_no_ring);
+      return;
+    case NrNativeVerdict::kSlotRange:
+      NrNativeBump(&NrNativeCounters::refused_slot);
+      return;
+    case NrNativeVerdict::kSequence:
+    default:
+      NrNativeBump(torn ? &NrNativeCounters::refused_torn
+                        : &NrNativeCounters::refused_sequence);
+      return;
+  }
+  if (!NrNativeRecordBoundsOk(rec.register_count, rec.constant_count)) {
+    NrNativeBump(&NrNativeCounters::refused_record);
+    return;
+  }
+  if (rec.flags & kNrNativeVerifyOnly) {
+    NrNativeBump(&NrNativeCounters::verified);
+    return;
+  }
+  // Precord capture defers draws into a segment log and replays them against
+  // a rewound file; an inline overlay would be captured half way. Refused.
+  if (g_precord_capture) {
+    NrNativeBump(&NrNativeCounters::refused_draw);
+    NrNativeBump(&NrNativeCounters::refused_precord);
+    if (!nr_native_precord_logged_) {
+      nr_native_precord_logged_ = true;
+      REXGPU_WARN(
+          "[jade-native-cp] REFUSED: precord capture is on, native records are not drawn "
+          "(counted as refused draw)");
+    }
+    return;
+  }
+  // The retail draw stop's gate: a repeat band drops the draw there too.
+  if (!NrNativeDrawAllowed()) {
+    NrNativeBump(&NrNativeCounters::skipped_band);
+    return;
+  }
+  // Shaders before any write, so a refusal needs no restore. Same pointer
+  // form and call as ExecutePacketType3_IM_LOAD.
+  const uint32_t vs_addr = rec.vs_address & ~3u;
+  const uint32_t ps_addr = rec.ps_address & ~3u;
+  Shader* vs = rec.vs_dwords
+                   ? LoadShader(xenos::ShaderType::kVertex, vs_addr,
+                                memory_->TranslatePhysical<uint32_t*>(vs_addr), rec.vs_dwords)
+                   : nullptr;
+  Shader* ps = rec.ps_dwords
+                   ? LoadShader(xenos::ShaderType::kPixel, ps_addr,
+                                memory_->TranslatePhysical<uint32_t*>(ps_addr), rec.ps_dwords)
+                   : nullptr;
+  if (!vs || (rec.ps_dwords && !ps)) {
+    NrNativeBump(&NrNativeCounters::refused_shader);
+    return;
+  }
+  NrNativeDelegateBody(vs, ps);
+}
+
+// The v1 delegate body on nr_native_rec_ (acquired and gated by the caller,
+// shaders loaded): overlay through WriteRegister, IssueDrawImpl, restore.
+// Also the v2 fast path's fallback (it restores its own raw overlay first).
+void D3D12CommandProcessor::NrNativeDelegateBody(Shader* vs, Shader* ps) {
+  using namespace nr_native;
+  const NrNativeDrawRecord& rec = nr_native_rec_;
+  // Overlay.
+  uint32_t n_saved = 0;
+  uint64_t regs_applied = 0, consts_applied = 0;
+  for (uint32_t i = 0; i < rec.register_count; ++i) {
+    const uint32_t index = rec.registers[i].index;
+    if (index < kNrNativeRegisterFloor) {
+      NrNativeBump(&NrNativeCounters::skipped_register_low);
+      continue;
+    }
+    if (!NrNativeRegisterWritable(index) || index >= RegisterFile::kRegisterCount) {
+      NrNativeBump(&NrNativeCounters::skipped_register_high);
+      continue;
+    }
+    nr_native_saved_[n_saved++] = {index, register_file_->values[index]};
+    WriteRegister(index, rec.registers[i].value);
+    ++regs_applied;
+  }
+  for (uint32_t i = 0; i < rec.constant_count; ++i) {
+    const uint32_t base = NrNativeConstantRegister(rec.constants[i].reg);
+    if (!base) {
+      NrNativeBump(&NrNativeCounters::skipped_constant_range);
+      continue;
+    }
+    for (uint32_t k = 0; k < 4; ++k) {
+      nr_native_saved_[n_saved++] = {base + k, register_file_->values[base + k]};
+      WriteRegister(base + k, std::bit_cast<uint32_t>(rec.constants[i].v[k]));
+    }
+    ++consts_applied;
+  }
+  // v2 fix: the three registers the replaced retail DRAW_INDX writes
+  // (VGT_DRAW_INITIATOR, VGT_DMA_BASE, VGT_DMA_SIZE). The record carries them
+  // only as fields, and PrimitiveProcessor::Process, IsPrimitivePolygonal and
+  // the system constants read the REGISTERS: without these the draw used the
+  // previous retail draw's index buffer, count and primitive type. Same
+  // WriteRegister + save/restore as every other overlaid register (no D3D12
+  // tail below 0x4000); not counted in registers_applied.
+  {
+    const FastDrawRegs dr = FastSynthDrawRegs(rec.prim_type, rec.index_count, rec.flags,
+                                              rec.index_base, rec.index_endian);
+    nr_native_saved_[n_saved++] = {kFastRegVgtDrawInitiator,
+                                   register_file_->values[kFastRegVgtDrawInitiator]};
+    WriteRegister(kFastRegVgtDrawInitiator, dr.initiator);
+    if (dr.indexed) {
+      nr_native_saved_[n_saved++] = {kFastRegVgtDmaBase,
+                                     register_file_->values[kFastRegVgtDmaBase]};
+      WriteRegister(kFastRegVgtDmaBase, dr.dma_base);
+      nr_native_saved_[n_saved++] = {kFastRegVgtDmaSize,
+                                     register_file_->values[kFastRegVgtDmaSize]};
+      WriteRegister(kFastRegVgtDmaSize, dr.dma_size);
+    }
+  }
+  NrNativeBump(&NrNativeCounters::registers_applied, regs_applied);
+  NrNativeBump(&NrNativeCounters::constants_applied, consts_applied);
+  // Draw, unless the overlaid state carries the retail tail's viz kill.
+  if (NrNativeVizKilled()) {
+    NrNativeBump(&NrNativeCounters::skipped_viz);
+  } else {
+    IndexBufferInfo ibi;
+    IndexBufferInfo* ibi_ptr = nullptr;
+    if (rec.flags & kNrNativeIndexed) {
+      const bool i32 = (rec.flags & kNrNativeIndex32) != 0;
+      const uint32_t index_size = i32 ? 4u : 2u;
+      ibi.format = i32 ? xenos::IndexFormat::kInt32 : xenos::IndexFormat::kInt16;
+      ibi.endianness = xenos::Endian(rec.index_endian & 3u);
+      ibi.count = rec.index_count;
+      ibi.guest_base = rec.index_base & ~(index_size - 1);
+      ibi.length = rec.index_length;
+      ibi_ptr = &ibi;
+    }
+    // The draw's own shaders through the gate the active_*_shader()
+    // accessors consult; the previous gate state is put back afterwards.
+    const bool gate_was = nr_issue_shaders_active_;
+    Shader* const gate_vs = nr_issue_vertex_shader_;
+    Shader* const gate_ps = nr_issue_pixel_shader_;
+    nr_issue_vertex_shader_ = vs;
+    nr_issue_pixel_shader_ = ps;
+    nr_issue_shaders_active_ = true;
+    const bool ok = IssueDrawImpl(xenos::PrimitiveType(rec.prim_type), rec.index_count, ibi_ptr,
+                                  /*major_mode_explicit=*/true);
+    // Capture while the shader accessor gate still names this native draw.
+    if (nr_fast_cmp_armed_) NrFastCmpCaptureV1(ok);
+    nr_issue_shaders_active_ = gate_was;
+    nr_issue_vertex_shader_ = gate_vs;
+    nr_issue_pixel_shader_ = gate_ps;
+    NrNativeBump(ok ? &NrNativeCounters::drawn : &NrNativeCounters::refused_draw);
+    // v2 compare mode: capture what v1 drew with, before the restore.
+  }
+  // Restore, newest first.
+  while (n_saved) {
+    const NrNativeSaved& sv = nr_native_saved_[--n_saved];
+    WriteRegister(sv.index, sv.value);
+  }
+}
+
+void D3D12CommandProcessor::NrRetailCmpCopySystem(void* destination) const {
+  // The lean derivation leaves system_constants_ at the previous draw.
+  // Select the same current CPU payload the successful bindings path uploads.
+  if (g_nr_sys_member_stale)
+    std::memcpy(destination, &g_nr_sys_state, sizeof(system_constants_));
+  else
+    std::memcpy(destination, &system_constants_, sizeof(system_constants_));
+}
+
+// ── [NR-NATIVE-R2] v2 bridge ────────────────────────────────────────────────
+// The fast executor (nr_native_fast.cpp) runs the same draw-path stages as
+// IssueDrawImpl; the pieces of state those stages keep in this file's
+// anonymous namespace are reached only through these members, each a
+// transcription of the IssueDrawImpl block it names.
+static_assert(sizeof(DcEntry) <= nr_native::kFastBlobBytes,
+              "[NR-NATIVE-R2] the fast entry's bindings blob must hold a DcEntry");
+static_assert(alignof(DcEntry) <= 16, "[NR-NATIVE-R2] the blob is 16-byte aligned");
+static_assert(std::is_trivially_destructible_v<DcEntry>,
+              "[NR-NATIVE-R2] blobs are overwritten, never destroyed");
+
+uint32_t D3D12CommandProcessor::NrFastEnvRefusal() const {
+  using namespace nr_native;
+  if (g_parallel_record) return kFastFbParallel;
+  if (g_instance) return kFastFbInstance;
+  if (!g_nr_swap || !bindless_resources_used_) return kFastFbNoSwap;
+  // A live tile recording / compare / replay, or tile replay awake (not
+  // dormant under the de-tile): every draw must advance its ordinals.
+  if (g_tile_rec_open || g_tile_cmp_open || g_tile_mode != 0 || (g_nr_tile_on && !g_tile_dormant)) {
+    return kFastFbTile;
+  }
+  if (g_nr_span_consume || g_spr_open) return kFastFbSpan;
+  // The reuse bundles key on the walk's current stop (NrRuseCurrentDraw),
+  // which a marker is not: NrUpdateBindings would restore or capture the
+  // wrong bundle.
+  if (g_nr_rub || g_nr_rub_fast || g_nr_ruf_v2b) return kFastFbReuse;
+  return kFastFbNone;
+}
+
+bool D3D12CommandProcessor::NrFastPrecordCapture() const { return g_precord_capture; }
+
+// IssueDrawImpl's [DRAW-POOL] key-time bookkeeping without the key, the
+// predictor or the hit: a pass change closes every batch, a draw outside the
+// order-independent class closes every batch (so later hits cannot be drawn
+// before it). Returns the class verdict; the fast draw never joins a batch.
+bool D3D12CommandProcessor::NrFastPoolPrologue(const RegisterFile& regs, bool* pool_on) {
+  *pool_on = g_pool_on;
+  if (!g_pool_on) return false;
+  uint64_t pk = 0;
+  pk = inst_mix(pk, regs[XE_GPU_REG_RB_SURFACE_INFO]);
+  pk = inst_mix(pk, regs[XE_GPU_REG_RB_MODECONTROL]);
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    pk = inst_mix(pk, regs[reg::RB_COLOR_INFO::rt_register_indices[i]]);
+  }
+  pk = inst_mix(pk, regs[XE_GPU_REG_RB_DEPTH_INFO]);
+  if (!g_pool_pass_open || pk != g_pool_pass_key) {
+    if (g_pool_pass_open) PoolClose(kPoolClosePass);
+    g_pool_pass_key = pk;
+    g_pool_pass_open = true;
+  }
+  const bool cls = PoolClassOpaque(regs);
+  if (!cls) PoolClose(kPoolCloseClass);
+  return cls;
+}
+
+// The prologue's two register-derived words, for an object entry: the pass
+// key (the inst_mix chain above) and the order-independent class verdict.
+void D3D12CommandProcessor::NrFastPoolBake(const RegisterFile& regs, uint64_t* pool_key,
+                                           bool* pool_cls) const {
+  uint64_t pk = 0;
+  pk = inst_mix(pk, regs[XE_GPU_REG_RB_SURFACE_INFO]);
+  pk = inst_mix(pk, regs[XE_GPU_REG_RB_MODECONTROL]);
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    pk = inst_mix(pk, regs[reg::RB_COLOR_INFO::rt_register_indices[i]]);
+  }
+  pk = inst_mix(pk, regs[XE_GPU_REG_RB_DEPTH_INFO]);
+  *pool_key = pk;
+  *pool_cls = PoolClassOpaque(regs);
+}
+
+// NrFastPoolPrologue on baked inputs: the same compares, the same closes.
+bool D3D12CommandProcessor::NrFastPoolApply(uint64_t pool_key, bool pool_cls, bool* pool_on) {
+  *pool_on = g_pool_on;
+  if (!g_pool_on) return false;
+  if (!g_pool_pass_open || pool_key != g_pool_pass_key) {
+    if (g_pool_pass_open) PoolClose(kPoolClosePass);
+    g_pool_pass_key = pool_key;
+    g_pool_pass_open = true;
+  }
+  if (!pool_cls) PoolClose(kPoolCloseClass);
+  return pool_cls;
+}
+
+// The system constants upload source (NrUpdateBindings uploads g_nr_sys_state
+// whenever cbuffer_binding_system_ is not up to date).
+void D3D12CommandProcessor::NrFastSysStateGet(void* destination) const {
+  std::memcpy(destination, &g_nr_sys_state, sizeof(g_nr_sys_state));
+}
+
+// Stores a derived block into the upload source. The member copy is then
+// stale (the next full-body derivation re-syncs it, as after the lean path);
+// g_nr_sys_changed follows the same rule as a derivation.
+bool D3D12CommandProcessor::NrFastSysStateSet(const void* source) {
+  const bool changed = std::memcmp(&g_nr_sys_state, source, sizeof(g_nr_sys_state)) != 0;
+  if (changed) std::memcpy(&g_nr_sys_state, source, sizeof(g_nr_sys_state));
+  g_nr_sys_changed = changed;
+  g_nr_sys_member_stale = true;
+  return changed;
+}
+
+bool D3D12CommandProcessor::NrFastSortOn() const { return g_sort_on; }
+
+void D3D12CommandProcessor::NrFastNativePsoFlags(bool* build, bool* bind) const {
+  *build = g_nr_native_pso;
+  *bind = g_nr_native_pso_bind;
+}
+
+void D3D12CommandProcessor::NrFastWidenScissor(const RegisterFile& regs,
+                                               draw_util::Scissor& scissor) const {
+  NrDetileWidenDrawScissor(regs, scissor);
+}
+
+void D3D12CommandProcessor::NrFastNoteDrawIssued(uint32_t host_vertex_count) {
+  GeoCount(host_vertex_count, false);
+  ++g_frame_issued;
+}
+
+void D3D12CommandProcessor::NrFastAfterResidency() {
+  // [NR-RSY] the residency mirror follows the emulated arrays; the fast loop
+  // does not transcribe its walk, so under verify the mirror is re-seeded.
+  if (g_nr_res && g_nr_verify) NrResVfetchSeedFromEmulated();
+}
+
+void D3D12CommandProcessor::NrFastDcRanges(const uint32_t (**ranges)[2], uint32_t* count) const {
+  *ranges = kDcRegRanges;
+  *count = uint32_t(rex::countof(kDcRegRanges));
+}
+
+// IssueDrawImpl's [NR-SWP] bindings block. `blob` = a DcEntry recorded by
+// NrFastBindCapture (restore the sampler params / heap indices / layout uids
+// / descriptor-indices packs from it) or null (derive). *bind_ok false when
+// the emulated fallback composed its own packs (nothing may be captured).
+bool D3D12CommandProcessor::NrFastBindings(const D3D12Shader* vs, const D3D12Shader* ps,
+                                           ID3D12RootSignature* root_signature, const void* blob,
+                                           bool direct, bool* bind_ok) {
+  *bind_ok = false;
+  if (!g_nr_swap) {
+    const bool ok = UpdateBindings(vs, ps, root_signature, false);
+    if (g_nr_rub) g_rub_stage_ok = false;
+    return ok;
+  }
+  bool refused = false;
+  g_dc_bind = static_cast<const DcEntry*>(blob);
+  g_dc_bind_direct = direct && blob != nullptr;
+  g_dc_bind_verify = nullptr;
+  g_dc_bind_ne = false;
+  bool ok = NrUpdateBindings(vs, ps, root_signature, false, &refused);
+  g_dc_bind = nullptr;
+  g_dc_bind_direct = false;
+  *bind_ok = !refused;
+  if (refused) {
+    g_dc_di_cur_n_v = UINT32_MAX;
+    g_dc_di_cur_n_p = UINT32_MAX;
+    ++g_nr_swap_probe.fallback;
+    g_rub_stage_ok = false;
+    if (g_nr_sys_member_stale) {
+      std::memcpy(&system_constants_, &g_nr_sys_state, sizeof(system_constants_));
+      g_nr_sys_member_stale = false;
+      ++g_nr_swap_probe.sys_lazy;
+    }
+    ok = UpdateBindings(vs, ps, root_signature, false);
+  } else {
+    ++g_nr_swap_probe.swapped;
+  }
+  return ok;
+}
+
+// The [dcache] record block's bindings half, into a blob: the state
+// NrUpdateBindings just left (derived or restored) for these shaders.
+// False (nothing usable) under the same refusals as the record.
+bool D3D12CommandProcessor::NrFastBindCapture(void* blob, const D3D12Shader* vs,
+                                              const D3D12Shader* ps) {
+  const uint32_t smp_v = uint32_t(vs->GetSamplerBindingsAfterTranslation().size());
+  const uint32_t smp_p = ps ? uint32_t(ps->GetSamplerBindingsAfterTranslation().size()) : 0u;
+  const bool bound_v = smp_v != 0 || !vs->GetTextureBindingsAfterTranslation().empty();
+  const bool bound_p = smp_p != 0 || (ps && !ps->GetTextureBindingsAfterTranslation().empty());
+  if ((bound_v && (g_dc_di_cur_n_v == UINT32_MAX || g_dc_di_cur_n_v > kDcDiMax)) ||
+      (bound_p && (g_dc_di_cur_n_p == UINT32_MAX || g_dc_di_cur_n_p > kDcDiMax))) {
+    return false;
+  }
+  if (smp_v > kDcSmpMax || smp_p > kDcSmpMax || current_samplers_vertex_.size() < smp_v ||
+      current_samplers_pixel_.size() < smp_p ||
+      current_sampler_bindless_indices_vertex_.size() < smp_v ||
+      current_sampler_bindless_indices_pixel_.size() < smp_p) {
+    return false;
+  }
+  DcEntry* e = new (blob) DcEntry();
+  e->vs = vs;
+  e->ps = ps;
+  e->smp_heap = sampler_bindless_heap_gpu_start_.ptr;
+  e->view_heap = view_bindless_heap_gpu_start_.ptr;
+  e->smp_n_v = uint8_t(smp_v);
+  e->smp_n_p = uint8_t(smp_p);
+  for (uint32_t i = 0; i < smp_v; ++i) {
+    e->smp_v[i] = current_samplers_vertex_[i].value;
+    e->si_v[i] = current_sampler_bindless_indices_vertex_[i];
+  }
+  for (uint32_t i = 0; i < smp_p; ++i) {
+    e->smp_p[i] = current_samplers_pixel_[i].value;
+    e->si_p[i] = current_sampler_bindless_indices_pixel_[i];
+  }
+  e->smp_uid_v = current_sampler_layout_uid_vertex_;
+  e->smp_uid_p = current_sampler_layout_uid_pixel_;
+  e->tex_uid_v = current_texture_layout_uid_vertex_;
+  e->tex_uid_p = current_texture_layout_uid_pixel_;
+  e->bound_v = bound_v ? 1 : 0;
+  e->bound_p = bound_p ? 1 : 0;
+  e->di_n_v = bound_v ? uint8_t(g_dc_di_cur_n_v) : 0;
+  e->di_n_p = bound_p ? uint8_t(g_dc_di_cur_n_p) : 0;
+  std::memcpy(e->di_v, g_dc_di_cur_v, e->di_n_v * sizeof(uint32_t));
+  std::memcpy(e->di_p, g_dc_di_cur_p, e->di_n_p * sizeof(uint32_t));
+  e->di_hash_v = XXH3_64bits(e->di_v, e->di_n_v * sizeof(uint32_t));
+  e->di_hash_p = XXH3_64bits(e->di_p, e->di_n_p * sizeof(uint32_t));
+  e->valid = 1;
+  return true;
+}
+
+// The direct bind's post-draw dirty set (N4-DIRECT-SUBMISSION.md section 2):
+// the descriptor-indices binding stale and the bound-pack mirror unknown for
+// the stages the blob bound, so the next retail IssueDrawImpl derives its
+// packs and rewrites the sampler members, layout uids and SRV keys the direct
+// bind did not restore.
+void D3D12CommandProcessor::NrFastDiPostDraw(bool vertex, bool pixel) {
+  if (vertex) {
+    cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+    g_dc_di_cur_n_v = UINT32_MAX;
+  }
+  if (pixel) {
+    cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+    g_dc_di_cur_n_p = UINT32_MAX;
+  }
+}
+
+// The descriptor-indices packs: a blob's (what a restore uploads) or, with
+// a null blob, the currently bound ones (what the last draw bound).
+void D3D12CommandProcessor::NrFastBoundPacks(const void* blob, const uint32_t** v, uint32_t* nv,
+                                             const uint32_t** p, uint32_t* np, bool* bound_v,
+                                             bool* bound_p) const {
+  if (blob) {
+    const DcEntry* e = static_cast<const DcEntry*>(blob);
+    *v = e->di_v;
+    *nv = e->di_n_v;
+    *p = e->di_p;
+    *np = e->di_n_p;
+    *bound_v = e->bound_v != 0;
+    *bound_p = e->bound_p != 0;
+    return;
+  }
+  *v = g_dc_di_cur_v;
+  *nv = g_dc_di_cur_n_v == UINT32_MAX ? 0u : g_dc_di_cur_n_v;
+  *p = g_dc_di_cur_p;
+  *np = g_dc_di_cur_n_p == UINT32_MAX ? 0u : g_dc_di_cur_n_p;
+  *bound_v = g_dc_di_cur_n_v != UINT32_MAX;
+  *bound_p = g_dc_di_cur_n_p != UINT32_MAX;
+}
+
 bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                           IndexBufferInfo* index_buffer_info,
                                           bool major_mode_explicit) {
+  if (nr_retail_cmp_active_)
+    NrRetailCmpDrawStart(primitive_type, index_count, index_buffer_info);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -8490,6 +8975,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
     if (InstancedBatchCanMerge(primitive_type, index_count, index_buffer_info,
                                active_vertex_shader(), active_pixel_shader())) {
       InstancedBatchAppend(regs);
+      if (nr_fast_cmp_armed_) NrFastCmpSkipDraw(2);  // deferred instanced append
       ++g_instance_draws_in;
       g_instance_dirty = false;
       g_instance_dirty_first_reg = UINT32_MAX;
@@ -8702,6 +9188,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         }
         if (g_gk_census) GkAfter(gk, pool_key, pool_hit, gk_r);
         if (pool_hit) {
+          if (nr_fast_cmp_armed_) NrFastCmpSkipDraw(1);  // append to an earlier pool draw
           g_spp_stop_kind = 1;  // [NR-SPP3]
           if (g_skc_on) {  // [SKC] the skipping host would hold the pre-group values
             SkcHit();
@@ -10080,19 +10567,25 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         PoolOpenAndDraw(pool_key, regs, vertex_shader, pixel_shader,
                         primitive_processing_result.host_draw_vertex_count, /*indexed=*/false,
                         std::min<uint32_t>(pool_pred + 1 + pool_pred / 4, 256), pool_ps_inst)) {
+      if (nr_fast_cmp_armed_) NrFastCmpSkipDraw(1);  // pool opener
       if (hiz_draw_.valid) HizRefuse(9, hiz_draw_.index_count);  // [hiz] a batch opener
     } else if (start_instanced) {
       if (hiz_draw_.valid) HizRefuse(9, hiz_draw_.index_count);  // [hiz]
       StartInstancedBatch(regs, active_vertex_shader(), active_pixel_shader(), primitive_type,
                           index_count, index_buffer_info,
                           primitive_processing_result.host_draw_vertex_count, /*indexed=*/false);
+      if (nr_fast_cmp_armed_) NrFastCmpSkipDraw(2);  // deferred instanced batch
     } else if (hiz_draw_.valid &&
                HizDraw(/*indexed=*/false, primitive_processing_result.host_draw_vertex_count)) {
       // [hiz] issued as an ExecuteIndirect whose arguments the checkpoint writes.
+      if (nr_fast_cmp_armed_) NrFastCmpSkipDraw(3);  // HiZ indirect
     } else {
       OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawInstanced(
           primitive_processing_result.host_draw_vertex_count, 1, ia_arg_dword2_, 0);
+      if (nr_fast_cmp_armed_) NrFastCmpCaptureDraw(pipeline_handle);
+      if (nr_retail_cmp_active_)
+        NrRetailCmpArgs(false, primitive_processing_result.host_draw_vertex_count, nullptr);
       OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
   } else {
@@ -10181,25 +10674,33 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
         PoolOpenAndDraw(pool_key, regs, vertex_shader, pixel_shader,
                         primitive_processing_result.host_draw_vertex_count, /*indexed=*/true,
                         std::min<uint32_t>(pool_pred + 1 + pool_pred / 4, 256), pool_ps_inst)) {
+      if (nr_fast_cmp_armed_) NrFastCmpSkipDraw(1);  // pool opener
       if (hiz_draw_.valid) HizRefuse(9, hiz_draw_.index_count);  // [hiz] a batch opener
     } else if (start_instanced) {
       if (hiz_draw_.valid) HizRefuse(9, hiz_draw_.index_count);  // [hiz]
       StartInstancedBatch(regs, active_vertex_shader(), active_pixel_shader(), primitive_type,
                           index_count, index_buffer_info,
                           primitive_processing_result.host_draw_vertex_count, /*indexed=*/true);
+      if (nr_fast_cmp_armed_) NrFastCmpSkipDraw(2);  // deferred instanced batch
     } else if (hiz_draw_.valid &&
                HizDraw(/*indexed=*/true, primitive_processing_result.host_draw_vertex_count)) {
       // [hiz] issued as an ExecuteIndirect whose arguments the checkpoint writes.
+      if (nr_fast_cmp_armed_) NrFastCmpSkipDraw(3);  // HiZ indirect
     } else {
       OccDrawBegin();  // [occ]
       deferred_command_list_.D3DDrawIndexedInstanced(
           primitive_processing_result.host_draw_vertex_count, 1, 0, INT(ia_arg_dword3_), 0);
+      if (nr_fast_cmp_armed_) NrFastCmpCaptureDraw(pipeline_handle);
+      if (nr_retail_cmp_active_)
+        NrRetailCmpArgs(true, primitive_processing_result.host_draw_vertex_count, &index_buffer_view);
       OccDrawEnd(primitive_processing_result.host_draw_vertex_count, 0);
     }
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
   }
+  if (nr_retail_cmp_active_)
+    NrRetailCmpCapture(vertex_shader, pixel_shader, primitive_processing_result);
   SortSegEnd();  // [sort]
 
   // [dcache] the record: a miss, an invalid entry or a verify mismatch of an
@@ -11212,10 +11713,10 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
         // [hitch] out-of-submission queue-operation fence wait on the CP.
         uint64_t hitch_wait_start = rex::chrono::Clock::QueryHostTickCount();
         WaitForSingleObject(fence_completion_event_, INFINITE);
-        g_hitch_probe.qops_wait_ticks.fetch_add(
-            rex::chrono::Clock::QueryHostTickCount() - hitch_wait_start,
-            std::memory_order_relaxed);
+        const uint64_t qops_wait = rex::chrono::Clock::QueryHostTickCount() - hitch_wait_start;
+        g_hitch_probe.qops_wait_ticks.fetch_add(qops_wait, std::memory_order_relaxed);
         g_hitch_probe.qops_waits.fetch_add(1, std::memory_order_relaxed);
+        ftrace::SplitWait(qops_wait);  // [ftrace] v3: blocking, not work
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -11238,9 +11739,10 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       // awaits) - big in GPU-drowned pockets, small when CPU-bound.
       uint64_t hitch_wait_start = rex::chrono::Clock::QueryHostTickCount();
       WaitForSingleObject(fence_completion_event_, INFINITE);
-      g_hitch_probe.fence_wait_ticks.fetch_add(
-          rex::chrono::Clock::QueryHostTickCount() - hitch_wait_start, std::memory_order_relaxed);
+      const uint64_t fence_wait = rex::chrono::Clock::QueryHostTickCount() - hitch_wait_start;
+      g_hitch_probe.fence_wait_ticks.fetch_add(fence_wait, std::memory_order_relaxed);
       g_hitch_probe.fence_waits.fetch_add(1, std::memory_order_relaxed);
+      ftrace::SplitWait(fence_wait);  // [ftrace] v3: blocking, not work
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -14002,6 +14504,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       GpuCensusConsumeCompleted();
       GpuCensusBeginSubmission();
     }
+    // [ftrace] same fences: completed pairs to their frames, open stamp.
+    if (ftrace_gpu_available_) {
+      FtraceGpuConsumeCompleted();
+      FtraceGpuBeginSubmission();
+    }
     // [occ] same fences: harvest completed draws, claim this submission's slots.
     if (occ_available_) {
       OccConsumeCompleted();
@@ -14095,6 +14602,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     uint64_t t0 = CpStallNow();
     ~StallSub() { g_cp_stall.sub += CpStallNow() - t0; }
   } _st_sub;
+  // [ftrace] v3: the whole body as endsub self time. The waits inside it
+  // (psowait in the pipeline cache, any fence/qops wait) charge the ledger
+  // at their sites, so this is the replay, Close, ExecuteCommandLists and
+  // Signal work only. Mode 3 only; one branch otherwise.
+  ftrace::SplitScope _ft_sub(&ftrace::SplitTotals::endsub_ticks, &ftrace::SplitTotals::endsub_n);
   // [GPU-PRECORD] Phase 1b-0: record any pending captured draws before the
   // submission closes, otherwise they would be lost.
   PrecordFlush();
@@ -14145,6 +14657,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // [gpu-census] final stamp closes the last span; must precede the
     // deferred list's Execute below.
     GpuCensusCloseSubmission();
+    FtraceGpuCloseSubmission();  // [ftrace] close stamp, same rule
 
     pipeline_cache_->EndSubmission();
 
@@ -14178,6 +14691,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // [gpu-census] the timestamps are replayed into the real list now, so
     // the resolve can be recorded directly on it.
     GpuCensusResolveSubmission();
+    FtraceGpuResolveSubmission();  // [ftrace] pair -> readback, on the real list
     OccResolveSubmission();  // [occ] both heaps -> readback, on the real list
     HizResolveSubmission();  // [hiz] verdict slots -> readback, on the real list
     command_list_->Close();
@@ -14235,22 +14749,32 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       }
       if (hitch_now - hitch_last_report >= hitch_freq) {
         hitch_last_report = hitch_now;
+        // The probe's counters are cumulative (the per-frame [ftrace] record
+        // diffs them too); this window's values are deltas against the last
+        // report. cp_max is a per-window maximum and is still cleared here.
         HitchProbe& hp = g_hitch_probe;
-        uint64_t fence_t = hp.fence_wait_ticks.exchange(0, std::memory_order_relaxed);
-        uint64_t fence_n = hp.fence_waits.exchange(0, std::memory_order_relaxed);
-        uint64_t qops_t = hp.qops_wait_ticks.exchange(0, std::memory_order_relaxed);
-        uint64_t qops_n = hp.qops_waits.exchange(0, std::memory_order_relaxed);
-        uint64_t endsub_t = hp.pso_endsub_wait_ticks.exchange(0, std::memory_order_relaxed);
-        uint64_t endsub_n = hp.pso_endsub_waits.exchange(0, std::memory_order_relaxed);
-        uint64_t cp_t = hp.pso_cp_ticks.exchange(0, std::memory_order_relaxed);
-        uint64_t cp_n = hp.pso_cp_creates.exchange(0, std::memory_order_relaxed);
+        static uint64_t hl[14] = {};
+        auto delta = [](const std::atomic<uint64_t>& counter, uint64_t& last) {
+          const uint64_t now_v = counter.load(std::memory_order_relaxed);
+          const uint64_t d = now_v - last;
+          last = now_v;
+          return d;
+        };
+        uint64_t fence_t = delta(hp.fence_wait_ticks, hl[0]);
+        uint64_t fence_n = delta(hp.fence_waits, hl[1]);
+        uint64_t qops_t = delta(hp.qops_wait_ticks, hl[2]);
+        uint64_t qops_n = delta(hp.qops_waits, hl[3]);
+        uint64_t endsub_t = delta(hp.pso_endsub_wait_ticks, hl[4]);
+        uint64_t endsub_n = delta(hp.pso_endsub_waits, hl[5]);
+        uint64_t cp_t = delta(hp.pso_cp_ticks, hl[6]);
+        uint64_t cp_n = delta(hp.pso_cp_creates, hl[7]);
         uint64_t cp_max = hp.pso_cp_max_ticks.exchange(0, std::memory_order_relaxed);
-        uint64_t thr_t = hp.pso_thr_ticks.exchange(0, std::memory_order_relaxed);
-        uint64_t thr_n = hp.pso_thr_creates.exchange(0, std::memory_order_relaxed);
-        uint64_t lib_hit = hp.lib_hits.exchange(0, std::memory_order_relaxed);
-        uint64_t lib_miss = hp.lib_misses.exchange(0, std::memory_order_relaxed);
-        uint64_t lib_store = hp.lib_stores.exchange(0, std::memory_order_relaxed);
-        uint64_t lib_stale = hp.lib_store_fails.exchange(0, std::memory_order_relaxed);
+        uint64_t thr_t = delta(hp.pso_thr_ticks, hl[8]);
+        uint64_t thr_n = delta(hp.pso_thr_creates, hl[9]);
+        uint64_t lib_hit = delta(hp.lib_hits, hl[10]);
+        uint64_t lib_miss = delta(hp.lib_misses, hl[11]);
+        uint64_t lib_store = delta(hp.lib_stores, hl[12]);
+        uint64_t lib_stale = delta(hp.lib_store_fails, hl[13]);
         if (fence_n | qops_n | endsub_n | cp_n | thr_n | lib_hit | lib_miss | lib_store |
             lib_stale) {
           double to_ms = 1000.0 / double(hitch_freq);
@@ -14266,6 +14790,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         // [gpu-census] same 1 Hz window: what the GPU spent the second on.
         GpuCensusReport1Hz();
         RttReport1Hz();  // [rtt]
+        nr_native::NrNativeReport1Hz();  // [jade-native-cp]
+        NrFastReport1Hz();               // [jade-native-fast] / [jade-native-cmp]
         OccReport1Hz();  // [occ]
       }
     }
@@ -16571,11 +17097,12 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
 
   if (g_draw_prof) g_bind_ns[1] += prof_ns_since(_bp_smp0);
 
-  if (dc_b) {
+  if (dc_b && !g_dc_bind_direct) {
     // [dcache] the member restore (the NrRufRestoreFromBundle shape, from
     // the entry): sampler params + heap indices, layout uids, and the SRV
     // keys of the restored bindings for the next derived draw's freshness
-    // check.
+    // check. The direct bind (N4 step 2) skips it: nothing after the draw
+    // reads these members before NrFastDiPostDraw forces a derivation.
     if (dc_b->bound_v) {
       current_sampler_layout_uid_vertex_ = dc_b->smp_uid_v;
       current_texture_layout_uid_vertex_ = dc_b->tex_uid_v;
@@ -16726,21 +17253,40 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   if (dc_b) {
     // [dcache] the entry's pack, uploaded only when the bound one differs;
     // an unbound stage is left alone (drive 858).
+    // [NR-NATIVE-R2] N4 step 2: the direct latch first. Same frame, same
+    // pack hash, and the binding's address is still the latched upload (any
+    // other upload of this stage moved it): the CBV bound holds the blob's
+    // pack, the direct bind marks it up to date and uploads nothing. The
+    // latch follows every blob bind so compare mode (not direct) can test
+    // the rule against the full path's own upload decision.
     const uint32_t dc_n = dc_b->di_n_v;
-    if (dc_b->bound_v &&
-        !(cbuffer_binding_descriptor_indices_vertex_.up_to_date && g_dc_di_cur_n_v == dc_n &&
-          std::memcmp(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t)) == 0)) {
-      uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
-          frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-          nullptr, nullptr, &cbuffer_binding_descriptor_indices_vertex_.address));
-      if (!descriptor_indices) {
-        return false;
+    NrDirectLatch& dl = nr_direct_latch_;
+    dl.di_latched[0] = dl.di_skipped[0] = dl.di_uploaded[0] = false;
+    if (dc_b->bound_v) {
+      const bool latch_hit = dl.di_frame[0] == frame_current_ && dl.di_hash[0] == dc_b->di_hash_v &&
+                             dl.di_address[0] == cbuffer_binding_descriptor_indices_vertex_.address;
+      dl.di_latched[0] = latch_hit;
+      if (g_dc_bind_direct && latch_hit) {
+        cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
+        dl.di_skipped[0] = true;
+      } else if (!(cbuffer_binding_descriptor_indices_vertex_.up_to_date && g_dc_di_cur_n_v == dc_n &&
+                   std::memcmp(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t)) == 0)) {
+        uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+            frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+            nullptr, nullptr, &cbuffer_binding_descriptor_indices_vertex_.address));
+        if (!descriptor_indices) {
+          return false;
+        }
+        std::memcpy(descriptor_indices, dc_b->di_v, dc_n * sizeof(uint32_t));
+        std::memcpy(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t));
+        g_dc_di_cur_n_v = dc_n;
+        cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
+        current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesVertex);
+        dl.di_uploaded[0] = true;
       }
-      std::memcpy(descriptor_indices, dc_b->di_v, dc_n * sizeof(uint32_t));
-      std::memcpy(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t));
-      g_dc_di_cur_n_v = dc_n;
-      cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
-      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesVertex);
+      dl.di_frame[0] = frame_current_;
+      dl.di_hash[0] = dc_b->di_hash_v;
+      dl.di_address[0] = cbuffer_binding_descriptor_indices_vertex_.address;
     }
   } else if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
     uint32_t span = 0;
@@ -16805,22 +17351,36 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
   }
   if (dc_b) {
     // [dcache] the entry's pack, uploaded only when the bound one differs;
-    // an unbound stage is left alone (drive 858).
+    // an unbound stage is left alone (drive 858). The N4 step 2 latch as
+    // for the vertex stage above.
     const uint32_t dc_n = dc_b->di_n_p;
-    if (dc_b->bound_p &&
-        !(cbuffer_binding_descriptor_indices_pixel_.up_to_date && g_dc_di_cur_n_p == dc_n &&
-          std::memcmp(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t)) == 0)) {
-      uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
-          frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-          nullptr, nullptr, &cbuffer_binding_descriptor_indices_pixel_.address));
-      if (!descriptor_indices) {
-        return false;
+    NrDirectLatch& dl = nr_direct_latch_;
+    dl.di_latched[1] = dl.di_skipped[1] = dl.di_uploaded[1] = false;
+    if (dc_b->bound_p) {
+      const bool latch_hit = dl.di_frame[1] == frame_current_ && dl.di_hash[1] == dc_b->di_hash_p &&
+                             dl.di_address[1] == cbuffer_binding_descriptor_indices_pixel_.address;
+      dl.di_latched[1] = latch_hit;
+      if (g_dc_bind_direct && latch_hit) {
+        cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
+        dl.di_skipped[1] = true;
+      } else if (!(cbuffer_binding_descriptor_indices_pixel_.up_to_date && g_dc_di_cur_n_p == dc_n &&
+                   std::memcmp(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t)) == 0)) {
+        uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+            frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+            nullptr, nullptr, &cbuffer_binding_descriptor_indices_pixel_.address));
+        if (!descriptor_indices) {
+          return false;
+        }
+        std::memcpy(descriptor_indices, dc_b->di_p, dc_n * sizeof(uint32_t));
+        std::memcpy(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t));
+        g_dc_di_cur_n_p = dc_n;
+        cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
+        current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
+        dl.di_uploaded[1] = true;
       }
-      std::memcpy(descriptor_indices, dc_b->di_p, dc_n * sizeof(uint32_t));
-      std::memcpy(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t));
-      g_dc_di_cur_n_p = dc_n;
-      cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
-      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
+      dl.di_frame[1] = frame_current_;
+      dl.di_hash[1] = dc_b->di_hash_p;
+      dl.di_address[1] = cbuffer_binding_descriptor_indices_pixel_.address;
     }
   } else if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
     uint32_t span = 0;
@@ -17266,6 +17826,213 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
   return readback_buffer_;
 }
 
+// [ftrace] the per-frame record's D3D12 columns: hitch/upload deltas since
+// the previous swap. ~15 relaxed loads; the base CP fills the rest.
+void D3D12CommandProcessor::OnFtraceSwap(ftrace::FrameRecord& r) {
+  const HitchProbe& hp = g_hitch_probe;
+  const double to_ms = 1000.0 / double(rex::chrono::Clock::QueryHostTickFrequency());
+  auto ld = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
+  FtraceLast n;
+  n.fence_t = ld(hp.fence_wait_ticks);
+  n.fence_n = ld(hp.fence_waits);
+  n.qops_t = ld(hp.qops_wait_ticks);
+  n.endsub_t = ld(hp.pso_endsub_wait_ticks);
+  n.cp_t = ld(hp.pso_cp_ticks);
+  n.cp_n = ld(hp.pso_cp_creates);
+  n.thr_t = ld(hp.pso_thr_ticks);
+  n.thr_n = ld(hp.pso_thr_creates);
+  n.lib_miss = ld(hp.lib_misses);
+  n.xlat_t = ld(hp.xlat_ticks);
+  n.xlat_n = ld(hp.xlat_count);
+  n.texup_n = ld(hp.texup_count);
+  n.texup_b = ld(hp.texup_bytes);
+  n.smup_n = ld(hp.smup_count);
+  n.smup_b = ld(hp.smup_bytes);
+  const FtraceLast& l = ftrace_last_;
+  r.fence_ms = double(n.fence_t - l.fence_t) * to_ms;
+  r.fence_n = uint32_t(n.fence_n - l.fence_n);
+  r.qops_ms = double(n.qops_t - l.qops_t) * to_ms;
+  r.psowait_ms = double(n.endsub_t - l.endsub_t) * to_ms;
+  r.pso_cp_ms = double(n.cp_t - l.cp_t) * to_ms;
+  r.pso_cp_n = uint32_t(n.cp_n - l.cp_n);
+  r.pso_thr_ms = double(n.thr_t - l.thr_t) * to_ms;
+  r.pso_thr_n = uint32_t(n.thr_n - l.thr_n);
+  r.lib_miss = uint32_t(n.lib_miss - l.lib_miss);
+  r.xlat_ms = double(n.xlat_t - l.xlat_t) * to_ms;
+  r.xlat_n = uint32_t(n.xlat_n - l.xlat_n);
+  r.texup_n = uint32_t(n.texup_n - l.texup_n);
+  r.texup_bytes = n.texup_b - l.texup_b;
+  r.smup_n = uint32_t(n.smup_n - l.smup_n);
+  r.smup_bytes = n.smup_b - l.smup_b;
+  ftrace_last_ = n;
+}
+
+// [ftrace] mode 2: one (open, close) timestamp pair per submission.
+bool D3D12CommandProcessor::InitializeFtraceGpuResources() {
+  ftrace_gpu_available_ = false;
+  ftrace_gpu_sub_active_ = false;
+  ftrace_gpu_next_pair_ = 0;
+  ftrace_gpu_pending_head_ = 0;
+  ftrace_gpu_pending_count_ = 0;
+  ftrace_gpu_acc_count_ = 0;
+  ftrace_gpu_dropped_ = 0;
+  ftrace_gpu_unfilled_ = 0;
+  ftrace_gpu_heap_.Reset();
+  ftrace_gpu_readback_.Reset();
+  ftrace_gpu_mapping_ = nullptr;
+  if (ftrace::Mode() < 2) {
+    return false;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  if (!device || !direct_queue) {
+    return false;
+  }
+  uint64_t timestamp_frequency = 0;
+  if (FAILED(direct_queue->GetTimestampFrequency(&timestamp_frequency)) || !timestamp_frequency) {
+    REXGPU_WARN("[ftrace] no timestamp frequency on the direct queue - gpu columns off");
+    return false;
+  }
+  ftrace_gpu_ticks_to_ms_ = 1000.0 / double(timestamp_frequency);
+  D3D12_QUERY_HEAP_DESC heap_desc;
+  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  heap_desc.Count = kFtraceGpuPairs * 2;
+  heap_desc.NodeMask = 0;
+  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&ftrace_gpu_heap_)))) {
+    REXGPU_WARN("[ftrace] timestamp query heap creation failed - gpu columns off");
+    return false;
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kFtraceGpuPairs * 2,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                             GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+                                             &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&ftrace_gpu_readback_)))) {
+    REXGPU_WARN("[ftrace] readback buffer allocation failed - gpu columns off");
+    ftrace_gpu_heap_.Reset();
+    return false;
+  }
+  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kFtraceGpuPairs * 2};
+  void* mapping = nullptr;
+  if (FAILED(ftrace_gpu_readback_->Map(0, &read_range, &mapping))) {
+    REXGPU_WARN("[ftrace] readback buffer map failed - gpu columns off");
+    ftrace_gpu_readback_.Reset();
+    ftrace_gpu_heap_.Reset();
+    return false;
+  }
+  ftrace_gpu_mapping_ = reinterpret_cast<const uint64_t*>(mapping);
+  ftrace_gpu_available_ = true;
+  REXGPU_INFO("[ftrace] gpu timestamps on: {} submission pairs, tick {:.1f} ns", kFtraceGpuPairs,
+              ftrace_gpu_ticks_to_ms_ * 1e6);
+  return true;
+}
+
+void D3D12CommandProcessor::ShutdownFtraceGpuResources() {
+  if (ftrace_gpu_available_) {
+    // The caller drained the queue: harvest what completed, flush the frame.
+    FtraceGpuConsumeCompleted();
+    FtraceGpuFlushFrame();
+    if (ftrace_gpu_dropped_ || ftrace_gpu_unfilled_) {
+      REXGPU_INFO("[ftrace] gpu pairs dropped={} unfilled={}", ftrace_gpu_dropped_,
+                  ftrace_gpu_unfilled_);
+    }
+  }
+  ftrace_gpu_available_ = false;
+  ftrace_gpu_sub_active_ = false;
+  ftrace_gpu_pending_count_ = 0;
+  if (ftrace_gpu_readback_ && ftrace_gpu_mapping_) {
+    ftrace_gpu_readback_->Unmap(0, nullptr);
+  }
+  ftrace_gpu_mapping_ = nullptr;
+  ftrace_gpu_readback_.Reset();
+  ftrace_gpu_heap_.Reset();
+}
+
+void D3D12CommandProcessor::FtraceGpuBeginSubmission() {
+  if (!ftrace_gpu_available_ || ftrace_gpu_sub_active_) {
+    return;
+  }
+  // Pairs are claimed and consumed in submission order, so the next pair is
+  // free whenever the pending ring has room.
+  if (ftrace_gpu_pending_count_ >= kFtraceGpuPairs) {
+    ++ftrace_gpu_dropped_;
+    return;
+  }
+  ftrace_gpu_sub_pair_ = ftrace_gpu_next_pair_;
+  ftrace_gpu_next_pair_ = (ftrace_gpu_next_pair_ + 1) % kFtraceGpuPairs;
+  // The frame this submission belongs to: the one the next swap closes.
+  ftrace_gpu_sub_frame_ = uint64_t(swap_counter_.load(std::memory_order_relaxed)) + 1;
+  ftrace_gpu_sub_active_ = true;
+  deferred_command_list_.D3DEndQuery(ftrace_gpu_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     ftrace_gpu_sub_pair_ * 2);
+}
+
+void D3D12CommandProcessor::FtraceGpuCloseSubmission() {
+  if (!ftrace_gpu_sub_active_) {
+    return;
+  }
+  deferred_command_list_.D3DEndQuery(ftrace_gpu_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     ftrace_gpu_sub_pair_ * 2 + 1);
+}
+
+void D3D12CommandProcessor::FtraceGpuResolveSubmission() {
+  if (!ftrace_gpu_sub_active_) {
+    return;
+  }
+  ftrace_gpu_sub_active_ = false;
+  command_list_->ResolveQueryData(ftrace_gpu_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                  ftrace_gpu_sub_pair_ * 2, 2, ftrace_gpu_readback_.Get(),
+                                  uint64_t(ftrace_gpu_sub_pair_) * 2 * sizeof(uint64_t));
+  FtraceGpuPending& pending =
+      ftrace_gpu_pending_[(ftrace_gpu_pending_head_ + ftrace_gpu_pending_count_) %
+                          kFtraceGpuPairs];
+  pending.submission = submission_current_;
+  pending.frame = ftrace_gpu_sub_frame_;
+  pending.pair = ftrace_gpu_sub_pair_;
+  ++ftrace_gpu_pending_count_;
+}
+
+void D3D12CommandProcessor::FtraceGpuFlushFrame() {
+  if (!ftrace_gpu_acc_count_) {
+    return;
+  }
+  const double busy_ms = double(ftrace_gpu_acc_busy_) * ftrace_gpu_ticks_to_ms_;
+  const double span_ms =
+      ftrace_gpu_acc_last_close_ >= ftrace_gpu_acc_first_open_
+          ? double(ftrace_gpu_acc_last_close_ - ftrace_gpu_acc_first_open_) * ftrace_gpu_ticks_to_ms_
+          : 0.0;
+  ftrace::FrameTraceRing* ring = ftrace::Ring();
+  if (!ring || !ring->FillGpu(ftrace_gpu_acc_frame_, busy_ms, span_ms)) {
+    ++ftrace_gpu_unfilled_;
+  }
+  ftrace_gpu_acc_count_ = 0;
+}
+
+void D3D12CommandProcessor::FtraceGpuConsumeCompleted() {
+  while (ftrace_gpu_pending_count_ &&
+         ftrace_gpu_pending_[ftrace_gpu_pending_head_].submission <= submission_completed_) {
+    const FtraceGpuPending& pending = ftrace_gpu_pending_[ftrace_gpu_pending_head_];
+    const uint64_t open = ftrace_gpu_mapping_[pending.pair * 2];
+    const uint64_t close = ftrace_gpu_mapping_[pending.pair * 2 + 1];
+    if (ftrace_gpu_acc_count_ && pending.frame != ftrace_gpu_acc_frame_) {
+      FtraceGpuFlushFrame();
+    }
+    if (!ftrace_gpu_acc_count_) {
+      ftrace_gpu_acc_frame_ = pending.frame;
+      ftrace_gpu_acc_busy_ = 0;
+      ftrace_gpu_acc_first_open_ = open;
+      ftrace_gpu_acc_last_close_ = close;
+    }
+    ftrace_gpu_acc_busy_ += close >= open ? close - open : 0;
+    if (open < ftrace_gpu_acc_first_open_) ftrace_gpu_acc_first_open_ = open;
+    if (close > ftrace_gpu_acc_last_close_) ftrace_gpu_acc_last_close_ = close;
+    ++ftrace_gpu_acc_count_;
+    ftrace_gpu_pending_head_ = (ftrace_gpu_pending_head_ + 1) % kFtraceGpuPairs;
+    --ftrace_gpu_pending_count_;
+  }
+}
+
 // [gpu-census] N-10c: price the GPU second by work class. See the header
 // for the design; report format:
 //   [gpu-census] gpu <busy>ms/s | draw a/n xfer b/n resolve c/n texup d/n
@@ -17666,6 +18433,7 @@ uint32_t D3D12CommandProcessor::OccDrawEnd(uint32_t idx, uint8_t kind) {
     deferred_command_list_.D3DEndQuery(occ_smp_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot);
   }
   OccCensusTag& t = g_occ_sub_tags[occ_sub_count_];
+  t.received_ordinal = received_draw_ordinal_;
   t.idx = idx;
   t.inst = 1;
   t.kind = kind;
@@ -17713,6 +18481,9 @@ void D3D12CommandProcessor::OccConsumeCompleted() {
       const D3D12_QUERY_DATA_PIPELINE_STATISTICS& st = occ_stats_mapping_[pending.start + i];
       const OccCensusTag& t = pending.tags[i];
       const uint64_t smp = t.smp ? occ_smp_mapping_[pending.start + i] : 0;
+      nr::ObserveDrawSamples(t.received_ordinal, st.IAPrimitives, st.VSInvocations,
+          st.PSInvocations, smp, uint32_t(t.smp != 0) | (uint32_t(t.kind != 0) << 1) |
+          (uint32_t(t.hiz != 0 && t.hiz_mode == 2) << 2) | (uint32_t(t.cls) << 8));
       const uint8_t cls = t.cls < kGpuCensusTotalClasses ? t.cls : uint8_t(kGpuCensusDraw);
       ++a.q;
       a.ia_prim += st.IAPrimitives;

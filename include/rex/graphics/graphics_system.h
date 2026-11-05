@@ -82,6 +82,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking);
+  // Progress of a running blocking InitializeShaderStorage (any thread).
+  bool GetShaderStorageProgress(uint32_t* phase, uint32_t* done, uint32_t* total);
 
   void RequestFrameTrace();
   void BeginTracing();

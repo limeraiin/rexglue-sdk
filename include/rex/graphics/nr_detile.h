@@ -116,6 +116,16 @@ uint32_t DetileWidenFullHeight(const DetileRegs& regs, bool count_refusal);
 // -1 = widen every band-1 segment (normal). N >= 0 = widen only segments
 // below N (2 = world + refraction widened, overlay left at band height).
 void DetileSetWidenSegLimit(int32_t seg);
+// True under a segment limit: the widen then reads the frame's tap progress
+// per draw, and a baked scissor cannot stand for it (the native executor
+// keeps its widen live while this holds).
+bool DetileWidenSegLimited();
+// Every input of DetileWidenFullHeight that is not a register, packed into
+// one word for the native executor's mode 2 environment compare: enabled,
+// armed, guard tripped, the segment limit, the full height and the pass
+// signature. Changes here are the DetileSetEnabled / DetileFrameEnd /
+// DetileSetWidenSegLimit environment stamp bumps.
+uint64_t DetileWidenStamp();
 
 // A TAIL REWRITE is a resolve outside the tiled pass (different RB_*_INFO
 // signature, window offset 0) whose destination is exactly a repeat band's

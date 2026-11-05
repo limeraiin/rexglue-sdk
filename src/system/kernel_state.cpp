@@ -894,6 +894,20 @@ void KernelState::UnregisterThread(XThread* thread) {
   }
 }
 
+uint32_t KernelState::PinGuestThreads(uint64_t mask) {
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t pinned = 0;
+  for (auto& entry : threads_by_id_) {
+    XThread* thread = entry.second;
+    if (!thread->is_guest_thread() || !thread->thread()) {
+      continue;
+    }
+    thread->thread()->set_affinity_mask(mask);
+    ++pinned;
+  }
+  return pinned;
+}
+
 void KernelState::OnThreadExecute(XThread* thread) {
   auto global_lock = global_critical_region_.Acquire();
 

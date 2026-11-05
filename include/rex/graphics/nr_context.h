@@ -564,6 +564,10 @@ struct CtxWalker {
   // state at stops (the 4a/5b compose); every other mode keeps the classic
   // silent skip.
   bool surface_pred_draws;
+  // [NR-NATIVE-R2] set by the caller AFTER CtxWalkBegin only on the walk that
+  // EXECUTES the buffer (NrSkipExecuteBuffer): a predicated-out native marker
+  // is then counted as refused_predicated. Observation walks leave it false.
+  bool native_exec;
   StateContext* ctx;
   uint16_t* draw_flags;
   uint32_t max_draws;

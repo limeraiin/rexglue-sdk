@@ -35,6 +35,8 @@
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/nr_cull.h>
+#include <rex/graphics/nr_native_submit.h>  // [NR-NATIVE-R2] WP1
+#include <rex/graphics/nr_native_fast.h>    // [NR-NATIVE-R2] v2
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
@@ -53,6 +55,7 @@ namespace rex::graphics::d3d12 {
 // [occ] one census tag per issued draw (file-scope in the .cpp so the draw
 // pool can write a batch's final instance count into it at close).
 struct OccCensusTag {
+  uint64_t received_ordinal;  // pool batches identify only their opener
   uint32_t idx;   // host index (or vertex) count per instance
   uint32_t inst;  // instances (pool batches: written at close)
   uint8_t kind;   // 0 plain, 1 pool batch
@@ -78,6 +81,7 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
+  bool GetShaderStorageProgress(ShaderStorageProgress* out) override;
 
   void RequestFrameTrace(const std::filesystem::path& root_path) override;
 
@@ -390,6 +394,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // unless precord capture owns the draw path (same exclusion as the
   // gpu_nr_issue seam, counted there as precord_skip).
   bool NrSkipBackendEligible() const override;
+  // [NR-NATIVE-R2] WP1: execute one native ring record at its marker (the
+  // delegate path: overlay onto the live register file through the full
+  // WriteRegister, draw through IssueDrawImpl, restore). CP thread only.
+  // v2: dispatches on gpu_native_exec (nr_native_fast.cpp) and times the path.
+  void NrNativeExecute(uint32_t slot_sequence) override;
+  void NrNativeEnd(uint32_t slot_sequence) override;
   // [N8F] The effect half of WriteRegistersFromMem, for a range whose values
   // were already stored at decode time by the coalescer.
   void NrApplyRangeEffects(uint32_t base, uint32_t n) override;
@@ -415,6 +425,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
+
+  // [ftrace] hitch/upload deltas and the native phase for the frame record.
+  void OnFtraceSwap(ftrace::FrameRecord& record) override;
 
   void OnPrimaryBufferEnd() override;
 
@@ -805,6 +818,18 @@ class D3D12CommandProcessor : public CommandProcessor {
   void GpuCensusResolveSubmission(); // ResolveQueryData on the real list
   void GpuCensusConsumeCompleted();
   void GpuCensusReport1Hz();
+
+  // [ftrace] mode 2: exactly two timestamps per submission (open, close) in
+  // a small ring of its own, independent of d3d12_gpu_census. Resolved per
+  // submission, consumed when its fence completes, accumulated per swap
+  // frame and written into the frame ring entry.
+  bool InitializeFtraceGpuResources();
+  void ShutdownFtraceGpuResources();
+  void FtraceGpuBeginSubmission();    // open stamp (deferred list)
+  void FtraceGpuCloseSubmission();    // close stamp, before the deferred replay
+  void FtraceGpuResolveSubmission();  // ResolveQueryData on the real list
+  void FtraceGpuConsumeCompleted();   // completed pairs -> per-frame accumulator
+  void FtraceGpuFlushFrame();         // accumulator -> frame ring entry
 
   // [occ] the occlusion census (drive 796 read: the city is ~6.5M indices /
   // ~2.2M triangles per frame; the iGPU prices triangles on screen). Every
@@ -1260,6 +1285,41 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t gpu_census_last_rt_keys_[5] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
                                           UINT32_MAX};
 
+  // [ftrace] mode 2 state: kFtraceGpuPairs submission slots of two
+  // timestamps each, a fixed pending ring in submission order and the
+  // current frame's accumulator. No allocation after init.
+  static constexpr uint32_t kFtraceGpuPairs = 1024;  // 2048 timestamp slots
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> ftrace_gpu_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> ftrace_gpu_readback_;
+  const uint64_t* ftrace_gpu_mapping_ = nullptr;
+  bool ftrace_gpu_available_ = false;
+  bool ftrace_gpu_sub_active_ = false;
+  double ftrace_gpu_ticks_to_ms_ = 0.0;
+  uint32_t ftrace_gpu_next_pair_ = 0;
+  uint32_t ftrace_gpu_sub_pair_ = 0;
+  uint64_t ftrace_gpu_sub_frame_ = 0;
+  struct FtraceGpuPending {
+    uint64_t submission;
+    uint64_t frame;
+    uint32_t pair;
+  };
+  FtraceGpuPending ftrace_gpu_pending_[kFtraceGpuPairs] = {};
+  uint32_t ftrace_gpu_pending_head_ = 0;
+  uint32_t ftrace_gpu_pending_count_ = 0;
+  uint64_t ftrace_gpu_acc_frame_ = 0;
+  uint64_t ftrace_gpu_acc_busy_ = 0;
+  uint64_t ftrace_gpu_acc_first_open_ = 0;
+  uint64_t ftrace_gpu_acc_last_close_ = 0;
+  uint32_t ftrace_gpu_acc_count_ = 0;
+  uint64_t ftrace_gpu_dropped_ = 0;   // no free pair when a submission opened
+  uint64_t ftrace_gpu_unfilled_ = 0;  // frame entry gone from the ring
+  // [ftrace] last-seen hitch/upload totals for the per-frame deltas.
+  struct FtraceLast {
+    uint64_t fence_t, fence_n, qops_t, endsub_t, cp_t, cp_n, thr_t, thr_n, lib_miss, xlat_t,
+        xlat_n, texup_n, texup_b, smup_n, smup_b;
+  };
+  FtraceLast ftrace_last_ = {};
+
   // [rtt] state. One record per resolve destination base (stable for the
   // run, compacted when unseen for 5 s) and one per texture guest range
   // (base address + shape); per-second counters reset at the report.
@@ -1462,6 +1522,127 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> marker_upload_;
   uint8_t* marker_mapping_ = nullptr;
   int marker_phase_ = -1;
+  // [NR-NATIVE-R2] WP1 scratch, CP thread only (no allocation per marker):
+  // the copied record and the (index, previous value) overlay save list.
+  nr_native::NrNativeDrawRecord nr_native_rec_ = {};
+  struct NrNativeSaved {
+    uint32_t index;
+    uint32_t value;
+  };
+  // (+3: the synthesized VGT draw registers, v2.)
+  std::array<NrNativeSaved, nr_native::kNrNativeMaxRegisters +
+                                4 * nr_native::kNrNativeMaxConstants + 3>
+      nr_native_saved_ = {};
+  bool nr_native_precord_logged_ = false;
+
+  // [NR-NATIVE-R2] v2: the fast executor (src/graphics/d3d12/nr_native_fast.cpp),
+  // selected per marker by gpu_native_exec: 0 = the v1 delegate body, 1 = fast,
+  // 2 = compare (the fast derivation runs without drawing, v1 draws, the two
+  // are compared). NrNativeExecute dispatches and times both paths.
+  // v1 = prologue (acquire, gates, shaders) + the delegate body (overlay
+  // through WriteRegister, IssueDrawImpl, restore) on nr_native_rec_.
+  void NrNativeExecuteV1(uint32_t slot_sequence);
+  void NrNativeDelegateBody(Shader* vs, Shader* ps);
+  // The fast path. `mode` 1 draws; 2 derives, runs v1 and compares.
+  void NrNativeExecuteFast(uint32_t slot_sequence, int mode);
+  struct NrFastPlan;  // defined in nr_native_fast.cpp
+  // Derivation (hit: from the entry; miss: through the SDK stages) and the
+  // emission. Both read the raw-overlaid live register file.
+  uint32_t NrFastDerive(NrFastPlan& plan);
+  bool NrFastEmit(NrFastPlan& plan);
+  void NrFastRecordEntry(NrFastPlan& plan, bool bindings_from_v1);
+  void NrFastInvalidate(const nr_native::FastChanges& ch);
+  // Compare mode: v1's delegate body calls this after its draw, before its
+  // restore, while the register file still holds v1's overlay.
+  bool nr_fast_cmp_armed_ = false;
+  void NrFastCmpCaptureV1(bool drew);
+  void NrFastCmpCaptureDraw(void* description_handle);
+  void NrFastCmpSkipDraw(uint32_t kind);
+  // Scoped native-versus-retail oracle, enabled only by gpu_native_retail_cmp.
+  bool nr_retail_cmp_active_ = false;
+  bool nr_retail_cmp_native_ = false;
+  void NrRetailCmpBegin(uint32_t slot_sequence);
+  void NrRetailCmpDrawStart(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                           const IndexBufferInfo* index_buffer_info);
+  void NrRetailCmpCapture(const D3D12Shader* vs, const D3D12Shader* ps,
+                          const PrimitiveProcessor::ProcessingResult& prim);
+  void NrRetailCmpArgs(bool indexed, uint32_t count, const D3D12_INDEX_BUFFER_VIEW* ibv);
+  void NrRetailCmpCopySystem(void* destination) const;
+  // 1 Hz [jade-native-fast] (fallback reasons, table sizes) and
+  // [jade-native-cmp] (per-class eq/ne), after [jade-native-cp].
+  static void NrFastReport1Hz();
+  // Bumped by ClearCaches and InitializeShaderStorage: every fast table entry
+  // recorded under an older generation is a miss.
+  uint32_t nr_fast_gen_ = 1;
+  // Bridge members, defined in command_processor.cpp (they read that file's
+  // draw-path state).
+  static constexpr size_t kNrFastBlobBytes = nr_native::kFastBlobBytes;
+  uint32_t NrFastEnvRefusal() const;
+  bool NrFastPrecordCapture() const;
+  bool NrFastPoolPrologue(const RegisterFile& regs, bool* pool_on);
+  bool NrFastSortOn() const;
+  void NrFastNativePsoFlags(bool* build, bool* bind) const;
+  void NrFastWidenScissor(const RegisterFile& regs, draw_util::Scissor& scissor) const;
+  void NrFastNoteDrawIssued(uint32_t host_vertex_count);
+  void NrFastAfterResidency();
+  void NrFastDcRanges(const uint32_t (**ranges)[2], uint32_t* count) const;
+  // `direct`: the N4 step 2 direct bind (an owned hit with a blob, mode 1):
+  // the descriptor-indices packs go by the self-validating latch below, the
+  // sampler members / layout uids / SRV keys are not restored (the post-draw
+  // dirty set NrFastDiPostDraw forces the next retail derivation to rewrite
+  // them), the per-stage results land in nr_direct_latch_.di_*.
+  bool NrFastBindings(const D3D12Shader* vs, const D3D12Shader* ps,
+                      ID3D12RootSignature* root_signature, const void* blob, bool direct,
+                      bool* bind_ok);
+  // The direct bind's post-draw dirty set for the descriptor-indices stages
+  // it bound: the binding is marked stale and the bound-pack mirror unknown,
+  // so a following retail IssueDrawImpl derives (and rewrites the members).
+  void NrFastDiPostDraw(bool vertex, bool pixel);
+  bool NrFastBindCapture(void* blob, const D3D12Shader* vs, const D3D12Shader* ps);
+  void NrFastBoundPacks(const void* blob, const uint32_t** v, uint32_t* nv, const uint32_t** p,
+                        uint32_t* np, bool* bound_v, bool* bound_p) const;
+  // Direct submission (gpu_native_direct, nr_native_fast.cpp): the pool
+  // prologue split into its register-reading bake (the pass key and the
+  // order-independent class, both pure functions of keyed registers) and
+  // its apply on baked inputs (the same compares and PoolClose calls), and
+  // the system constants upload source (the mirror NrUpdateBindings uploads;
+  // Set returns whether the bytes changed and marks the member stale).
+  void NrFastPoolBake(const RegisterFile& regs, uint64_t* pool_key, bool* pool_cls) const;
+  bool NrFastPoolApply(uint64_t pool_key, bool pool_cls, bool* pool_on);
+  void NrFastSysStateGet(void* destination) const;
+  bool NrFastSysStateSet(const void* source);
+  // The direct path's system constants latch: the upload of the entry block
+  // hashing to sys_hash lives at `address` in `frame`. Self-validating: any
+  // other upload moves cbuffer_binding_system_.address, a new frame reuses
+  // addresses, so a match proves the bound CBV holds the entry's bytes.
+  struct NrDirectLatch {
+    uint64_t frame = UINT64_MAX;
+    uint64_t sys_hash = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+    // N4 step 2: the descriptor-indices packs ([0] vertex, [1] pixel), the
+    // same rule: the upload of the blob pack hashing to di_hash lives at
+    // di_address in di_frame. Written by NrUpdateBindings after every blob
+    // bind (direct or not), so compare mode exercises it; the per-bind
+    // verdicts (latched: the rule matched; skipped: the direct bind took it;
+    // uploaded: the full rule uploaded anyway) feed the mode 2 classes.
+    uint64_t di_frame[2] = {UINT64_MAX, UINT64_MAX};
+    uint64_t di_hash[2] = {0, 0};
+    D3D12_GPU_VIRTUAL_ADDRESS di_address[2] = {0, 0};
+    bool di_latched[2] = {false, false};
+    bool di_skipped[2] = {false, false};
+    bool di_uploaded[2] = {false, false};
+  } nr_direct_latch_;
+  // Step 2: the object lookup split from the derivation (a direct hit looks
+  // up through the record map and never overlays), the overlay applied on
+  // demand (a miss, a non-direct draw, a direct draw whose render target
+  // latch missed), and the executor's shared memory watch (the index
+  // residency latch's invalidation generation) released at shutdown.
+  void NrFastLookup(NrFastPlan& plan);
+  void NrFastApplyOverlay(NrFastPlan& plan);
+  void NrFastShutdown();
+  // N4 step 4: the live values of the environment fields an entry bakes
+  // under the stamp (nr_direct_env.h), for the record and the mode 2 compare.
+  nr_native::FastEnvFields NrFastEnvFields() const;
   uint32_t hiz_slot_next_ = 0, hiz_sub_first_slot_ = 0, hiz_frame_slots_ = 0;
   // The last Hi-Z build: its depth target, the transfer epoch it saw and the
   // received-draw count at that point; a checkpoint within hiz_rebuild_

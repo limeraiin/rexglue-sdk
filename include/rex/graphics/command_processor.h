@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/graphics/frame_trace.h>  // [ftrace]
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/trace_writer.h>
@@ -48,7 +49,8 @@ class Shader;
 // Command-processor thread only, so a plain int is correct.
 extern int g_n7_n8b_phase;
 
-// [stall] The CP-thread stall catcher (always on). Drive 848 (RTX 1440p
+// [stall] The CP-thread stall catcher. Buffer duration/counts are always on;
+// per-operation clocks require detailed frame tracing (mode 3). Drive 848 (RTX 1440p
 // --no-vsync, CP-bound at ~18 ms/frame): fps ran 56/56/38 every third
 // second at a CONSTANT draw count - ~320 ms lost inside the indirect-buffer
 // bracket every 3 s, no fence wait, no PSO wait, no swap time. These running
@@ -68,6 +70,10 @@ struct CpStallTicks {
 };
 extern CpStallTicks g_cp_stall;
 inline uint64_t CpStallNow() {
+  // Begin() latches this on the CP thread before processing any commands.
+  // Keep both ends of every bracket at zero in normal play, avoiding several
+  // clock reads per draw and submission without changing the work in between.
+  if (!ftrace::g_exec_split) return 0;
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count());
@@ -194,6 +200,21 @@ class CommandProcessor {
   // awaited.
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                        bool blocking);
+
+  // Startup preparation progress, sampled by the playtest progress window.
+  struct ShaderStorageProgress {
+    uint32_t phase = 0;
+    uint32_t done = 0;
+    uint32_t total = 0;
+  };
+  virtual bool GetShaderStorageProgress(ShaderStorageProgress* out) {
+    (void)out;
+    return false;
+  }
+
+  // [ftrace] Called at every XE_SWAP after the base fields are filled; the
+  // backend adds its hitch/upload/GPU columns. Default: nothing (Vulkan).
+  virtual void OnFtraceSwap(ftrace::FrameRecord& record) { (void)record; }
 
   virtual void RequestFrameTrace(const std::filesystem::path& root_path);
   virtual void BeginTracing(const std::filesystem::path& root_path);
@@ -415,6 +436,22 @@ class CommandProcessor {
   // non-D3D12 backends refuse). Base default false keeps every backend that
   // has not opted in on the executor path.
   virtual bool NrSkipBackendEligible() const { return false; }
+  // [NR-NATIVE-R2] WP1: a native marker (type-3 NOP, two payload dwords, the
+  // first kNrNativeMarkerMagic) reached the executor at its stream position.
+  // The second dword names the ring record (slot | sequence << 16). Base:
+  // no-op, so backends without native submission keep the NOP semantics.
+  virtual void NrNativeExecute(uint32_t slot_sequence) { (void)slot_sequence; }
+  virtual void NrNativeEnd(uint32_t slot_sequence) { (void)slot_sequence; }
+  // [NR-NATIVE-R2] The retail draw stop's pre-dispatch gate, for a marker:
+  // false when de-tile calls the live state a repeat band, or while a band
+  // execution's value store runs (its side effects are deferred). On true,
+  // fires the deferred N8F effects exactly as a retail draw dispatch does.
+  bool NrNativeDrawAllowed();
+  // Pure version of the band predicate, used to avoid copying unused native
+  // record payloads. Does not fire deferred draw-dispatch effects.
+  bool NrNativeDrawBandAllowed() const;
+  // [NR-NATIVE-R2] The retail draw tail's PA_SC_VIZ_QUERY kill test.
+  bool NrNativeVizKilled() const;
   // [N8F] Deferred-effects support. NrApplyRangeEffects re-fires exactly the
   // side-effect half of the backend's WriteRegistersFromMem for a range whose
   // VALUES are already in the register file (the value copy has happened at
@@ -476,7 +513,8 @@ class CommandProcessor {
   // draw.
   void ExecutePacketType3DrawTail(uint32_t vgt_draw_initiator_value,
                                   IndexBufferInfo* index_buffer_info,
-                                  const char* opcode_name, uint32_t draw_opcode);
+                                  const char* opcode_name, uint32_t draw_opcode,
+                                  uint32_t packet_address);
   bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
@@ -536,6 +574,8 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+  // Nonzero only while issuing one received draw; copied into GPU query tags.
+  uint64_t received_draw_ordinal_ = 0;
   std::atomic<uint32_t> swap_counter_{0};
 
   uint32_t primary_buffer_ptr_ = 0;

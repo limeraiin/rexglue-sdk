@@ -23,6 +23,8 @@
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/d3d12/hitch_probe.h>  // [ftrace] upload counters
+#include <rex/graphics/frame_trace_scope.h>  // [ftrace] v3 texup bracket
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
@@ -1679,8 +1681,16 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   // the whole impl prices as texture-upload GPU work.
   D3D12CommandProcessor::GpuCensusScope gpu_census_scope(command_processor_,
                                                          D3D12CommandProcessor::kGpuCensusTexUp);
+  // [ftrace] v3: the whole load as texup self time (a scratch-buffer await
+  // or an EndSubmission inside it charges the ledger and is excluded).
+  ftrace::SplitScope _ft_texup(&ftrace::SplitTotals::texup_ticks);
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
+  // [ftrace] one upload per load, sized by the guest bytes it reads.
+  g_hitch_probe.texup_count.fetch_add(1, std::memory_order_relaxed);
+  g_hitch_probe.texup_bytes.fetch_add(
+      (load_base ? texture.GetGuestBaseSize() : 0u) + (load_mips ? texture.GetGuestMipsSize() : 0u),
+      std::memory_order_relaxed);
   // [rtt] the census: a texture (re)load, matched to the resolve that wrote it.
   command_processor_.RttNoteTextureLoad(
       texture_key.base_page << 12, texture.GetGuestBaseSize(), texture_key.mip_page << 12,
@@ -2069,6 +2079,11 @@ void D3D12TextureCache::NrTexCaptureImpl(uint32_t slot, NrTexSnap& s) {
 void D3D12TextureCache::NrTexRestoreImpl(uint32_t slot, const NrTexSnap& s) {
   d3d12_texture_bindings_[slot].descriptor_index = s.descriptor_index;
   d3d12_texture_bindings_[slot].descriptor_index_signed = s.descriptor_index_signed;
+}
+
+bool D3D12TextureCache::NrTexRestoreImplEqual(uint32_t slot, const NrTexSnap& s) const {
+  return d3d12_texture_bindings_[slot].descriptor_index == s.descriptor_index &&
+         d3d12_texture_bindings_[slot].descriptor_index_signed == s.descriptor_index_signed;
 }
 
 void D3D12TextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {

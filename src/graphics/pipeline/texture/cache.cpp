@@ -515,6 +515,7 @@ bool TextureCache::NrTexRestore(const NrTexSnap* snaps, uint32_t count) {
       return false;
     }
   }
+  bool wrote = false;
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t index = snaps[i].slot;
     const uint32_t index_bit = UINT32_C(1) << index;
@@ -523,9 +524,36 @@ bool TextureCache::NrTexRestore(const NrTexSnap* snaps, uint32_t count) {
       // recorded binding.
       continue;
     }
-    texture_bindings_[index] = snaps[i].binding;
     texture_bindings_in_sync_ |= index_bit;
+    // [NR-NATIVE-R2] a slot that already holds the snapshot's content (the
+    // common case between two owned entries of one material) is not written,
+    // so the binding generation stays put and the next generation-latched
+    // hit of either entry skips this restore.
+    if (NrTexBindingEqual(texture_bindings_[index], snaps[i].binding) &&
+        NrTexRestoreImplEqual(index, snaps[i])) {
+      continue;
+    }
+    texture_bindings_[index] = snaps[i].binding;
     NrTexRestoreImpl(index, snaps[i]);
+    wrote = true;
+  }
+  if (wrote) NrTexBindingGenerationBump();  // writer 3 (nr_binding_generation)
+  return true;
+}
+
+bool TextureCache::NrTexLatchCheck(const NrTexSnap* snaps, uint32_t count,
+                                   uint32_t* bad_slot) const {
+  *bad_slot = UINT32_MAX;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t index = snaps[i].slot;
+    const TextureBinding& b = texture_bindings_[index];
+    bool ok = NrTexBindingEqual(b, snaps[i].binding) && NrTexRestoreImplEqual(index, snaps[i]);
+    if (ok && b.texture && b.texture->outdated_mask()) ok = false;
+    if (ok && b.texture_signed && b.texture_signed->outdated_mask()) ok = false;
+    if (!ok) {
+      *bad_slot = index;
+      return false;
+    }
   }
   return true;
 }
@@ -535,7 +563,7 @@ bool TextureCache::NrTexRestore(const NrTexSnap* snaps, uint32_t count) {
 // CommitPreparedTextureLoad sequence RequestTextures runs, over every bound
 // texture whose outdated mask is set. A texture that is up to date costs one
 // atomic load.
-void TextureCache::NrTexEnsureLoaded(uint32_t mask) {
+bool TextureCache::NrTexEnsureLoaded(uint32_t mask) {
   constexpr size_t kMaxLoads = 2 * xenos::kTextureFetchConstantCount;
   PendingTextureLoad loads[kMaxLoads];
   PendingSharedMemoryRange ranges[2 * kMaxLoads];
@@ -561,17 +589,20 @@ void TextureCache::NrTexEnsureLoaded(uint32_t mask) {
     }
   };
   uint32_t remaining = mask, index;
+  uint32_t outdated = 0;  // textures outdated before the loads below
   while (rex::bit_scan_forward(remaining, &index)) {
     remaining &= ~(UINT32_C(1) << index);
     const TextureBinding* binding = GetValidTextureBinding(index);
     if (!binding) {
       continue;
     }
+    outdated += binding->texture && binding->texture->outdated_mask() ? 1u : 0u;
+    outdated += binding->texture_signed && binding->texture_signed->outdated_mask() ? 1u : 0u;
     queue(binding->texture);
     queue(binding->texture_signed);
   }
   if (!load_count) {
-    return;
+    return outdated == 0;
   }
   bool ranges_ok = true;
   if (range_count) {
@@ -588,6 +619,10 @@ void TextureCache::NrTexEnsureLoaded(uint32_t mask) {
       LoadTextureData(*loads[i].texture);
     }
   }
+  for (size_t i = 0; i < load_count; ++i) {
+    if (loads[i].texture != nullptr && loads[i].texture->outdated_mask()) return false;
+  }
+  return true;
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -756,6 +791,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
                          : std::chrono::steady_clock::time_point{};
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
+    NrTexBindingGenerationBump();  // writer 2 (nr_binding_generation)
   }
   if (texp) {
     auto texp_end = std::chrono::steady_clock::now();
@@ -942,6 +978,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
   Texture& texture = *static_cast<Texture*>(context);
   texture.WatchCallback(global_lock, argument != 0);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
+  texture.texture_cache().NrTexBindingGenerationBump();  // writer 4 (nr_binding_generation)
 }
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
@@ -1195,6 +1232,7 @@ void TextureCache::ResetTextureBindings(bool from_destructor) {
   if (!from_destructor && bindings_reset) {
     UpdateTextureBindingsImpl(bindings_reset);
   }
+  NrTexBindingGenerationBump();  // writer 1 (nr_binding_generation)
 }
 
 void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract) {
@@ -1269,6 +1307,7 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
     // Resolves themselves do exactly the opposite of what this should do.
     return;
   }
+  NrTexBindingGenerationBump();  // writer 5 (nr_binding_generation)
   // Mark scaled resolve ranges as non-scaled. Textures themselves will be
   // invalidated by their shared memory watches.
   uint32_t resolve_page_first = address_first >> 12;

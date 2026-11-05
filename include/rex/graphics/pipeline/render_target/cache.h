@@ -211,6 +211,13 @@ class RenderTargetCache {
   // RT-maintenance re-runs a buffer-level native replay would owe. Public:
   // read by the owning D3D12CommandProcessor, not a subclass.
   uint64_t nr_update_body_runs() const { return nr_update_body_runs_; }
+  // [NR-NATIVE-R2] direct submission: moves whenever a later Update could
+  // bind or transfer differently than the previous one did for the same
+  // inputs: every body run (a changed fingerprint, stored on success) and
+  // every ownership mutation (ChangeOwnership from resolves, clears and
+  // EDRAM stores; DestroyAllRenderTargets). Equal serials and equal inputs
+  // mean the entry guard above would skip the body.
+  uint64_t nr_update_serial() const { return nr_update_body_runs_ + ownership_generation_; }
 
  protected:
 

@@ -8,6 +8,7 @@
  */
 
 #include "rex/graphics/nr_context.h"
+#include "rex/graphics/nr_native_submit.h"  // [NR-NATIVE-R2] WP1
 
 #include <cstring>
 #include <intrin.h>
@@ -397,6 +398,12 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
   if (CtxPredicatedOut(w->bin, hdr)) {
     ++w->stats->pred_skipped;
     if (op == 0x22) ++w->stats->pred_draws;
+    // [NR-NATIVE-R2] the executing walk skips a predicated-out native marker
+    // natively, before the executor's own predicate site could count it.
+    if (w->native_exec && op == 0x10 && j + 1 < dwords &&
+        nr_native::NrNativeIsMarker(hdr, w->cur_arg)) {
+      nr_native::NrNativeBump(&nr_native::NrNativeCounters::refused_predicated);
+    }
     // [NR-5B-3] under a stop-resolving compose, a predicated-out draw must
     // still surface: its group's state (record-carried under suppression)
     // has to apply even though the draw never executes. The cursor is
@@ -419,7 +426,11 @@ bool CtxWalkStep(CtxWalker* w, CtxDrawStop* stop, bool delegate_stops = false) {
   // decode. After the predicate check (a predicated-out packet never runs and
   // is skipped natively above), before any decode. The cursor stays AT the
   // header for the executor's dispatch; CtxWalkSkipDelegated resumes past it.
-  if (delegate_stops && stop && !CtxNativeOp(op)) {
+  // [NR-NATIVE-R2] a native marker is a NOP the executor must run (it names a
+  // ring record to draw at this position), so it leaves the native set.
+  if (delegate_stops && stop &&
+      (!CtxNativeOp(op) ||
+       (op == 0x10 && j + 1 < dwords && nr_native::NrNativeIsScopeMarker(hdr, w->cur_arg)))) {
     if (w->rec) w->rec->push_back({kCtxMemoDeleg, 0, uint16_t(op), 0, j, j});
     w->cursor = j;
     ++w->stats->delegate_stops;
@@ -837,6 +848,11 @@ bool CtxPlanNext(CtxWalker* w, CtxDrawStop* stop) {
       if (!(w->bin.select & w->bin.mask)) {
         ++w->stats->pred_skipped;
         if (op.kind == kPlanDraw && op.reg == 0x22) ++w->stats->pred_draws;
+        // [NR-NATIVE-R2] markers compile to kPlanDeleg (see CtxPlanCompile).
+        if (w->native_exec && op.kind == kPlanDeleg && op.reg == 0x10 &&
+            nr_native::NrNativeIsMarker(hdr, w->cur_arg)) {
+          nr_native::NrNativeBump(&nr_native::NrNativeCounters::refused_predicated);
+        }
         continue;
       }
       if (op.kind == kPlanDraw && op.reg == 0x22) ++w->stats->pred_draws_run;
@@ -1456,6 +1472,25 @@ uint32_t CtxPlanCompile(const uint8_t* raw, uint32_t ndwords, CtxPlanOp* out,
         guard(j, h);
         break;
       case 0x10:  // NOP: the executor skips by count
+        // [NR-NATIVE-R2] a native marker is executed (a delegate); any other
+        // two-dword NOP guards its first payload dword too, so a marker
+        // patched in place later demotes the op instead of being skipped.
+        if (cnt == 2) {
+          const uint32_t d1 = BE32(raw, j + 1);
+          if (nr_native::NrNativeIsScopeMarker(h, d1)) {
+            emit(kPlanDeleg, -1, 0, pf, op, 0, len, j);
+            guard(j, h);
+            guard(j + 1, d1);
+            if (st) ++st->delegs;
+            break;
+          }
+          emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
+          guard(j, h);
+          guard(j + 1, d1);
+          if (st) ++st->skips;
+          break;
+        }
+        [[fallthrough]];
       case 0x3B:  // INVALIDATE_STATE: the executor reads and ignores
         emit(kPlanSkip, -1, 0, pf, op, 0, len, j);
         guard(j, h);

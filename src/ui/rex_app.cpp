@@ -21,6 +21,7 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/shader_preload_catalog.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
@@ -36,6 +37,7 @@
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/shader_progress.h>
 #include <rex/ui/startup_config_dialog.h>
 #include <rex/version.h>
 
@@ -509,7 +511,34 @@ void ReXApp::LaunchModule() {
       uint32_t title_id = runtime_->kernel_state()->title_id();
       if (title_id != 0) {
         REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
+        // Use the player's own database, plus the playtest pipeline catalog.
+        // Merge entries so a smaller catalog never discards player discoveries.
+#if REX_HAS_D3D12
+        if (title_id == 0x555307E5 &&
+            dynamic_cast<graphics::d3d12::D3D12GraphicsSystem*>(graphics_system)) {
+          try {
+            const auto result = graphics::PrepareShaderPreloadCatalog(
+                runtime_->cache_root() / "shaders" / "shareable",
+                rex::filesystem::GetExecutableFolder() / "shaders",
+                runtime_->game_data_root() / "xeshader.sdb", title_id);
+            REXLOG_INFO("[shader-preload] catalog: {} database shaders, {} total shader blobs, "
+                        "{} recorded pipelines", result.database_shaders, result.shaders,
+                        result.pipelines);
+          } catch (const std::exception& error) {
+            REXLOG_ERROR("[shader-preload] catalog preparation failed: {}. "
+                         "Using the existing cache.", error.what());
+          }
+        }
+#endif
+        // A small native "preparing shaders" window (own thread) while the
+        // blocking boot pass translates the stored shaders and builds their
+        // pipelines; only appears when the pass takes more than a moment.
+        auto progress = rex::ui::StartShaderProgressWindow(
+            GetDisplayName(), [graphics_system](uint32_t* phase, uint32_t* done, uint32_t* total) {
+              return graphics_system->GetShaderStorageProgress(phase, done, total);
+            });
         graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+        progress.reset();
       }
     }
 

@@ -30,6 +30,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/nr_direct_env.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/texture_cache.h>
@@ -926,6 +927,9 @@ bool D3D12RenderTargetCache::Initialize() {
 
     depth_float24_round_ = REXCVAR_GET(depth_float24_round);
     depth_float24_convert_in_pixel_shader_ = REXCVAR_GET(depth_float24_convert_in_pixel_shader);
+    // [NR-NATIVE-R2] N4 step 4: the path, the gamma flag and the depth
+    // convert flag are environment inputs of baked native draw heads.
+    nr::NrDirectEnvBump();
 
     // Check if 2x MSAA is supported or needs to be emulated with 4x MSAA
     // instead.

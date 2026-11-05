@@ -17,11 +17,15 @@ set(REXGRAPHICS_CORE_SOURCES
 # GPU system files - full backend
 set(REXGRAPHICS_SYSTEM_SOURCES
     graphics_system.cpp
+    shader_preload_catalog.cpp
     command_processor.cpp
+    frame_trace.cpp
     nr_draw_registry.cpp
     nr_draw_cache.cpp
     nr_lifecycle_trace.cpp
+    nr_draw_observer.cpp
     nr_cpu_readback.cpp
+    nr_native_submit.cpp
     nr_cull.cpp
     nr_buffer_cache.cpp
     nr_state_walk.cpp
@@ -107,6 +111,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/deferred_command_list.cpp
         d3d12/pipeline_cache.cpp
         d3d12/nr_native_pso.cpp
+        d3d12/nr_native_fast.cpp
         d3d12/vb_mirror.cpp
     )
 endif()

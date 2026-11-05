@@ -61,6 +61,7 @@ if(WIN32)
         window_win.cpp
         windowed_app_context_win.cpp
         startup_config_dialog_win.cpp
+        shader_progress_win.cpp
     )
 else()
     set(REXUI_PLATFORM_SOURCES
@@ -68,6 +69,7 @@ else()
         window_gtk.cpp
         windowed_app_context_gtk.cpp
         startup_config_dialog_stub.cpp
+        shader_progress_stub.cpp
     )
 endif()
 

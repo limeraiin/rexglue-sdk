@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -35,6 +36,7 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/hitch_probe.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
+#include <rex/graphics/frame_trace_scope.h>  // [ftrace] v3 exec split
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/dxbc.h>
@@ -326,6 +328,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   // shaders/local/, not shareable/. Must be up before the boot creation pass
   // below so the stored pipelines load instead of compiling.
   InitializePipelineLibrary(shader_storage_root / "local", title_id, edram_rov_used);
+  boot_phase_.store(1, std::memory_order_relaxed);
+  boot_processed_.store(0, std::memory_order_relaxed);
+  boot_total_.store(0, std::memory_order_relaxed);
 
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
@@ -490,13 +495,26 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         // Translate each needed modification on this thread after performing
         // modification-independent analysis of the whole shader.
         uint64_t ucode_data_hash = shader_to_translate->ucode_data_hash();
+        // The playtest cache covered only variants seen during gameplay.
+        // Also translate the default variant of every database shader, including
+        // those with no captured pipeline. Device pipelines still require real
+        // shader pairs and render state; do not invent those combinations.
+        std::set<uint64_t> modifications;
+        modifications.insert(shader_to_translate->type() == xenos::ShaderType::kPixel
+            ? translator.GetDefaultPixelShaderModification(
+                  shader_to_translate->GetDynamicAddressableRegisterCount(0))
+            : translator.GetDefaultVertexShaderModification(
+                  shader_to_translate->GetDynamicAddressableRegisterCount(0)));
         for (auto modification_it = shader_translations_needed.lower_bound(
                  std::make_pair(ucode_data_hash, uint64_t(0)));
              modification_it != shader_translations_needed.end() &&
              modification_it->first == ucode_data_hash;
              ++modification_it) {
+          modifications.insert(modification_it->second);
+        }
+        for (uint64_t modification : modifications) {
           D3D12Shader::D3D12Translation* translation = static_cast<D3D12Shader::D3D12Translation*>(
-              shader_to_translate->GetOrCreateTranslation(modification_it->second));
+              shader_to_translate->GetOrCreateTranslation(modification));
           // Only try (and delete in case of failure) if it's a new translation.
           // If it's a shader previously encountered in the game, translation of
           // which has failed, and the shader storage is loaded later, keep it
@@ -512,6 +530,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
           --shader_translation_threads_busy;
         }
+        boot_processed_.fetch_add(1, std::memory_order_relaxed);
       }
       if (dxc_compiler) {
         dxc_compiler->Release();
@@ -558,7 +577,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
         shader_translation_threads_needed =
             std::min(shader_translation_threads_busy + shaders_to_translate.size() + size_t(1),
-                     logical_processor_count - size_t(1));
+                     std::max(size_t(1), logical_processor_count - size_t(1)));
       }
       while (shader_translation_threads.size() < shader_translation_threads_needed) {
         auto thread = rex::thread::Thread::Create({}, shader_translation_thread_function);
@@ -568,6 +587,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
       // Request ucode information gathering and translation of all the needed
       // shaders.
+      boot_total_.fetch_add(1, std::memory_order_relaxed);
       {
         std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
         shaders_to_translate.push_back(shader);
@@ -594,6 +614,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         }
       }
     }
+    REXGPU_INFO("[shader-preload] {} failed shader translations", shaders_failed_to_translate.size());
     REXGPU_INFO("Translated {} shaders from the storage in {} milliseconds", shaders_translated,
                 (rex::chrono::Clock::QueryHostTickCount() - shader_storage_initialization_start) *
                     1000 / rex::chrono::Clock::QueryHostTickFrequency());
@@ -631,8 +652,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     }
 
     size_t pipelines_created = 0;
+    boot_processed_.store(0, std::memory_order_relaxed);
+    boot_total_.store(uint32_t(pipeline_stored_descriptions.size()), std::memory_order_relaxed);
+    boot_phase_.store(2, std::memory_order_relaxed);
     for (const PipelineStoredDescription& pipeline_stored_description :
          pipeline_stored_descriptions) {
+      boot_processed_.fetch_add(1, std::memory_order_relaxed);
       const PipelineDescription& pipeline_description = pipeline_stored_description.description;
       // TODO(Triang3l): On Vulkan, skip pipelines requiring unsupported device
       // features (to keep the cache files mostly shareable across devices).
@@ -754,6 +779,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           rex::thread::Wait(creation_threads_.back().get(), false);
           creation_threads_.pop_back();
         }
+      }
         bool await_creation_completion_event;
         {
           // Cleanup so additional threads can be created later again.
@@ -772,10 +798,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           creation_request_cond_.notify_one();
           rex::thread::Wait(creation_completion_event_.get(), false);
         }
-      }
     }
 
     pipeline_library_boot_pass_ = false;
+    boot_phase_.store(0, std::memory_order_relaxed);
     REXGPU_INFO(
         "Created {} graphics pipelines (not including reading the "
         "descriptions) from the storage in {} milliseconds",
@@ -792,6 +818,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         uint64_t(sizeof(pipeline_storage_file_header) +
                  sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
   } else {
+    boot_phase_.store(0, std::memory_order_relaxed);
     rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
     pipeline_storage_file_header.magic = pipeline_storage_magic;
     pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
@@ -890,9 +917,10 @@ void PipelineCache::EndSubmission() {
       // the whole frame at this wait.
       uint64_t wait_start = rex::chrono::Clock::QueryHostTickCount();
       rex::thread::Wait(creation_completion_event_.get(), false);
-      g_hitch_probe.pso_endsub_wait_ticks.fetch_add(
-          rex::chrono::Clock::QueryHostTickCount() - wait_start, std::memory_order_relaxed);
+      const uint64_t pso_wait = rex::chrono::Clock::QueryHostTickCount() - wait_start;
+      g_hitch_probe.pso_endsub_wait_ticks.fetch_add(pso_wait, std::memory_order_relaxed);
       g_hitch_probe.pso_endsub_waits.fetch_add(1, std::memory_order_relaxed);
+      ftrace::SplitWait(pso_wait);  // [ftrace] v3: blocking inside endsub, not work
     }
   }
 }
@@ -1196,6 +1224,15 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                             IDxbcConverter* dxbc_converter, IDxcUtils* dxc_utils,
                                             IDxcCompiler* dxc_compiler) {
   D3D12Shader& shader = static_cast<D3D12Shader&>(translation.shader());
+  // [hitch]/[ftrace] time the whole translation, every return path.
+  struct XlatTimer {
+    uint64_t start = rex::chrono::Clock::QueryHostTickCount();
+    ~XlatTimer() {
+      g_hitch_probe.xlat_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - start,
+                                         std::memory_order_relaxed);
+      g_hitch_probe.xlat_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  } xlat_timer;
 
   // Perform translation.
   // If this fails the shader will be marked as invalid and ignored later.
@@ -1778,6 +1815,16 @@ void PipelineCache::NrNativePsoRelease(void* ctx, ID3D12PipelineState* state) {
   if (state) {
     state->Release();
   }
+}
+
+bool PipelineCache::NrCopyPipelineDescription(void* pipeline_handle, uint32_t* out16) const {
+  static_assert(sizeof(PipelineDescription) == 16 * sizeof(uint32_t));
+  static_assert(offsetof(PipelineDescription, vertex_shader_modification) == 8);
+  static_assert(offsetof(PipelineDescription, pixel_shader_modification) == 24);
+  const Pipeline* pipeline = reinterpret_cast<const Pipeline*>(pipeline_handle);
+  if (!pipeline || !out16) return false;
+  std::memcpy(out16, &pipeline->description.description, sizeof(PipelineDescription));
+  return true;
 }
 
 ID3D12PipelineState* PipelineCache::NrNativePipeline(void* pipeline_handle,
@@ -4269,6 +4316,27 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
     pipeline->root_signature.store(root_signature, std::memory_order_release);
   }
 
+  return true;
+}
+
+bool PipelineCache::GetBootProgress(uint32_t* phase, uint32_t* done, uint32_t* total) {
+  uint32_t ph = boot_phase_.load(std::memory_order_relaxed);
+  if (ph == 0) {
+    return false;
+  }
+  *phase = ph;
+  *total = boot_total_.load(std::memory_order_relaxed);
+  uint32_t processed = boot_processed_.load(std::memory_order_relaxed);
+  if (ph == 1) {
+    *done = processed;
+    return true;
+  }
+  size_t in_flight = 0;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    in_flight = creation_queue_.size() + creation_threads_busy_;
+  }
+  *done = processed > in_flight ? uint32_t(processed - in_flight) : 0;
   return true;
 }
 

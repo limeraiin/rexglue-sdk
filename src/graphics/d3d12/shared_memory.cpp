@@ -16,6 +16,8 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/d3d12/hitch_probe.h>  // [ftrace] upload counters
+#include <rex/graphics/frame_trace_scope.h>  // [ftrace] v3 smup bracket
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -370,6 +372,8 @@ bool D3D12SharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  // [ftrace] v3: the whole function as smup self time (mode 3 only).
+  ftrace::SplitScope _ft_smup(&ftrace::SplitTotals::smup_ticks);
   // [gpu-census] actual guest-memory upload copies get recorded below.
   D3D12CommandProcessor::GpuCensusScope gpu_census_scope(
       command_processor_, D3D12CommandProcessor::kGpuCensusMemUp);
@@ -404,6 +408,9 @@ bool D3D12SharedMemory::UploadRanges(
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));
+      // [ftrace] one upload per copy, bytes as copied.
+      g_hitch_probe.smup_count.fetch_add(1, std::memory_order_relaxed);
+      g_hitch_probe.smup_bytes.fetch_add(uint64_t(upload_buffer_size), std::memory_order_relaxed);
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;

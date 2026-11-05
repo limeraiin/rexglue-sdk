@@ -526,8 +526,45 @@ class TextureCache {
   // [dcache] For bindings restored from a CROSS-FRAME entry: any bound
   // texture whose guest memory was written since the capture (its watch
   // fired, outdated_mask set) reloads through the request's own load path.
-  // Only the derivation is skipped; the load rule is unchanged.
-  void NrTexEnsureLoaded(uint32_t mask);
+  // Only the derivation is skipped; the load rule is unchanged. Returns true
+  // when every bound texture of the mask is up to date afterwards (the
+  // native executor latches its binding generation only then).
+  bool NrTexEnsureLoaded(uint32_t mask);
+  // [NR-NATIVE-R2] N4 step 3: the binding generation. Monotonic, bumped by
+  // every event that changes what a fetch constant slot RESOLVES TO (the
+  // binding content: key, swizzle, signs, texture objects, host descriptor
+  // indices) or whether the resolved texture holds current data. The writers,
+  // every one of them in this class or its backend, are:
+  //   1. ResetTextureBindings (every reset site: BeginFrame, the outdated
+  //      flag consumed by RequestTextures, CompletedSubmissionUpdated's
+  //      destroy, EvictTextureForRecreation, DestroyAllTextures / ClearCache);
+  //   2. RequestTextures when it rewrote a slot's content (bindings_changed,
+  //      which also drives UpdateTextureBindingsImpl, the descriptor writer);
+  //   3. NrTexRestore when it wrote a slot whose content differed;
+  //   4. the texture memory watch (TextureCache::WatchCallback: the data
+  //      behind a binding is outdated; another thread, hence the atomic);
+  //   5. ScaledResolveGlobalWatchCallback (a range leaving the scaled set
+  //      changes the key the next derivation produces).
+  // NOT a writer: TextureFetchConstantsWritten. A fetch constant write only
+  // clears the in-sync bit; the content changes when RequestTextures derives
+  // the slot again (writer 2). The native executor keys its entries on the
+  // record's fetch constants, so a live write by itself cannot change what an
+  // owned entry's slot resolves to. The draw resolution scale is set once in
+  // the constructor (no runtime writer; the executor's environment stamp
+  // records it).
+  uint32_t nr_binding_generation() const {
+    return nr_binding_generation_.load(std::memory_order_relaxed);
+  }
+  // A texture memory watch fired since the last RequestTextures: the restore
+  // path refuses and so must a generation-latched skip of it.
+  bool NrTexOutdatedPending() const {
+    return texture_became_outdated_.load(std::memory_order_relaxed);
+  }
+  // Compare-mode probe of the generation latch: true when every snapshot's
+  // slot currently holds exactly that binding (content and descriptor
+  // indices) and its textures are up to date; *bad_slot the first that does
+  // not (UINT32_MAX when all do). Never used on the fast path.
+  bool NrTexLatchCheck(const NrTexSnap* snaps, uint32_t count, uint32_t* bad_slot) const;
   // [dcache] Bumped whenever a Texture object is destroyed (eviction, clear):
   // a cross-frame entry holding Texture pointers from an older generation
   // must not be restored.
@@ -541,6 +578,20 @@ class TextureCache {
   // (the descriptor indices).
   virtual void NrTexCaptureImpl(uint32_t /*slot*/, NrTexSnap& /*s*/) {}
   virtual void NrTexRestoreImpl(uint32_t /*slot*/, const NrTexSnap& /*s*/) {}
+  // True when the backend half of the slot (the descriptor indices) already
+  // equals the snapshot's: NrTexRestore then writes nothing for the slot.
+  virtual bool NrTexRestoreImplEqual(uint32_t /*slot*/, const NrTexSnap& /*s*/) const {
+    return true;
+  }
+  // The binding content compare NrTexRestore and NrTexLatchCheck use.
+  static bool NrTexBindingEqual(const TextureBinding& a, const TextureBinding& b) {
+    return !(a.key != b.key) && a.host_swizzle == b.host_swizzle &&
+           a.swizzled_signs == b.swizzled_signs && a.texture == b.texture &&
+           a.texture_signed == b.texture_signed;
+  }
+  void NrTexBindingGenerationBump() {
+    nr_binding_generation_.fetch_add(1, std::memory_order_relaxed);
+  }
 
  protected:
   SharedMemory& shared_memory() const { return shared_memory_; }
@@ -687,6 +738,7 @@ class TextureCache {
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
   uint32_t nr_texture_destroy_generation_ = 0;  // [dcache]
+  std::atomic<uint32_t> nr_binding_generation_{1};  // [NR-NATIVE-R2] see nr_binding_generation()
 };
 
 }  // namespace rex::graphics

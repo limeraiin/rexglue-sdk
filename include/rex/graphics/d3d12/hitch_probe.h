@@ -18,8 +18,10 @@ namespace rex::graphics::d3d12 {
 // lesson). These counters name the blocking site instead of guessing.
 // Written from the CP thread (fence waits, EndSubmission pipeline-creation
 // wait, draw-time PSO creates) and from the pipeline creation threads
-// (worker-side creates), reported and reset once a second from the D3D12
-// command processor's frame close. All _ticks fields are host ticks from
+// (worker-side creates). Every counter is CUMULATIVE and never reset: the
+// 1 Hz [hitch] reporter and the per-frame [ftrace] record each diff against
+// their own last copies. The one exception is pso_cp_max_ticks, a per-window
+// maximum the reporter clears. All _ticks fields are host ticks from
 // rex::chrono::Clock::QueryHostTickCount, converted to ms at report time.
 struct HitchProbe {
   // CheckSubmissionFence: the submission-fence wait (frame-open pacing and
@@ -52,6 +54,15 @@ struct HitchProbe {
   // rejected (a stale entry; the library cannot replace it). Any nonzero here
   // is a pipeline recompiled on EVERY boot.
   std::atomic<uint64_t> lib_store_fails{0};
+  // PipelineCache::TranslateAnalyzedShader (ucode -> DXBC, any thread).
+  std::atomic<uint64_t> xlat_ticks{0};
+  std::atomic<uint64_t> xlat_count{0};
+  // [ftrace] uploads recorded into the command list: texture-cache loads
+  // (guest bytes loaded) and shared-memory UploadRanges (bytes copied).
+  std::atomic<uint64_t> texup_count{0};
+  std::atomic<uint64_t> texup_bytes{0};
+  std::atomic<uint64_t> smup_count{0};
+  std::atomic<uint64_t> smup_bytes{0};
 };
 
 extern HitchProbe g_hitch_probe;

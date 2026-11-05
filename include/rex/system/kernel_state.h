@@ -275,6 +275,9 @@ class KernelState {
 
   void RegisterThread(XThread* thread);
   void UnregisterThread(XThread* thread);
+  // [cpu-pin] Applies an affinity mask to every registered guest thread
+  // (host threads untouched). Returns the number pinned.
+  uint32_t PinGuestThreads(uint64_t mask);
   void OnThreadExecute(XThread* thread);
   void OnThreadExit(XThread* thread);
   object_ref<XThread> GetThreadByID(uint32_t thread_id);

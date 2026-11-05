@@ -34,6 +34,8 @@
 #include <rex/graphics/nr_detile.h>
 #include <rex/graphics/nr_draw_cache.h>
 #include <rex/graphics/nr_lifecycle_trace.h>
+#include <rex/graphics/nr_draw_observer.h>
+#include <rex/graphics/nr_native_submit.h>  // [NR-NATIVE-R2] WP1
 #include <rex/graphics/nr_state_walk.h>
 #include <rex/graphics/nr_draw_registry.h>
 #include <rex/graphics/nr_regfile.h>
@@ -52,7 +54,21 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
-REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+#ifdef _WIN32
+#include <windows.h>  // [ftrace] QueryThreadCycleTime at the swap
+// [ftrace] page faults at the swap. PSAPI_VERSION 2 maps GetProcessMemoryInfo
+// to K32GetProcessMemoryInfo, exported by kernel32 (no psapi.lib).
+#ifndef PSAPI_VERSION
+#define PSAPI_VERSION 2
+#endif
+#include <psapi.h>
+#endif
+#include <rex/graphics/frame_trace_scope.h>   // [ftrace] v3 exec split
+#include <rex/system/cpu_pin.h>                 // [cpu-pin] CP core ownership
+#include <rex/ui/graphics_upload_buffer_pool.h>  // [ftrace] v3 upalloc totals
+
+REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -108,6 +124,25 @@ REXCVAR_DEFINE_INT32(gpu_n7, 1, "GPU",
                      "N-8f coalescer CLEAN/COALESCE 5 s each in place, 6 = "
                      "report + cycle the N-9 plan replay CLEAN/PROG 5 s "
                      "each in place (decode-exact; pair adjacent phases).");
+
+// [ftrace] Per-frame timing trace (include/rex/graphics/frame_trace.h). One
+// record at every XE_SWAP: ~25 counter reads and one struct store, no
+// allocation and no log line per frame. Summarized once a second after the
+// [n7] line, dumped to <log stem>.frames.csv beside the log at shutdown.
+// Mode 3 adds the exec split: self time of IssueDraw, EndSubmission, the
+// texture-cache load and the shared-memory upload (disjoint, net of the
+// HitchProbe waits), upload-pool page creations and page faults (v3 CSV).
+REXCVAR_DEFINE_INT32(gpu_frame_trace, 0, "GPU",
+                     "[ftrace] per-frame timing record at every swap: 0 = off (default), "
+                     "1 = CPU-side record, 2 = also a GPU "
+                     "timestamp pair per submission (busy/span per frame), "
+                     "3 = also the CP exec split (draw/endsub/texup/smup self "
+                     "time, upload-pool page creates, page faults) and stall class timing.");
+
+// [cpu-pin] The CP thread and the hot guest threads never share a physical
+// core (include/rex/system/cpu_pin.h). Windows only; off below 4 logical
+// processors.
+REXCVAR_DEFINE_INT32(cpu_pin, 0, "GPU", rex::system::cpu_pin::kModeHelp);
 
 // [PM4-CENSUS] Naruto §11.7 draw-emission census. Settles where the ~10k
 // heavy-forest draws/frame come from: counts DRAW_INDX vs DRAW_INDX_2 packets,
@@ -1632,6 +1667,136 @@ uint64_t g_stall_slow_n = 0, g_stall_slow_ns = 0;  // buffers over 20 ms
 // call site; draws de-tile removed never reach it, so this counts what the
 // consumer actually did -- the number every rung below has to move.
 uint64_t g_n7_draws = 0;
+
+// [N7]/[ftrace] The worker loop's spin/exec brackets. CP thread only; file
+// scope so the XE_SWAP handler can read them at the frame boundary. The
+// [n7] window logic below is unchanged (it keeps its own last copies).
+uint64_t prof_spin_ns = 0, prof_exec_ns = 0;
+uint64_t prof_exec_calls = 0, prof_starves = 0;
+uint64_t n7_wakes = 0;  // per [n7] window, reset by the reporter
+// [ftrace] cumulative wakes (never reset) and the open exec bracket's start,
+// so a swap can charge the in-progress ExecutePrimaryBuffer to its frame.
+uint64_t g_cp_wakes_total = 0;
+std::chrono::steady_clock::time_point g_cp_exec_t0{};
+bool g_cp_exec_open = false;
+// [ftrace] WAIT_REG_MEM blocking inside the exec bracket (the guest's vblank
+// wait): cumulative host ticks spent while the value did not match (Sleep
+// and yield paths alike) and the number of packets that waited at least
+// once. Cumulative, never reset; the swap takes deltas. CP thread only.
+uint64_t g_cp_wait_ticks_total = 0;
+uint64_t g_cp_wait_packets_total = 0;
+// [ftrace] v4: the CP thread's logical processor and its migration tally.
+// Sampled at the wake, at every draw and at the swap while the trace is on;
+// one GetCurrentProcessorNumber (a few ns) per sample. Cumulative, never
+// reset; the swap takes deltas. CP thread only.
+uint32_t g_cp_cpu_last = ftrace::kNoCpu;
+uint64_t g_cp_migr_total = 0;
+inline void CpSampleCpu() {
+#ifdef _WIN32
+  ftrace::MigrNote(uint32_t(GetCurrentProcessorNumber()), g_cp_cpu_last, g_cp_migr_total);
+#endif
+}
+
+#ifdef _WIN32
+// [ftrace] v5: per-logical-processor busy times at the swap. One
+// NtQuerySystemInformation(SystemProcessorPerformanceInformation) per frame
+// (group 0, a few microseconds for 12 processors) into a double-buffered
+// table; the swap reads the delta of the CP's own processor and of its SMT
+// sibling (sibling table from the core topology, built once). CP thread
+// only; no cvar, any trace mode.
+struct CpProcPerf {  // SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION, 48 bytes
+  int64_t idle;
+  int64_t kernel;
+  int64_t user;
+  int64_t dpc;
+  int64_t interrupt;
+  uint32_t interrupt_count;
+  uint32_t pad;
+};
+static_assert(sizeof(CpProcPerf) == 48, "SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION layout");
+constexpr ULONG kSystemProcessorPerformanceInformation = 8;
+typedef LONG(NTAPI* CpNtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
+
+struct CpProcBusy {
+  bool init = false;
+  bool usable = false;
+  CpNtQuerySystemInformationFn query = nullptr;
+  uint32_t logical = 0;
+  std::vector<int32_t> sibling;  // ftrace::SiblingTableFromCores
+  std::vector<CpProcPerf> buf[2];
+  int cur = 0;
+  bool have_prev = false;
+
+  void Init() {
+    init = true;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    query = reinterpret_cast<CpNtQuerySystemInformationFn>(
+        GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    if (!query) return;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    logical = si.dwNumberOfProcessors;
+    if (!logical || logical > 64) return;
+    buf[0].assign(logical, CpProcPerf{});
+    buf[1].assign(logical, CpProcPerf{});
+    sibling.assign(logical, ftrace::kNoSibling);
+    // Core masks as cpu_pin reads them (variable-size records, group 0).
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    std::vector<uint8_t> raw(len ? len : 1);
+    auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(raw.data());
+    if (len && GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
+      uint64_t cores[64];
+      size_t count = 0;
+      for (DWORD off = 0; off + 8 <= len;) {
+        auto* p = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(raw.data() + off);
+        if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount >= 1 &&
+            p->Processor.GroupMask[0].Group == 0 && count < 64) {
+          cores[count++] = uint64_t(p->Processor.GroupMask[0].Mask);
+        }
+        if (!p->Size) break;
+        off += p->Size;
+      }
+      ftrace::SiblingTableFromCores(cores, count, sibling.data(), logical);
+    }
+    usable = true;
+  }
+
+  // Samples every processor; fills the record's v5 columns for `cpu`
+  // (the CP's processor at this swap) from the previous sample.
+  void Sample(int32_t cpu, ftrace::FrameRecord& r) {
+    if (!init) Init();
+    if (!usable) return;
+    std::vector<CpProcPerf>& now = buf[cur ^ 1];
+    const std::vector<CpProcPerf>& prev = buf[cur];
+    ULONG got = 0;
+    const ULONG bytes = ULONG(now.size() * sizeof(CpProcPerf));
+    if (query(kSystemProcessorPerformanceInformation, now.data(), bytes, &got) < 0 ||
+        got < bytes) {
+      have_prev = false;
+      return;
+    }
+    if (have_prev && cpu >= 0 && uint32_t(cpu) < logical) {
+      auto times = [](const CpProcPerf& p) {
+        ftrace::ProcTimes t;
+        t.idle = uint64_t(p.idle);
+        t.kernel = uint64_t(p.kernel);
+        t.user = uint64_t(p.user);
+        return t;
+      };
+      r.own_busy_ms = ftrace::BusyDeltaMs(times(prev[cpu]), times(now[cpu]));
+      const int32_t sib = sibling[cpu];
+      if (sib >= 0 && uint32_t(sib) < logical) {
+        r.sib_busy_ms = ftrace::BusyDeltaMs(times(prev[sib]), times(now[sib]));
+      }
+    }
+    cur ^= 1;
+    have_prev = true;
+  }
+};
+CpProcBusy g_cp_proc_busy;
+#endif
 
 // [PM4-CENSUS] Only the cmd-proc worker thread executes packets, so plain
 // globals (no atomics) -- same pattern as g_issuedraw_ns / g_split_prof. Depth
@@ -5529,6 +5694,14 @@ void NrSdbObserve(xenos::ShaderType shader_type, uint32_t guest_address,
 CpStallTicks g_cp_stall;
 
 void CommandProcessor::WorkerThreadMain() {
+  // [ftrace] mode read once, before SetupContext so the D3D12 GPU half can
+  // size its timestamp heap from it.
+  ftrace::Begin(REXCVAR_GET(gpu_frame_trace));
+  // [cpu-pin] 1 = this thread alone on one physical core, guest threads on
+  // the rest. Applied before any guest thread competes for this core.
+  if (REXCVAR_GET(cpu_pin) >= 1) {
+    system::cpu_pin::Enable(kernel_state_, REXCVAR_GET(cpu_pin));
+  }
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
@@ -5928,9 +6101,9 @@ void CommandProcessor::WorkerThreadMain() {
   // inflated gpu_worker_profile by ~20%.
   const bool kTimeExec = true;
   using prof_clock = std::chrono::steady_clock;
-  uint64_t prof_spin_ns = 0, prof_exec_ns = 0;
-  uint64_t prof_spin_loops = 0, prof_event_waits = 0, prof_exec_calls = 0,
-           prof_starves = 0;
+  // prof_spin_ns / prof_exec_ns / prof_exec_calls / prof_starves are file
+  // scope now (the XE_SWAP handler reads them for [ftrace]).
+  uint64_t prof_spin_loops = 0, prof_event_waits = 0;
   uint64_t last_spin_ns = 0, last_exec_ns = 0, last_spin_loops = 0,
            last_event_waits = 0, last_exec_calls = 0, last_starves = 0;
   uint64_t last_type_ns[4] = {0, 0, 0, 0}, last_type_cnt[4] = {0, 0, 0, 0};
@@ -5938,7 +6111,7 @@ void CommandProcessor::WorkerThreadMain() {
   uint64_t last_type0_split_ns = 0;
   auto prof_last_report = prof_clock::now();
   const int32_t kN7 = REXCVAR_GET(gpu_n7);
-  uint64_t n7_backlog_sum = 0, n7_backlog_max = 0, n7_wakes = 0;
+  uint64_t n7_backlog_sum = 0, n7_backlog_max = 0;  // n7_wakes: file scope
   uint64_t n7_last_frames = 0, n7_last_draws = 0;
   uint64_t n7_last_spin_ns = 0, n7_last_exec_ns = 0;
   uint64_t n7_last_exec_calls = 0, n7_last_starves = 0;
@@ -6009,8 +6182,13 @@ void CommandProcessor::WorkerThreadMain() {
         if (backlog > n7_backlog_max) n7_backlog_max = backlog;
         ++n7_wakes;
       }
+      ++g_cp_wakes_total;  // [ftrace]
+      if (ftrace::g_on) CpSampleCpu();  // [ftrace] v4
       auto exec_t0 = kTimeExec ? prof_clock::now() : prof_clock::time_point{};
+      g_cp_exec_t0 = exec_t0;  // [ftrace] the swap charges the open bracket
+      g_cp_exec_open = kTimeExec;
       read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+      g_cp_exec_open = false;
       if (kTimeExec) {
         prof_exec_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                             prof_clock::now() - exec_t0).count();
@@ -6153,6 +6331,7 @@ void CommandProcessor::WorkerThreadMain() {
         const uint64_t frames_now = swap_counter_.load(std::memory_order_relaxed);
         const uint64_t frames = frames_now - n7_last_frames;
         const uint64_t draws = g_n7_draws - n7_last_draws;
+        nr::ObserveDrawReport(g_n7_draws, frames_now);
         const double spin_ms = (prof_spin_ns - n7_last_spin_ns) / 1e6;
         const double exec_ms = (prof_exec_ns - n7_last_exec_ns) / 1e6;
         const double fps = 1000.0 * double(frames) / wall_ms;
@@ -6171,6 +6350,7 @@ void CommandProcessor::WorkerThreadMain() {
             n7_wakes ? (n7_backlog_sum / n7_wakes) : uint64_t(0), n7_backlog_max,
             draws, prof_exec_calls - n7_last_exec_calls,
             prof_starves - n7_last_starves);
+        ftrace::Report1Hz();  // [ftrace] same cadence, right after [n7]
         // The split, when this window was a SPLIT-ON phase. draw and exec are
         // clean brackets; type0 carries ~3-8% of its own self-inflation, so
         // other% is a floor. This is the number that orders N-8 against N-9.
@@ -6304,6 +6484,9 @@ void CommandProcessor::WorkerThreadMain() {
           static CpStallTicks s_last;
           const CpStallTicks& c = g_cp_stall;
           auto ms = [](uint64_t ns) { return double(ns) / 1e6; };
+          // The cheap buffer detector remains active without per-draw clocks.
+          // -1 marks unmeasured classes (and the resulting unknown remainder).
+          auto timed_ms = [&](uint64_t ns) { return ftrace::g_exec_split ? ms(ns) : -1.0; };
           const StallBest& b = g_stall_best;
           const uint64_t named = b.d.tex + b.d.mem + b.d.rt + b.d.prim + b.d.sub + b.d.pso +
                                  b.swap_ns;
@@ -6311,13 +6494,13 @@ void CommandProcessor::WorkerThreadMain() {
               "[stall] win tex {:.1f} mem {:.1f} rt {:.1f} prim {:.1f} sub {:.1f} (ecl {:.1f}) "
               "pso {:.1f} ms | slow(>20ms) {} bufs {:.1f}ms | max ib {:.2f}ms @{:#010x}/{}dw "
               "draws {} : tex {:.2f} mem {:.2f} rt {:.2f} prim {:.2f} sub {:.2f} (ecl {:.2f}) "
-              "pso {:.2f} swap {:.2f} other {:.2f}",
-              ms(c.tex - s_last.tex), ms(c.mem - s_last.mem), ms(c.rt - s_last.rt),
-              ms(c.prim - s_last.prim), ms(c.sub - s_last.sub), ms(c.ecl - s_last.ecl),
+              "pso {:.2f} swap {:.2f} other {:.2f} | class_timing={}",
+              timed_ms(c.tex - s_last.tex), timed_ms(c.mem - s_last.mem), timed_ms(c.rt - s_last.rt),
+              timed_ms(c.prim - s_last.prim), timed_ms(c.sub - s_last.sub), timed_ms(c.ecl - s_last.ecl),
               ms(c.pso - s_last.pso), g_stall_slow_n, ms(g_stall_slow_ns), ms(b.ns), b.ptr,
-              b.count, b.d.draws, ms(b.d.tex), ms(b.d.mem), ms(b.d.rt), ms(b.d.prim),
-              ms(b.d.sub), ms(b.d.ecl), ms(b.d.pso), ms(b.swap_ns),
-              ms(b.ns > named ? b.ns - named : 0));
+              b.count, b.d.draws, timed_ms(b.d.tex), timed_ms(b.d.mem), timed_ms(b.d.rt), timed_ms(b.d.prim),
+              timed_ms(b.d.sub), timed_ms(b.d.ecl), ms(b.d.pso), ms(b.swap_ns),
+              timed_ms(b.ns > named ? b.ns - named : 0), ftrace::g_exec_split ? "on" : "off");
           s_last = c;
           g_stall_best = StallBest{};
           g_stall_slow_n = 0;
@@ -7982,7 +8165,9 @@ bool CommandProcessor::SetupContext() {
   return true;
 }
 
-void CommandProcessor::ShutdownContext() {}
+void CommandProcessor::ShutdownContext() {
+  ftrace::DumpAtShutdown();  // [ftrace] idempotent (D3D12 dumps before this)
+}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
@@ -9525,6 +9710,8 @@ bool NrSwapNextStop(uint32_t pbase, const uint8_t* raw,
 void CommandProcessor::NrSkipExecuteBuffer(uint32_t ptr, uint32_t count) {
   ++g_skp_bufs;
   g_nr_skip_bufactive = true;
+  // [NR-NATIVE-R2] this walk executes the buffer: count predicated markers.
+  g_ctx_walker.native_exec = true;
   // [NR-SPP] whole-buffer bracket.
   const bool spp = g_skp_prof;
   const auto spp_buf_t0 = spp ? std::chrono::steady_clock::now()
@@ -10549,7 +10736,9 @@ bool CommandProcessor::NrSkipDrawDirect(uint32_t opcode, uint32_t dword,
   }
   ExecutePacketType3DrawTail(
       vgt_draw_initiator.value, is_indexed ? &index_buffer_info : nullptr,
-      opcode == 0x22 ? "PM4_DRAW_INDX" : "PM4_DRAW_INDX_2", opcode);
+      opcode == 0x22 ? "PM4_DRAW_INDX" : "PM4_DRAW_INDX_2", opcode,
+      uint32_t(reinterpret_cast<uintptr_t>(raw + dword * 4) -
+               reinterpret_cast<uintptr_t>(memory_->physical_membase())) & 0x1FFFFFFFu);
   return true;
 }
 
@@ -10770,6 +10959,16 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       }
     }
     if (!any_pass || opcode == PM4_XE_SWAP) {
+      // [NR-NATIVE-R2] a predicated-out native marker never reaches the NOP
+      // executor: count it here (peek, then rewind; the skip below consumes).
+      if (!any_pass && opcode == PM4_NOP && count == 2) {
+        const auto nat_off = reader->read_offset();
+        const uint32_t nat_d0 = reader->ReadAndSwap<uint32_t>();
+        reader->set_read_offset(nat_off);
+        if (nr_native::NrNativeIsMarkerPayload(count, nat_d0)) {
+          nr_native::NrNativeBump(&nr_native::NrNativeCounters::refused_predicated);
+        }
+      }
       reader->AdvanceRead(count * sizeof(uint32_t));
       trace_writer_.WritePacketEnd();
       return true;
@@ -10957,10 +11156,56 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, ui
 
 bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
                                               uint32_t count) {
+  // [NR-NATIVE-R2] WP1: a two-dword NOP whose first payload dword is the
+  // native magic executes the named ring record here, at this exact stream
+  // position, on the CP thread. Reading both dwords consumes the packet
+  // exactly as the skip below would. Every other NOP is unchanged.
+  if (count == 2) {
+    const uint32_t d0 = reader->ReadAndSwap<uint32_t>();
+    const uint32_t d1 = reader->ReadAndSwap<uint32_t>();
+    if (nr_native::NrNativeIsMarkerPayload(count, d0)) {
+      NrNativeExecute(d1);
+    } else if (d0 == nr_native::kNrNativeEndMarkerMagic) {
+      NrNativeEnd(d1);
+    }
+    return true;
+  }
   // skip N 32-bit words to get to the next packet
   // No-op, ignore some data.
   reader->AdvanceRead(count * sizeof(uint32_t));
   return true;
+}
+
+// [NR-NATIVE-R2] See the header. The band test is de-tile's own pure
+// predicate on the live band registers (the same six the retail draw stop
+// reads), evaluated before any overlay; a running band value store (N97)
+// defers side effects a draw would consume, so a marker there is skipped
+// too (the retail stop in such an execution drops its draw as a band).
+bool CommandProcessor::NrNativeDrawBandAllowed() const {
+  if (g_nr_detile_mode) {
+    if (g_n97_filter) return false;
+    const uint32_t* rf = register_file_->values;
+    const nr::DetileRegs regs{rf[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+                              rf[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                              rf[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+                              rf[XE_GPU_REG_RB_SURFACE_INFO],
+                              rf[XE_GPU_REG_RB_COLOR_INFO],
+                              rf[XE_GPU_REG_RB_DEPTH_INFO]};
+    if (nr::DetileIsRepeatBand(regs)) return false;
+  }
+  return true;
+}
+
+bool CommandProcessor::NrNativeDrawAllowed() {
+  if (!NrNativeDrawBandAllowed()) return false;
+  // [N8F] a draw is about to dispatch: fire the deferred effects first.
+  if (g_n8f_nspans) N8fFlush();
+  return true;
+}
+
+bool CommandProcessor::NrNativeVizKilled() const {
+  const auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+  return viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z;
 }
 
 bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet,
@@ -11023,6 +11268,126 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   ++counter_;
   // Pure presented-frame tally (real swaps only, no vblank pollution).
   swap_counter_.fetch_add(1, std::memory_order_relaxed);
+
+  // [ftrace] one record per presented frame: the CP thread's own brackets as
+  // deltas since the previous swap, then the backend's columns. The open
+  // exec bracket (this swap runs inside ExecutePrimaryBuffer) is charged to
+  // this frame so exec never lags a frame behind.
+  if (ftrace::FrameTraceRing* ring = ftrace::Ring()) {
+    static uint64_t last_ticks = 0, last_exec_ns = 0, last_spin_ns = 0, last_starves = 0,
+                    last_wakes = 0, last_draws = 0, last_swap_ns = 0, last_wait_ticks = 0,
+                    last_wait_packets = 0, last_cycles = 0;
+    // [ftrace] v3 last copies: the split ledger, the pool creates, page faults.
+    static uint64_t last_draw_t = 0, last_draw_n = 0, last_endsub_t = 0, last_endsub_n = 0,
+                    last_texup_t = 0, last_smup_t = 0, last_upalloc_n = 0, last_upalloc_t = 0,
+                    last_pf = 0;
+    // [ftrace] v4 last copies: migrations and the native executor stages.
+    static uint64_t last_migr = 0, last_nr_lookup = 0, last_nr_derive = 0, last_nr_const = 0,
+                    last_nr_bind = 0, last_nr_emit = 0, last_nr_n = 0;
+    CpSampleCpu();  // [ftrace] v4: the swap's own sample closes the frame
+    const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    const double to_ms = 1000.0 / double(ftrace::TickFrequency());
+    // The CP thread's own CPU time (cycles) so a slow frame separates "did
+    // more work" from "slept or was descheduled". 0 off Windows.
+    uint64_t cycles = 0;
+#ifdef _WIN32
+    {
+      ULONG64 c = 0;
+      if (QueryThreadCycleTime(GetCurrentThread(), &c)) cycles = c;
+    }
+#endif
+    uint64_t exec_ns = prof_exec_ns;
+    if (g_cp_exec_open) {
+      exec_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - g_cp_exec_t0)
+                              .count());
+    }
+    ftrace::FrameRecord r;
+    r.frame = swap_counter_.load(std::memory_order_relaxed);
+    r.t_ms = double(now - ftrace::StartTicks()) * to_ms;
+    r.dt_ms = last_ticks ? double(now - last_ticks) * to_ms : 0.0;
+    r.exec_ms = double(exec_ns - last_exec_ns) / 1e6;
+    r.spin_ms = double(prof_spin_ns - last_spin_ns) / 1e6;
+    r.idle_ms = ftrace::IdleMs(r.dt_ms, r.exec_ms, r.spin_ms);
+    r.starves = uint32_t(prof_starves - last_starves);
+    r.wakes = uint32_t(g_cp_wakes_total - last_wakes);
+    r.draws = uint32_t(g_n7_draws - last_draws);
+    r.swap_ms = double(g_n7_swap_ns - last_swap_ns) / 1e6;
+    r.phase = nr_native::NrNativePhase();
+    r.wait_ms = double(g_cp_wait_ticks_total - last_wait_ticks) * to_ms;
+    r.wait_n = uint32_t(g_cp_wait_packets_total - last_wait_packets);
+    r.cpu_mcyc = last_ticks ? double(cycles - last_cycles) / 1e6 : 0.0;
+    // [ftrace] v4: the processor this swap ran on and the migrations since
+    // the previous swap (any mode; -1 and 0 off Windows).
+    r.cpu_id = g_cp_cpu_last == ftrace::kNoCpu ? -1 : int32_t(g_cp_cpu_last);
+    r.migr = last_ticks ? uint32_t(g_cp_migr_total - last_migr) : 0;
+    last_migr = g_cp_migr_total;
+    // [ftrace] v3: the exec split (mode 3 only, the columns stay 0 below it;
+    // no bracket is open here, IssueSwap returned above) and the page-fault
+    // delta (any mode, one syscall).
+    if (ftrace::g_exec_split) {
+      const ftrace::SplitTotals& sp = ftrace::g_split;
+      const uint64_t up_n = rex::ui::g_upload_pool_trace.creates.load(std::memory_order_relaxed);
+      const uint64_t up_t =
+          rex::ui::g_upload_pool_trace.create_ticks.load(std::memory_order_relaxed);
+      r.draw_ms = double(sp.draw_ticks - last_draw_t) * to_ms;
+      r.draw_n = uint32_t(sp.draw_n - last_draw_n);
+      r.endsub_ms = double(sp.endsub_ticks - last_endsub_t) * to_ms;
+      r.endsub_n = uint32_t(sp.endsub_n - last_endsub_n);
+      r.texup_ms = double(sp.texup_ticks - last_texup_t) * to_ms;
+      r.smup_ms = double(sp.smup_ticks - last_smup_t) * to_ms;
+      r.upalloc_n = uint32_t(up_n - last_upalloc_n);
+      r.upalloc_ms = double(up_t - last_upalloc_t) * to_ms;
+      // v4: the native executor stages (bracketed in the D3D12 fast path).
+      r.nr_lookup_ms = double(sp.nr_lookup_ticks - last_nr_lookup) * to_ms;
+      r.nr_derive_ms = double(sp.nr_derive_ticks - last_nr_derive) * to_ms;
+      r.nr_const_ms = double(sp.nr_const_ticks - last_nr_const) * to_ms;
+      r.nr_bind_ms = double(sp.nr_bind_ticks - last_nr_bind) * to_ms;
+      r.nr_emit_ms = double(sp.nr_emit_ticks - last_nr_emit) * to_ms;
+      r.nr_n = uint32_t(sp.nr_n - last_nr_n);
+      last_draw_t = sp.draw_ticks;
+      last_draw_n = sp.draw_n;
+      last_endsub_t = sp.endsub_ticks;
+      last_endsub_n = sp.endsub_n;
+      last_texup_t = sp.texup_ticks;
+      last_smup_t = sp.smup_ticks;
+      last_upalloc_n = up_n;
+      last_upalloc_t = up_t;
+      last_nr_lookup = sp.nr_lookup_ticks;
+      last_nr_derive = sp.nr_derive_ticks;
+      last_nr_const = sp.nr_const_ticks;
+      last_nr_bind = sp.nr_bind_ticks;
+      last_nr_emit = sp.nr_emit_ticks;
+      last_nr_n = sp.nr_n;
+    }
+#ifdef _WIN32
+    {
+      PROCESS_MEMORY_COUNTERS pmc;
+      pmc.cb = sizeof(pmc);
+      if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        const uint64_t pf_now = pmc.PageFaultCount;
+        r.pf = last_ticks ? uint32_t(pf_now - last_pf) : 0;
+        last_pf = pf_now;
+      }
+    }
+    // [ftrace] v5: the CP's own processor and its SMT sibling busy time
+    // since the previous swap (any mode; -1 on the first swap, with no
+    // sibling, or when the query fails).
+    g_cp_proc_busy.Sample(r.cpu_id, r);
+#endif
+    OnFtraceSwap(r);
+    ring->Push(r);
+    last_ticks = now;
+    last_exec_ns = exec_ns;
+    last_spin_ns = prof_spin_ns;
+    last_starves = prof_starves;
+    last_wakes = g_cp_wakes_total;
+    last_draws = g_n7_draws;
+    last_swap_ns = g_n7_swap_ns;
+    last_wait_ticks = g_cp_wait_ticks_total;
+    last_wait_packets = g_cp_wait_packets_total;
+    last_cycles = cycles;
+  }
 
   // [NR-5B-DBG] register-file divergence probe: class hashes + the key
   // visibility registers, snapshotted AT THE SWAP (frame-aligned, so two
@@ -11255,6 +11620,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // [ftrace] host ticks at the first unmatched read; 0 while never blocked.
+  uint64_t wait_t0 = 0;
+
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -11298,6 +11666,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
     if (!matched) {
       // Wait.
+      if (!wait_t0) wait_t0 = rex::chrono::Clock::QueryHostTickCount();  // [ftrace]
       if (wait >= 0x100) {
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {
@@ -11311,6 +11680,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
         if (!worker_running_) {
           // Short-circuited exit.
+          g_cp_wait_ticks_total += rex::chrono::Clock::QueryHostTickCount() - wait_t0;
+          ++g_cp_wait_packets_total;
           return false;
         }
       } else {
@@ -11318,6 +11689,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+
+  if (wait_t0) {
+    // [ftrace] everything from the first non-match to the match: the sleeps,
+    // the yields and the re-reads between them.
+    g_cp_wait_ticks_total += rex::chrono::Clock::QueryHostTickCount() - wait_t0;
+    ++g_cp_wait_packets_total;
+  }
 
   return true;
 }
@@ -11567,6 +11945,15 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
                                               const char* opcode_name, uint32_t draw_opcode,
                                               uint32_t viz_query_condition,
                                               uint32_t count_remaining) {
+  // The header and optional viz token have already been consumed. Recover
+  // the header within the ring, including a wrap at its end, before parsing.
+  const uint32_t consumed = draw_opcode == 0x22 ? 8u : 4u;
+  const uint32_t read_offset = reader->read_offset();
+  const uint32_t header_offset = read_offset >= consumed ? read_offset - consumed
+      : reader->capacity() - (consumed - read_offset);
+  const uint32_t packet_address = uint32_t(
+      reinterpret_cast<uintptr_t>(reader->buffer() + header_offset) -
+      reinterpret_cast<uintptr_t>(memory_->physical_membase())) & 0x1FFFFFFFu;
   // if viz_query_condition != 0, this is a conditional draw based on viz query.
   // This ID matches the one issued in PM4_VIZ_QUERY
   // uint32_t viz_id = viz_query_condition & 0x3F;
@@ -11655,7 +12042,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
     // skip's direct draw path (NrSkipDrawDirect) runs the exact same code.
     ExecutePacketType3DrawTail(vgt_draw_initiator.value,
                                is_indexed ? &index_buffer_info : nullptr,
-                               opcode_name, draw_opcode);
+                               opcode_name, draw_opcode, packet_address);
   }
 
   // If read the packed correctly, but merely couldn't execute it (because of,
@@ -11673,7 +12060,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 // run this body, so the two paths cannot drift.
 void CommandProcessor::ExecutePacketType3DrawTail(
     uint32_t vgt_draw_initiator_value, IndexBufferInfo* index_buffer_info,
-    const char* opcode_name, uint32_t draw_opcode) {
+    const char* opcode_name, uint32_t draw_opcode, uint32_t packet_address) {
   reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
   vgt_draw_initiator.value = vgt_draw_initiator_value;
   {
@@ -11832,13 +12219,25 @@ void CommandProcessor::ExecutePacketType3DrawTail(
         ++g_nrd_skipped_depth;
       }
       ++g_n7_draws;  // [N7] executed draws, unconditional
+      if (ftrace::g_on) CpSampleCpu();  // [ftrace] v4: one processor read per draw
+      nr::ObserveReceivedDraw(g_n7_draws, packet_address, vgt_draw_initiator_value,
+          uint32_t(register_file_->Get<reg::RB_MODECONTROL>().edram_mode));
+      received_draw_ordinal_ = g_n7_draws;
       N8eDrawBoundary();  // [N8E] close this draw's constant-interval union
       const bool kTimeDraw = g_exec_prof || g_split_prof;
       const auto draw_t0 = kTimeDraw ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
+      // [ftrace] v3 exec split: the same bracket site, its own tick pair
+      // (host ticks, the ledger's unit) only in mode 3. Closed where the
+      // profiler's bracket closes so both measure the same span.
+      const bool kSplitDraw = ftrace::g_exec_split;
+      const ftrace::SplitMark draw_mark =
+          kSplitDraw ? ftrace::SplitEnter(ftrace::g_split, rex::chrono::Clock::QueryHostTickCount())
+                     : ftrace::SplitMark{};
       const bool draw_succeeded =
           IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                     index_buffer_info, major_mode_explicit);
+      received_draw_ordinal_ = 0;
       // [NR-ISSUE] Disarm unconditionally: the handshake is one draw wide.
       if (nr_issue_armed_ || nr_issue_shaders_active_) {
         nr_issue_armed_ = false;
@@ -11851,6 +12250,11 @@ void CommandProcessor::ExecutePacketType3DrawTail(
         g_issuedraw_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now() - draw_t0).count();
         g_draw_cnt++;
+      }
+      if (kSplitDraw) {  // [ftrace] v3
+        ftrace::SplitLeave(ftrace::g_split, draw_mark, rex::chrono::Clock::QueryHostTickCount(),
+                           ftrace::g_split.draw_ticks);
+        ++ftrace::g_split.draw_n;
       }
       // [NR-RES] Coverage of this draw's own shader references. Here rather
       // than in the walk: the shaders are analyzed only once IssueDraw has

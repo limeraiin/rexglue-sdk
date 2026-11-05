@@ -72,6 +72,12 @@ void InitLoggingEarly();
 void ShutdownLogging();
 
 /**
+ * Path of the active log file sink (logs/<app>_NNN.log), empty when logging
+ * has no file sink. Lets a sidecar file land beside the log.
+ */
+std::filesystem::path CurrentLogFilePath();
+
+/**
  * Register a new log category at runtime.
  *
  * The returned handle can be used with REXLOG_CAT_* macros and all
