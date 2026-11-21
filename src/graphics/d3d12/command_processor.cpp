@@ -14980,14 +14980,6 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     nr_in.texture_ctx = static_cast<TextureCache*>(texture_cache_.get());
   };
 
-  // [NR-LEAN] 5-4-4b inc 2b: the member is stale whenever the lean path below
-  // skipped the emulated derivation. Re-sync it from the mirror (the byte-
-  // proven equivalent of what the skipped body would have written, sticky
-  // fields included) before any full-body run reads it for dirty compares.
-  if (g_nr_sys_member_stale) {
-    std::memcpy(&system_constants_, &g_nr_sys_state, sizeof(system_constants_));
-    g_nr_sys_member_stale = false;
-  }
   if (g_nr_lean_sys && !edram_rov_used) {
     // Mirror-only fast path: run the 5-3b-1 derivation the swap uploads and
     // collapse the emulated body's per-field dirty accumulation into one
@@ -15010,6 +15002,13 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       return;
     }
     // ROV refusal (never seen in this game): fall through to the full body.
+  }
+
+  // The full derivation uses the previous values for its dirty comparisons.
+  // After a lean draw those values, including sticky fields, live in the mirror.
+  if (g_nr_sys_member_stale) {
+    std::memcpy(&system_constants_, &g_nr_sys_state, sizeof(system_constants_));
+    g_nr_sys_member_stale = false;
   }
 
   // Get the color info register values for each render target. Also, for ROV,

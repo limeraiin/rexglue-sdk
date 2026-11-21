@@ -5908,6 +5908,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   // order; "dhd"/"chd" self hits are what decide whether the EDRAM host-depth
   // round trip is reachable at all in this game.
   ++xfer_census_passes_;
+  // Keep cumulative counts per pass and amortize the diagnostic clock read.
+  if ((xfer_census_passes_ & 1023) != 0) {
+    return;
+  }
   const auto xfer_census_now = std::chrono::steady_clock::now();
   if (xfer_census_now - xfer_census_last_report_ >= std::chrono::seconds(1)) {
     xfer_census_last_report_ = xfer_census_now;
