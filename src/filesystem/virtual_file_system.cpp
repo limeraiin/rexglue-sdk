@@ -192,7 +192,7 @@ bool VirtualFileSystem::DeletePath(const std::string_view path) {
   return parent->Delete(entry);
 }
 
-X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view path,
+X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, std::string_view path,
                                      FileDisposition creation_disposition, uint32_t desired_access,
                                      bool is_directory, bool is_non_directory, File** out_file,
                                      FileAction* out_action) {
@@ -229,6 +229,16 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
 
+  // Directory and drive opens must use their original guest paths. A mounted
+  // replacement file is keyed by the physical guest path of the found entry.
+  if (entry && !(entry->attributes() & kFileAttributeDirectory)) {
+    auto lock = global_critical_region_.Acquire();
+    std::string target;
+    if (ResolveSymbolicLink(entry->absolute_path(), target)) {
+      entry = ResolvePath(target);
+      parent_entry = entry ? entry->parent() : nullptr;
+    }
+  }
   if (entry) {
     if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
       return X_STATUS_FILE_IS_A_DIRECTORY;

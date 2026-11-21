@@ -56,6 +56,7 @@ constexpr int IDC_SKIP_LAUNCHER = 1011;
 constexpr int IDC_DLC_UNINSTALL = 1012;
 constexpr int IDC_PORTABLE_SAVES = 1015;
 constexpr int IDC_TEXT_LANGUAGE = 1016;
+constexpr int IDC_UI_PACK = 1017;
 // (1013 retired: the draw-coalescing checkbox is gone, option is dead.)
 
 struct GpuOption {
@@ -121,6 +122,8 @@ constexpr int IDC_TAB = 1200, IDC_MNK = 1201, IDC_DEFAULTS = 1204;
 enum Tab { kTabOptions, kTabControls, kTabCredits, kTabCount };
 
 struct DialogState {
+  HWND ui_pack = nullptr;
+  HANDLE ui_pack_job = nullptr;
   KeyboardSettings keyboard;
   HWND tab = nullptr, pages[kTabCount] = {}, mnk_check = nullptr;
   HWND defaults_btn = nullptr, hint = nullptr;
@@ -429,6 +432,19 @@ HWND MakeControl(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD sty
   return ctl;
 }
 
+using UiPackTask = int (*)(int,const wchar_t*,HANDLE*);
+UiPackTask GetUiPackTask() {
+  return reinterpret_cast<UiPackTask>(GetProcAddress(GetModuleHandleW(nullptr),"NarutoUiPackTask"));
+}
+
+void UpdateUiPack(DialogState* st) {
+  if (!st->ui_pack || st->ui_pack_job) return;
+  auto task = GetUiPackTask();
+  const int status = task ? task(0, GetEditText(st->edit_data).c_str(), nullptr) : 0;
+  SetWindowTextW(st->ui_pack, status == 2 ? L"Uninstall 2× UI" : L"Install 2× UI");
+  EnableWindow(st->ui_pack,status != 0);
+}
+
 void BuildOptions(HWND hwnd, DialogState* st) {
   HFONT font = st->font;
   auto make = [st](HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y,
@@ -487,6 +503,8 @@ void BuildOptions(HWND hwnd, DialogState* st) {
   make(hwnd, L"BUTTON", L"Uninstall", WS_TABSTOP, 604, 264, 148, 28, IDC_DLC_UNINSTALL, font);
   make(hwnd, L"STATIC", L"Voice and audio packs work. Character packs are not supported.", SS_LEFT,
        440, 298, 312, 60, -1, st->font_small ? st->font_small : font);
+  if (GetUiPackTask())
+    st->ui_pack = make(hwnd, L"BUTTON", L"Install 2× UI", WS_TABSTOP, 440, 354, 312, 28, IDC_UI_PACK, font);
 
   // Skip this dialog on future launches (persists to the skip_config_dialog
   // cvar). Bottom-left, aligned with the Play/Quit buttons.
@@ -566,6 +584,7 @@ void BuildOptions(HWND hwnd, DialogState* st) {
   // Needs edit_data populated first: the list marks entries belonging to another
   // game, which is decided by the title id of the selected game data folder.
   RefreshDlcList(hwnd, st);
+  UpdateUiPack(st);
 }
 
 void SelectTab(DialogState* st, int index) {
@@ -732,6 +751,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       if (!st)
         break;
       int id = LOWORD(wparam);
+      if (id == IDC_UI_PACK && !st->ui_pack_job) {
+        auto task = GetUiPackTask();
+        auto root = GetEditText(st->edit_data);
+        int status = task ? task(0,root.c_str(),nullptr) : 0;
+        if (status && task(status == 2 ? 2 : 1,root.c_str(),&st->ui_pack_job)) {
+          SetWindowTextW(st->ui_pack,status == 2 ? L"Uninstalling 2× UI..." : L"Installing 2× UI...");
+          EnableWindow(st->ui_pack,FALSE);
+          EnableWindow(GetDlgItem(hwnd,IDOK),FALSE);
+          SetTimer(hwnd,IDC_UI_PACK,200,nullptr);
+        } else {
+          MessageBoxW(hwnd,L"Check the game data folder and the bundled UI package.",L"2× UI",MB_OK | MB_ICONERROR);
+          UpdateUiPack(st);
+        }
+        return 0;
+      }
       if (id == IDC_PORTABLE_SAVES) {
         st->content_root =
             SendMessageW(st->check_portable_saves, BM_GETCHECK, 0, 0) == BST_CHECKED
@@ -759,6 +793,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         std::wstring picked = BrowseForFolder(hwnd, GetEditText(st->edit_data));
         if (!picked.empty()) {
           SetWindowTextW(st->edit_data, picked.c_str());
+          UpdateUiPack(st);
           RefreshDlcList(hwnd, st);  // title id (and so the "other game" marks) changed
         }
         return 0;
@@ -781,11 +816,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         return 0;
       }
       if (id == IDC_DATA && HIWORD(wparam) == EN_KILLFOCUS) {
+        UpdateUiPack(st);
         // A different game folder can change which entries count as "other game".
         RefreshDlcList(hwnd, st);
         return 0;
       }
       if (id == IDOK) {
+        if (st->ui_pack_job) return 0;
         if (ApplyAndSave(hwnd, st, *g_config_path)) {
           st->play = true;
           st->done = true;
@@ -817,6 +854,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         SetTextColor(dc, RGB(90, 90, 90));
       return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
     }
+    case WM_TIMER:
+      if (st && wparam == IDC_UI_PACK && st->ui_pack_job &&
+          WaitForSingleObject(st->ui_pack_job,0) == WAIT_OBJECT_0) {
+        DWORD code = 1;
+        GetExitCodeProcess(st->ui_pack_job,&code);
+        CloseHandle(st->ui_pack_job);
+        st->ui_pack_job = nullptr;
+        KillTimer(hwnd,IDC_UI_PACK);
+        UpdateUiPack(st);
+        EnableWindow(GetDlgItem(hwnd,IDOK),TRUE);
+        if (code) MessageBoxW(hwnd,L"The UI package operation failed. See error.txt in the game's UI-Cache folder.",
+                              L"2× UI",MB_OK | MB_ICONERROR);
+        return 0;
+      }
+      break;
     case WM_CLOSE:
       if (st) {
         st->play = false;
@@ -940,6 +992,7 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
     }
   }
 
+  if (state.ui_pack_job) CloseHandle(state.ui_pack_job);
   if (state.keyboard.pad_normal)
     DeleteObject(state.keyboard.pad_normal);
   if (state.keyboard.pad_grey)
