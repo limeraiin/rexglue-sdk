@@ -167,7 +167,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     // it can be removed.
     if (content_type == XContentType::kMarketplaceContent) {
       std::string guest_module;
-      if (ContentDirectoryHasGuestModule(file_info.path / file_info.name, &guest_module)) {
+      if (ContentDirectoryHasGuestModule(file_info.path / file_info.name, &guest_module, title_id)) {
         // Games poll the content enumerator constantly (this title: ~660x per
         // boot), so warn once per package instead of flooding the log.
         static std::mutex warned_mutex;

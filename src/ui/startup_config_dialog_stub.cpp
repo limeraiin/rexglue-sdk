@@ -19,4 +19,7 @@ bool ShowStartupConfigDialog(std::string_view /*app_name*/,
   return true;
 }
 
+void ShowStandaloneSettings(std::string_view, const std::filesystem::path&,
+                            const std::filesystem::path&) {}
+
 }  // namespace rex::ui

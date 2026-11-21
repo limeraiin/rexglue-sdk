@@ -109,6 +109,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
+  void OnDestroy() override;
 
   /// Called after path defaults are computed, before Runtime is constructed.
   /// Override to adjust game/user/update data paths programmatically.
@@ -168,6 +169,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Populates `resolved_defaults_` with the PathConfig produced by
   /// OnConfigurePaths.
   virtual bool SetupEnvironment();
+  virtual bool UsesStartupDialog() const { return true; }
 
   /// Construct Runtime with the given paths, call runtime_->Setup, load the
   /// XEX image, initialize the rexcrt heap. Runs OnPostSetup at the end.
@@ -200,7 +202,6 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
   // WindowedApp overrides
   bool OnInitialize() override;
-  void OnDestroy() override;
 
   // WindowListener overrides
   void OnClosing(ui::UIEvent& e) override;

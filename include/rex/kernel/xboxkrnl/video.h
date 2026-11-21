@@ -24,6 +24,9 @@ class KernelState;
 
 namespace rex::kernel::xboxkrnl {
 
+// Set before starting guest threads for titles with a fixed logical framebuffer.
+void SetGuestDisplaySize(uint32_t width, uint32_t height);
+
 void VdQueryVideoMode(system::X_VIDEO_MODE* video_mode);
 
 // Register video variable exports (VdGlobalDevice, VdHSIOCalibrationLock, etc.)

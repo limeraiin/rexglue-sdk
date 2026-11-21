@@ -191,7 +191,7 @@ bool ReXApp::SetupEnvironment() {
     if (std::filesystem::exists(startup_config)) {
       rex::cvar::LoadConfig(startup_config);
     }
-    if (!REXCVAR_GET(skip_config_dialog)) {
+    if (UsesStartupDialog() && !REXCVAR_GET(skip_config_dialog)) {
       // The dialog's DLC panel installs/removes content directly, so it needs the
       // user data root up front. Resolved the same way as below; note this is the
       // pre-OnConfigurePaths value, so an app that relocates user data in that hook

@@ -222,10 +222,16 @@ void VdGetCurrentDisplayInformation_entry(ppc_ptr_t<X_DISPLAY_INFO> display_info
   display_info->actual_display_width = (uint16_t)mode.display_width;
 }
 
+static uint32_t guest_width = 0, guest_height = 0;
+void SetGuestDisplaySize(uint32_t width, uint32_t height) {
+  guest_width = width;
+  guest_height = height;
+}
+
 void VdQueryVideoMode(X_VIDEO_MODE* video_mode) {
   // Exposed as CVARs so the guest can observe custom display settings.
-  uint32_t display_width = GetConfiguredVideoModeWidth();
-  uint32_t display_height = GetConfiguredVideoModeHeight();
+  uint32_t display_width = guest_width ? guest_width : GetConfiguredVideoModeWidth();
+  uint32_t display_height = guest_height ? guest_height : GetConfiguredVideoModeHeight();
   float refresh_rate_hz = GetConfiguredVideoModeRefreshRate();
 
   std::memset(video_mode, 0, sizeof(X_VIDEO_MODE));

@@ -3904,7 +3904,12 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     name = rex::string::to_utf16(
         fmt::format("VS {:016X}", runtime_description.vertex_shader->shader().ucode_data_hash()));
   }
-  state->SetName(reinterpret_cast<LPCWSTR>(name.c_str()));
+  {
+    // Concurrent requests can receive the same cached driver object.
+    static std::mutex naming_mutex;
+    std::lock_guard lock(naming_mutex);
+    state->SetName(reinterpret_cast<LPCWSTR>(name.c_str()));
+  }
   return state;
 }
 
@@ -3975,6 +3980,9 @@ ID3D12PipelineState* PipelineCache::CreateGraphicsPipelineWithLibrary(
       name[i] = L"0123456789ABCDEF"[(name_hash >> ((15 - i) * 4)) & 0xF];
     }
     name[16] = 0;
+    // D3D12 requires external synchronization when loading the same library entry.
+    static std::mutex entry_locks[128];
+    std::lock_guard entry_lock(entry_locks[name_hash % std::size(entry_locks)]);
     if (SUCCEEDED(
             pipeline_library_->LoadGraphicsPipeline(name, &state_desc, IID_PPV_ARGS(&state)))) {
       g_hitch_probe.lib_hits.fetch_add(1, std::memory_order_relaxed);

@@ -10,10 +10,15 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <queue>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <rex/crypto/sha256.h>
 #include <span>
 
 #include <fmt/format.h>
@@ -56,6 +61,46 @@ bool IsGuestModuleName(std::string_view name) {
   }
   auto ext = lower.substr(dot);
   return ext == ".dll" || ext == ".xex" || ext == ".xexp";
+}
+
+// The title registers these during startup, before opening the launcher.
+std::vector<ContentModule> supported_modules;
+std::vector<RetailContent> retail_content;
+
+const ContentModule* FindContentModule(uint32_t title, std::string_view name, uint64_t size) {
+  for (const auto& module : supported_modules) {
+    if (module.title_id == title && module.size == size && module.file_name == LowerAscii(name))
+      return &module;
+  }
+  return nullptr;
+}
+
+bool SupportsEntry(uint32_t title, rex::filesystem::Entry* entry) {
+  const auto* module = FindContentModule(title, entry->name(), entry->size());
+  if (!module) return false;
+  rex::filesystem::File* file = nullptr;
+  if (entry->Open(rex::filesystem::FileAccess::kFileReadData, &file) != X_STATUS_SUCCESS)
+    return false;
+  std::vector<uint8_t> bytes(entry->size());
+  size_t read = 0;
+  auto status = file->ReadSync(bytes, 0, &read);
+  file->Destroy();
+  return status == X_STATUS_SUCCESS && read == bytes.size() &&
+         rex::crypto::sha256({reinterpret_cast<const char*>(bytes.data()), read}) == module->sha256;
+}
+
+bool MatchesInstalledModule(const std::filesystem::path& path, const ContentModule& module) {
+  // Marketplace enumeration is polled during play. Hash an installed revision only once.
+  static std::mutex mutex;
+  static std::map<std::filesystem::path, std::pair<std::filesystem::file_time_type, std::string>> cache;
+  std::error_code ec;
+  auto modified = std::filesystem::last_write_time(path, ec);
+  if (ec) return false;
+  std::lock_guard lock(mutex);
+  auto it = cache.find(path);
+  if (it == cache.end() || it->second.first != modified)
+    it = cache.insert_or_assign(path, std::make_pair(modified, rex::crypto::sha256_file(path))).first;
+  return it->second.second == module.sha256;
 }
 
 std::filesystem::path ContentDirectory(const std::filesystem::path& content_root, uint32_t title_id,
@@ -121,21 +166,26 @@ X_RESULT ExtractEntry(rex::filesystem::Entry* entry, const std::filesystem::path
   while (remaining > 0) {
     size_t bytes_read = 0;
     size_t to_read = std::min(remaining, kBufferSize);
-    in_file->ReadSync(std::span<uint8_t>(buffer.get(), to_read), offset, &bytes_read);
-    if (bytes_read == 0) {
+    auto status = in_file->ReadSync(std::span<uint8_t>(buffer.get(), to_read), offset, &bytes_read);
+    if (status != X_STATUS_SUCCESS || bytes_read == 0 ||
+        fwrite(buffer.get(), 1, bytes_read, out_file) != bytes_read) {
       break;
     }
-    fwrite(buffer.get(), 1, bytes_read, out_file);
     offset += bytes_read;
     remaining -= bytes_read;
   }
 
-  fclose(out_file);
+  bool complete = fclose(out_file) == 0 && remaining == 0;
   in_file->Destroy();
-  return X_ERROR_SUCCESS;
+  return complete ? X_ERROR_SUCCESS : X_ERROR_ACCESS_DENIED;
 }
 
 }  // namespace
+
+void RegisterContentModule(ContentModule module) {
+  module.file_name = LowerAscii(module.file_name);
+  supported_modules.push_back(std::move(module));
+}
 
 bool InspectContentPackage(const std::filesystem::path& package_path,
                            ContentPackageInfo* out_info) {
@@ -182,17 +232,22 @@ bool InspectContentPackage(const std::filesystem::path& package_path,
   // Mount just far enough to read the file table, so callers can see what the
   // package actually contains (and spot guest modules before installing).
   auto device = std::make_unique<rex::filesystem::StfsContainerDevice>("", package_path);
-  if (device->Initialize()) {
-    if (auto* root = device->ResolvePath("")) {
-      for (const auto& child : root->children()) {
-        out_info->files.push_back(child->name());
-        if (!(child->attributes() & rex::filesystem::kFileAttributeDirectory) &&
-            IsGuestModuleName(child->name())) {
-          out_info->has_guest_module = true;
-          if (out_info->guest_module_name.empty()) {
-            out_info->guest_module_name = child->name();
-          }
-        }
+  if (!device->Initialize()) return false;
+  auto* root = device->ResolvePath("");
+  if (!root) return false;
+  std::queue<rex::filesystem::Entry*> dirs;
+  dirs.push(root);
+  while (!dirs.empty()) {
+    auto* dir = dirs.front();
+    dirs.pop();
+    for (const auto& child : dir->children()) {
+      if (dir == root) out_info->files.push_back(child->name());
+      if (child->attributes() & rex::filesystem::kFileAttributeDirectory) {
+        dirs.push(child.get());
+      } else if (IsGuestModuleName(child->name()) &&
+                 (dir != root || !SupportsEntry(out_info->title_id, child.get()))) {
+        out_info->has_guest_module = true;
+        if (out_info->guest_module_name.empty()) out_info->guest_module_name = child->name();
       }
     }
   }
@@ -201,7 +256,8 @@ bool InspectContentPackage(const std::filesystem::path& package_path,
 }
 
 bool ContentDirectoryHasGuestModule(const std::filesystem::path& directory,
-                                    std::string* out_module_name) {
+                                    std::string* out_module_name, uint32_t title_id,
+                                    std::string* out_display_name) {
   std::error_code ec;
   for (auto it = std::filesystem::recursive_directory_iterator(directory, ec);
        !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
@@ -210,6 +266,11 @@ bool ContentDirectoryHasGuestModule(const std::filesystem::path& directory,
     }
     auto name = rex::path_to_utf8(it->path().filename());
     if (IsGuestModuleName(name)) {
+      auto* module = FindContentModule(title_id, name, it->file_size(ec));
+      if (!ec && module && it.depth() == 0 && MatchesInstalledModule(it->path(), *module)) {
+        if (out_display_name) *out_display_name = module->display_name;
+        continue;
+      }
       if (out_module_name) {
         *out_module_name = name;
       }
@@ -298,7 +359,8 @@ std::vector<InstalledContentEntry> ListInstalledContent(const std::filesystem::p
       // Flag already-installed content that carries guest code, so the user can
       // see which entry is preventing the game from starting.
       entry.has_guest_module =
-          ContentDirectoryHasGuestModule(entry.directory, &entry.guest_module_name);
+          ContentDirectoryHasGuestModule(entry.directory, &entry.guest_module_name, dir_title,
+                                         entry.display_name == entry.file_name ? &entry.display_name : nullptr);
 
       result.push_back(std::move(entry));
     }
@@ -325,12 +387,88 @@ const char* ContentInstallResultToString(ContentInstallResult result) {
     case ContentInstallResult::kWrongTitle:
       return "This package is for a different game.";
     case ContentInstallResult::kUnsupportedGuestModule:
-      return "Not supported. This DLC replaces game program code, which a native "
-             "PC build cannot load, and would stop the game from starting.";
+      return "This build has no matching native module for the game code in this DLC.";
     case ContentInstallResult::kExtractFailed:
       return "Extract failed. Check free disk space.";
   }
   return "Unknown error.";
+}
+
+static ContentInstallResult PublishContent(const ContentPackageInfo& info,
+    const std::filesystem::path& content_root, std::filesystem::path* out_install_dir,
+    const std::function<bool(const std::filesystem::path&)>& write_payload) {
+  auto install_dir = ContentDirectory(content_root, info.title_id, info.content_type, info.file_name);
+  if (out_install_dir) {
+    *out_install_dir = install_dir;
+  }
+
+  // Cheap re-check: a populated destination means this package was imported on
+  // an earlier run, so nothing to do.
+  std::error_code exists_ec;
+  if (std::filesystem::is_directory(install_dir, exists_ec) &&
+      !std::filesystem::is_empty(install_dir, exists_ec)) {
+    return ContentInstallResult::kAlreadyInstalled;
+  }
+
+  std::error_code ec;
+  auto title_root = install_dir.parent_path().parent_path();
+  auto staging_root = title_root / "Installing";
+  std::filesystem::create_directories(staging_root, ec);
+  if (ec) return ContentInstallResult::kExtractFailed;
+  // A unique scratch directory lets independent installer processes race to publish safely.
+  auto temp = staging_root / rex::to_path(info.file_name + "-" + std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count()));
+  if (!std::filesystem::create_directory(temp, ec)) return ContentInstallResult::kExtractFailed;
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+  } cleanup{temp};
+  auto payload = temp / "payload";
+  std::filesystem::create_directories(install_dir.parent_path(), ec);
+  if (ec) {
+    return ContentInstallResult::kExtractFailed;
+  }
+
+  if (!write_payload(payload)) return ContentInstallResult::kExtractFailed;
+
+  // Header file: the runtime's content enumerator reads display name/title/type
+  // from here, so DLC shows up with its proper name.
+  XCONTENT_AGGREGATE_DATA data{};
+  data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+  data.content_type = XContentType::kMarketplaceContent;
+  data.title_id = info.title_id;
+  data.xuid = 0;
+  data.set_file_name(info.file_name);
+  data.set_display_name(rex::path_to_utf16(rex::to_path(info.display_name)));
+
+  auto header_path = ContentHeaderPath(content_root, info.title_id, info.content_type,
+                                       info.file_name);
+  std::error_code header_ec;
+  std::filesystem::create_directories(header_path.parent_path(), header_ec);
+  if (header_ec) {
+    return ContentInstallResult::kExtractFailed;
+  }
+
+  auto staged_header = temp / "package.header";
+  auto* file = rex::filesystem::OpenFile(staged_header, "wb");
+  if (!file) {
+    return ContentInstallResult::kExtractFailed;
+  }
+  bool wrote = fwrite(&data, 1, sizeof(data), file) == sizeof(data);
+  if (wrote && info.license_mask != 0)
+    wrote = fwrite(&info.license_mask, 1, sizeof(info.license_mask), file) == sizeof(info.license_mask);
+  if (fclose(file) != 0 || !wrote) return ContentInstallResult::kExtractFailed;
+  std::filesystem::rename(staged_header, header_path, ec);
+  if (ec) return ContentInstallResult::kExtractFailed;
+  std::filesystem::rename(payload, install_dir, ec);
+  if (ec) {
+    std::error_code other_ec;
+    if (std::filesystem::is_directory(install_dir, other_ec) &&
+        !std::filesystem::is_empty(install_dir, other_ec)) return ContentInstallResult::kAlreadyInstalled;
+    return ContentInstallResult::kExtractFailed;
+  }
+
+  return ContentInstallResult::kSuccess;
 }
 
 ContentInstallResult InstallContentPackage(const std::filesystem::path& package_path,
@@ -356,19 +494,6 @@ ContentInstallResult InstallContentPackage(const std::filesystem::path& package_
     return ContentInstallResult::kUnsupportedGuestModule;
   }
 
-  auto install_dir = ContentDirectory(content_root, info.title_id, info.content_type, info.file_name);
-  if (out_install_dir) {
-    *out_install_dir = install_dir;
-  }
-
-  // Cheap re-check: a populated destination means this package was imported on
-  // an earlier run, so nothing to do.
-  std::error_code exists_ec;
-  if (std::filesystem::is_directory(install_dir, exists_ec) &&
-      !std::filesystem::is_empty(install_dir, exists_ec)) {
-    return ContentInstallResult::kAlreadyInstalled;
-  }
-
   auto device = std::make_unique<rex::filesystem::StfsContainerDevice>("", package_path);
   if (!device->Initialize()) {
     return ContentInstallResult::kNotAContentPackage;
@@ -378,12 +503,7 @@ ContentInstallResult InstallContentPackage(const std::filesystem::path& package_
     return ContentInstallResult::kNotAContentPackage;
   }
 
-  std::error_code ec;
-  std::filesystem::create_directories(install_dir, ec);
-  if (ec) {
-    return ContentInstallResult::kExtractFailed;
-  }
-
+  return PublishContent(info, content_root, out_install_dir, [&](const auto& payload) {
   std::queue<rex::filesystem::Entry*> queue;
   queue.push(root);
   while (!queue.empty()) {
@@ -392,40 +512,118 @@ ContentInstallResult InstallContentPackage(const std::filesystem::path& package_
     for (auto& child : entry->children()) {
       queue.push(child.get());
     }
-    if (ExtractEntry(entry, install_dir) != X_ERROR_SUCCESS) {
-      return ContentInstallResult::kExtractFailed;
+    if (ExtractEntry(entry, payload) != X_ERROR_SUCCESS) {
+      return false;
     }
   }
 
-  // Header file: the runtime's content enumerator reads display name/title/type
-  // from here, so DLC shows up with its proper name.
-  XCONTENT_AGGREGATE_DATA data{};
-  data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
-  data.content_type = XContentType::kMarketplaceContent;
-  data.title_id = info.title_id;
-  data.xuid = 0;
-  data.set_file_name(info.file_name);
-  data.set_display_name(rex::path_to_utf16(rex::to_path(info.display_name)));
+    return true;
+  });
+}
 
-  auto header_path = ContentHeaderPath(content_root, info.title_id, info.content_type,
-                                       info.file_name);
-  std::error_code header_ec;
-  std::filesystem::create_directories(header_path.parent_path(), header_ec);
-  if (header_ec) {
-    return ContentInstallResult::kExtractFailed;
-  }
+void RegisterRetailContent(RetailContent content) {
+  retail_content.push_back(std::move(content));
+}
 
-  auto* file = rex::filesystem::OpenFile(header_path, "wb");
-  if (!file) {
-    return ContentInstallResult::kExtractFailed;
+static bool ReadXeniaHeader(const std::filesystem::path& path, ContentPackageInfo& info) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) return !ec;
+  // Current Canary writes an STFS container header. Older builds use the
+  // aggregate structure followed by an optional host-endian license mask.
+  if (auto header = rex::filesystem::StfsContainerDevice::ReadPackageHeader(path)) {
+    if (header->metadata.execution_info.title_id != info.title_id ||
+        uint32_t(header->metadata.content_type.get()) != info.content_type) return false;
+    for (const auto& license : header->header.licenses)
+      if (license.license_flags) info.license_mask |= license.license_bits;
+    return true;
   }
-  fwrite(&data, 1, sizeof(data), file);
-  if (info.license_mask != 0) {
-    fwrite(&info.license_mask, 1, sizeof(info.license_mask), file);
-  }
-  fclose(file);
+  auto* f = rex::filesystem::OpenFile(path, "rb");
+  if (!f) return false;
+  XCONTENT_AGGREGATE_DATA header{};
+  bool valid = fread(&header, 1, sizeof(header), f) == sizeof(header) &&
+               header.title_id == info.title_id && uint32_t(header.content_type.get()) == info.content_type;
+  if (valid) fread(&info.license_mask, sizeof(info.license_mask), 1, f);
+  fclose(f);
+  return valid;
+}
 
-  return ContentInstallResult::kSuccess;
+static ContentInstallResult ImportXeniaPackage(const std::filesystem::path& path,
+    const std::filesystem::path& destination, const RetailContent& retail, bool automatic) {
+  ContentPackageInfo info{};
+  info.title_id = retail.title_id;
+  info.content_type = static_cast<uint32_t>(XContentType::kMarketplaceContent);
+  info.file_name = retail.content_id;
+  info.display_name = retail.display_name;
+  auto target = ContentDirectory(destination, info.title_id, info.content_type, info.file_name);
+  auto ignored = target.parent_path().parent_path() / "XeniaIgnored" / target.filename();
+  std::error_code ec;
+  if (std::filesystem::is_directory(target, ec) && !std::filesystem::is_empty(target, ec))
+    return ContentInstallResult::kAlreadyInstalled;
+  if (automatic && std::filesystem::exists(ignored, ec)) return ContentInstallResult::kAlreadyInstalled;
+
+  if (std::filesystem::is_regular_file(path, ec))
+    return InstallContentPackage(path, destination, info.title_id, false);
+  // Only copy the title-defined retail payload. Saves and emulator-specific
+  // bookkeeping are outside this set, even when both apps use Documents.
+  for (const auto& [name, size] : retail.files)
+    if (std::filesystem::file_size(path / name, ec) != size || ec)
+      return ContentInstallResult::kExtractFailed;
+  if (ContentDirectoryHasGuestModule(path, nullptr, info.title_id))
+    return ContentInstallResult::kUnsupportedGuestModule;
+  auto header = path.parent_path().parent_path() / "Headers" / "00000002" /
+                (rex::path_to_utf8(path.filename()) + ".header");
+  if (!ReadXeniaHeader(header, info)) return ContentInstallResult::kNotAContentPackage;
+  return PublishContent(info, destination, nullptr, [&](const auto& payload) {
+    std::filesystem::create_directory(payload, ec);
+    if (ec) return false;
+    for (const auto& [name, size] : retail.files)
+      if (!std::filesystem::copy_file(path / name, payload / name, ec)) return false;
+    return true;
+  });
+}
+
+XeniaImportResult ImportXeniaContent(const std::filesystem::path& destination, uint32_t title_id,
+                                     const std::filesystem::path& source) {
+  XeniaImportResult result;
+  if (!title_id || destination.empty() || retail_content.empty()) return result;
+  const bool automatic = source.empty();
+  std::vector<std::filesystem::path> roots;
+  if (automatic) {
+    auto documents = rex::filesystem::GetUserFolder();
+    if (documents.empty()) return result;
+    for (auto folder : {"Xenia", "Xenia Canary", "xenia-canary"}) roots.push_back(documents / folder);
+  } else {
+    roots.push_back(source);
+  }
+  auto title = fmt::format("{:08X}", title_id);
+  for (const auto& root : roots) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) continue;
+    for (const auto& base : {root / "content", root}) {
+      for (const auto& layout : {base / kMarketplaceXuid / title, base / title}) {
+        auto type_dir = layout / "00000002";
+        for (auto it = std::filesystem::directory_iterator(type_dir, ec);
+             !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+          auto& path = it->path();
+          auto name = LowerAscii(rex::path_to_utf8(path.filename()));
+          for (const auto& retail : retail_content) {
+            if (retail.title_id != title_id) continue;
+            std::error_code entry_ec;
+            bool named = name == LowerAscii(retail.content_id);
+            if (!named && (!it->is_directory(entry_ec) ||
+                           !std::filesystem::is_regular_file(path / retail.files.front().first, entry_ec)))
+              continue;
+            auto status = ImportXeniaPackage(path, destination, retail, automatic);
+            if (status == ContentInstallResult::kSuccess) ++result.installed;
+            else if (status == ContentInstallResult::kAlreadyInstalled) ++result.existing;
+            else ++result.failed;
+            break;
+          }
+        }
+      }
+    }
+  }
+  return result;
 }
 
 bool UninstallContent(const InstalledContentEntry& entry) {
@@ -435,6 +633,13 @@ bool UninstallContent(const InstalledContentEntry& entry) {
   std::error_code header_ec;
   bool header_removed = std::filesystem::remove(entry.header_file, header_ec);
 
+  if (!dir_ec && removed > 0 && std::any_of(retail_content.begin(), retail_content.end(),
+      [&](const auto& pack) { return pack.title_id == entry.title_id &&
+                                    LowerAscii(pack.content_id) == LowerAscii(entry.file_name); })) {
+    auto ignored_dir = entry.directory.parent_path().parent_path() / "XeniaIgnored";
+    std::filesystem::create_directories(ignored_dir, dir_ec);
+    if (!dir_ec) rex::filesystem::CreateEmptyFile(ignored_dir / entry.directory.filename());
+  }
   return (!dir_ec && removed > 0) || header_removed;
 }
 

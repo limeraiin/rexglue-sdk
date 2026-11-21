@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/cvar_config.h>
 #include <rex/filesystem.h>
 #include <rex/system/xam/content_install.h>
 
@@ -57,6 +58,7 @@ constexpr int IDC_DLC_UNINSTALL = 1012;
 constexpr int IDC_PORTABLE_SAVES = 1015;
 constexpr int IDC_TEXT_LANGUAGE = 1016;
 constexpr int IDC_UI_PACK = 1017;
+constexpr int IDC_XENIA_IMPORT = 1018;
 // (1013 retired: the draw-coalescing checkbox is gone, option is dead.)
 
 struct GpuOption {
@@ -129,6 +131,8 @@ struct DialogState {
   HWND defaults_btn = nullptr, hint = nullptr;
   UINT dpi = 96;
   HFONT font_bold = nullptr;
+  bool standalone = false;
+  bool save_location_changed = false;
   bool done = false;
   bool play = false;
   HWND combo_renderer = nullptr;
@@ -188,11 +192,12 @@ int CALLBACK BrowseCallback(HWND hwnd, UINT msg, LPARAM /*lp*/, LPARAM data) {
   return 0;
 }
 
-std::wstring BrowseForFolder(HWND owner, const std::wstring& initial) {
+std::wstring BrowseForFolder(HWND owner, const std::wstring& initial,
+                             const wchar_t* title = L"Select the game data folder") {
   std::wstring result;
   BROWSEINFOW bi{};
   bi.hwndOwner = owner;
-  bi.lpszTitle = L"Select the game data folder";
+  bi.lpszTitle = title;
   bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
   if (!initial.empty()) {
     bi.lpfn = BrowseCallback;
@@ -293,7 +298,7 @@ void ClearPendingInstallFor(DialogState* st, const std::string& file_name) {
   }
   rex::cvar::SetFlagByName("install_content", "");
   if (!st->config_path.empty()) {
-    rex::cvar::SaveConfig(st->config_path);
+    rex::cvar::SaveConfigValues(st->config_path, {"install_content"});
   }
 }
 
@@ -328,6 +333,7 @@ void RefreshDlcList(HWND hwnd, DialogState* st) {
   }
 
   const uint32_t game_title = DetectGameTitleId(GetEditText(st->edit_data));
+  rex::system::xam::ImportXeniaContent(st->content_root, game_title);
   st->dlc_entries = rex::system::xam::ListInstalledContent(st->content_root);
 
   for (const auto& entry : st->dlc_entries) {
@@ -441,7 +447,7 @@ void UpdateUiPack(DialogState* st) {
   if (!st->ui_pack || st->ui_pack_job) return;
   auto task = GetUiPackTask();
   const int status = task ? task(0, GetEditText(st->edit_data).c_str(), nullptr) : 0;
-  SetWindowTextW(st->ui_pack, status == 2 ? L"Uninstall 2× UI" : L"Install 2× UI");
+  SetWindowTextW(st->ui_pack, status == 2 ? L"Uninstall HD UI" : L"Install HD UI");
   EnableWindow(st->ui_pack,status != 0);
 }
 
@@ -457,38 +463,41 @@ void BuildOptions(HWND hwnd, DialogState* st) {
   st->combo_renderer = make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
                             172, 16, 260, 220, IDC_RENDERER, font);
 
-  make(hwnd, L"STATIC", L"Window resolution:", SS_LEFT, 16, 52, 150, 20, -1, font);
-  st->combo_res = make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172,
-                       50, 260, 220, IDC_RES, font);
+  if (!st->standalone) {
+    make(hwnd, L"STATIC", L"Window resolution:", SS_LEFT, 16, 52, 150, 20, -1, font);
+    st->combo_res = make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172,
+                         50, 260, 220, IDC_RES, font);
 
-  make(hwnd, L"STATIC", L"Internal resolution:", SS_LEFT, 16, 86, 150, 20, -1, font);
-  st->combo_internal_res =
-      make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 84, 260,
-           220, IDC_INTERNAL_RES, font);
+    make(hwnd, L"STATIC", L"Internal resolution:", SS_LEFT, 16, 86, 150, 20, -1, font);
+    st->combo_internal_res =
+        make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 172, 84, 260,
+             220, IDC_INTERNAL_RES, font);
 
-  make(hwnd, L"STATIC", L"Display mode:", SS_LEFT, 16, 120, 150, 20, -1, font);
-  st->combo_display = make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
-                           172, 118, 260, 220, IDC_DISPLAY_MODE, font);
+    make(hwnd, L"STATIC", L"Display mode:", SS_LEFT, 16, 120, 150, 20, -1, font);
+    st->combo_display = make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+                             172, 118, 260, 220, IDC_DISPLAY_MODE, font);
 
-  // Vsync is always on (no dialog control; forced true in ApplyAndSave).
-  st->check_exp_60fps = make(hwnd, L"BUTTON", L"60 FPS open world", BS_AUTOCHECKBOX | WS_TABSTOP,
-                             172, 154, 300, 22, IDC_EXP_60FPS, font);
+    // Vsync is always on (no dialog control; forced true in ApplyAndSave).
+    st->check_exp_60fps = make(hwnd, L"BUTTON", L"60 FPS open world", BS_AUTOCHECKBOX | WS_TABSTOP,
+                               172, 154, 300, 22, IDC_EXP_60FPS, font);
 
-  make(hwnd, L"STATIC", L"Text language:", SS_LEFT, 16, 190, 150, 20, -1, font);
-  st->combo_text_language =
-      make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
-           172, 188, 260, 180, IDC_TEXT_LANGUAGE, font);
+    make(hwnd, L"STATIC", L"Text language:", SS_LEFT, 16, 190, 150, 20, -1, font);
+    st->combo_text_language =
+        make(hwnd, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+             172, 188, 260, 180, IDC_TEXT_LANGUAGE, font);
+  }
 
-  make(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, 228, 200, 20, -1, font);
-  st->edit_data = make(hwnd, L"EDIT", nullptr, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, 250,
+  const int data_y = st->standalone ? 62 : 228;
+  make(hwnd, L"STATIC", L"Game data folder:", SS_LEFT, 16, data_y, 200, 20, -1, font);
+  st->edit_data = make(hwnd, L"EDIT", nullptr, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 16, data_y + 22,
                        330, 24, IDC_DATA, font);
-  make(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, 249, 80, 26, IDC_BROWSE, font);
+  make(hwnd, L"BUTTON", L"Browse...", WS_TABSTOP, 352, data_y + 21, 80, 26, IDC_BROWSE, font);
 
   st->check_portable_saves =
       make(hwnd, L"BUTTON", L"Save files beside game (portable)", BS_AUTOCHECKBOX | WS_TABSTOP, 16,
-           302, 416, 24, IDC_PORTABLE_SAVES, font);
+           data_y + 74, 416, 24, IDC_PORTABLE_SAVES, font);
   make(hwnd, L"STATIC", L"Default: Documents\\naruto. Portable: UserData beside Game.", SS_LEFT, 16,
-       334, 416, 32, -1, st->font_small);
+       data_y + 106, 416, 32, -1, st->font_small);
   const auto portable_root =
       (rex::filesystem::GetExecutableFolder() / "../UserData").lexically_normal();
   SendMessageW(st->check_portable_saves, BM_SETCHECK,
@@ -501,16 +510,17 @@ void BuildOptions(HWND hwnd, DialogState* st) {
                       440, 40, 312, 216, IDC_DLC_LIST, font);
   make(hwnd, L"BUTTON", L"Install DLC...", WS_TABSTOP, 440, 264, 148, 28, IDC_DLC_INSTALL, font);
   make(hwnd, L"BUTTON", L"Uninstall", WS_TABSTOP, 604, 264, 148, 28, IDC_DLC_UNINSTALL, font);
-  make(hwnd, L"STATIC", L"Voice and audio packs work. Character packs are not supported.", SS_LEFT,
-       440, 298, 312, 60, -1, st->font_small ? st->font_small : font);
+  make(hwnd, L"BUTTON", L"Import Xenia DLC...", WS_TABSTOP, 440, 300, 312, 28, IDC_XENIA_IMPORT, font);
   if (GetUiPackTask())
-    st->ui_pack = make(hwnd, L"BUTTON", L"Install 2× UI", WS_TABSTOP, 440, 354, 312, 28, IDC_UI_PACK, font);
+    st->ui_pack = make(hwnd, L"BUTTON", L"Install HD UI", WS_TABSTOP, 440, 354, 312, 28, IDC_UI_PACK, font);
 
   // Skip this dialog on future launches (persists to the skip_config_dialog
   // cvar). Bottom-left, aligned with the Play/Quit buttons.
-  st->check_skip_launcher =
-      make(hwnd, L"BUTTON", L"Skip launcher next time", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 376, 228,
-           22, IDC_SKIP_LAUNCHER, font);
+  if (!st->standalone) {
+    st->check_skip_launcher =
+        make(hwnd, L"BUTTON", L"Skip launcher next time", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 376, 228,
+             22, IDC_SKIP_LAUNCHER, font);
+  }
 
   // --- Populate from current cvar values ---
   std::string gpu = rex::cvar::GetFlagByName("gpu");
@@ -523,49 +533,51 @@ void BuildOptions(HWND hwnd, DialogState* st) {
   }
   SendMessageW(st->combo_renderer, CB_SETCURSEL, gpu_sel, 0);
 
-  int cur_w = std::atoi(rex::cvar::GetFlagByName("video_mode_width").c_str());
-  int cur_h = std::atoi(rex::cvar::GetFlagByName("video_mode_height").c_str());
-  int res_sel = 0;
-  for (int i = 0; i < int(std::size(kResPresets)); ++i) {
-    SendMessageW(st->combo_res, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(kResPresets[i].label));
-    if (cur_w == kResPresets[i].width && cur_h == kResPresets[i].height)
-      res_sel = i;
-  }
-  SendMessageW(st->combo_res, CB_SETCURSEL, res_sel, 0);
+  if (!st->standalone) {
+    int cur_w = std::atoi(rex::cvar::GetFlagByName("video_mode_width").c_str());
+    int cur_h = std::atoi(rex::cvar::GetFlagByName("video_mode_height").c_str());
+    int res_sel = 0;
+    for (int i = 0; i < int(std::size(kResPresets)); ++i) {
+      SendMessageW(st->combo_res, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(kResPresets[i].label));
+      if (cur_w == kResPresets[i].width && cur_h == kResPresets[i].height)
+        res_sel = i;
+    }
+    SendMessageW(st->combo_res, CB_SETCURSEL, res_sel, 0);
 
-  int cur_scale = std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str());
-  int internal_sel = 0;
-  for (int i = 0; i < int(std::size(kInternalResOptions)); ++i) {
-    SendMessageW(st->combo_internal_res, CB_ADDSTRING, 0,
-                 reinterpret_cast<LPARAM>(kInternalResOptions[i].label));
-    if (cur_scale == kInternalResOptions[i].scale)
-      internal_sel = i;
-  }
-  SendMessageW(st->combo_internal_res, CB_SETCURSEL, internal_sel, 0);
+    int cur_scale = std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str());
+    int internal_sel = 0;
+    for (int i = 0; i < int(std::size(kInternalResOptions)); ++i) {
+      SendMessageW(st->combo_internal_res, CB_ADDSTRING, 0,
+                   reinterpret_cast<LPARAM>(kInternalResOptions[i].label));
+      if (cur_scale == kInternalResOptions[i].scale)
+        internal_sel = i;
+    }
+    SendMessageW(st->combo_internal_res, CB_SETCURSEL, internal_sel, 0);
 
-  SendMessageW(st->check_exp_60fps, BM_SETCHECK,
-               rex::cvar::GetFlagByName("open_world_60fps") == "true" ? BST_CHECKED : BST_UNCHECKED,
-               0);
+    SendMessageW(st->check_exp_60fps, BM_SETCHECK,
+                 rex::cvar::GetFlagByName("open_world_60fps") == "true" ? BST_CHECKED : BST_UNCHECKED,
+                 0);
 
-  bool cur_fullscreen = rex::cvar::GetFlagByName("fullscreen") == "true";
-  int display_sel = 0;
-  for (int i = 0; i < int(std::size(kDisplayModes)); ++i) {
-    SendMessageW(st->combo_display, CB_ADDSTRING, 0,
-                 reinterpret_cast<LPARAM>(kDisplayModes[i].label));
-    if (cur_fullscreen == kDisplayModes[i].fullscreen)
-      display_sel = i;
-  }
-  SendMessageW(st->combo_display, CB_SETCURSEL, display_sel, 0);
+    bool cur_fullscreen = rex::cvar::GetFlagByName("fullscreen") == "true";
+    int display_sel = 0;
+    for (int i = 0; i < int(std::size(kDisplayModes)); ++i) {
+      SendMessageW(st->combo_display, CB_ADDSTRING, 0,
+                   reinterpret_cast<LPARAM>(kDisplayModes[i].label));
+      if (cur_fullscreen == kDisplayModes[i].fullscreen)
+        display_sel = i;
+    }
+    SendMessageW(st->combo_display, CB_SETCURSEL, display_sel, 0);
 
-  const int language = std::atoi(rex::cvar::GetFlagByName("user_language").c_str());
-  int language_sel = 0;  // Missing or unsupported values fall back to English.
-  for (int i = 0; i < int(std::size(kTextLanguages)); ++i) {
-    SendMessageW(st->combo_text_language, CB_ADDSTRING, 0,
-                 reinterpret_cast<LPARAM>(kTextLanguages[i].label));
-    if (language == kTextLanguages[i].id)
-      language_sel = i;
+    const int language = std::atoi(rex::cvar::GetFlagByName("user_language").c_str());
+    int language_sel = 0;  // Missing or unsupported values fall back to English.
+    for (int i = 0; i < int(std::size(kTextLanguages)); ++i) {
+      SendMessageW(st->combo_text_language, CB_ADDSTRING, 0,
+                   reinterpret_cast<LPARAM>(kTextLanguages[i].label));
+      if (language == kTextLanguages[i].id)
+        language_sel = i;
+    }
+    SendMessageW(st->combo_text_language, CB_SETCURSEL, language_sel, 0);
   }
-  SendMessageW(st->combo_text_language, CB_SETCURSEL, language_sel, 0);
 
   std::wstring data_dir = Widen(rex::cvar::GetFlagByName("game_data_root"));
   if (data_dir.empty()) {
@@ -641,9 +653,9 @@ void BuildControls(HWND hwnd, DialogState* st) {
               ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, S(16), S(16), pageW - S(32),
               pageH - S(32), -1, st->font);
   int x = S(800) - margin - btnW;
-  MakeControl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP, x, bottom, btnW, S(28), IDCANCEL, st->font);
+  MakeControl(hwnd, L"BUTTON", st->standalone ? L"Cancel" : L"Quit", WS_TABSTOP, x, bottom, btnW, S(28), IDCANCEL, st->font);
   x -= btnW + gap;
-  HWND play = MakeControl(hwnd, L"BUTTON", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP | WS_GROUP, x,
+  HWND play = MakeControl(hwnd, L"BUTTON", st->standalone ? L"Save" : L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP | WS_GROUP, x,
                           bottom, btnW, S(28), IDOK, st->font);
   x -= btnW + gap;
   st->defaults_btn = MakeControl(hwnd, L"BUTTON", L"Defaults", WS_TABSTOP, x, bottom, btnW, S(28),
@@ -682,56 +694,75 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
     gpu_sel = 0;
   rex::cvar::SetFlagByName("gpu", kGpuOptions[gpu_sel].value);
 
-  int res_sel = int(SendMessageW(st->combo_res, CB_GETCURSEL, 0, 0));
-  if (res_sel < 0 || res_sel >= int(std::size(kResPresets)))
-    res_sel = 0;
-  rex::cvar::SetFlagByName("video_mode_width", std::to_string(kResPresets[res_sel].width));
-  rex::cvar::SetFlagByName("video_mode_height", std::to_string(kResPresets[res_sel].height));
+  if (!st->standalone) {
+    int res_sel = int(SendMessageW(st->combo_res, CB_GETCURSEL, 0, 0));
+    if (res_sel < 0 || res_sel >= int(std::size(kResPresets)))
+      res_sel = 0;
+    rex::cvar::SetFlagByName("video_mode_width", std::to_string(kResPresets[res_sel].width));
+    rex::cvar::SetFlagByName("video_mode_height", std::to_string(kResPresets[res_sel].height));
 
-  int internal_sel = int(SendMessageW(st->combo_internal_res, CB_GETCURSEL, 0, 0));
-  if (internal_sel < 0 || internal_sel >= int(std::size(kInternalResOptions)))
-    internal_sel = 0;
-  rex::cvar::SetFlagByName("resolution_scale",
-                           std::to_string(kInternalResOptions[internal_sel].scale));
+    int internal_sel = int(SendMessageW(st->combo_internal_res, CB_GETCURSEL, 0, 0));
+    if (internal_sel < 0 || internal_sel >= int(std::size(kInternalResOptions)))
+      internal_sel = 0;
+    rex::cvar::SetFlagByName("resolution_scale",
+                             std::to_string(kInternalResOptions[internal_sel].scale));
 
-  // Vsync is always on (no dialog control) — force it true on every save.
-  rex::cvar::SetFlagByName("vsync", "true");
+    // Vsync is always on (no dialog control) — force it true on every save.
+    rex::cvar::SetFlagByName("vsync", "true");
 
-  rex::cvar::SetFlagByName(
-      "open_world_60fps",
-      SendMessageW(st->check_exp_60fps, BM_GETCHECK, 0, 0) == BST_CHECKED ? "true" : "false");
+    rex::cvar::SetFlagByName(
+        "open_world_60fps",
+        SendMessageW(st->check_exp_60fps, BM_GETCHECK, 0, 0) == BST_CHECKED ? "true" : "false");
 
-  int display_sel = int(SendMessageW(st->combo_display, CB_GETCURSEL, 0, 0));
-  if (display_sel < 0 || display_sel >= int(std::size(kDisplayModes)))
-    display_sel = 0;
-  rex::cvar::SetFlagByName("fullscreen", kDisplayModes[display_sel].fullscreen ? "true" : "false");
-  int language_sel = int(SendMessageW(st->combo_text_language, CB_GETCURSEL, 0, 0));
-  if (language_sel < 0 || language_sel >= int(std::size(kTextLanguages)))
-    language_sel = 0;
-  rex::cvar::SetFlagByName("user_language", std::to_string(kTextLanguages[language_sel].id));
+    int display_sel = int(SendMessageW(st->combo_display, CB_GETCURSEL, 0, 0));
+    if (display_sel < 0 || display_sel >= int(std::size(kDisplayModes)))
+      display_sel = 0;
+    rex::cvar::SetFlagByName("fullscreen", kDisplayModes[display_sel].fullscreen ? "true" : "false");
+    int language_sel = int(SendMessageW(st->combo_text_language, CB_GETCURSEL, 0, 0));
+    if (language_sel < 0 || language_sel >= int(std::size(kTextLanguages)))
+      language_sel = 0;
+    rex::cvar::SetFlagByName("user_language", std::to_string(kTextLanguages[language_sel].id));
+  }
   rex::cvar::SetFlagByName("game_data_root", Narrow(data));
 
   // NB: `install_content` is deliberately left alone here. DLC is installed and
   // removed directly by the panel on the right, so that cvar is now only the
   // headless/CLI import path — the launcher must neither set nor wipe it.
 
-  // Persist the "skip launcher next time" choice. If set, the next launch boots
-  // straight into the game; clear skip_config_dialog in naruto.toml to get the
-  // dialog back.
-  rex::cvar::SetFlagByName(
-      "skip_config_dialog",
-      SendMessageW(st->check_skip_launcher, BM_GETCHECK, 0, 0) == BST_CHECKED ? "true" : "false");
+  if (!st->standalone) {
+    // Persist the "skip launcher next time" choice. If set, the next launch boots
+    // straight into the game; clear skip_config_dialog in naruto.toml to get the
+    // dialog back.
+    rex::cvar::SetFlagByName(
+        "skip_config_dialog",
+        SendMessageW(st->check_skip_launcher, BM_GETCHECK, 0, 0) == BST_CHECKED ? "true" : "false");
+  }
 
   rex::cvar::SetFlagByName("mnk_mode", st->keyboard.mnk ? "true" : "false");
-  rex::cvar::SetFlagByName("user_data_root",
-                           SendMessageW(st->check_portable_saves, BM_GETCHECK, 0, 0) == BST_CHECKED
-                               ? "../UserData"
-                               : "");
-  rex::cvar::SetFlagByName("mnk_user_index", "0");
-  rex::cvar::SetFlagByName("mnk_mouse_look", "false");
-  for (int i = 0; i < kBindCount; ++i)
+  std::vector<std::string> changed{"gpu", "game_data_root", "mnk_mode"};
+  if (!st->standalone || st->save_location_changed) {
+    rex::cvar::SetFlagByName("user_data_root",
+        SendMessageW(st->check_portable_saves, BM_GETCHECK, 0, 0) == BST_CHECKED ? "../UserData" : "");
+    changed.push_back("user_data_root");
+  }
+  if (st->keyboard.mnk) {
+    rex::cvar::SetFlagByName("mnk_user_index", "0");
+    rex::cvar::SetFlagByName("mnk_mouse_look", "false");
+    changed.insert(changed.end(), {"mnk_user_index", "mnk_mouse_look"});
+  }
+  for (int i = 0; i < kBindCount; ++i) {
     rex::cvar::SetFlagByName(kBinds[i].cvar, st->keyboard.binds[i]);
-  rex::cvar::SaveConfig(config_path);
+    changed.push_back(kBinds[i].cvar);
+  }
+  if (st->standalone) {
+    if (!rex::cvar::SaveConfigValues(config_path, changed)) {
+      MessageBoxW(hwnd, L"Could not write the game configuration. Check the folder permissions.",
+                  L"Naruto Settings", MB_OK | MB_ICONERROR);
+      return false;
+    }
+  } else {
+    rex::cvar::SaveConfig(config_path);
+  }
   return true;
 }
 
@@ -756,17 +787,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         auto root = GetEditText(st->edit_data);
         int status = task ? task(0,root.c_str(),nullptr) : 0;
         if (status && task(status == 2 ? 2 : 1,root.c_str(),&st->ui_pack_job)) {
-          SetWindowTextW(st->ui_pack,status == 2 ? L"Uninstalling 2× UI..." : L"Installing 2× UI...");
+          SetWindowTextW(st->ui_pack,status == 2 ? L"Uninstalling HD UI..." : L"Installing HD UI...");
           EnableWindow(st->ui_pack,FALSE);
           EnableWindow(GetDlgItem(hwnd,IDOK),FALSE);
           SetTimer(hwnd,IDC_UI_PACK,200,nullptr);
         } else {
-          MessageBoxW(hwnd,L"Check the game data folder and the bundled UI package.",L"2× UI",MB_OK | MB_ICONERROR);
+          MessageBoxW(hwnd,L"Check the game data folder and the bundled UI package.",L"HD UI",MB_OK | MB_ICONERROR);
           UpdateUiPack(st);
         }
         return 0;
       }
       if (id == IDC_PORTABLE_SAVES) {
+        st->save_location_changed = true;
         st->content_root =
             SendMessageW(st->check_portable_saves, BM_GETCHECK, 0, 0) == BST_CHECKED
                 ? (rex::filesystem::GetExecutableFolder() / "../UserData").lexically_normal()
@@ -795,6 +827,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           SetWindowTextW(st->edit_data, picked.c_str());
           UpdateUiPack(st);
           RefreshDlcList(hwnd, st);  // title id (and so the "other game" marks) changed
+        }
+        return 0;
+      }
+      if (id == IDC_XENIA_IMPORT) {
+        auto folder = BrowseForFolder(hwnd, L"", L"Select your Xenia folder or its content folder");
+        if (!folder.empty()) {
+          auto title = DetectGameTitleId(GetEditText(st->edit_data));
+          auto result = rex::system::xam::ImportXeniaContent(st->content_root, title, folder);
+          RefreshDlcList(hwnd, st);
+          auto msg = L"Installed: " + std::to_wstring(result.installed) +
+                     L"   Already installed: " + std::to_wstring(result.existing) +
+                     L"   Failed: " + std::to_wstring(result.failed);
+          if (!result.installed && !result.existing && !result.failed)
+            msg = L"No matching DLC found. Check the game data and Xenia folders.";
+          MessageBoxW(hwnd, msg.c_str(), L"Xenia DLC", MB_OK | MB_ICONINFORMATION);
         }
         return 0;
       }
@@ -865,7 +912,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         UpdateUiPack(st);
         EnableWindow(GetDlgItem(hwnd,IDOK),TRUE);
         if (code) MessageBoxW(hwnd,L"The UI package operation failed. See error.txt in the game's UI-Cache folder.",
-                              L"2× UI",MB_OK | MB_ICONERROR);
+                              L"HD UI",MB_OK | MB_ICONERROR);
         return 0;
       }
       break;
@@ -889,7 +936,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
 }  // namespace
 
-bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::path& config_path,
+static bool ShowConfigDialog(bool standalone, std::string_view app_name, const std::filesystem::path& config_path,
                              const std::filesystem::path& content_root) {
   HINSTANCE hinstance = GetModuleHandleW(nullptr);
 
@@ -908,6 +955,7 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
   RegisterClassExW(&wc);  // ignore failure if already registered
 
   DialogState state;
+  state.standalone = standalone;
   state.content_root = content_root;
   if (state.content_root.is_relative() && !state.content_root.empty())
     state.content_root = rex::filesystem::GetExecutableFolder() / state.content_root;
@@ -954,7 +1002,7 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
   int x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
   int y = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
-  std::wstring title = Widen(std::string(app_name)) + L"  -  Setup";
+  std::wstring title = Widen(std::string(app_name)) + (standalone ? L" Settings" : L"  -  Setup");
 
   HWND hwnd = CreateWindowExW(0, kClassName, title.c_str(), style, x, y, win_w, win_h, nullptr,
                               nullptr, hinstance, &state);
@@ -1005,6 +1053,16 @@ bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::p
     DeleteObject(state.font_small);
   g_config_path = nullptr;
   return state.play;
+}
+
+bool ShowStartupConfigDialog(std::string_view app_name, const std::filesystem::path& config_path,
+                             const std::filesystem::path& content_root) {
+  return ShowConfigDialog(false, app_name, config_path, content_root);
+}
+
+void ShowStandaloneSettings(std::string_view app_name, const std::filesystem::path& config_path,
+                            const std::filesystem::path& content_root) {
+  ShowConfigDialog(true, app_name, config_path, content_root);
 }
 
 }  // namespace rex::ui

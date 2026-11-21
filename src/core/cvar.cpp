@@ -6,7 +6,11 @@
  * @license     BSD 3-Clause License
  */
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
@@ -18,6 +22,7 @@
 #include <CLI/CLI.hpp>
 
 #include <rex/cvar.h>
+#include <rex/cvar_config.h>
 #include <rex/logging.h>
 
 #include <toml++/toml.hpp>
@@ -584,6 +589,62 @@ void SaveConfig(const std::filesystem::path& config_path) {
     REXLOG_INFO("Saved config to {}", config_path.string());
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
+  }
+}
+
+// Update existing nested TOML keys using the same flattening as ApplyTomlTable.
+static void MergeConfigKeys(toml::table& table, const std::string& prefix, toml::table& values) {
+  for (auto&& [key, node] : table) {
+    std::string name = prefix + std::string(key);
+    if (node.is_table()) {
+      MergeConfigKeys(*node.as_table(), name + "_", values);
+    } else if (const auto* replacement = values.get(name)) {
+      table.insert_or_assign(key, *replacement);
+      values.erase(name);
+    }
+  }
+}
+
+bool SaveConfigValues(const std::filesystem::path& path, const std::vector<std::string>& names) {
+#ifdef _WIN32
+  // The game and its settings utility can save independently.
+  struct WriterLock {
+    HANDLE handle = CreateMutexW(nullptr, FALSE, L"Local\\ReXGlue-ConfigWriter");
+    ~WriterLock() { if (handle) { ReleaseMutex(handle); CloseHandle(handle); } }
+  } lock;
+  if (!lock.handle || WaitForSingleObject(lock.handle, INFINITE) == WAIT_FAILED) return false;
+#else
+  static std::mutex write_mutex;
+  std::lock_guard lock(write_mutex);
+#endif
+  auto temp = path;
+  temp += ".writing-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  try {
+    toml::table table;
+    if (std::filesystem::exists(path)) {
+      std::ifstream input(path);
+      input.exceptions(std::ios::badbit);
+      if (!input) return false;
+      table = toml::parse(input);
+    }
+    std::string assignments;
+    for (const auto& name : names) {
+      if (const auto* entry = GetFlagInfo(name)) AppendTomlAssignment(assignments, *entry);
+    }
+    auto values = toml::parse(assignments);
+    MergeConfigKeys(table, "", values);
+    for (auto&& [key, value] : values) table.insert_or_assign(key, value);
+    std::ofstream out(temp);
+    out.exceptions(std::ios::badbit | std::ios::failbit);
+    out << table << '\n';
+    out.close();
+    std::filesystem::rename(temp, path);
+    return true;
+  } catch (const std::exception& error) {
+    std::error_code ignored;
+    std::filesystem::remove(temp, ignored);
+    REXLOG_ERROR("Could not save config: {}", error.what());
+    return false;
   }
 }
 

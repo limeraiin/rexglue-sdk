@@ -27,10 +27,39 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace rex {
 namespace system {
 namespace xam {
+
+/// Register an exact guest binary for which the title has a native companion.
+struct ContentModule {
+  uint32_t title_id;
+  std::string file_name;
+  uint64_t size;
+  std::string sha256;
+  std::string display_name;
+};
+void RegisterContentModule(ContentModule module);
+
+// Files expected in a legacy, extracted Xenia package (which may lack a header).
+struct RetailContent {
+  uint32_t title_id;
+  std::string content_id;
+  std::string display_name;
+  std::vector<std::pair<std::string, uint64_t>> files;
+};
+void RegisterRetailContent(RetailContent content);
+struct XeniaImportResult {
+  unsigned installed = 0;
+  unsigned existing = 0;
+  unsigned failed = 0;
+};
+// With no source, check the standard Documents folders and respect previous
+// uninstalls. An explicit source can be a portable Xenia or content folder.
+XeniaImportResult ImportXeniaContent(const std::filesystem::path& destination, uint32_t title_id,
+                                     const std::filesystem::path& source = {});
 
 /// What a content package declares about itself, read from its STFS header.
 struct ContentPackageInfo {
@@ -45,7 +74,7 @@ struct ContentPackageInfo {
   std::string file_name;       ///< package file name == content id
   std::vector<std::string> files;  ///< top-level entries inside the package
 
-  /// True when the package ships PowerPC guest code (a .dll/.xex/.xexp). Such
+  /// True when the package ships unregistered guest code (.dll/.xex/.xexp). Such
   /// content cannot work under static recompilation: the module was never fed
   /// to the recompiler, so calling into it traps on the first instruction.
   bool has_guest_module = false;
@@ -56,11 +85,12 @@ struct ContentPackageInfo {
 /// if the file is missing or is not a recognisable STFS content package.
 bool InspectContentPackage(const std::filesystem::path& package_path, ContentPackageInfo* out_info);
 
-/// True when an *installed* content directory contains PowerPC guest code, i.e.
+/// True when an *installed* content directory contains unregistered guest code, i.e.
 /// content that cannot work under static recompilation. `out_module_name`
 /// receives the offending file name when non-null.
 bool ContentDirectoryHasGuestModule(const std::filesystem::path& directory,
-                                    std::string* out_module_name = nullptr);
+                                    std::string* out_module_name = nullptr, uint32_t title_id = 0,
+                                    std::string* out_display_name = nullptr);
 
 /// One installed DLC directory found under a content root.
 struct InstalledContentEntry {
