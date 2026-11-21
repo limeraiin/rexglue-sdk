@@ -1274,11 +1274,32 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       trace_writer_(graphics_system->memory()->physical_membase()),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
-      write_ptr_index_(0) {
+      write_ptr_index_(0),
+      event_write_event_(rex::thread::Event::CreateAutoResetEvent(false)) {
   assert_not_null(write_ptr_index_event_);
 }
 
 CommandProcessor::~CommandProcessor() = default;
+
+rex::thread::WaitResult CommandProcessor::WaitForEventWrite(uint32_t physical,
+                                                            uint32_t expected_guest_value) {
+  using rex::thread::WaitResult;
+  if (!event_write_event_ || physical >= 0x20000000u || (physical & 3)) return WaitResult::kFailed;
+  // The CP owns the event. Only a physical address is published, so title
+  // termination cannot leave the writer referring to a guest thread's stack.
+  // Other callers keep polling. A registration stranded by forced termination
+  // merely disables backoff until this processor is destroyed.
+  uint32_t empty = UINT32_MAX;
+  if (!event_write_address_.compare_exchange_strong(empty, physical)) return WaitResult::kSuccess;
+  auto* word = memory_->TranslatePhysical<uint32_t*>(physical);
+  const uint32_t current = std::atomic_ref(*word).load(std::memory_order_seq_cst);
+  auto result = WaitResult::kSuccess;
+  if (current == rex::byte_swap(expected_guest_value)) {
+    result = rex::thread::Wait(event_write_event_.get(), false, std::chrono::milliseconds(1));
+  }
+  event_write_address_.store(UINT32_MAX, std::memory_order_release);
+  return result;
+}
 
 bool CommandProcessor::Initialize() {
   // Initialize the gamma ramps to their default (linear) values - taken from
@@ -11871,7 +11892,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  auto* destination = memory_->TranslatePhysical<uint32_t*>(address);
+  // Order the write before testing the registration, paired with the waiter's
+  // CAS before its re-read. Either it sees the new word or we signal its event.
+  std::atomic_ref(*destination).store(data_value, std::memory_order_seq_cst);
+  if (event_write_address_.load(std::memory_order_seq_cst) == (address & 0x1FFFFFFFu)) {
+    event_write_event_->Set();
+  }
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }

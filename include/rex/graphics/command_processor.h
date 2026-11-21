@@ -148,6 +148,10 @@ class CommandProcessor {
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   virtual ~CommandProcessor();
 
+  // Wait briefly for an EVENT_WRITE_SHD to this physical word. The guest
+  // must still check its own completion predicate after every return.
+  rex::thread::WaitResult WaitForEventWrite(uint32_t physical, uint32_t expected_guest_value);
+
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
 
@@ -646,6 +650,8 @@ class CommandProcessor {
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+  std::unique_ptr<rex::thread::Event> event_write_event_;
+  std::atomic<uint32_t> event_write_address_{UINT32_MAX};
 };
 
 // [NR-RUB] Phase 5-4-5-1: the pending draw stop's reuse verdict
