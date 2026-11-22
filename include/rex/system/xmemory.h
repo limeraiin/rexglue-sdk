@@ -283,6 +283,9 @@ class PhysicalHeap : public BaseHeap {
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications, bool enable_data_providers);
+  // Whether the page holding the address is write-watched. Call with the
+  // global critical region locked.
+  bool IsWriteWatched(uint32_t virtual_address) const;
   // Returns true if any page in the range was watched.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
@@ -528,6 +531,7 @@ class Memory {
   static bool AccessViolationCallbackThunk(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
+  static bool WriteWatchQueryThunk(void* context, void* host_address);
 
   std::filesystem::path file_name_;
   uint32_t system_page_size_ = 0;

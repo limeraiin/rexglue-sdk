@@ -406,13 +406,21 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
     auto lock = global_critical_region_.Acquire();
-    memory::PageAccess cur_access;
-    size_t page_length = memory::page_size();
-    memory::QueryProtect(fault_host_address, page_length, cur_access);
-    if (cur_access != memory::PageAccess::kNoAccess &&
-        (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
-      // Another thread has cleared this watch. Abort.
-      return true;
+    // A write to a page whose watch is still set faulted because of that
+    // watch, and watches only change under this lock. Skip the host query
+    // then: its cost grows with the run of equally protected pages after the
+    // address, which is megabytes for buffers the title rewrites every frame.
+    const bool write_watched = is_write && write_watch_query_ &&
+                               write_watch_query_(write_watch_query_context_, fault_host_address);
+    if (!write_watched) {
+      memory::PageAccess cur_access;
+      size_t page_length = memory::page_size();
+      memory::QueryProtect(fault_host_address, page_length, cur_access);
+      if (cur_access != memory::PageAccess::kNoAccess &&
+          (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
+        // Another thread has cleared this watch. Abort.
+        return true;
+      }
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.

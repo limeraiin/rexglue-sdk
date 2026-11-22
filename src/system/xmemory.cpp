@@ -205,6 +205,9 @@ bool Memory::Initialize() {
   mmio_handler_ = runtime::MMIOHandler::Install(
       virtual_membase_, physical_membase_, physical_membase_ + 0x1FFFFFFF, HostToGuestVirtualThunk,
       this, AccessViolationCallbackThunk, this);
+  if (mmio_handler_) {
+    mmio_handler_->SetWriteWatchQuery(WriteWatchQueryThunk, this);
+  }
   if (!mmio_handler_) {
     REXSYS_ERROR("Unable to install MMIO handlers");
     assert_always();
@@ -557,6 +560,22 @@ bool Memory::AccessViolationCallbackThunk(
     void* host_address, bool is_write) {
   return reinterpret_cast<memory::Memory*>(context)->AccessViolationCallback(
       std::move(global_lock_locked_once), host_address, is_write);
+}
+
+bool Memory::WriteWatchQueryThunk(void* context, void* host_address) {
+  // The same address checks as AccessViolationCallback.
+  auto* memory = reinterpret_cast<memory::Memory*>(context);
+  if (reinterpret_cast<size_t>(host_address) < reinterpret_cast<size_t>(memory->virtual_membase_) ||
+      reinterpret_cast<size_t>(host_address) >=
+          reinterpret_cast<size_t>(memory->physical_membase_)) {
+    return false;
+  }
+  uint32_t virtual_address = memory->HostToGuestVirtual(host_address);
+  BaseHeap* heap = memory->LookupHeap(virtual_address);
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    return false;
+  }
+  return static_cast<PhysicalHeap*>(heap)->IsWriteWatched(virtual_address);
 }
 
 bool Memory::TriggerPhysicalMemoryCallbacks(
@@ -1879,6 +1898,20 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                          (system_page_last + 1 - protect_system_page_first) * system_page_size_,
                          protect_access);
   }
+}
+
+bool PhysicalHeap::IsWriteWatched(uint32_t virtual_address) const {
+  // The page TriggerCallbacks tests for a one byte range at this address.
+  if (virtual_address < heap_base_) {
+    return false;
+  }
+  uint32_t heap_relative_address = virtual_address - heap_base_;
+  if (heap_relative_address >= heap_size_) {
+    return false;
+  }
+  uint32_t system_page = std::min(
+      (heap_relative_address + host_address_offset()) / system_page_size_, system_page_count_ - 1);
+  return (system_page_flags_[system_page >> 6].notify_on_invalidation >> (system_page & 63)) & 1;
 }
 
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,

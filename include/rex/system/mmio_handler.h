@@ -57,6 +57,13 @@ class MMIOHandler {
                                               const void* host_to_guest_virtual_context,
                                               AccessViolationCallback access_violation_callback,
                                               void* access_violation_callback_context);
+  // Tells whether a faulting write hit a page whose write watch is still set.
+  // Called with global_critical_region locked.
+  typedef bool (*WriteWatchQuery)(void* context, void* host_address);
+  void SetWriteWatchQuery(WriteWatchQuery query, void* context) {
+    write_watch_query_ = query;
+    write_watch_query_context_ = context;
+  }
   static MMIOHandler* global_handler();
 
   bool RegisterRange(uint32_t virtual_address, uint32_t mask, uint32_t size, void* context,
@@ -90,6 +97,9 @@ class MMIOHandler {
   static MMIOHandler* global_handler_;
 
   rex::thread::global_critical_region global_critical_region_;
+
+  WriteWatchQuery write_watch_query_ = nullptr;
+  void* write_watch_query_context_ = nullptr;
 
  private:
   struct DecodedLoadStore {
