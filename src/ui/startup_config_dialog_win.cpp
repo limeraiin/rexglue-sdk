@@ -703,10 +703,16 @@ void BuildControls(HWND hwnd, DialogState* st) {
       CreateWindowExW(0, kCanvasClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, S(54),
                       pageW, pageH - S(54), p, nullptr, st->keyboard.hinst, &st->keyboard);
   MakeControl(st->pages[kTabCredits], L"EDIT",
-              L"Special thanks to Simeon, Armin Suljovikj, ObsoleteSponge, Kalarot, Dante Smith, "
-              L"Vexil Megga, cody russell, Hailnate13x, GUARD, ctrlalt3l1t3, Austin_Toonz, "
-              L"Mark_Rampage, PELIODAS(Bubu), Sega The Hedgehog, Jesus Cantu, Enel, Chris Parnell "
-              L"and eddie for their Patreon support.",
+              L"Special thanks to Jorge Luis, William Kitchen, luboo 24century, Ngoc Duy Anh Nguyen, "
+              L"lilfrosty, pecan_blandy, San Mitch, Einar Nesje, Eudy Mart\u00EDnez, Spartan Joe, "
+              L"SonOfFaith, Shadow Scornsear, Jeff Davis, YorSR, Derik.Digital, Gustavo Zuccon, "
+              L"Abraham ENQ, Michael Vermeeren, Rog\u00E9rio, N30NC0R3, Phreakyx, Xzavier pich, eze "
+              L"legui, Billy Midoriya, Jacob Krause, Rex, AngelKessie, Mashar, GoyaRice, Christian "
+              L"Mendez, StoneColdUFC, Josh, Kian Doherty, foltzyyy, Yuncle, SM47, zeb zeb, Noah, "
+              L"Khalid, M, Seath Scaleless, Rayane Mx2, Cyphr, Silver, ShinobiHunter93, Lemontine, "
+              L"ha ios, YueOrigin, Hollywood Akeem, pimp the heartless, eddie, Chris Parnell, Armin "
+              L"Suljovikj, Enel, P E L I O D A S, Austin_Toonz, Kalarot and Logan Lane for their "
+              L"Patreon support.",
               ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, S(16), S(16), pageW - S(32),
               pageH - S(32), -1, st->font);
   int x = S(800) - margin - btnW;
