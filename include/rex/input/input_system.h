@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -34,6 +35,8 @@ class InputSystem : public system::IInputSystem {
   void Shutdown() override;
 
   void AddDriver(std::unique_ptr<InputDriver> driver);
+  bool LastInputWasKeyboard() const { return last_keyboard_.load(std::memory_order_relaxed); }
+  void AddKeyboardDriver(std::unique_ptr<InputDriver> driver);
   void AttachWindow(rex::ui::Window* window);
   void SetActiveCallback(std::function<bool()> callback);
 
@@ -46,6 +49,9 @@ class InputSystem : public system::IInputSystem {
   rex::ui::Window* window_ = nullptr;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
+  InputDriver* keyboard_ = nullptr;
+  std::atomic<uint32_t> previous_activity_[2]{};
+  std::atomic<bool> last_keyboard_{false};
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

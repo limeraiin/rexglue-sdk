@@ -38,10 +38,18 @@ X_STATUS InputSystem::Setup() {
 
 void InputSystem::Shutdown() {
   drivers_.clear();
+  keyboard_ = nullptr;
+  for (auto& activity : previous_activity_) activity.store(0, std::memory_order_relaxed);
+  last_keyboard_.store(false, std::memory_order_relaxed);
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
   drivers_.push_back(std::move(driver));
+}
+
+void InputSystem::AddKeyboardDriver(std::unique_ptr<InputDriver> driver) {
+  keyboard_ = driver.get();
+  AddDriver(std::move(driver));
 }
 
 void InputSystem::AttachWindow(rex::ui::Window* window) {
@@ -80,6 +88,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   bool any_connected = false;
   bool first_result = true;
   X_INPUT_STATE merged = {};
+  uint32_t activity[2]{};
 
   for (auto& driver : drivers_) {
     X_INPUT_STATE state = {};
@@ -88,6 +97,15 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
       any_connected = true;
     }
     if (result == X_ERROR_SUCCESS) {
+      if (user_index == 0) {
+        const auto& pad = state.gamepad;
+        uint32_t mask = pad.buttons;
+        for (int axis : {int(pad.thumb_lx), int(pad.thumb_ly), int(pad.thumb_rx), int(pad.thumb_ry)}) {
+          mask = (mask << 2) | (axis > 12000 ? 1u : axis < -12000 ? 2u : 0u);
+        }
+        mask = (mask << 2) | (pad.left_trigger > 48 ? 1u : 0u) | (pad.right_trigger > 48 ? 2u : 0u);
+        activity[driver.get() == keyboard_] |= mask;
+      }
       if (first_result) {
         merged = state;
         first_result = false;
@@ -116,6 +134,14 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     }
   }
 
+  if (user_index == 0) {
+    for (unsigned source = 0; source < 2; ++source) {
+      auto& previous = previous_activity_[source];
+      if (activity[source] == previous.load(std::memory_order_relaxed)) continue;
+      if (activity[source] & ~previous.exchange(activity[source], std::memory_order_relaxed))
+        last_keyboard_.store(source == 1, std::memory_order_relaxed);
+    }
+  }
   if (first_result) {
     return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -182,7 +208,7 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     // MnK driver (keyboard/mouse -> controller emulation)
     auto mnk_driver = std::make_unique<mnk::MnkInputDriver>(nullptr, 0);
     if (mnk_driver->Setup() == X_STATUS_SUCCESS) {
-      input->AddDriver(std::move(mnk_driver));
+      input->AddKeyboardDriver(std::move(mnk_driver));
     }
   }
 
