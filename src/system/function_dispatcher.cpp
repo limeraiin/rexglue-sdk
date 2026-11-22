@@ -13,6 +13,8 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <atomic>
+
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -33,6 +35,21 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }
 
 }  // namespace
+
+// Bumped, under the dispatcher's lock, before any function table change.
+static std::atomic<uint64_t> g_function_table_generation{1};
+
+struct IndirectCallCache {
+  static constexpr uint32_t kEntryCount = 1024;
+  struct Entry {
+    uint32_t address = 0;
+    PPCFunc* func = nullptr;
+  };
+  uint64_t generation = 0;
+  const FunctionDispatcher* owner = nullptr;
+  Entry entries[kEntryCount];
+};
+static thread_local IndirectCallCache t_indirect_call_cache;
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
@@ -246,11 +263,13 @@ bool FunctionDispatcher::SetFunction(uint32_t guest_address, ::PPCFunc* func) {
     return false;
   }
 
+  g_function_table_generation.fetch_add(1, std::memory_order_acq_rel);
   function_table_[guest_address] = func;
 
   if (!memory_->SetFunction(guest_address, func)) {
     REXLOG_ERROR("SetFunction: dispatcher / Memory module-table state out of sync at {:08X}",
                  guest_address);
+    g_function_table_generation.fetch_add(1, std::memory_order_acq_rel);
     function_table_.erase(guest_address);
     return false;
   }
@@ -262,12 +281,31 @@ bool FunctionDispatcher::SetFunction(uint32_t guest_address, ::PPCFunc* func) {
 }
 
 ::PPCFunc* FunctionDispatcher::GetFunction(uint32_t guest_address) {
+  // Cross-module indirect calls resolve here on every call. A per-thread
+  // direct-mapped cache answers the repeats without the lock and the hash
+  // lookup; any change to a function table drops every thread's cache.
+  IndirectCallCache& cache = t_indirect_call_cache;
+  const uint64_t generation = g_function_table_generation.load(std::memory_order_acquire);
+  IndirectCallCache::Entry& entry =
+      cache.entries[(guest_address >> 2) & (IndirectCallCache::kEntryCount - 1)];
+  if (cache.generation == generation && cache.owner == this && entry.func &&
+      entry.address == guest_address) {
+    return entry.func;
+  }
   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
   auto it = function_table_.find(guest_address);
-  if (it != function_table_.end()) {
-    return it->second;
+  if (it == function_table_.end()) {
+    return nullptr;
   }
-  return nullptr;
+  // Changes happen under this lock, so the generation read here is current.
+  const uint64_t current = g_function_table_generation.load(std::memory_order_acquire);
+  if (cache.generation != current || cache.owner != this) {
+    cache = IndirectCallCache{};
+    cache.generation = current;
+    cache.owner = this;
+  }
+  entry = {guest_address, it->second};
+  return it->second;
 }
 
 uint32_t FunctionDispatcher::AllocateThunk(::PPCFunc* func, uint32_t caller_address) {
@@ -358,6 +396,7 @@ std::optional<std::pair<uint32_t, uint32_t>> FunctionDispatcher::UnregisterModul
                                  return mti.code_base == code_base;
                                });
 
+  g_function_table_generation.fetch_add(1, std::memory_order_acq_rel);
   for (uint32_t addr : it->second.addresses) {
     function_table_.erase(addr);
     memory_->SetFunction(addr, nullptr);
