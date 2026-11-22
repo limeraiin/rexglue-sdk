@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <condition_variable>
 #include <forward_list>
+#include <mutex>
 
 #include <disruptorplus/multi_threaded_claim_strategy.hpp>
 #include <disruptorplus/ring_buffer.hpp>
@@ -66,10 +68,23 @@ class TimerQueue {
 
     while (!stop_token.stop_requested()) {
       {
-        // Consume new wait items and add them to sorted wait queue
-        dp::sequence_t available = claim_strategy_.wait_until_published(
-            next_sequence, next_sequence - 1,
-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
+        // Consume new wait items and add them to sorted wait queue. Block until
+        // a timer is queued or the earliest one is due: the spin strategy's own
+        // timed wait burns its whole spin phase on every wake, which a 1 ms
+        // recurring timer turns into several percent of a core.
+        dp::sequence_t available = next_sequence - 1;
+        {
+          std::unique_lock<std::mutex> lock(wake_mutex_);
+          const auto published = [&]() {
+            available = claim_strategy_.last_published_after(next_sequence - 1);
+            return available != next_sequence - 1;
+          };
+          if (wait_queue_.empty()) {
+            wake_cv_.wait(lock, published);
+          } else {
+            wake_cv_.wait_until(lock, wait_queue_.front()->due_, published);
+          }
+        }
 
         // Check for timeout
         if (available != next_sequence - 1) {
@@ -132,6 +147,10 @@ class TimerQueue {
     auto sequence = claim_strategy_.claim_one();
     buffer_[sequence] = std::move(wait_item);
     claim_strategy_.publish(sequence);
+    // Taking the mutex orders this publish against the dispatch thread's
+    // predicate check, so the wake cannot be lost.
+    { std::lock_guard<std::mutex> lock(wake_mutex_); }
+    wake_cv_.notify_one();
 
     return wait_item_weak;
   }
@@ -149,6 +168,8 @@ class TimerQueue {
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread
   std::forward_list<std::shared_ptr<WaitItem>> wait_queue_;
+  std::mutex wake_mutex_;
+  std::condition_variable wake_cv_;
   std::jthread dispatch_thread_;
 };
 
