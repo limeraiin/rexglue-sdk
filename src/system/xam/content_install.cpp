@@ -66,6 +66,7 @@ bool IsGuestModuleName(std::string_view name) {
 // The title registers these during startup, before opening the launcher.
 std::vector<ContentModule> supported_modules;
 std::vector<RetailContent> retail_content;
+std::vector<std::pair<std::string, std::string>> file_replacements;
 
 const ContentModule* FindContentModule(uint32_t title, std::string_view name, uint64_t size) {
   for (const auto& module : supported_modules) {
@@ -523,6 +524,14 @@ ContentInstallResult InstallContentPackage(const std::filesystem::path& package_
 
 void RegisterRetailContent(RetailContent content) {
   retail_content.push_back(std::move(content));
+}
+
+void RegisterContentFileReplacement(std::string file_name, std::string guest_path) {
+  file_replacements.emplace_back(std::move(file_name), std::move(guest_path));
+}
+
+const std::vector<std::pair<std::string, std::string>>& ContentFileReplacements() {
+  return file_replacements;
 }
 
 static bool ReadXeniaHeader(const std::filesystem::path& path, ContentPackageInfo& info) {

@@ -58,6 +58,7 @@ constexpr int IDC_DLC_UNINSTALL = 1012;
 constexpr int IDC_PORTABLE_SAVES = 1015;
 constexpr int IDC_TEXT_LANGUAGE = 1016;
 constexpr int IDC_UI_PACK = 1017;
+constexpr int IDC_LANGUAGES = 1019;
 constexpr int IDC_XENIA_IMPORT = 1018;
 // (1013 retired: the draw-coalescing checkbox is gone, option is dead.)
 
@@ -126,6 +127,11 @@ enum Tab { kTabOptions, kTabControls, kTabCredits, kTabCount };
 struct DialogState {
   HWND ui_pack = nullptr;
   HANDLE ui_pack_job = nullptr;
+  HWND languages = nullptr;
+  HANDLE languages_job = nullptr;
+  // Codes of the installed language packs, in the order they follow the
+  // retail languages in the text language list.
+  std::vector<std::wstring> language_packs;
   KeyboardSettings keyboard;
   HWND tab = nullptr, pages[kTabCount] = {}, mnk_check = nullptr;
   HWND defaults_btn = nullptr, hint = nullptr;
@@ -443,12 +449,67 @@ UiPackTask GetUiPackTask() {
   return reinterpret_cast<UiPackTask>(GetProcAddress(GetModuleHandleW(nullptr),"NarutoUiPackTask"));
 }
 
+// The title reports 0 without usable game data, 1 when the content can be
+// installed, 2 when it is installed and 3 when this edition does not bundle it.
 void UpdateUiPack(DialogState* st) {
   if (!st->ui_pack || st->ui_pack_job) return;
   auto task = GetUiPackTask();
   const int status = task ? task(0, GetEditText(st->edit_data).c_str(), nullptr) : 0;
-  SetWindowTextW(st->ui_pack, status == 2 ? L"Uninstall HD UI" : L"Install HD UI");
-  EnableWindow(st->ui_pack,status != 0);
+  SetWindowTextW(st->ui_pack, status == 2   ? L"Uninstall HD UI"
+                              : status == 3 ? L"HD UI: unavailable in Lite version"
+                                            : L"Install HD UI");
+  EnableWindow(st->ui_pack, status == 1 || status == 2);
+}
+
+UiPackTask GetLanguageTask() {
+  return reinterpret_cast<UiPackTask>(GetProcAddress(GetModuleHandleW(nullptr), "NarutoLanguageTask"));
+}
+
+void UpdateLanguages(DialogState* st) {
+  if (!st->languages || st->languages_job) return;
+  auto task = GetLanguageTask();
+  const int status = task ? task(0, GetEditText(st->edit_data).c_str(), nullptr) : 0;
+  SetWindowTextW(st->languages, status == 2   ? L"Uninstall extra languages"
+                                : status == 3 ? L"Extra languages: unavailable in Lite version"
+                                              : L"Install extra languages (Turkish, Polish)");
+  EnableWindow(st->languages, status == 1 || status == 2);
+}
+
+// The retail languages, then the installed language packs. A selected pack
+// is stored in text_language_pack; the retail language then stays English,
+// which a pack shows wherever it has no text.
+void FillTextLanguages(DialogState* st) {
+  if (!st->combo_text_language) return;
+  st->language_packs.clear();
+  using ListPacks = int (*)(wchar_t*, int);
+  auto list = reinterpret_cast<ListPacks>(GetProcAddress(GetModuleHandleW(nullptr), "NarutoLanguageList"));
+  wchar_t codes[256] = {};
+  if (list && list(codes, int(std::size(codes))) > 0) {
+    for (const wchar_t* at = codes; *at;) {
+      const wchar_t* end = wcschr(at, L'\n');
+      if (!end) break;
+      st->language_packs.emplace_back(at, end);
+      at = end + 1;
+    }
+  }
+  SendMessageW(st->combo_text_language, CB_RESETCONTENT, 0, 0);
+  const int language = std::atoi(rex::cvar::GetFlagByName("user_language").c_str());
+  int selected = 0;  // Missing or unsupported values fall back to English.
+  for (int i = 0; i < int(std::size(kTextLanguages)); ++i) {
+    SendMessageW(st->combo_text_language, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(kTextLanguages[i].label));
+    if (language == kTextLanguages[i].id)
+      selected = i;
+  }
+  const std::wstring pack = Widen(rex::cvar::GetFlagByName("text_language_pack"));
+  for (size_t i = 0; i < st->language_packs.size(); ++i) {
+    const std::wstring& code = st->language_packs[i];
+    const std::wstring label = code == L"tr" ? L"Turkish" : code == L"pl" ? L"Polish" : code;
+    SendMessageW(st->combo_text_language, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+    if (code == pack)
+      selected = int(std::size(kTextLanguages) + i);
+  }
+  SendMessageW(st->combo_text_language, CB_SETCURSEL, selected, 0);
 }
 
 void BuildOptions(HWND hwnd, DialogState* st) {
@@ -513,6 +574,9 @@ void BuildOptions(HWND hwnd, DialogState* st) {
   make(hwnd, L"BUTTON", L"Import Xenia DLC...", WS_TABSTOP, 440, 300, 312, 28, IDC_XENIA_IMPORT, font);
   if (GetUiPackTask())
     st->ui_pack = make(hwnd, L"BUTTON", L"Install HD UI", WS_TABSTOP, 440, 354, 312, 28, IDC_UI_PACK, font);
+  if (GetLanguageTask())
+    st->languages = make(hwnd, L"BUTTON", L"Install extra languages", WS_TABSTOP, 440, 390, 312, 28,
+                         IDC_LANGUAGES, font);
 
   // Skip this dialog on future launches (persists to the skip_config_dialog
   // cvar). Bottom-left, aligned with the Play/Quit buttons.
@@ -568,15 +632,7 @@ void BuildOptions(HWND hwnd, DialogState* st) {
     }
     SendMessageW(st->combo_display, CB_SETCURSEL, display_sel, 0);
 
-    const int language = std::atoi(rex::cvar::GetFlagByName("user_language").c_str());
-    int language_sel = 0;  // Missing or unsupported values fall back to English.
-    for (int i = 0; i < int(std::size(kTextLanguages)); ++i) {
-      SendMessageW(st->combo_text_language, CB_ADDSTRING, 0,
-                   reinterpret_cast<LPARAM>(kTextLanguages[i].label));
-      if (language == kTextLanguages[i].id)
-        language_sel = i;
-    }
-    SendMessageW(st->combo_text_language, CB_SETCURSEL, language_sel, 0);
+    FillTextLanguages(st);
   }
 
   std::wstring data_dir = Widen(rex::cvar::GetFlagByName("game_data_root"));
@@ -597,6 +653,7 @@ void BuildOptions(HWND hwnd, DialogState* st) {
   // game, which is decided by the title id of the selected game data folder.
   RefreshDlcList(hwnd, st);
   UpdateUiPack(st);
+  UpdateLanguages(st);
 }
 
 void SelectTab(DialogState* st, int index) {
@@ -719,8 +776,15 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
       display_sel = 0;
     rex::cvar::SetFlagByName("fullscreen", kDisplayModes[display_sel].fullscreen ? "true" : "false");
     int language_sel = int(SendMessageW(st->combo_text_language, CB_GETCURSEL, 0, 0));
-    if (language_sel < 0 || language_sel >= int(std::size(kTextLanguages)))
+    const int pack_sel = language_sel - int(std::size(kTextLanguages));
+    if (pack_sel >= 0 && pack_sel < int(st->language_packs.size())) {
+      rex::cvar::SetFlagByName("text_language_pack", Narrow(st->language_packs[pack_sel]));
       language_sel = 0;
+    } else {
+      rex::cvar::SetFlagByName("text_language_pack", "");
+      if (language_sel < 0 || language_sel >= int(std::size(kTextLanguages)))
+        language_sel = 0;
+    }
     rex::cvar::SetFlagByName("user_language", std::to_string(kTextLanguages[language_sel].id));
   }
   rex::cvar::SetFlagByName("game_data_root", Narrow(data));
@@ -797,6 +861,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         return 0;
       }
+      if (id == IDC_LANGUAGES && !st->languages_job) {
+        auto task = GetLanguageTask();
+        auto root = GetEditText(st->edit_data);
+        int status = task ? task(0, root.c_str(), nullptr) : 0;
+        if ((status == 1 || status == 2) && task(status, root.c_str(), &st->languages_job)) {
+          SetWindowTextW(st->languages, status == 2 ? L"Uninstalling extra languages..."
+                                                    : L"Installing extra languages...");
+          EnableWindow(st->languages, FALSE);
+          EnableWindow(GetDlgItem(hwnd, IDOK), FALSE);
+          SetTimer(hwnd, IDC_LANGUAGES, 200, nullptr);
+        } else {
+          MessageBoxW(hwnd, L"Check the game data folder and the bundled language packs.",
+                      L"Extra languages", MB_OK | MB_ICONERROR);
+          UpdateLanguages(st);
+        }
+        return 0;
+      }
       if (id == IDC_PORTABLE_SAVES) {
         st->save_location_changed = true;
         st->content_root =
@@ -826,6 +907,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (!picked.empty()) {
           SetWindowTextW(st->edit_data, picked.c_str());
           UpdateUiPack(st);
+          UpdateLanguages(st);
           RefreshDlcList(hwnd, st);  // title id (and so the "other game" marks) changed
         }
         return 0;
@@ -864,12 +946,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       }
       if (id == IDC_DATA && HIWORD(wparam) == EN_KILLFOCUS) {
         UpdateUiPack(st);
+        UpdateLanguages(st);
         // A different game folder can change which entries count as "other game".
         RefreshDlcList(hwnd, st);
         return 0;
       }
       if (id == IDOK) {
-        if (st->ui_pack_job) return 0;
+        if (st->ui_pack_job || st->languages_job) return 0;
         if (ApplyAndSave(hwnd, st, *g_config_path)) {
           st->play = true;
           st->done = true;
@@ -902,6 +985,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
     }
     case WM_TIMER:
+      if (st && wparam == IDC_LANGUAGES && st->languages_job &&
+          WaitForSingleObject(st->languages_job, 0) == WAIT_OBJECT_0) {
+        DWORD code = 1;
+        GetExitCodeProcess(st->languages_job, &code);
+        CloseHandle(st->languages_job);
+        st->languages_job = nullptr;
+        KillTimer(hwnd, IDC_LANGUAGES);
+        UpdateLanguages(st);
+        // The text language list follows the installed packs.
+        FillTextLanguages(st);
+        EnableWindow(GetDlgItem(hwnd, IDOK), !st->ui_pack_job);
+        if (code) MessageBoxW(hwnd, L"The language operation failed. See error.txt in the game's UI-Cache folder.",
+                              L"Extra languages", MB_OK | MB_ICONERROR);
+        return 0;
+      }
       if (st && wparam == IDC_UI_PACK && st->ui_pack_job &&
           WaitForSingleObject(st->ui_pack_job,0) == WAIT_OBJECT_0) {
         DWORD code = 1;
@@ -910,7 +1008,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         st->ui_pack_job = nullptr;
         KillTimer(hwnd,IDC_UI_PACK);
         UpdateUiPack(st);
-        EnableWindow(GetDlgItem(hwnd,IDOK),TRUE);
+        EnableWindow(GetDlgItem(hwnd,IDOK),!st->languages_job);
         if (code) MessageBoxW(hwnd,L"The UI package operation failed. See error.txt in the game's UI-Cache folder.",
                               L"HD UI",MB_OK | MB_ICONERROR);
         return 0;
@@ -1041,6 +1139,7 @@ static bool ShowConfigDialog(bool standalone, std::string_view app_name, const s
   }
 
   if (state.ui_pack_job) CloseHandle(state.ui_pack_job);
+  if (state.languages_job) CloseHandle(state.languages_job);
   if (state.keyboard.pad_normal)
     DeleteObject(state.keyboard.pad_normal);
   if (state.keyboard.pad_grey)

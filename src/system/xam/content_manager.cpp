@@ -55,10 +55,19 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+  // OpenFile follows a link keyed by the physical guest path of a found file.
+  for (const auto& [file_name, guest_path] : ContentFileReplacements()) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(package_path / rex::to_path(file_name), ec)) continue;
+    replaced_files_.push_back(rex::string::utf8_join_guest_paths(device_path_, file_name));
+    fs->RegisterSymbolicLink(replaced_files_.back(), guest_path);
+    REXLOG_INFO("Content file {} is served from {}", replaced_files_.back(), guest_path);
+  }
 }
 
 ContentPackage::~ContentPackage() {
   auto fs = kernel_state_->file_system();
+  for (const auto& link : replaced_files_) fs->UnregisterSymbolicLink(link);
   fs->UnregisterSymbolicLink(root_name_ + ":");
   fs->UnregisterDevice(device_path_);
 }

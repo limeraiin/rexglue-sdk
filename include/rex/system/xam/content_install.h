@@ -51,6 +51,12 @@ struct RetailContent {
   std::vector<std::pair<std::string, uint64_t>> files;
 };
 void RegisterRetailContent(RetailContent content);
+
+/// Serve `guest_path` wherever a mounted content package holds a file named
+/// `file_name`. The package on disk is not changed; the title supplies the
+/// device behind `guest_path`.
+void RegisterContentFileReplacement(std::string file_name, std::string guest_path);
+const std::vector<std::pair<std::string, std::string>>& ContentFileReplacements();
 struct XeniaImportResult {
   unsigned installed = 0;
   unsigned existing = 0;

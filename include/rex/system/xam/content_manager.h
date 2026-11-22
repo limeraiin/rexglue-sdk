@@ -136,6 +136,8 @@ class ContentPackage {
   std::string root_name_;
   std::string device_path_;
   std::filesystem::path package_path_;
+  // Links from this package's files to the replacements a title registered.
+  std::vector<std::string> replaced_files_;
   XCONTENT_AGGREGATE_DATA content_data_;
   uint32_t license_ = 0;
 };
