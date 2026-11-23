@@ -486,6 +486,19 @@ REXCVAR_DEFINE_UINT32(gpu_ia_verify, 0, "GPU/D3D12",
 REXCVAR_DEFINE_UINT32(gpu_ia_mb, 512, "GPU/D3D12",
                       "[ia] the host-order shadow's mapped-memory budget in MB (4 MB regions, "
                       "mapped on first touch).");
+// [fetch-need] The fetch constants buffer (192 dwords: 32 texture or 96
+// vertex fetch constants) went stale on almost every draw because each mesh
+// writes its vertex fetch constants, and was uploaded and bound again each
+// time (Steam Deck town: 0.80 uploads per binding) although an
+// input-assembler vertex shader reads none of them. With this on, a stale
+// buffer is uploaded only when a pair of dwords the draw's shaders read
+// differs from the upload already bound (FetchCbLatch in the header).
+REXCVAR_DEFINE_INT32(gpu_fetch_need, 1, "GPU/D3D12",
+                     "[fetch-need] upload the fetch constants buffer only when a constant the "
+                     "bound shaders read differs from the bound upload: 0 off (upload whenever "
+                     "a fetch constant was written), 1 on (default), 2 on with every constant "
+                     "the draw does not read poisoned in the upload (a shader reading outside "
+                     "its set then shows as broken geometry or texturing).");
 // [dcache] The per-draw IDENTITY cache of derived state (NEXT-AGENT.md, the
 // design pass after drive 853). A draw whose identity (everything the
 // derivation reads except the float constants) was seen before takes its
@@ -593,6 +606,47 @@ uint64_t g_n8b_skip_rng = 0, g_n8b_skip_dw = 0;
 // Index: 0 = float vertex, 1 = float pixel, 2 = bool/loop, 3 = fetch.
 uint64_t g_n8c_up[4] = {};
 uint64_t g_n8c_binds = 0;
+
+// [fetch-need] gpu_fetch_need, latched once a frame in IssueSwap, and the
+// census: stale fetch buffers left alone because the bound upload already
+// held every pair the draw reads; uploads the fast executor composed from a
+// record (never part of g_n8c_up[3], which counts NrUpdateBindings); and the
+// part of g_n8c_up[3] uploaded under the old rule because the draw's read
+// set was unknown (a raw vertex fetch, memexport, a recording or replaying
+// feature, the cvar at 0).
+int32_t g_fetch_need = 1;
+uint64_t g_n8c_fetch_skip = 0;
+uint64_t g_n8c_fetch_map = 0;
+uint64_t g_n8c_fetch_unknown = 0;
+
+// gpu_fetch_need 2: every pair outside `pairs` reads as all ones.
+void FetchCbPoison(uint32_t* dwords, const uint32_t pairs[3]) {
+  for (uint32_t p = 0; p < 96; ++p) {
+    if (!(pairs[p >> 5] & (uint32_t(1) << (p & 31)))) {
+      dwords[2 * p] = UINT32_MAX;
+      dwords[2 * p + 1] = UINT32_MAX;
+    }
+  }
+}
+
+// Whether `held` (192 dwords, the bound upload) equals what `read` returns
+// for every dword of the pairs in `pairs`.
+template <typename Read>
+bool FetchCbPairsHeld(const uint32_t* held, const uint32_t pairs[3], Read&& read) {
+  for (uint32_t w = 0; w < 3; ++w) {
+    uint32_t bits = pairs[w];
+    while (bits) {
+      uint32_t b = 0;
+      rex::bit_scan_forward(bits, &b);
+      bits &= bits - 1;
+      const uint32_t d = (w * 32 + b) * 2;
+      if (held[d] != read(d) || held[d + 1] != read(d + 1)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 // One bulk constant range: count how many of its dwords already match the
 // register file, and report whether ALL of them did. base[] is guest-endian,
@@ -6400,6 +6454,9 @@ void D3D12CommandProcessor::ShutdownContext() {
   frame_open_ = false;
   frame_current_ = 1;
   frame_completed_ = 0;
+  // [fetch-need] the frame counter restarts: a latch of an earlier frame 1
+  // must not match the next one.
+  fetch_cb_latch_ = FetchCbLatch{};
   std::memset(closed_frame_submissions_, 0, sizeof(closed_frame_submissions_));
 
   // First release the fences since they may reference fence_completion_event_.
@@ -6857,6 +6914,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // `gpu_n7 3` owns it while it is cycling the three phases in place; otherwise
   // the old gpu_dedupe_constants cvar is the switch and means "census + act".
   g_dedupe_constants = REXCVAR_GET(gpu_dedupe_constants);
+  g_fetch_need = REXCVAR_GET(gpu_fetch_need);  // [fetch-need]
   g_n8b_mode = rex::graphics::g_n7_n8b_phase >= 0 ? rex::graphics::g_n7_n8b_phase
                                                   : (g_dedupe_constants ? 2 : 0);
   // The census report. Unconditional whenever the census is armed -- it must NOT
@@ -6867,19 +6925,30 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // census so it does not disappear when the census is not armed.
   if (REXCVAR_GET(gpu_n7)) {
     static uint64_t l_up[4] = {}, l_binds = 0;
+    static uint64_t l_fetch_skip = 0, l_fetch_map = 0, l_fetch_unknown = 0;  // [fetch-need]
     static auto l_report = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     if (now - l_report >= std::chrono::seconds(1)) {
       const uint64_t b = g_n8c_binds - l_binds;
       const double per = b ? 1.0 / double(b) : 0.0;
+      // [fetch-need] fetch_skipped: stale fetch buffers left bound because
+      // every pair the draw reads was already in the upload; fetch_unknown:
+      // the part of fetch= uploaded because the read set was unknown;
+      // fetch_from_map: uploads the fast executor composed from a record
+      // (not in fetch=).
       REXGPU_INFO(
           "[n8c] cbuffer uploads/s: float_v={} float_p={} bool_loop={} fetch={} "
-          "| binds={} | per bind: {:.2f} {:.2f} {:.2f} {:.2f}",
+          "| binds={} | per bind: {:.2f} {:.2f} {:.2f} {:.2f} "
+          "| fetch_need={} fetch_skipped={} fetch_unknown={} fetch_from_map={}",
           g_n8c_up[0] - l_up[0], g_n8c_up[1] - l_up[1], g_n8c_up[2] - l_up[2],
           g_n8c_up[3] - l_up[3], b, double(g_n8c_up[0] - l_up[0]) * per,
           double(g_n8c_up[1] - l_up[1]) * per, double(g_n8c_up[2] - l_up[2]) * per,
-          double(g_n8c_up[3] - l_up[3]) * per);
+          double(g_n8c_up[3] - l_up[3]) * per, g_fetch_need, g_n8c_fetch_skip - l_fetch_skip,
+          g_n8c_fetch_unknown - l_fetch_unknown, g_n8c_fetch_map - l_fetch_map);
       for (int c = 0; c < 4; ++c) l_up[c] = g_n8c_up[c];
+      l_fetch_skip = g_n8c_fetch_skip;
+      l_fetch_unknown = g_n8c_fetch_unknown;
+      l_fetch_map = g_n8c_fetch_map;
       l_binds = g_n8c_binds;
       l_report = now;
     }
@@ -9136,6 +9205,93 @@ bool D3D12CommandProcessor::NrFastBindings(const D3D12Shader* vs, const D3D12Sha
   return ok;
 }
 
+// [fetch-need] The pairs of fetch constant dwords this draw's shaders read
+// from the buffer, by the translator's own record. Known only for an
+// input-assembler draw: its vertex shader variant takes every fetch from an
+// input register and reads no vertex fetch constant (a variant that did is
+// flagged by the translator), so what is left is what the texture fetches of
+// the two stages request. A raw vertex fetch, memexport, and the machinery
+// that records or replays the binding emission keep the old rule.
+bool D3D12CommandProcessor::FetchCbNeededPairs(const D3D12Shader* vertex_shader,
+                                               const D3D12Shader* pixel_shader,
+                                               bool shared_memory_is_uav,
+                                               uint32_t pairs_out[3]) const {
+  if (g_fetch_need == 0 || !fetch_cb_ia_draw_ || shared_memory_is_uav ||
+      vertex_shader->IaFetchReadsConstant()) {
+    return false;
+  }
+  // Tile and span replay, the reuse bundles, the instancing coalescer and
+  // parallel record (the fast executor's environment refusals) and precord
+  // all rely on "a stale flag is an upload in this draw's span".
+  if (g_precord_capture || NrFastEnvRefusal() != nr_native::kFastFbNone) {
+    return false;
+  }
+  vertex_shader->GetTextureFetchPairsRead(pairs_out);
+  if (pixel_shader != nullptr) {
+    uint32_t pixel_pairs[3];
+    pixel_shader->GetTextureFetchPairsRead(pixel_pairs);
+    for (uint32_t i = 0; i < 3; ++i) {
+      pairs_out[i] |= pixel_pairs[i];
+    }
+  }
+  return true;
+}
+
+bool D3D12CommandProcessor::NrFastFetchStage(const D3D12Shader* vs, const D3D12Shader* ps,
+                                             bool ia, const nr_native::FastRegMap* map,
+                                             uint64_t* uploaded_bytes) {
+  fetch_cb_ia_draw_ = ia;
+  fetch_cb_latched_draw_ = false;
+  if (map == nullptr) {
+    // The live file holds the draw's fetch constants (the overlay is applied,
+    // or the record changes none of them): NrUpdateBindings decides.
+    return true;
+  }
+  // The overlay was skipped and the record's fetch constants differ from the
+  // live file: the buffer this draw needs is the map's, which NrUpdateBindings
+  // cannot compose. Leave the bound upload when it already holds every pair
+  // the shaders read, else compose all 192 dwords from the map (the previous
+  // rule did that for every such draw).
+  static_assert(sizeof(fetch_cb_latch_.dwords) == nr::kBindFetchBytes);
+  const uint32_t* rf = register_file_->values;
+  const auto read_map = [map, rf](uint32_t dword) {
+    return map->Read(rf, uint32_t(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) + dword);
+  };
+  uint32_t pairs[3];
+  const bool known = FetchCbNeededPairs(vs, ps, false, pairs);
+  if (known && FetchCbLatchValid() && FetchCbPairsHeld(fetch_cb_latch_.dwords, pairs, read_map)) {
+    fetch_cb_latched_draw_ = true;
+    ++g_n8c_fetch_skip;
+    return true;
+  }
+  uint8_t* fetch_constants = constant_buffer_pool_->Request(
+      frame_current_, nr::kBindFetchBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr,
+      nullptr, &cbuffer_binding_fetch_.address);
+  if (fetch_constants == nullptr) {
+    return false;
+  }
+  // Staged in the latch (cached memory), published with one memcpy: the
+  // upload heap is never read back.
+  for (uint32_t i = 0; i < 32 * 6; ++i) {
+    fetch_cb_latch_.dwords[i] = read_map(i);
+  }
+  const bool poisoned = known && g_fetch_need == 2;
+  if (poisoned) {
+    FetchCbPoison(fetch_cb_latch_.dwords, pairs);
+  }
+  std::memcpy(fetch_constants, fetch_cb_latch_.dwords, nr::kBindFetchBytes);
+  fetch_cb_latch_.frame = frame_current_;
+  fetch_cb_latch_.address = cbuffer_binding_fetch_.address;
+  // Up to date as the map upload always was (the post-draw dirty set of the
+  // skipped overlay clears it again); a poisoned upload never is.
+  cbuffer_binding_fetch_.up_to_date = !poisoned;
+  fetch_cb_latched_draw_ = true;
+  current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FetchConstants);
+  ++g_n8c_fetch_map;
+  *uploaded_bytes += nr::kBindFetchBytes;
+  return true;
+}
+
 // The [dcache] record block's bindings half, into a blob: the state
 // NrUpdateBindings just left (derived or restored) for these shaders.
 // False (nothing usable) under the same refusals as the record.
@@ -10524,6 +10680,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type, u
   // when armed; a refusal (sampler-heap overflow) falls back to the emulated
   // one on the same coherent state machine, counted.
   bool _dp_bind_ok;
+  // [fetch-need] the bindings' fetch constants inputs for this draw: the
+  // vertex shader translation is the input-assembler variant exactly when
+  // ia_draw (the modification above, and a [dcache] entry of the other
+  // variant was refused), and the buffer comes from the live file.
+  fetch_cb_ia_draw_ = ia_draw;
+  fetch_cb_latched_draw_ = false;
   if (g_nr_swap) {
     bool nr_swp_refused = false;
     // [dcache] the bindings half: restore from the entry (consume) or
@@ -16111,7 +16273,12 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_bool_loop_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_bool_loop_constants);
   }
-  if (!cbuffer_binding_fetch_.up_to_date) {
+  // [fetch-need] The emulated path keeps the old rule (a stale buffer is
+  // uploaded whole from the register file; the new address drops the latch).
+  // The one exception is a buffer the fast executor already composed or
+  // validated against the record for this draw: the live file is not this
+  // draw's fetch constants then.
+  if (!cbuffer_binding_fetch_.up_to_date && !fetch_cb_latched_draw_) {
     constexpr uint32_t kFetchConstantsSize = 32 * 6 * sizeof(uint32_t);
     uint8_t* fetch_constants = constant_buffer_pool_->Request(
         frame_current_, kFetchConstantsSize, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
@@ -17352,30 +17519,55 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_bool_loop_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_BoolLoopConstants);
   }
-  if (!cbuffer_binding_fetch_.up_to_date) {
-    ++g_n8c_up[3];  // [N8C]
-    if (g_draw_prof) ++g_bind_cnt[7];
-    if (g_draw_prof) ++g_bind_cnt[2];
-    auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
-                              : std::chrono::steady_clock::time_point{};
-    uint8_t* fetch_constants = constant_buffer_pool_->Request(
-        frame_current_, nr::kBindFetchBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-        nullptr, nullptr, &cbuffer_binding_fetch_.address);
-    if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
-    if (fetch_constants == nullptr) {
-      return false;
+  // [fetch-need] A stale fetch buffer (a fetch constant was written since its
+  // upload, or the frame opened) is uploaded only when the bound upload does
+  // not already hold every pair of dwords this draw's shaders read. The flag
+  // stays false after a skip: the next draw reads other pairs and compares
+  // its own. Nothing to do when the fast executor already served the draw
+  // (fetch_cb_latched_draw_: the live file is not the draw's source then).
+  if (!cbuffer_binding_fetch_.up_to_date && !fetch_cb_latched_draw_) {
+    static_assert(sizeof(fetch_cb_latch_.dwords) == nr::kBindFetchBytes);
+    const uint32_t* const fetch_src = nr_rf + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t fetch_pairs[3];
+    const bool fetch_known =
+        FetchCbNeededPairs(vertex_shader, pixel_shader, shared_memory_is_uav, fetch_pairs);
+    if (fetch_known && FetchCbLatchValid() &&
+        FetchCbPairsHeld(fetch_cb_latch_.dwords, fetch_pairs,
+                         [fetch_src](uint32_t dword) { return fetch_src[dword]; })) {
+      ++g_n8c_fetch_skip;
+    } else {
+      ++g_n8c_up[3];  // [N8C]
+      if (!fetch_known) ++g_n8c_fetch_unknown;
+      if (g_draw_prof) ++g_bind_cnt[7];
+      if (g_draw_prof) ++g_bind_cnt[2];
+      auto _bp_rq0 = g_draw_prof ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+      uint8_t* fetch_constants = constant_buffer_pool_->Request(
+          frame_current_, nr::kBindFetchBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+          nullptr, nullptr, &cbuffer_binding_fetch_.address);
+      if (g_draw_prof) g_bind_ns[6] += prof_ns_since(_bp_rq0);
+      if (fetch_constants == nullptr) {
+        return false;
+      }
+      // The latch is the staging copy (cached memory, never the upload heap):
+      // the verbatim register window, with gpu_fetch_need 2 every pair the
+      // draw does not read poisoned.
+      nr::BindComposeFetch(nr_rf, fetch_cb_latch_.dwords, nr::kBindFetchBytes);
+      const bool fetch_poisoned = fetch_known && g_fetch_need == 2;
+      if (fetch_poisoned) {
+        FetchCbPoison(fetch_cb_latch_.dwords, fetch_pairs);
+      }
+      std::memcpy(fetch_constants, fetch_cb_latch_.dwords, nr::kBindFetchBytes);
+      fetch_cb_latch_.frame = frame_current_;
+      fetch_cb_latch_.address = cbuffer_binding_fetch_.address;
+      if (g_nr_rub_cmp && g_rub_stage_ok) {
+        g_rub_stage.ftc.resize(nr::kBindFetchBytes);
+        std::memcpy(g_rub_stage.ftc.data(), fetch_cb_latch_.dwords, nr::kBindFetchBytes);
+      }
+      // A poisoned upload is not the register window: it stays stale.
+      cbuffer_binding_fetch_.up_to_date = !fetch_poisoned;
+      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FetchConstants);
     }
-    uint8_t* nr_rub_dst = fetch_constants;
-    if (g_nr_rub_cmp && g_rub_stage_ok) {
-      g_rub_stage.ftc.resize(nr::kBindFetchBytes);
-      nr_rub_dst = g_rub_stage.ftc.data();
-    }
-    nr::BindComposeFetch(nr_rf, nr_rub_dst, nr::kBindFetchBytes);
-    if (nr_rub_dst != fetch_constants) {
-      std::memcpy(fetch_constants, nr_rub_dst, nr::kBindFetchBytes);
-    }
-    cbuffer_binding_fetch_.up_to_date = true;
-    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_FetchConstants);
   }
 
   // The shared-memory binding flavor.

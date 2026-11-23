@@ -2249,11 +2249,20 @@ bool D3D12CommandProcessor::NrFastEmit(NrFastPlan& plan) {
                       uint32_t(kRootParameter_Bindless_BoolLoopConstants))) {
       return false;
     }
-    if ((plan.dry.tex_fetch || plan.dry.vtx_fetch[0] || plan.dry.vtx_fetch[1]) &&
-        !upload_range(kFastRegFetchBase, kFastRegFetchEnd - kFastRegFetchBase, cbuffer_binding_fetch_,
-                      uint32_t(kRootParameter_Bindless_FetchConstants))) {
-      return false;
-    }
+  }
+  // [fetch-need] The fetch buffer goes through the command processor's stage
+  // (it owns the latch of the bound upload): with the overlay skipped and a
+  // record fetch constant differing from the live file it composes the
+  // buffer from the map as before, unless the bound upload already holds
+  // every pair the shaders read; otherwise it only tells NrUpdateBindings
+  // whether the vertex shader is the input-assembler variant.
+  if (!NrFastFetchStage(vs, ps, plan.ia,
+                        plan.overlay_skip &&
+                                (plan.dry.tex_fetch || plan.dry.vtx_fetch[0] || plan.dry.vtx_fetch[1])
+                            ? &g_map
+                            : nullptr,
+                        &lean_bytes)) {
+    return false;
   }
   // Constant buffer bytes this draw uploads (the bindings' dirty rules).
   {
