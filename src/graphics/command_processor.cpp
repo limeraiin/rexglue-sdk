@@ -8611,6 +8611,13 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count, uint32_t ring_index) {
   nr::LifecycleReplayScope lifecycle_scope(ptr, count, ring_index);
   SCOPE_profile_cpu_f("gpu");
+  // The backend hook after a top-level buffer, on every exit path.
+  struct IbEndHook {
+    CommandProcessor* cp;
+    ~IbEndHook() {
+      if (cp) cp->OnIndirectBufferEnd();
+    }
+  } ib_end_hook{g_pm4_ib_depth == 0 ? this : nullptr};
   // [N7] one bracket per indirect buffer (~5.8k/s at city). Subtracting the
   // skip path's own buf total leaves the buffers that DECLINED the skip.
   const auto n7_ib_t0 = std::chrono::steady_clock::now();

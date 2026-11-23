@@ -33,7 +33,17 @@ class DeferredCommandList {
                       size_t initial_size_bytes = 1_MiB);
 
   void Reset();
-  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  // What a replay carries from one range to the next when several ranges are
+  // recorded into the same real command list: draws, dispatches and indirect
+  // executions are dropped while no pipeline is bound, and a later range
+  // inherits the pipeline an earlier one bound.
+  struct ReplayState {
+    ID3D12PipelineState* pipeline = nullptr;
+    // Draws, dispatches and indirect executions dropped for want of a pipeline.
+    uint64_t dropped = 0;
+  };
+  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1,
+               ReplayState* state = nullptr);
 
   // [NR-BFC] Phase 5-4-6-0: current stream size in elements -- the span
   // anchor for the buffer-replay census (the stream is Reset per submission,
@@ -234,11 +244,19 @@ class DeferredCommandList {
     command_stream_ = std::vector<uintmax_t>();
     return out;
   }
+  // [stream] Hand everything recorded so far to an early replay: `out` receives
+  // the stream and this list continues in out's old storage (cleared, capacity
+  // kept). Outstanding span anchors die exactly as they do at Reset.
+  void StreamTake(std::vector<uintmax_t>& out) {
+    out.clear();
+    command_stream_.swap(out);
+    ++reset_generation_;
+  }
   // Replay a previously-taken segment stream into the real command list, in order,
   // without disturbing the stream currently being recorded.
   void ExecuteStream(const std::vector<uintmax_t>& stream, ID3D12GraphicsCommandList* command_list,
-                     ID3D12GraphicsCommandList1* command_list_1) {
-    ExecuteRange(stream.data(), stream.size(), command_list, command_list_1);
+                     ID3D12GraphicsCommandList1* command_list_1, ReplayState* state = nullptr) {
+    ExecuteRange(stream.data(), stream.size(), command_list, command_list_1, state);
   }
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
@@ -889,7 +907,7 @@ class DeferredCommandList {
   // both delegate here so segment replay and full-list replay share one code path.
   void ExecuteRange(const uintmax_t* stream_data, size_t stream_size,
                     ID3D12GraphicsCommandList* command_list,
-                    ID3D12GraphicsCommandList1* command_list_1);
+                    ID3D12GraphicsCommandList1* command_list_1, ReplayState* state = nullptr);
 
   const D3D12CommandProcessor& command_processor_;
 

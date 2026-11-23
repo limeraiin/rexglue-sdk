@@ -591,6 +591,7 @@ struct D3D12CommandProcessor::NrFastPlan {
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
 void D3D12CommandProcessor::NrNativeExecute(uint32_t slot_sequence) {
+  StreamFlushIfLarge();  // [stream] nothing of this marker is recorded yet
   if (REXCVAR_GET(gpu_native_retail_cmp)) NrRetailCmpBegin(slot_sequence);
   nr_retail_cmp_native_ = nr_retail_cmp_active_;
   struct NativeScopeExit {

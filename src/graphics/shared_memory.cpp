@@ -681,6 +681,49 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
                                                            << page_size_log2_);
 }
 
+void SharedMemory::AuditCollectValidPages(uint32_t* cursor, uint32_t max_pages,
+                                          std::vector<std::pair<uint32_t, uint32_t>>& runs) {
+  runs.clear();
+  const uint32_t page_count = kBufferSize >> page_size_log2_;
+  auto global_lock = global_critical_region_.Acquire();
+  const uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+  if (!valid_flags || !page_count) {
+    return;
+  }
+  uint32_t page = *cursor < page_count ? *cursor : 0;
+  uint32_t collected = 0;
+  for (uint32_t scanned = 0; scanned < page_count && collected < max_pages; ++scanned) {
+    const uint64_t bits =
+        valid_flags[page >> 6] & ~system_page_flags_valid_and_gpu_written_[page >> 6];
+    if ((bits >> (page & 63)) & 1) {
+      if (!runs.empty() && runs.back().first + runs.back().second == page) {
+        ++runs.back().second;
+      } else {
+        runs.emplace_back(page, 1u);
+      }
+      ++collected;
+    }
+    if (++page == page_count) {
+      page = 0;
+    }
+  }
+  *cursor = page;
+}
+
+bool SharedMemory::AuditPageValid(uint32_t page) {
+  if (page >= (kBufferSize >> page_size_log2_)) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  const uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+  if (!valid_flags) {
+    return false;
+  }
+  const uint64_t bits =
+      valid_flags[page >> 6] & ~system_page_flags_valid_and_gpu_written_[page >> 6];
+  return ((bits >> (page & 63)) & 1) != 0;
+}
+
 void SharedMemory::PrepareForTraceDownload() {
   ReleaseTraceDownloadRanges();
   assert_true(trace_download_ranges_.empty());

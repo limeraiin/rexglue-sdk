@@ -430,6 +430,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnFtraceSwap(ftrace::FrameRecord& record) override;
 
   void OnPrimaryBufferEnd() override;
+  void OnIndirectBufferEnd() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -927,6 +928,63 @@ class D3D12CommandProcessor : public CommandProcessor {
   // submission, replayed in order before the final (current) deferred list at
   // EndSubmission. Empty when gpu_parallel_record is off (zero overhead).
   std::vector<std::vector<uintmax_t>> precord_segments_;
+
+  // [stream] Early replay of the deferred list. At the end of a top-level
+  // indirect buffer the stream recorded so far goes to a worker that records
+  // it into the real command list while this thread keeps deriving; the
+  // submission still closes with one Close / ExecuteCommandLists / Signal on
+  // this thread after the worker has drained, so the D3D12 call sequence is
+  // the one EndSubmission alone would have produced.
+  // [sm-audit] gpu_page_audit_ms: read the valid shared-memory pages back and
+  // compare them with guest memory.
+  void SmAuditTick();
+  Microsoft::WRL::ComPtr<ID3D12Resource> sm_audit_buffer_;
+  uint32_t sm_audit_buffer_size_ = 0;
+  const uint8_t* sm_audit_mapped_ = nullptr;
+
+  bool StreamEnsureAllocator();
+  void StreamFlush();
+  // At a draw boundary or the end of a top-level indirect buffer: hand off
+  // once a chunk's worth has been recorded.
+  void StreamFlushIfLarge() {
+    if (stream_chunk_elements_ &&
+        deferred_command_list_.stream_size_elements() >= stream_chunk_elements_) {
+      StreamFlush();
+    }
+  }
+  void StreamDrain();
+  void StreamWorkerMain();
+  void StreamShutdown();
+  void StreamReport1Hz();
+  std::thread stream_thread_;
+  std::mutex stream_mutex_;
+  std::condition_variable stream_cv_;       // worker: a job or shutdown
+  std::condition_variable stream_idle_cv_;  // this thread: drained
+  std::deque<std::vector<uintmax_t>> stream_jobs_;
+  std::vector<std::vector<uintmax_t>> stream_free_;
+  bool stream_busy_ = false;
+  // This thread is replaying the queue itself (EndSubmission); the worker
+  // takes no job until it is cleared.
+  bool stream_draining_ = false;
+  bool stream_shutdown_ = false;
+  bool stream_started_ = false;
+  // This thread only: the real list is Reset for the open submission and holds
+  // (or is receiving) replayed chunks.
+  bool stream_list_open_ = false;
+  // The replay state of the real list while stream_list_open_: whoever holds
+  // the list (the worker with stream_busy_, this thread otherwise) owns it.
+  DeferredCommandList::ReplayState stream_replay_state_;
+  // kSetPipelineStateHandle commands recorded when the stream last started
+  // empty: a handle resolves only after EndSubmission has awaited creation.
+  uint64_t stream_handle_count_ = 0;
+  // Latched per frame: the chunk size in stream elements, 0 = off.
+  size_t stream_chunk_elements_ = 0;
+  struct StreamStats {
+    uint64_t flushes = 0, elements = 0, tail_elements = 0, submissions = 0;
+    uint64_t refused_small = 0, refused_handle = 0, refused_mode = 0;
+    uint64_t drains = 0, drain_waits = 0, drain_ticks = 0, drain_stolen = 0;
+    uint64_t dropped = 0;  // actions the replay skipped with no pipeline bound
+  } stream_stats_;
 
   // [GPU-PRECORD] Phase 1b-0: deferred draw capture/replay (single-thread
   // foundation for off-thread segment recording). When gpu_precord_capture is on,

@@ -96,6 +96,14 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // [sm-audit] Up to max_pages pages whose host copy is supposed to equal guest
+  // memory (valid and not GPU-written), as (first page, page count) runs. The
+  // scan starts at *cursor, wraps, and leaves *cursor where it stopped.
+  void AuditCollectValidPages(uint32_t* cursor, uint32_t max_pages,
+                              std::vector<std::pair<uint32_t, uint32_t>>& runs);
+  // Whether the page is still valid and not GPU-written.
+  bool AuditPageValid(uint32_t page);
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.

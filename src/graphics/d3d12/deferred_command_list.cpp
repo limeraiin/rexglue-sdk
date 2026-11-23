@@ -31,19 +31,21 @@ void DeferredCommandList::Reset() {
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
-                                  ID3D12GraphicsCommandList1* command_list_1) {
-  ExecuteRange(command_stream_.data(), command_stream_.size(), command_list, command_list_1);
+                                  ID3D12GraphicsCommandList1* command_list_1, ReplayState* state) {
+  ExecuteRange(command_stream_.data(), command_stream_.size(), command_list, command_list_1, state);
 }
 
 void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stream_size,
                                        ID3D12GraphicsCommandList* command_list,
-                                       ID3D12GraphicsCommandList1* command_list_1) {
+                                       ID3D12GraphicsCommandList1* command_list_1,
+                                       ReplayState* state) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   const uintmax_t* stream = stream_data;
   size_t stream_remaining = stream_size;
-  ID3D12PipelineState* current_pipeline_state = nullptr;
+  ID3D12PipelineState* current_pipeline_state = state ? state->pipeline : nullptr;
+  uint64_t dropped = 0;
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -91,6 +93,8 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
           auto& args = *reinterpret_cast<const D3DDispatchArguments*>(stream);
           command_list->Dispatch(args.thread_group_count_x, args.thread_group_count_y,
                                  args.thread_group_count_z);
+        } else {
+          ++dropped;
         }
       } break;
       case Command::kD3DExecuteIndirect: {
@@ -99,6 +103,8 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
           command_list->ExecuteIndirect(args.command_signature, args.max_command_count,
                                         args.argument_buffer, args.argument_buffer_offset,
                                         args.count_buffer, args.count_buffer_offset);
+        } else {
+          ++dropped;
         }
       } break;
       case Command::kD3DDrawIndexedInstanced: {
@@ -107,6 +113,8 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
           command_list->DrawIndexedInstanced(args.index_count_per_instance, args.instance_count,
                                              args.start_index_location, args.base_vertex_location,
                                              args.start_instance_location);
+        } else {
+          ++dropped;
         }
       } break;
       case Command::kD3DDrawInstanced: {
@@ -114,6 +122,8 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
           auto& args = *reinterpret_cast<const D3DDrawInstancedArguments*>(stream);
           command_list->DrawInstanced(args.vertex_count_per_instance, args.instance_count,
                                       args.start_vertex_location, args.start_instance_location);
+        } else {
+          ++dropped;
         }
       } break;
       case Command::kD3DBeginQuery: {
@@ -290,6 +300,10 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
     }
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
+  }
+  if (state) {
+    state->pipeline = current_pipeline_state;
+    state->dropped += dropped;
   }
 }
 

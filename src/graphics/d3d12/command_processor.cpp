@@ -155,6 +155,37 @@ REXCVAR_DEFINE_BOOL(gpu_parallel_record, false, "GPU/D3D12",
                     "Off by default.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_stream_replay, false, "GPU/D3D12",
+                    "[stream] force the replay worker on: the deferred command list is recorded "
+                    "into the real one in chunks while the frame is still being derived, instead "
+                    "of all of it in EndSubmission. The submission boundaries and the D3D12 call "
+                    "order are unchanged. gpu_stream_auto turns it on by itself where it pays. "
+                    "Never active while the state sorter, the Hi-Z cull or a precord probe is.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_stream_auto, true, "GPU/D3D12",
+                    "[stream] turn the replay worker on by itself while the command processor "
+                    "thread is the bottleneck (its CPU share over half a second at or above 85%, "
+                    "off again at or below 65%). gpu_stream_replay forces it on regardless.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_page_audit_ms, 0, "GPU/D3D12",
+                     "[sm-audit] every N ms read back up to 128 MB of the pages the shared memory "
+                     "holds valid (not GPU-written) and compare them with guest memory; a page "
+                     "that differs while still valid is stale. 0 = off. Diagnostic: it waits for "
+                     "the GPU.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_stream_chunk, 2048, "GPU/D3D12",
+                     "[stream] recorded stream elements (8 bytes each, roughly 12 to 15 per draw) "
+                     "per chunk handed to the replay worker (256..65536).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_stream_replay_cycle, 0, "GPU/D3D12",
+                     "[stream] A/B: seconds per phase, stream replay on / off in place (0 = no "
+                     "cycling). Each switch logs '[stream] cycle phase='.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(gpu_precord_capture, false, "GPU/D3D12",
                     "[GPU-PRECORD] Phase 1b-0 capture/replay correctness probe (Ch.9 cmd-proc "
                     "parallel-record track): defer each draw's recording into a per-segment "
@@ -647,6 +678,8 @@ uint64_t g_draw_count = 0;
 // between forced full-state re-emits (correctness probe; tunable cvar comes in Phase 3).
 bool g_parallel_record = false;
 static constexpr uint32_t kParallelRecordSegmentDraws = 256;
+// [stream] latched once per frame in IssueSwap.
+bool g_stream_replay = false;
 // [GPU-PRECORD] Phase 1b-0: cached once/frame in IssueSwap. When on, draws are
 // deferred into a per-segment event log and replayed at flush boundaries (segment
 // size reuses kParallelRecordSegmentDraws).
@@ -6239,6 +6272,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   // while the parse thread is blocked inside PrecordFlush).
   PrecordWorkerShutdown();
   AwaitAllQueueOperationsCompletion();
+  StreamShutdown();  // [stream] nothing is open after the await
   // [ftrace] every submission is complete now: harvest the last timestamp
   // pairs into their frames, then write the CSV beside the log.
   ShutdownFtraceGpuResources();
@@ -6817,6 +6851,7 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  SmAuditTick();  // [sm-audit] off unless gpu_page_audit_ms is set
 
   // [N8B] Refresh the census/dedupe mode once per frame (cmd-proc thread only).
   // `gpu_n7 3` owns it while it is cycling the three phases in place; otherwise
@@ -6905,6 +6940,66 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   g_draw_dump = REXCVAR_GET(gpu_draw_dump);
   // [GPU-PRECORD] Phase 1a correctness-probe flag (forced segment-boundary re-emit).
   g_parallel_record = REXCVAR_GET(gpu_parallel_record);
+  g_stream_replay = REXCVAR_GET(gpu_stream_replay);  // [stream]
+  if (!g_stream_replay && REXCVAR_GET(gpu_stream_auto)) {
+    // The worker costs wake-ups and a second thread's time, and buys frames
+    // only where this thread is what the frame waits for.
+    static uint64_t s_wall0 = 0, s_cpu0 = 0, s_worker0 = 0;
+    static bool s_auto_on = false;
+    auto thread_cpu = [](HANDLE thread) -> uint64_t {
+      FILETIME creation, exit, kernel, user;
+      if (!GetThreadTimes(thread, &creation, &exit, &kernel, &user)) {
+        return 0;
+      }
+      return ((uint64_t(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
+             ((uint64_t(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+    };
+    const uint64_t wall = rex::chrono::Clock::QueryHostTickCount();
+    const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+    if (wall - s_wall0 >= frequency / 2) {
+      // What this thread would carry alone: its own time plus the worker's.
+      const uint64_t cpu = thread_cpu(GetCurrentThread());
+      uint64_t worker = 0;
+      {
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        if (stream_started_) {
+          worker = thread_cpu(static_cast<HANDLE>(stream_thread_.native_handle()));
+        }
+      }
+      if (cpu && s_wall0) {
+        const double seconds = double(wall - s_wall0) / double(frequency);
+        const double own = double(cpu - s_cpu0) * 1e-7 / seconds;
+        const double moved = worker >= s_worker0 ? double(worker - s_worker0) * 1e-7 / seconds : 0.0;
+        const double demand = own + moved;
+        const bool on = s_auto_on ? demand > 0.70 : own >= 0.85;
+        if (on != s_auto_on) {
+          s_auto_on = on;
+          REXGPU_INFO("[stream] auto {} (command thread {:.0f}%, worker {:.0f}% of a core)",
+                      on ? "on" : "off", own * 100.0, moved * 100.0);
+        }
+      }
+      s_cpu0 = cpu;
+      s_worker0 = worker;
+      s_wall0 = wall;
+    }
+    g_stream_replay = s_auto_on;
+  }
+  if (const int32_t stream_cycle = REXCVAR_GET(gpu_stream_replay_cycle); stream_cycle > 0) {
+    static const auto s_cycle_t0 = std::chrono::steady_clock::now();
+    static int s_cycle_phase = -1;
+    const int phase = int(std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now() - s_cycle_t0)
+                              .count() /
+                          stream_cycle) &
+                      1;
+    g_stream_replay = phase == 0;
+    if (phase != s_cycle_phase) {
+      s_cycle_phase = phase;
+      REXGPU_INFO("[stream] cycle phase={}", phase == 0 ? "on" : "off");
+    }
+  }
+  stream_chunk_elements_ =
+      g_stream_replay ? size_t(std::clamp<int32_t>(REXCVAR_GET(gpu_stream_chunk), 256, 65536)) : 0;
   // [GPU-PRECORD] Phase 1b-0 capture/replay correctness-probe flag.
   g_precord_capture = REXCVAR_GET(gpu_precord_capture);
   // [GPU-PRECORD] Phase 1b-1b: local-register-file replay + worker (thread ⇒ localrf).
@@ -8270,6 +8365,275 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+void D3D12CommandProcessor::OnIndirectBufferEnd() { StreamFlushIfLarge(); }
+
+void D3D12CommandProcessor::SmAuditTick() {
+  const int32_t period_ms = REXCVAR_GET(gpu_page_audit_ms);
+  if (period_ms <= 0 || !shared_memory_) {
+    return;
+  }
+  static auto s_last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::milliseconds(period_ms)) {
+    return;
+  }
+  s_last = now;
+  if (!BeginSubmission(true)) {
+    return;
+  }
+  static uint32_t s_cursor = 0;
+  static std::vector<std::pair<uint32_t, uint32_t>> s_runs;
+  static uint64_t s_audits = 0, s_stale_total = 0, s_pages_total = 0;
+  constexpr uint32_t kMaxPages = 32768;
+  const uint32_t page_log2 = shared_memory_->GetPageSizeLog2();
+  shared_memory_->AuditCollectValidPages(&s_cursor, kMaxPages, s_runs);
+  uint32_t pages = 0;
+  for (const auto& run : s_runs) {
+    pages += run.second;
+  }
+  if (!pages) {
+    return;
+  }
+  const uint32_t size = pages << page_log2;
+  if (sm_audit_buffer_size_ < size) {
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    const uint32_t new_size = kMaxPages << page_log2;
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, new_size, D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    if (FAILED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+      REXGPU_ERROR("[sm-audit] failed to create the {} MB readback buffer", new_size >> 20);
+      return;
+    }
+    D3D12_RANGE read_range = {0, new_size};
+    void* mapped = nullptr;
+    if (FAILED(buffer->Map(0, &read_range, &mapped))) {
+      return;
+    }
+    sm_audit_buffer_ = buffer;
+    sm_audit_buffer_size_ = new_size;
+    sm_audit_mapped_ = static_cast<const uint8_t*>(mapped);
+  }
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+  uint64_t offset = 0;
+  for (const auto& run : s_runs) {
+    const uint64_t length = uint64_t(run.second) << page_log2;
+    deferred_command_list_.D3DCopyBufferRegion(sm_audit_buffer_.Get(), offset, shared_memory_buffer,
+                                               uint64_t(run.first) << page_log2, length);
+    offset += length;
+  }
+  if (!AwaitAllQueueOperationsCompletion()) {
+    return;
+  }
+  // A guest write to a valid page faults and clears the valid bit before the
+  // store lands, so a page that differs and is still valid was never told.
+  const uint32_t page_size = uint32_t(1) << page_log2;
+  uint32_t stale = 0, first_stale = 0;
+  const uint8_t* host = sm_audit_mapped_;
+  for (const auto& run : s_runs) {
+    for (uint32_t i = 0; i < run.second; ++i, host += page_size) {
+      const uint32_t page = run.first + i;
+      const uint8_t* guest = memory_->TranslatePhysical(page << page_log2);
+      if (std::memcmp(host, guest, page_size) != 0 && shared_memory_->AuditPageValid(page) &&
+          std::memcmp(host, guest, page_size) != 0) {
+        if (!stale) {
+          first_stale = page << page_log2;
+        }
+        ++stale;
+      }
+    }
+  }
+  ++s_audits;
+  s_stale_total += stale;
+  s_pages_total += pages;
+  if (stale || (s_audits & 7) == 1) {
+    REXGPU_INFO("[sm-audit] #{}: {} valid pages compared, {} stale (first {:08X}), {} stale of {} "
+                "pages in total",
+                s_audits, pages, stale, first_stale, s_stale_total, s_pages_total);
+  }
+}
+
+bool D3D12CommandProcessor::StreamEnsureAllocator() {
+  if (command_allocator_writable_first_) {
+    return true;
+  }
+  ID3D12CommandAllocator* command_allocator;
+  if (FAILED(GetD3D12Provider().GetDevice()->CreateCommandAllocator(
+          D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&command_allocator)))) {
+    REXGPU_ERROR("Failed to create a command allocator");
+    return false;
+  }
+  command_allocator_writable_first_ = new CommandAllocator;
+  command_allocator_writable_first_->command_allocator = command_allocator;
+  command_allocator_writable_first_->last_usage_submission = 0;
+  command_allocator_writable_first_->next = nullptr;
+  command_allocator_writable_last_ = command_allocator_writable_first_;
+  return true;
+}
+
+// [stream] This thread, before a draw records anything or after a top-level
+// indirect buffer: no command is half written, and nothing but the constructs
+// refused below holds a position in the stream (every span anchor is checked
+// against the reset generation, which StreamTake advances).
+void D3D12CommandProcessor::StreamFlush() {
+  if (!submission_open_ || device_removed_) {
+    return;
+  }
+  // The sorter rewrites its open window in place and the Hi-Z pool patches a
+  // recorded ExecuteIndirect at pool close; the precord and instancing probes
+  // replay or defer draws of their own.
+  if (g_sort_on || hiz_phase_ != 0 || g_parallel_record || g_precord_capture || g_instance ||
+      instanced_batch_.active || !precord_segments_.empty()) {
+    ++stream_stats_.refused_mode;
+    return;
+  }
+  const size_t elements = deferred_command_list_.stream_size_elements();
+  if (deferred_command_list_.command_count(
+          DeferredCommandList::Command::kSetPipelineStateHandle) != stream_handle_count_) {
+    // A pipeline still being created: its handle resolves in EndSubmission.
+    ++stream_stats_.refused_handle;
+    return;
+  }
+  if (!stream_list_open_) {
+    if (!StreamEnsureAllocator()) {
+      return;
+    }
+    ID3D12CommandAllocator* command_allocator =
+        command_allocator_writable_first_->command_allocator;
+    command_allocator->Reset();
+    command_list_->Reset(command_allocator, nullptr);
+    stream_list_open_ = true;
+    stream_replay_state_ = {};
+  }
+  std::vector<uintmax_t> chunk;
+  {
+    std::lock_guard<std::mutex> lock(stream_mutex_);
+    if (!stream_started_) {
+      stream_shutdown_ = false;
+      stream_thread_ = std::thread([this] { StreamWorkerMain(); });
+      stream_started_ = true;
+    }
+    if (!stream_free_.empty()) {
+      chunk = std::move(stream_free_.back());
+      stream_free_.pop_back();
+    }
+  }
+  if (chunk.capacity() < elements) {
+    chunk.reserve(std::max(elements * 2, size_t(1_MiB / sizeof(uintmax_t))));
+  }
+  deferred_command_list_.StreamTake(chunk);
+  ++stream_stats_.flushes;
+  stream_stats_.elements += elements;
+  {
+    std::lock_guard<std::mutex> lock(stream_mutex_);
+    stream_jobs_.push_back(std::move(chunk));
+  }
+  stream_cv_.notify_one();
+}
+
+// This thread, closing the submission: the chunk the worker is in the middle
+// of has to finish, everything still queued behind it is replayed here
+// rather than waited for.
+void D3D12CommandProcessor::StreamDrain() {
+  ++stream_stats_.drains;
+  std::deque<std::vector<uintmax_t>> queued;
+  {
+    std::unique_lock<std::mutex> lock(stream_mutex_);
+    stream_draining_ = true;
+    if (stream_busy_) {
+      ++stream_stats_.drain_waits;
+      const uint64_t t0 = rex::chrono::Clock::QueryHostTickCount();
+      stream_idle_cv_.wait(lock, [this] { return !stream_busy_; });
+      stream_stats_.drain_ticks += rex::chrono::Clock::QueryHostTickCount() - t0;
+    }
+    queued.swap(stream_jobs_);
+  }
+  for (std::vector<uintmax_t>& chunk : queued) {
+    deferred_command_list_.ExecuteStream(chunk, command_list_, command_list_1_,
+                                         &stream_replay_state_);
+    chunk.clear();
+  }
+  stream_stats_.drain_stolen += queued.size();
+  std::lock_guard<std::mutex> lock(stream_mutex_);
+  for (std::vector<uintmax_t>& chunk : queued) {
+    stream_free_.push_back(std::move(chunk));
+  }
+  stream_draining_ = false;
+}
+
+void D3D12CommandProcessor::StreamWorkerMain() {
+  std::unique_lock<std::mutex> lock(stream_mutex_);
+  for (;;) {
+    stream_cv_.wait(lock, [this] {
+      return (!stream_jobs_.empty() && !stream_draining_) || stream_shutdown_;
+    });
+    if (stream_shutdown_) {
+      break;
+    }
+    std::vector<uintmax_t> chunk = std::move(stream_jobs_.front());
+    stream_jobs_.pop_front();
+    stream_busy_ = true;
+    lock.unlock();
+    // The real list is this thread's until the queue is empty and busy is
+    // clear; the chunk is self-contained (no pipeline handles).
+    deferred_command_list_.ExecuteStream(chunk, command_list_, command_list_1_,
+                                         &stream_replay_state_);
+    chunk.clear();
+    lock.lock();
+    stream_busy_ = false;
+    stream_free_.push_back(std::move(chunk));
+    if (stream_draining_) {
+      stream_idle_cv_.notify_all();
+    }
+  }
+}
+
+void D3D12CommandProcessor::StreamShutdown() {
+  {
+    std::lock_guard<std::mutex> lock(stream_mutex_);
+    if (!stream_started_) {
+      return;
+    }
+    stream_shutdown_ = true;
+  }
+  stream_cv_.notify_all();
+  if (stream_thread_.joinable()) {
+    stream_thread_.join();
+  }
+  std::lock_guard<std::mutex> lock(stream_mutex_);
+  stream_started_ = false;
+  stream_jobs_.clear();
+  stream_free_.clear();
+}
+
+void D3D12CommandProcessor::StreamReport1Hz() {
+  static StreamStats s_last;
+  const StreamStats& c = stream_stats_;
+  const uint64_t flushes = c.flushes - s_last.flushes;
+  const uint64_t refused = (c.refused_mode - s_last.refused_mode) +
+                           (c.refused_handle - s_last.refused_handle);
+  if (g_stream_replay || flushes || refused || c.dropped != s_last.dropped) {
+    const uint64_t streamed = c.elements - s_last.elements;
+    const uint64_t tail = c.tail_elements - s_last.tail_elements;
+    const double to_ms = 1000.0 / double(rex::chrono::Clock::QueryHostTickFrequency());
+    REXGPU_INFO(
+        "[stream] {} | chunks/s {} submissions/s {} | elements streamed {} tail {} ({:.1f}% "
+        "streamed) | refused small {} handle {} mode {} | drains {} waited {} for {:.2f} ms "
+        "took over {} chunks | dropped {}",
+        g_stream_replay ? "on" : "off", flushes, c.submissions - s_last.submissions, streamed,
+        tail, streamed + tail ? 100.0 * double(streamed) / double(streamed + tail) : 0.0,
+        c.refused_small - s_last.refused_small, c.refused_handle - s_last.refused_handle,
+        c.refused_mode - s_last.refused_mode, c.drains - s_last.drains,
+        c.drain_waits - s_last.drain_waits, double(c.drain_ticks - s_last.drain_ticks) * to_ms,
+        c.drain_stolen - s_last.drain_stolen, c.dropped - s_last.dropped);
+  }
+  s_last = c;
+}
+
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                           const uint32_t* host_address, uint32_t dword_count) {
   // [GPU-PRECORD] Phase 1b-1c Inc 4 (H1): the parse thread mutates the shared shaders_
@@ -8286,6 +8650,7 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
   ++g_cp_stall.draws;  // [stall]
+  StreamFlushIfLarge();  // [stream] nothing of this draw is recorded yet
   // [NR-ISSUE] Increment 4d: the base executor armed this draw to be issued
   // from the composed shadow register file. Unsupported alongside precord
   // capture (both default off): fall through to the normal path there, but
@@ -14498,6 +14863,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    stream_handle_count_ = deferred_command_list_.command_count(
+        DeferredCommandList::Command::kSetPipelineStateHandle);  // [stream]
     // [gpu-census] harvest whatever the fence check above completed, then
     // claim this submission's timestamp region (ts0 lands first in the list).
     if (gpu_census_available_) {
@@ -14621,20 +14988,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
 
   // Make sure there is a command allocator to write commands to.
-  if (submission_open_ && !command_allocator_writable_first_) {
-    ID3D12CommandAllocator* command_allocator;
-    if (FAILED(provider.GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                            IID_PPV_ARGS(&command_allocator)))) {
-      REXGPU_ERROR("Failed to create a command allocator");
-      // Try to submit later. Completely dropping the submission is not
-      // permitted because resources would be left in an undefined state.
-      return false;
-    }
-    command_allocator_writable_first_ = new CommandAllocator;
-    command_allocator_writable_first_->command_allocator = command_allocator;
-    command_allocator_writable_first_->last_usage_submission = 0;
-    command_allocator_writable_first_->next = nullptr;
-    command_allocator_writable_last_ = command_allocator_writable_first_;
+  if (submission_open_ && !StreamEnsureAllocator()) {
+    // Try to submit later. Completely dropping the submission is not
+    // permitted because resources would be left in an undefined state.
+    return false;
   }
 
   bool is_closing_frame = is_swap && frame_open_;
@@ -14674,8 +15031,18 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // happens between Xenia submissions.
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
+    ++stream_stats_.submissions;
+    stream_stats_.tail_elements += deferred_command_list_.stream_size_elements();
+    // [stream] the list was Reset at the first hand-off and holds the chunks
+    // replayed so far; what was recorded since follows with their state.
+    const bool stream_continued = stream_list_open_;
+    if (stream_continued) {
+      StreamDrain();
+      stream_list_open_ = false;
+    } else {
+      command_allocator->Reset();
+      command_list_->Reset(command_allocator, nullptr);
+    }
     // [GPU-PRECORD] Phase 1a-ii: replay completed segment streams in submission
     // order first, then the final (still-current) deferred list. Concatenated they
     // are the exact command sequence the single-list path would have produced.
@@ -14687,7 +15054,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // [DRAW-POOL] the GPU reads the argument buffers from here on: no batch
     // recorded in this list may take another instance.
     if (g_pool_on) PoolClose(kPoolCloseSubmit);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
+    DeferredCommandList::ReplayState replay_state;
+    if (stream_continued) {
+      replay_state = stream_replay_state_;
+    }
+    deferred_command_list_.Execute(command_list_, command_list_1_, &replay_state);
+    stream_stats_.dropped += replay_state.dropped;
     // [gpu-census] the timestamps are replayed into the real list now, so
     // the resolve can be recorded directly on it.
     GpuCensusResolveSubmission();
@@ -14792,6 +15164,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         RttReport1Hz();  // [rtt]
         nr_native::NrNativeReport1Hz();  // [jade-native-cp]
         NrFastReport1Hz();               // [jade-native-fast] / [jade-native-cmp]
+        StreamReport1Hz();               // [stream]
         OccReport1Hz();  // [occ]
       }
     }
