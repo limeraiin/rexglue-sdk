@@ -847,6 +847,55 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   return true;
 }
 
+// [NR-NATIVE-R2] The entry guard's eligibility and compare, as Update takes
+// them above (fingerprint_eligible and the memcmp): keep the three in step.
+bool RenderTargetCache::NrLastUpdateInputs(NrUpdateInputs* out) const {
+  if (!REXCVAR_GET(gpu_skip_unchanged_rt_update) || GetPath() == Path::kPixelShaderInterlock ||
+      REXCVAR_GET(execute_unclipped_draw_vs_on_cpu) || !rt_update_fingerprint_valid_) {
+    return false;
+  }
+  const RtUpdateFingerprint& fingerprint = rt_update_fingerprint_;
+  out->is_rasterization_done = fingerprint.is_rasterization_done;
+  out->normalized_depth_control = fingerprint.normalized_depth_control;
+  out->normalized_color_mask = fingerprint.normalized_color_mask;
+  out->path = fingerprint.path;
+  static_assert(sizeof(out->regs) == sizeof(fingerprint.regs));
+  std::memcpy(out->regs, fingerprint.regs, sizeof(out->regs));
+  return true;
+}
+
+RenderTargetCache::NrUpdateGuard RenderTargetCache::NrProbeUpdateGuard(
+    const NrUpdateInputs& inputs, uint32_t* reg_out) const {
+  if (!REXCVAR_GET(gpu_skip_unchanged_rt_update) || GetPath() == Path::kPixelShaderInterlock ||
+      REXCVAR_GET(execute_unclipped_draw_vs_on_cpu)) {
+    return NrUpdateGuard::kOff;
+  }
+  if (!rt_update_fingerprint_valid_) {
+    return NrUpdateGuard::kReset;
+  }
+  const RtUpdateFingerprint& fingerprint = rt_update_fingerprint_;
+  // Update fingerprints the live path: the inputs' path must be both the
+  // stored one and the current one.
+  if (fingerprint.is_rasterization_done != inputs.is_rasterization_done ||
+      fingerprint.normalized_depth_control != inputs.normalized_depth_control ||
+      fingerprint.normalized_color_mask != inputs.normalized_color_mask ||
+      fingerprint.path != inputs.path || inputs.path != uint32_t(GetPath())) {
+    return NrUpdateGuard::kDrawState;
+  }
+  for (uint32_t i = 0; i < uint32_t(rex::countof(fingerprint.regs)); ++i) {
+    if (fingerprint.regs[i] != inputs.regs[i]) {
+      if (reg_out) {
+        *reg_out = i;
+      }
+      return NrUpdateGuard::kRegisters;
+    }
+  }
+  if (fingerprint.ownership_generation != ownership_generation_) {
+    return NrUpdateGuard::kOwnership;
+  }
+  return NrUpdateGuard::kHolds;
+}
+
 uint32_t RenderTargetCache::GetLastUpdateBoundRenderTargets(
     uint32_t* depth_and_color_formats_out) const {
   if (GetPath() != Path::kHostRenderTargets) {
