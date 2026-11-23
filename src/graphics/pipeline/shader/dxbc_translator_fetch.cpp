@@ -128,6 +128,13 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   // [ia] An IA variant never needs the address (every fetch of an eligible
   // shader takes the IA path; a mini fetch has its own element).
   if (!instr.is_mini_fetch && !IsVertexShaderIaFetch()) {
+    // [fetch-need] The address below reads the fetch constant: the same mark
+    // as at the raw load, for a modification that asked for the
+    // input-assembler variant and is not one (a domain shader, an ineligible
+    // shader).
+    if (is_vertex_shader() && GetDxbcShaderModification().vertex.ia_fetch) {
+      ia_fetch_reads_constant_ = true;
+    }
     dxbc::Dest address_dest(dxbc::Dest::R(system_temp_grad_v_vfetch_address_, 0b1000));
     if (instr.attributes.stride) {
       // Convert the index to an integer by flooring or by rounding to the
@@ -184,6 +191,14 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     a_.OpMov(dxbc::Dest::R(system_temp_result_, needed_words),
              dxbc::Src::V1D(ia_register, ia_swizzle));
   } else {
+  // [fetch-need] The raw load reads the fetch constant (its endianness below).
+  // A modification asking for the input-assembler variant is not expected
+  // here (every fetch of an eligible shader has an element); if one gets
+  // here, the shader is marked so the command processor keeps uploading the
+  // vertex fetch constants for it.
+  if (is_vertex_shader() && GetDxbcShaderModification().vertex.ia_fetch) {
+    ia_fetch_reads_constant_ = true;
+  }
   dxbc::Dest address_temp_dest(dxbc::Dest::R(system_temp_result_, 0b1000));
   dxbc::Src address_temp_src(dxbc::Src::R(system_temp_result_, dxbc::Src::kWWWW));
 

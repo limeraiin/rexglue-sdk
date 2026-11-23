@@ -78,6 +78,21 @@ class DxbcShader : public Shader {
     return sampler_bindings_;
   }
 
+  // [fetch-need] What the translations of this shader read from the fetch
+  // constants buffer, over every modification translated so far. A bit per
+  // two-dword pair of the 96 (texture fetch constant * 3 + pair) that a
+  // texture fetch reads; vertex fetch constants are not in it (a raw vertex
+  // fetch reads the ones in constant_register_map().vertex_fetch_bitmap, an
+  // input-assembler variant none unless IaFetchReadsConstant()).
+  void GetTextureFetchPairsRead(uint32_t pairs_out[3]) const {
+    for (uint32_t i = 0; i < 3; ++i) {
+      pairs_out[i] = texture_fetch_pairs_read_[i].load(std::memory_order_relaxed);
+    }
+  }
+  bool IaFetchReadsConstant() const {
+    return ia_fetch_reads_constant_.load(std::memory_order_relaxed);
+  }
+
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 
@@ -88,6 +103,9 @@ class DxbcShader : public Shader {
   std::vector<TextureBinding> texture_bindings_;
   std::vector<SamplerBinding> sampler_bindings_;
   uint32_t used_texture_mask_ = 0;
+  // [fetch-need] Written by PostTranslation of any modification, on any thread.
+  std::atomic<uint32_t> texture_fetch_pairs_read_[3]{};
+  std::atomic<bool> ia_fetch_reads_constant_{false};
 };
 
 }  // namespace rex::graphics
