@@ -1577,6 +1577,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   // entry (received draws since the build: <256, <512, <1024, more).
   std::vector<uint8_t> hiz_slot_cls_;
   void SwapPhaseMarker(ID3D12Resource* guest_output, int phase);  // a cycler's top-left block
+  // [shader-notice] A small green "Shaders are compiling..." in the bottom left
+  // corner of the frame while shaders are translated or pipelines created, and
+  // for half a second after the last one.
+  void SwapShaderNotice(ID3D12Resource* guest_output, uint32_t width, uint32_t height);
+  Microsoft::WRL::ComPtr<ID3D12Resource> notice_upload_;
+  uint32_t notice_scale_ = 0;
+  uint64_t notice_upload_submission_ = 0;
+  uint64_t notice_work_seen_ = UINT64_MAX;
+  uint64_t notice_until_ticks_ = 0;
   Microsoft::WRL::ComPtr<ID3D12Resource> marker_upload_;
   uint8_t* marker_mapping_ = nullptr;
   int marker_phase_ = -1;

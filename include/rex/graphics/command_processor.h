@@ -159,6 +159,11 @@ class CommandProcessor {
   // (XE_SWAP packet), unlike counter() which is also bumped by every vblank in
   // GraphicsSystem::MarkVblank(). Use this to measure the true game frame rate.
   uint32_t swap_counter() const { return swap_counter_.load(std::memory_order_relaxed); }
+  // The "Shaders are compiling..." corner notice is left out of frames a photo
+  // is about to be taken from.
+  void set_shader_notice_suppressed(bool suppressed) {
+    shader_notice_suppressed_.store(suppressed, std::memory_order_relaxed);
+  }
 
   // [GPU-PRECORD] Phase 1b-1c Inc 2: while a captured segment is being replayed, each
   // replayed draw's own active shaders come from the per-draw replay fields (set in
@@ -655,6 +660,10 @@ class CommandProcessor {
   uint32_t gamma_ramp_rw_component_ = 0;
   std::unique_ptr<rex::thread::Event> event_write_event_;
   std::atomic<uint32_t> event_write_address_{UINT32_MAX};
+
+ protected:
+  // Last on purpose: see set_shader_notice_suppressed.
+  std::atomic<bool> shader_notice_suppressed_{false};
 };
 
 // [NR-RUB] Phase 5-4-5-1: the pending draw stop's reuse verdict

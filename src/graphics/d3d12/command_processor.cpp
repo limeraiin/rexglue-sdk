@@ -176,6 +176,12 @@ REXCVAR_DEFINE_INT32(gpu_page_audit_ms, 0, "GPU/D3D12",
                      "the GPU.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(shader_compile_notice, true, "GPU/D3D12",
+                    "Show a small green \"Shaders are compiling...\" in the bottom left corner "
+                    "while shaders are translated or pipelines created, and for half a second "
+                    "after the last one.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(gpu_stream_chunk, 2048, "GPU/D3D12",
                      "[stream] recorded stream elements (8 bytes each, roughly 12 to 15 per draw) "
                      "per chunk handed to the replay worker (256..65536).")
@@ -8433,6 +8439,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             REXCVAR_GET(gpu_native_phase_marker) && nat_phase >= 0) {
           SwapPhaseMarker(guest_output_resource, std::clamp(nat_phase, 0, 3));
         }
+        SwapShaderNotice(guest_output_resource, guest_output_width, guest_output_height);
 
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
@@ -19546,6 +19553,158 @@ void D3D12CommandProcessor::SwapPhaseMarker(ID3D12Resource* guest_output, int ph
                         D3D12_RESOURCE_STATE_COPY_DEST);
   SubmitBarriers();
   deferred_command_list_.D3DCopyTextureRegion(&dst, 16, 16, 0, &src, nullptr);
+  PushTransitionBarrier(guest_output, D3D12_RESOURCE_STATE_COPY_DEST,
+                        ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+}
+
+namespace {
+// 5 x 9 cells (rows 7 and 8 hold descenders), one string per glyph.
+struct NoticeGlyph {
+  char c;
+  const char* rows;
+};
+constexpr NoticeGlyph kNoticeGlyphs[] = {
+    {'S', " ### #   ##     ###     ##   # ###           "},
+    {'h', "#    #    # ## ##  ##   ##   ##   #          "},
+    {'a', "           ###     # #####   # ####          "},
+    {'d', "    #    # ## ##  ###   ##   # ####          "},
+    {'e', "           ### #   #######     ###           "},
+    {'r', "          # ## ##  ##    #    #              "},
+    {'s', "           #####     ###     #####           "},
+    {'c', "           ### #   ##    #   # ###           "},
+    {'o', "           ### #   ##   ##   # ###           "},
+    {'m', "          ## # # # ## # ## # ## # #          "},
+    {'p', "          #### #   ##   ##   ##### #    #    "},
+    {'i', "  #        ##    #    #    #   ###           "},
+    {'l', " ##    #    #    #    #    #   ###           "},
+    {'n', "          # ## ##  ##   ##   ##   #          "},
+    {'g', "           #####   ##   ##   # ####    # ### "},
+    {'.', "                          ##   ##            "},
+};
+constexpr char kNoticeText[] = "Shaders are compiling...";
+constexpr uint32_t kNoticeChars = sizeof(kNoticeText) - 1;
+constexpr uint32_t kNoticeCellW = 6, kNoticeCellH = 9, kNoticePad = 3;
+constexpr uint32_t kNoticeW = kNoticeChars * kNoticeCellW + 2 * kNoticePad - 1;
+constexpr uint32_t kNoticeH = kNoticeCellH + 2 * kNoticePad;
+}  // namespace
+
+void D3D12CommandProcessor::SwapShaderNotice(ID3D12Resource* guest_output, uint32_t width,
+                                             uint32_t height) {
+  // The work since the last swap, from the counters the [hitch] report reads:
+  // shader translations and graphics pipeline creations on any thread.
+  const uint64_t work = g_hitch_probe.xlat_count.load(std::memory_order_relaxed) +
+                        g_hitch_probe.pso_cp_creates.load(std::memory_order_relaxed) +
+                        g_hitch_probe.pso_thr_creates.load(std::memory_order_relaxed);
+  const bool first = notice_work_seen_ == UINT64_MAX;
+  const bool busy = (!first && work != notice_work_seen_) ||
+                    (pipeline_cache_ && pipeline_cache_->IsCreatingPipelines());
+  notice_work_seen_ = work;  // the first swap only latches: boot-time creations are not shown
+  if (!busy && !notice_until_ticks_) {
+    return;
+  }
+  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  if (busy) {
+    if (!notice_until_ticks_) {
+      REXGPU_INFO("[shader-notice] on (translations and pipeline creations so far: {})", work);
+    }
+    notice_until_ticks_ = now + rex::chrono::Clock::QueryHostTickFrequency() / 2;
+  } else if (now >= notice_until_ticks_) {
+    notice_until_ticks_ = 0;
+    return;
+  }
+  if (!guest_output || !REXCVAR_GET(shader_compile_notice) ||
+      shader_notice_suppressed_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  // About 1/24 of the frame's height: 2x at 720p, 4x at 1440p.
+  const uint32_t scale = std::clamp<uint32_t>((height + 180) / 360, 1, 8);
+  const uint32_t w = kNoticeW * scale, h = kNoticeH * scale;
+  if (width < w + 16 * scale || height < h + 16 * scale) {
+    return;
+  }
+  const uint32_t pitch = rex::align(w * 4, uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+  if (!notice_upload_ || notice_scale_ != scale) {
+    if (notice_upload_) {
+      // The copies recorded from the old buffer may not have executed yet.
+      notice_upload_->AddRef();
+      resources_for_deletion_.emplace_back(notice_upload_submission_, notice_upload_.Get());
+      notice_upload_.Reset();
+    }
+    D3D12_RESOURCE_DESC desc;
+    ui::d3d12::util::FillBufferResourceDesc(desc, uint64_t(pitch) * h, D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+    if (FAILED(GetD3D12Provider().GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesUpload, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)))) {
+      return;
+    }
+    void* mapping = nullptr;
+    if (FAILED(upload->Map(0, nullptr, &mapping)) || !mapping) {
+      return;
+    }
+    // R10G10B10A2_UNORM: r | g << 10 | b << 20 | a << 30. Green on black.
+    constexpr uint32_t kBack = 3u << 30;
+    constexpr uint32_t kInk = 96u | (1023u << 10) | (96u << 20) | (3u << 30);
+    auto* pixels = static_cast<uint8_t*>(mapping);
+    for (uint32_t y = 0; y < h; ++y) {
+      uint32_t* row = reinterpret_cast<uint32_t*>(pixels + size_t(y) * pitch);
+      for (uint32_t x = 0; x < w; ++x) {
+        row[x] = kBack;
+      }
+    }
+    for (uint32_t i = 0; i < kNoticeChars; ++i) {
+      const char* rows = nullptr;
+      for (const NoticeGlyph& g : kNoticeGlyphs) {
+        if (g.c == kNoticeText[i]) {
+          rows = g.rows;
+          break;
+        }
+      }
+      if (!rows) {
+        continue;  // the space
+      }
+      for (uint32_t gy = 0; gy < kNoticeCellH; ++gy) {
+        for (uint32_t gx = 0; gx < 5; ++gx) {
+          if (rows[gy * 5 + gx] != '#') {
+            continue;
+          }
+          const uint32_t x0 = (kNoticePad + i * kNoticeCellW + gx) * scale;
+          const uint32_t y0 = (kNoticePad + gy) * scale;
+          for (uint32_t sy = 0; sy < scale; ++sy) {
+            uint32_t* row = reinterpret_cast<uint32_t*>(pixels + size_t(y0 + sy) * pitch);
+            for (uint32_t sx = 0; sx < scale; ++sx) {
+              row[x0 + sx] = kInk;
+            }
+          }
+        }
+      }
+    }
+    upload->Unmap(0, nullptr);
+    notice_upload_ = upload;
+    notice_scale_ = scale;
+  }
+  notice_upload_submission_ = submission_current_;
+  D3D12_TEXTURE_COPY_LOCATION dst;
+  dst.pResource = guest_output;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION src;
+  src.pResource = notice_upload_.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src.PlacedFootprint.Offset = 0;
+  src.PlacedFootprint.Footprint.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  src.PlacedFootprint.Footprint.Width = w;
+  src.PlacedFootprint.Footprint.Height = h;
+  src.PlacedFootprint.Footprint.Depth = 1;
+  src.PlacedFootprint.Footprint.RowPitch = pitch;
+  // As SwapPhaseMarker: the swap's own transition of the guest output may be
+  // pending, and one ResourceBarrier call may not transition it twice.
+  SubmitBarriers();
+  PushTransitionBarrier(guest_output, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyTextureRegion(&dst, 8 * scale, height - h - 8 * scale, 0, &src,
+                                              nullptr);
   PushTransitionBarrier(guest_output, D3D12_RESOURCE_STATE_COPY_DEST,
                         ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
 }
