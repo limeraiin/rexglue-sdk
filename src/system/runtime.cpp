@@ -10,6 +10,7 @@
  */
 
 #include <rex/chrono/clock.h>
+#include <rex/cpu_sampler.h>
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
@@ -70,6 +71,11 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
 
   // Start profiler (Tracy network threads, counter init)
   rex::perf::Profiler::Startup();
+
+  // In-process sampler: nothing unless cpu_sample_hz is set. Here, and not in
+  // a backend's worker start, so the config is loaded, logging is up and every
+  // thread the runtime creates from now on is seen.
+  rex::cpu_sampler::Start();
 
   // Initialize SEH exception support for hardware exception handling
   rex::initialize_seh();
@@ -225,6 +231,10 @@ void Runtime::Shutdown() {
   if (instance_ == this) {
     instance_ = nullptr;
   }
+
+  // First: the sample file is written before any teardown can hang, and
+  // teardown itself is not sampled.
+  rex::cpu_sampler::Stop();
 
   if (graphics_system_) {
     graphics_system_->Shutdown();

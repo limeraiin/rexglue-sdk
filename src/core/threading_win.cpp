@@ -17,6 +17,7 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cpu_sampler.h>
 
 #define LOG_LASTERROR() \
   { spdlog::error("Win32 Error 0x{:08X} in {}(...)", GetLastError(), __FUNCTION__); }
@@ -64,6 +65,7 @@ void raise_thread_name_exception(HANDLE thread, const std::string& name) {
 }
 
 static void set_thread_name_impl(HANDLE thread, const std::string_view name) {
+  rex::cpu_sampler::NoteThreadName(::GetThreadId(thread), name);
   auto kernel = GetModuleHandleW(L"kernel32.dll");
   if (kernel) {
     auto func = (SetThreadDescriptionFn)GetProcAddress(kernel, "SetThreadDescription");
