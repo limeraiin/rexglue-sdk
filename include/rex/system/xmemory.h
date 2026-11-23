@@ -287,9 +287,13 @@ class PhysicalHeap : public BaseHeap {
   // global critical region locked.
   bool IsWriteWatched(uint32_t virtual_address) const;
   // Returns true if any page in the range was watched.
+  // force: call the invalidation callbacks even when no page of the range is
+  // watched. A page uploaded while the guest had it read-only or inaccessible
+  // is valid for the GPU without a watch, and nothing else would ever tell it
+  // when the range becomes writable again or is freed.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
-                        bool unwatch_exact_range, bool unprotect = true);
+                        bool unwatch_exact_range, bool unprotect = true, bool force = false);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 

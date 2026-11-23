@@ -1748,7 +1748,7 @@ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
   }
 
   // Not caring about the contents anymore.
-  TriggerCallbacks(std::move(global_lock), address, size, true, true);
+  TriggerCallbacks(std::move(global_lock), address, size, true, true, true, true);
 
   return BaseHeap::Decommit(address, size);
 }
@@ -1772,7 +1772,7 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   // thus callback handlers will keep considering this range valid forever.
   uint32_t region_size;
   if (QuerySize(base_address, &region_size)) {
-    TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true);
+    TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true, true, true);
   }
 
   return BaseHeap::Release(base_address, out_region_size);
@@ -1785,7 +1785,7 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   // Only invalidate if making writable again, for simplicity - not when simply
   // marking some range as immutable, for instance.
   if (protect & memory::kMemoryProtectWrite) {
-    TriggerCallbacks(std::move(global_lock), address, size, true, true, false);
+    TriggerCallbacks(std::move(global_lock), address, size, true, true, false, true);
   }
 
   if (!parent_heap_->Protect(GetPhysicalAddress(address), size, protect, old_protect)) {
@@ -1916,7 +1916,7 @@ bool PhysicalHeap::IsWriteWatched(uint32_t virtual_address) const {
 
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                     uint32_t virtual_address, uint32_t length, bool is_write,
-                                    bool unwatch_exact_range, bool unprotect) {
+                                    bool unwatch_exact_range, bool unprotect, bool force) {
   // TODO(Triang3l): Support read watches.
   assert_true(is_write);
   if (!is_write) {
@@ -1962,7 +1962,7 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       break;
     }
   }
-  if (!any_watched) {
+  if (!any_watched && !force) {
     return false;
   }
 
