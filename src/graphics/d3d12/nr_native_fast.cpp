@@ -219,6 +219,7 @@ struct FastStats {
   uint64_t nodraw_async = 0;     // pipeline still compiling (not recorded)
   uint64_t rt_rederive = 0;      // hit re-derived: bound render target formats differ
   uint64_t tex_restore_fail = 0; // entry snapshots refused (a watch fired): full request
+  uint64_t tex_dead = 0;         // hit re-derived: textures destroyed after the lookup
   uint64_t blob_refused = 0;     // bindings not recordable (restore off for the entry)
   uint64_t shader_recheck = 0, shader_recheck_ne = 0;
   uint64_t pso_table_hit = 0;    // object miss served by the PSO table
@@ -1458,6 +1459,19 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
       for (uint32_t i = 0; rt_same && i < 5; ++i) {
         if ((bits & (1u << i)) && formats[i] != e->rt_formats[i]) rt_same = false;
       }
+    }
+    // The lookup compared the texture destroy generation before begin():
+    // opening a submission checks the fence, and a completed submission lets
+    // the texture cache destroy textures (the [dcache] consume re-reads the
+    // generation for the same reason). An entry whose snapshots may name a
+    // destroyed Texture is neither restored nor latched: the object is
+    // re-derived, as after a failed restore. It leaves through the render
+    // target branch below, so rt_rederive counts it too; tex_dead tells the
+    // two apart.
+    if (rt_same && plan.tex_count != 0 &&
+        e->tex_gen != texture_cache_->nr_texture_destroy_generation()) {
+      ++g_stats.tex_dead;
+      rt_same = false;
     }
     // (b0) The entry-owned texture skip, ahead of the generation latch (b)
     // below. A direct bind (NrFastEmit: an owned hit with a bindings blob,
@@ -3092,7 +3106,7 @@ void D3D12CommandProcessor::NrFastReport1Hz() {
                  g_direct.overlay_skip + g_direct.overlay_live_rt + g_direct.overlay_live_blob +
                  g_direct.overlay_live_other + g_direct.tex_skip + g_direct.tex_live +
                  g_direct.di_skip + g_direct.sys_skip + g_direct.ia_live + g_direct.env_refresh +
-                 g_direct.tex_own + g_direct.tex_own_unbound;
+                 g_direct.tex_own + g_direct.tex_own_unbound + g_stats.tex_dead;
   for (uint32_t i = 0; i < kFastOwnReasons; ++i) sig += g_direct.tex_own_no[i];
   for (uint32_t i = 0; i < kFastFbReasons; ++i) sig += g_stats.fb[i];
   for (uint32_t i = 0; i < kFastCmpClasses; ++i) sig += g_cmp.eq[i] + g_cmp.ne[i];
@@ -3111,6 +3125,7 @@ void D3D12CommandProcessor::NrFastReport1Hz() {
       "ib_skip={} ovl_skip={} ovl_live rt/blob/other={}/{}/{} tex_skip={} tex_live={} "
       "tex_gen_miss={} tex_outdated={} direct_di_skip={} direct_sys_skip={} direct_ia={} "
       "tex_own={} tex_own_no bind/dead/pending/stale={}/{}/{}/{} tex_own_unbound={} "
+      "tex_dead={} "
       "direct_env_refresh={} env_stamp={} | fallback{}",
       REXCVAR_GET(gpu_native_exec), REXCVAR_GET(gpu_native_fast_lean),
       REXCVAR_GET(gpu_native_direct), g_stats.entries, g_stats.evictions, g_stats.delegate_hits,
@@ -3122,8 +3137,8 @@ void D3D12CommandProcessor::NrFastReport1Hz() {
       g_direct.tex_live, g_direct.tex_gen_miss, g_direct.tex_outdated, g_direct.di_skip,
       g_direct.sys_skip, g_direct.ia_live, g_direct.tex_own, g_direct.tex_own_no[kFastOwnNoBind],
       g_direct.tex_own_no[kFastOwnDead], g_direct.tex_own_no[kFastOwnPending],
-      g_direct.tex_own_no[kFastOwnStale], g_direct.tex_own_unbound, g_direct.env_refresh,
-      nr::NrDirectEnvStamp(), fb.empty() ? std::string(" none") : fb);
+      g_direct.tex_own_no[kFastOwnStale], g_direct.tex_own_unbound, g_stats.tex_dead,
+      g_direct.env_refresh, nr::NrDirectEnvStamp(), fb.empty() ? std::string(" none") : fb);
   bool any_direct = false;
   for (uint32_t i = 0; i < kFastDirectClasses; ++i) {
     any_direct |= (g_direct.eq[i] | g_direct.ne[i]) != 0;
