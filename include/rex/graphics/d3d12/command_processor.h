@@ -1690,6 +1690,45 @@ class D3D12CommandProcessor : public CommandProcessor {
     bool di_skipped[2] = {false, false};
     bool di_uploaded[2] = {false, false};
   } nr_direct_latch_;
+  // [fetch-need] The fetch constants buffer is uploaded only when a pair of
+  // dwords the bound shaders read differs from the upload already bound
+  // (gpu_fetch_need). The latch holds the dwords of the upload at `address`
+  // in `frame`, self-validating like the direct latch: any other upload of
+  // the stage moves cbuffer_binding_fetch_.address, a new frame reuses
+  // addresses. A draw whose vertex shader is the input-assembler variant
+  // reads the pairs its shaders' texture fetches request
+  // (DxbcShader::GetTextureFetchPairsRead) and no vertex fetch constant; any
+  // other draw reads an unknown set and uploads whenever the binding is
+  // stale, as before. cbuffer_binding_fetch_.up_to_date keeps its meaning
+  // (true: the upload equals the whole register range) and stays false
+  // after a skipped upload, so the next draw compares its own pairs.
+  struct FetchCbLatch {
+    uint64_t frame = UINT64_MAX;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+    uint32_t dwords[32 * 6] = {};
+  } fetch_cb_latch_;
+  // Both are written by the caller of the bindings for every draw
+  // (IssueDrawImpl, NrFastFetchStage) and read by UpdateBindings /
+  // NrUpdateBindings: the vertex shader is the input-assembler variant; the
+  // bound upload already serves this draw (the fast path composed or
+  // validated it against the record), so the bindings must not compose it
+  // from the live file.
+  bool fetch_cb_ia_draw_ = false;
+  bool fetch_cb_latched_draw_ = false;
+  // The pairs the draw reads (a bit per pair, 96). False when the set is
+  // unknown: the upload follows the stale flag alone.
+  bool FetchCbNeededPairs(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
+                          bool shared_memory_is_uav, uint32_t pairs_out[3]) const;
+  bool FetchCbLatchValid() const {
+    return fetch_cb_latch_.frame == frame_current_ &&
+           fetch_cb_latch_.address == cbuffer_binding_fetch_.address;
+  }
+  // The fast executor's fetch constants stage, before NrFastBindings. `map`
+  // is the record map when the overlay was skipped and a record fetch
+  // constant differs from the live file (the buffer cannot be composed from
+  // the live file then), null otherwise. False: the pool request failed.
+  bool NrFastFetchStage(const D3D12Shader* vs, const D3D12Shader* ps, bool ia,
+                        const nr_native::FastRegMap* map, uint64_t* uploaded_bytes);
   // Step 2: the object lookup split from the derivation (a direct hit looks
   // up through the record map and never overlays), the overlay applied on
   // demand (a miss, a non-direct draw, a direct draw whose render target

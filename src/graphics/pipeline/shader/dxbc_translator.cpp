@@ -115,6 +115,9 @@ void DxbcShaderTranslator::Reset() {
 
   shader_code_.clear();
   vertex_input_elements_.clear();  // [ia]
+  // [fetch-need]
+  fetch_pairs_read_[0] = fetch_pairs_read_[1] = fetch_pairs_read_[2] = 0;
+  ia_fetch_reads_constant_ = false;
 
   cbuffer_count_ = 0;
   // System constants always used in prologues/epilogues.
@@ -1278,6 +1281,20 @@ void DxbcShaderTranslator::PostTranslation() {
     dxbc_translation->vertex_input_elements_ = vertex_input_elements_;
   }
   DxbcShader* dxbc_shader = dynamic_cast<DxbcShader*>(&translation.shader());
+  // [fetch-need] The union over every translation of the shader (they can run
+  // on different threads). A pipeline is bound only after its translations
+  // completed, so the union covers whatever variant a draw runs.
+  if (dxbc_shader) {
+    for (uint32_t i = 0; i < 3; ++i) {
+      if (fetch_pairs_read_[i]) {
+        dxbc_shader->texture_fetch_pairs_read_[i].fetch_or(fetch_pairs_read_[i],
+                                                           std::memory_order_relaxed);
+      }
+    }
+    if (ia_fetch_reads_constant_) {
+      dxbc_shader->ia_fetch_reads_constant_.store(true, std::memory_order_relaxed);
+    }
+  }
   if (dxbc_shader &&
       !dxbc_shader->bindings_setup_entered_.test_and_set(std::memory_order_relaxed)) {
     dxbc_shader->texture_bindings_.clear();

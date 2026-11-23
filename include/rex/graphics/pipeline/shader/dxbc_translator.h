@@ -920,6 +920,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
       cbuffer_index_fetch_constants_ = cbuffer_count_++;
     }
     uint32_t total_pair_index = fetch_constant_index * 3 + pair_index;
+    // [fetch-need] The only source of a texture fetch constant read: the pair
+    // is recorded for the command processor's upload decision.
+    fetch_pairs_read_[total_pair_index >> 5] |= uint32_t(1) << (total_pair_index & 31);
     return dxbc::Src::CB(cbuffer_index_fetch_constants_, uint32_t(CbufferRegister::kFetchConstants),
                          total_pair_index >> 1, (total_pair_index & 1) ? 0b10101110 : 0b00000100);
   }
@@ -1186,6 +1189,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // [ia] The input elements of the current translation (empty unless the
   // input-assembler variant); copied to the DxbcTranslation in PostTranslation.
   std::vector<VertexInputElement> vertex_input_elements_;
+
+  // [fetch-need] What the current translation reads from the fetch constants
+  // buffer, merged into the DxbcShader in PostTranslation. A bit per two-dword
+  // pair (texture fetch constant * 3 + pair = the vertex fetch constant index
+  // of the same dwords) requested by a texture fetch, and whether a vertex
+  // shader modification asking for the input-assembler variant still emitted
+  // a read of a vertex fetch constant (the address or the raw load).
+  uint32_t fetch_pairs_read_[3];
+  bool ia_fetch_reads_constant_;
 };
 
 }  // namespace rex::graphics
