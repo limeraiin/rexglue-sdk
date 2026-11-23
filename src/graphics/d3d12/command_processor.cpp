@@ -493,6 +493,9 @@ REXCVAR_DEFINE_UINT32(gpu_ia_mb, 512, "GPU/D3D12",
 // input-assembler vertex shader reads none of them. With this on, a stale
 // buffer is uploaded only when a pair of dwords the draw's shaders read
 // differs from the upload already bound (FetchCbLatch in the header).
+REXCVAR_DEFINE_INT32(gpu_fetch_need_cycle, 0, "GPU/D3D12",
+                     "[fetch-need] A/B: seconds per phase, gpu_fetch_need as set / 0 in place "
+                     "(0 = no cycling). Each switch logs '[fetch] cycle phase='.");
 REXCVAR_DEFINE_INT32(gpu_fetch_need, 1, "GPU/D3D12",
                      "[fetch-need] upload the fetch constants buffer only when a constant the "
                      "bound shaders read differs from the bound upload: 0 off (upload whenever "
@@ -6915,6 +6918,23 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // the old gpu_dedupe_constants cvar is the switch and means "census + act".
   g_dedupe_constants = REXCVAR_GET(gpu_dedupe_constants);
   g_fetch_need = REXCVAR_GET(gpu_fetch_need);  // [fetch-need]
+  if (const int32_t fetch_cycle = REXCVAR_GET(gpu_fetch_need_cycle); fetch_cycle > 0) {
+    // A/B in place: the configured rule against the old one (0).
+    static const auto s_fetch_t0 = std::chrono::steady_clock::now();
+    static int s_fetch_phase = -1;
+    const int phase = int(std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now() - s_fetch_t0)
+                              .count() /
+                          fetch_cycle) &
+                      1;
+    if (phase != s_fetch_phase) {
+      s_fetch_phase = phase;
+      // The latch describes an upload made under the other rule.
+      cbuffer_binding_fetch_.up_to_date = false;
+      REXGPU_INFO("[fetch] cycle phase={}", phase == 0 ? "on" : "off");
+    }
+    if (phase == 1) g_fetch_need = 0;
+  }
   g_n8b_mode = rex::graphics::g_n7_n8b_phase >= 0 ? rex::graphics::g_n7_n8b_phase
                                                   : (g_dedupe_constants ? 2 : 0);
   // The census report. Unconditional whenever the census is armed -- it must NOT

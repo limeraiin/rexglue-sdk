@@ -75,6 +75,14 @@ REXCVAR_DEFINE_INT32(gpu_native_fast_lean, 1, "GPU/D3D12",
                      "record constants composed straight into the float upload (no overlay "
                      "or restore of them); the sort census and the occlusion eligibility "
                      "decode skipped while their consumers are off.");
+REXCVAR_DEFINE_INT32(gpu_native_latch_cycle, 0, "GPU/D3D12",
+                     "A/B: seconds per phase, the direct hit's entry-keyed latches (own textures, "
+                     "render target inputs, index range) on / refused in place for whole frames "
+                     "(0 = no cycling). Each switch logs '[latch] cycle phase='.");
+REXCVAR_DEFINE_INT32(gpu_native_direct_cycle, 0, "GPU/D3D12",
+                     "A/B: seconds per phase, direct submission on / off in place for whole "
+                     "frames (0 = no cycling; needs gpu_native_direct 1). Each switch logs "
+                     "'[direct] cycle phase='.");
 REXCVAR_DEFINE_INT32(gpu_native_direct, 1, "GPU/D3D12",
                      "[jade-native] direct emit head for owned object hits (N4 step 1): 0 off, "
                      "1 direct (default; the entry's baked viewport / scissor / stencil / Hi-Z mask / "
@@ -278,6 +286,8 @@ struct FastStats {
   uint64_t entries = 0;
 };
 FastStats g_stats;
+// gpu_native_latch_cycle's off phase: the entry-keyed latches refuse.
+bool g_fast_latch_off = false;
 
 // The entry-owned texture skip's verdict: taken, or the first reason it is not.
 enum : uint32_t {
@@ -913,6 +923,44 @@ void D3D12CommandProcessor::NrNativeExecuteFast(uint32_t slot_sequence, int mode
   // Direct submission needs the lean float path (the record's constants never
   // enter the live file) and the fast emission.
   plan.dmode = mode == 1 && lean ? REXCVAR_GET(gpu_native_direct) : 0;
+  if (const int32_t cycle = REXCVAR_GET(gpu_native_direct_cycle); cycle > 0 && plan.dmode == 1) {
+    // A/B in place: whole frames alternate between the direct head and the
+    // fast path without it.
+    static const auto s_t0 = std::chrono::steady_clock::now();
+    static uint64_t s_frame = UINT64_MAX;
+    static int s_phase = -1;
+    if (s_frame != frame_current_) {
+      s_frame = frame_current_;
+      const int phase = int(std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - s_t0)
+                                .count() /
+                            cycle) &
+                        1;
+      if (phase != s_phase) {
+        s_phase = phase;
+        REXGPU_INFO("[direct] cycle phase={}", phase == 0 ? "on" : "off");
+      }
+    }
+    if (s_phase == 1) plan.dmode = 0;
+  }
+  if (const int32_t cycle = REXCVAR_GET(gpu_native_latch_cycle); cycle > 0) {
+    static const auto s_t0 = std::chrono::steady_clock::now();
+    static uint64_t s_frame = UINT64_MAX;
+    static int s_phase = -1;
+    if (s_frame != frame_current_) {
+      s_frame = frame_current_;
+      const int phase = int(std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - s_t0)
+                                .count() /
+                            cycle) &
+                        1;
+      if (phase != s_phase) {
+        s_phase = phase;
+        REXGPU_INFO("[latch] cycle phase={}", phase == 0 ? "on" : "off");
+      }
+      g_fast_latch_off = phase == 1;
+    }
+  }
   if (plan.dmode) {
     // The record map: the lookup and every direct consumer read the record
     // through it, so a direct hit never needs the overlay.
@@ -942,8 +990,9 @@ void D3D12CommandProcessor::NrNativeExecuteFast(uint32_t slot_sequence, int mode
     const FastEntry* e = plan.entry;
     if (!e->blob_ok) {
       ++g_direct.overlay_live_blob;
-    } else if (!e->rt_in_ok || render_target_cache_->NrProbeUpdateGuard(e->rt_in) !=
-                                   RenderTargetCache::NrUpdateGuard::kHolds) {
+    } else if (g_fast_latch_off || !e->rt_in_ok ||
+               render_target_cache_->NrProbeUpdateGuard(e->rt_in) !=
+                   RenderTargetCache::NrUpdateGuard::kHolds) {
       ++g_direct.overlay_live_rt;
     } else if (occ_sub_active_ || NrFastSortOn() || nr_retail_cmp_active_) {
       ++g_direct.overlay_live_other;
@@ -1417,7 +1466,8 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
       const uint32_t shm_gen = g_shm_gen.load(std::memory_order_relaxed);
       uint64_t range_gen = 0;
       const bool range_ok = FastShmRangeGen(plan.ib_req_base, plan.ib_req_size, &range_gen);
-      const bool ib_latched = e->ib_latched != 0 && range_ok && e->shm_range_gen == range_gen;
+      const bool ib_latched = !g_fast_latch_off && e->ib_latched != 0 && range_ok &&
+                              e->shm_range_gen == range_gen;
       if (plan.dmode == 1 && ib_latched && plan.direct_env_ok) {
         plan.ib_skip = true;
         ++g_direct.ib_skip;
@@ -1501,7 +1551,8 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
         e->direct_ok != 0 && e->rt_in_ok != 0
             ? uint32_t(render_target_cache_->NrProbeUpdateGuard(e->rt_in, &rt_reg))
             : kFastRtNoBake;
-    const bool rt_latched = rt_guard == uint32_t(RenderTargetCache::NrUpdateGuard::kHolds);
+    const bool rt_latched = !g_fast_latch_off &&
+                            rt_guard == uint32_t(RenderTargetCache::NrUpdateGuard::kHolds);
     if (plan.dmode == 1 && rt_latched && plan.direct_env_ok) {
       plan.rt_skip = true;
       ++g_direct.rt_skip;
@@ -1659,7 +1710,7 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
     // is left to class txl: re-deriving would rewrite the slots txl reads.
     if (rt_same && plan.dmode != 0 && plan.direct_env_ok && plan.tex_count != 0) {
       uint32_t own = kFastOwnOk;
-      if (!e->blob_ok || nr_retail_cmp_active_) {
+      if (!e->blob_ok || nr_retail_cmp_active_ || g_fast_latch_off) {
         own = kFastOwnNoBind;
       } else if (e->tex_gen != texture_cache_->nr_texture_destroy_generation()) {
         own = kFastOwnDead;
