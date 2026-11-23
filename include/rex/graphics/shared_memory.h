@@ -103,6 +103,13 @@ class SharedMemory {
                               std::vector<std::pair<uint32_t, uint32_t>>& runs);
   // Whether the page is still valid and not GPU-written.
   bool AuditPageValid(uint32_t page);
+  // [NR-NATIVE-R2] Whether every page of the range is flagged valid, that is
+  // whether RequestRange would return at its all-valid check without an
+  // upload (the same lock-free read of the active flags). The fast
+  // executor's compare mode asks it before the request its index residency
+  // latch would have skipped. Not a residency proof on its own: the flags
+  // are dropped at a frame end under clear_memory_page_state.
+  bool NrRangeFlaggedValid(uint32_t start, uint32_t length) const;
 
  protected:
   SharedMemory(memory::Memory& memory);
