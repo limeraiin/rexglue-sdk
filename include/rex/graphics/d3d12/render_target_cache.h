@@ -81,8 +81,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
 
   // [NR-NATIVE-R2] direct submission: the per-draw half of Update for a draw
-  // whose inputs are proven unchanged since the last Update (the fast
-  // executor's nr_update_serial latch): the [xfer] read census note per used
+  // whose inputs are proven to be the ones the entry guard holds (the fast
+  // executor asks NrProbeUpdateGuard with the entry's baked inputs and calls
+  // this only on kHolds): the [xfer] read census note per used
   // target from a baked verdict (FastXferVerdict), then the latched command
   // list binding (a new submission or a state change rebinds; equal targets
   // cost the pointer compare). Skipped: the base body and its fingerprint,

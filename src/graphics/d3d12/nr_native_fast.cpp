@@ -141,11 +141,25 @@ struct FastEntry {
   draw_util::Scissor sc_guest = {};  // GetScissor, guest pixels, before the live widen
   nr::NrSysConstants sys = {};
   // Step 2 latches and bakes.
-  uint64_t rt_serial = UINT64_MAX;  // RT cache nr_update_serial at the entry's last Update
+  // The render target latch: the inputs of this entry's Update (a pure
+  // function of the key: sixteen keyed registers, the entry's depth control
+  // and color mask, the path), taken from the cache's entry guard after the
+  // entry's own Update. The skip asks the cache whether its guard holds
+  // exactly these now (NrProbeUpdateGuard). rt_serial is the retired latch
+  // (nr_update_serial at the entry's last Update), kept to count the hits
+  // it would have refused (rt_skip_new).
+  uint8_t rt_in_ok = 0;
+  RenderTargetCache::NrUpdateInputs rt_in = {};
+  uint64_t rt_serial = UINT64_MAX;
   uint8_t xfer_used = 0, xfer_reads = 0;  // FastXferVerdict at record
   uint8_t xfer_reason[5] = {};
-  uint8_t ib_latched = 0;      // a successful index RequestRange under shm_gen
-  uint32_t shm_gen = 0;        // the executor's shared memory invalidation generation
+  // The index residency latch: a successful index RequestRange made after
+  // reading shm_range_gen (FastShmRangeGen of the index range). shm_gen is
+  // the retired global generation, kept to count the hits it would have
+  // refused (ib_skip_new).
+  uint8_t ib_latched = 0;
+  uint64_t shm_range_gen = 0;
+  uint32_t shm_gen = 0;
   uint32_t indx_offset = 0;    // VGT_INDX_OFFSET.indx_offset (keyed)
   uint32_t dt_regs[6] = {};    // the de-tile widen's six registers (keyed)
   // Step 3: the host scissor after the widen and the scale (baked unless a
@@ -196,9 +210,46 @@ FastDrawRegs g_dr;
 FastOverlayStats g_ost;
 std::atomic<uint32_t> g_shm_gen{1};
 void* g_shm_watch = nullptr;
-void ShmWatchCallback(const std::unique_lock<std::recursive_mutex>&, void*, uint32_t, uint32_t,
-                      bool) {
+// (c) The same watch per 256 KiB bucket of the shared memory buffer (the span
+// one CPU write invalidates: MemoryInvalidationCallback widens to a 64-page
+// block). The global generation moves on any write anywhere, a guest thread
+// filling a dynamic buffer or a resolve, so it refused every entry once per
+// such event; a bucket moves only when a fired range overlaps it. 64-bit and
+// monotonic: a sum over a range is unchanged exactly when no bucket of the
+// range moved.
+constexpr uint32_t kFastShmBucketLog2 = 18;
+constexpr uint32_t kFastShmBuckets = SharedMemory::kBufferSize >> kFastShmBucketLog2;
+std::atomic<uint64_t> g_shm_bucket_gen[kFastShmBuckets];
+void ShmWatchCallback(const std::unique_lock<std::recursive_mutex>&, void*, uint32_t address_first,
+                      uint32_t address_last, bool) {
   g_shm_gen.fetch_add(1, std::memory_order_relaxed);
+  // An inverted range cannot be placed: every bucket moves.
+  uint32_t first = address_first >> kFastShmBucketLog2;
+  uint32_t last = address_last >> kFastShmBucketLog2;
+  if (address_last < address_first) {
+    first = 0;
+    last = kFastShmBuckets - 1;
+  }
+  if (last >= kFastShmBuckets) last = kFastShmBuckets - 1;
+  for (uint32_t b = first; b <= last; ++b) {
+    g_shm_bucket_gen[b].fetch_add(1, std::memory_order_relaxed);
+  }
+}
+// The generation of an index range: the sum over its buckets. False for a
+// range RequestRange refuses (empty is never requested by an entry; outside
+// the buffer), which is then never latched.
+bool FastShmRangeGen(uint32_t start, uint32_t length, uint64_t* out) {
+  if (!length || start >= SharedMemory::kBufferSize ||
+      (SharedMemory::kBufferSize - start) < length) {
+    return false;
+  }
+  const uint32_t last = (start + length - 1) >> kFastShmBucketLog2;
+  uint64_t sum = 0;
+  for (uint32_t b = start >> kFastShmBucketLog2; b <= last; ++b) {
+    sum += g_shm_bucket_gen[b].load(std::memory_order_relaxed);
+  }
+  *out = sum;
+  return true;
 }
 // Per-marker scratch the plan points at (never re-initialized per draw).
 TextureCache::NrTexSnap g_plan_tex[kFastTexMax];
@@ -237,6 +288,10 @@ enum : uint32_t {
   kFastOwnStale,    // one of the entry's own textures has outdated data
   kFastOwnReasons
 };
+// The render target latch refusal reasons: the guard probe's verdicts, then
+// an entry that holds no baked inputs.
+constexpr uint32_t kFastRtNoBake = uint32_t(RenderTargetCache::NrUpdateGuard::kCount);
+constexpr uint32_t kFastRtLiveReasons = kFastRtNoBake + 1;
 
 // Direct submission (gpu_native_direct): counters and the mode 2 classes.
 struct FastDirectStats {
@@ -249,6 +304,18 @@ struct FastDirectStats {
   uint64_t ib_skip = 0;        // (c) index RequestRange skipped by the latch
   uint64_t overlay_skip = 0;   // (d) neither overlay apply nor restore
   uint64_t overlay_live_rt = 0, overlay_live_blob = 0, overlay_live_other = 0;  // (d) refusals
+  // (a) by the entry guard probe. rt_skip_new: of rt_skip, the retired
+  // serial latch would have run Update. rt_live: mode 1 hits that ran Update,
+  // by the probe's verdict (RenderTargetCache::NrUpdateGuard; kFastRtNoBake
+  // for an entry without baked inputs). rt_reg_ne: of kRegisters, the first
+  // differing register in fingerprint order.
+  uint64_t rt_skip_new = 0;
+  uint64_t rt_live[kFastRtLiveReasons] = {};
+  uint64_t rt_reg_ne[16] = {};
+  // (c) by the range's buckets. ib_skip_new: of ib_skip, the retired global
+  // generation had moved. ib_live_gen: mode 1 request made because a bucket
+  // of the latched range moved; ib_live_first: the entry had no latch yet.
+  uint64_t ib_skip_new = 0, ib_live_gen = 0, ib_live_first = 0;
   // Step 3: (b) the texture generation latch; the di and sys latches; the
   // IA entries whose index view stays live; step 4: entries re-baked after
   // an environment stamp change.
@@ -522,6 +589,17 @@ uint32_t FirstDiffDword(const void* a, const void* b, uint32_t bytes) {
   return UINT32_MAX;
 }
 
+// The inputs of the Update(true, ndc, color mask) that just returned true,
+// read back from the cache's entry guard (the guard stores the call's own
+// inputs on a body run and equals them on a guard hit). Refused when the
+// guard is not eligible, or when it does not hold the scalars the call
+// passed: inputs of another call are never baked into an entry.
+bool FastReadUpdateInputs(const RenderTargetCache& cache, uint32_t ndc, uint32_t color_mask,
+                          RenderTargetCache::NrUpdateInputs* out) {
+  return cache.NrLastUpdateInputs(out) && out->is_rasterization_done == 1u &&
+         out->normalized_depth_control == ndc && out->normalized_color_mask == color_mask;
+}
+
 uint32_t PackedFloatRegister(const uint64_t bitmap[4], uint32_t packed_dword) {
   uint32_t packed_register = packed_dword / 4;
   for (uint32_t word = 0; word < 4; ++word) {
@@ -605,6 +683,10 @@ struct D3D12CommandProcessor::NrFastPlan {
   // The hit skipped its texture restore on the entry's own proof: the fetch
   // slots do not hold the entry's bindings, so only a direct bind may follow.
   bool tex_own = false;
+  // A miss: the inputs of its Update, read back from the entry guard right
+  // after the call.
+  bool rt_in_ok = false;
+  RenderTargetCache::NrUpdateInputs rt_in = {};
   uint64_t sys_hash_draw = 0; // the patched block's hash (the latch key)
   FastChanges dry;            // (d) the dirty set a skipped overlay owes, pre and post draw
 };
@@ -848,7 +930,10 @@ void D3D12CommandProcessor::NrNativeExecuteFast(uint32_t slot_sequence, int mode
   // (d) the overlay is skipped for a direct hit whose every register consumer
   // reads the map or the entry: the bindings restore from the blob (else
   // NrUpdateBindings derives sampler params from the live fetch constants),
-  // the render target latch holds (else Update reads sixteen live registers),
+  // the render target cache's entry guard holds the entry's inputs (else
+  // Update reads sixteen live registers; asked again where the Update would
+  // run, NrFastDerive, since opening the submission may reset the guard: a
+  // refusal there applies the overlay late),
   // no occlusion submission (OccSetElig reads the live file), no sorter
   // segment and no retail comparator (both capture the live file).
   bool overlay_skip = false;
@@ -857,7 +942,8 @@ void D3D12CommandProcessor::NrNativeExecuteFast(uint32_t slot_sequence, int mode
     const FastEntry* e = plan.entry;
     if (!e->blob_ok) {
       ++g_direct.overlay_live_blob;
-    } else if (e->rt_serial != render_target_cache_->nr_update_serial()) {
+    } else if (!e->rt_in_ok || render_target_cache_->NrProbeUpdateGuard(e->rt_in) !=
+                                   RenderTargetCache::NrUpdateGuard::kHolds) {
       ++g_direct.overlay_live_rt;
     } else if (occ_sub_active_ || NrFastSortOn() || nr_retail_cmp_active_) {
       ++g_direct.overlay_live_other;
@@ -1318,22 +1404,60 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
     plan.tex_count = e->tex_count;
     for (uint32_t i = 0; i < e->tex_count; ++i) plan.tex[i] = e->tex[i];
     // The index residency the skipped Process would have requested. (c) The
-    // entry latches a successful request under the shared memory
-    // invalidation generation (the executor's global watch: CPU writes and
-    // GPU writes to requested pages, resolves included); residency only
-    // moves through an invalidation, so an equal generation means the pages
-    // are still valid and allocated.
+    // entry latches a successful request under the invalidation generation
+    // of the index range's own buckets (the executor's global watch: CPU
+    // writes and GPU writes to requested pages, resolves included, each
+    // fired with the range it invalidates), read before the request. The
+    // host copy of a page only goes stale through an invalidation whose
+    // fired range covers it, so an equal generation means no page of the
+    // range was invalidated since that request: the copy is current and
+    // allocated. (The frame-end flag drop of clear_memory_page_state fires
+    // nothing and changes no content: a request would re-upload equal bytes.)
     if (plan.prim.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
       const uint32_t shm_gen = g_shm_gen.load(std::memory_order_relaxed);
-      const bool ib_latched = e->ib_latched != 0 && e->shm_gen == shm_gen;
+      uint64_t range_gen = 0;
+      const bool range_ok = FastShmRangeGen(plan.ib_req_base, plan.ib_req_size, &range_gen);
+      const bool ib_latched = e->ib_latched != 0 && range_ok && e->shm_range_gen == range_gen;
       if (plan.dmode == 1 && ib_latched && plan.direct_env_ok) {
         plan.ib_skip = true;
         ++g_direct.ib_skip;
+        if (e->shm_gen != shm_gen) {
+          // The retired global latch would have requested here, and then
+          // held this generation.
+          ++g_direct.ib_skip_new;
+          e->shm_gen = shm_gen;
+        }
       } else {
+        // Compare: the latch said skip, so the request must find every page
+        // already flagged valid (asked before it runs) and succeed. A range
+        // whose generation moved during the check was invalidated under it,
+        // not by the latch. Where the flags are dropped every frame
+        // (clear_memory_page_state) only the success is comparable.
+        const bool cmp_ib = dcmp && ib_latched;
+        const bool flagged =
+            cmp_ib && shared_memory_->NrRangeFlaggedValid(plan.ib_req_base, plan.ib_req_size);
         const bool ok = shared_memory_->RequestRange(plan.ib_req_base, plan.ib_req_size);
-        if (dcmp && ib_latched) DirectCount(kFastDirectIb, ok, rec, plan.ib_req_base, ok, shm_gen);
+        if (cmp_ib) {
+          uint64_t gen_after = 0;
+          const bool moved =
+              !FastShmRangeGen(plan.ib_req_base, plan.ib_req_size, &gen_after) ||
+              gen_after != range_gen;
+          const bool still_valid = flagged || moved || REXCVAR_GET(clear_memory_page_state);
+          DirectCount(kFastDirectIb, ok && still_valid, rec, plan.ib_req_base,
+                      (flagged ? 2u : 0u) | (ok ? 1u : 0u), plan.ib_req_size);
+        }
         if (!ok) return kFastFbProcess;
-        e->ib_latched = 1;
+        if (plan.dmode == 1 && plan.direct_env_ok) {
+          if (e->ib_latched) {
+            ++g_direct.ib_live_gen;
+          } else {
+            ++g_direct.ib_live_first;
+          }
+        }
+        // No latch before the watch exists (it is registered by the first
+        // direct-mode marker): the buckets saw nothing until then.
+        e->ib_latched = range_ok && g_shm_watch != nullptr ? 1 : 0;
+        e->shm_range_gen = range_gen;
         e->shm_gen = shm_gen;
       }
     }
@@ -1362,18 +1486,40 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
     // PA_SC_WINDOW_OFFSET / SCISSOR_TL / SCISSOR_BR, PA_SC_SCREEN_SCISSOR_BR,
     // PA_CL_CLIP_CNTL, PA_CL_VTE_CNTL, PA_SU_SC_MODE_CNTL, PA_SU_VTX_CNTL,
     // PA_CL_VPORT_YSCALE / YOFFSET) plus the entry's ndc and color mask, the
-    // path (env stamp) and its own ownership generation. The entry latches
-    // the cache's nr_update_serial after its Update: an equal serial means no
-    // body ran and no ownership moved since, so the entry guard would skip
-    // the body; only the per-draw tail runs (xfer note, latched binding).
+    // path (env stamp) and its own ownership generation. The entry holds
+    // those inputs (rt_in, read back from the guard after its own Update)
+    // and asks the cache whether its entry guard holds exactly them now: the
+    // previous Update, of any draw, native or retail, had the same inputs,
+    // and no ownership moved since. That is the condition under which Update
+    // itself returns before its body, so only the per-draw tail runs (xfer
+    // note, latched binding). The retired latch compared nr_update_serial
+    // with the value at this entry's own last Update: any body run of any
+    // other draw refused it, so an object drawn once per frame never hit.
     const uint64_t rt_serial = render_target_cache_->nr_update_serial();
-    const bool rt_latched = e->rt_serial == rt_serial && e->direct_ok != 0;
+    uint32_t rt_reg = 0;
+    const uint32_t rt_guard =
+        e->direct_ok != 0 && e->rt_in_ok != 0
+            ? uint32_t(render_target_cache_->NrProbeUpdateGuard(e->rt_in, &rt_reg))
+            : kFastRtNoBake;
+    const bool rt_latched = rt_guard == uint32_t(RenderTargetCache::NrUpdateGuard::kHolds);
     if (plan.dmode == 1 && rt_latched && plan.direct_env_ok) {
       plan.rt_skip = true;
       ++g_direct.rt_skip;
+      if (e->rt_serial != rt_serial) {
+        // The retired latch would have called Update here (a guard hit) and
+        // then held this serial.
+        ++g_direct.rt_skip_new;
+        e->rt_serial = rt_serial;
+      }
       render_target_cache_->NrDirectUpdateTail(e->xfer_reads, e->xfer_reason);
       NrNativeBump(&NrNativeCounters::rt_update_skipped);
     } else {
+      if (plan.dmode == 1 && plan.direct_env_ok && e->direct_ok != 0) {
+        ++g_direct.rt_live[rt_guard];
+        if (rt_guard == uint32_t(RenderTargetCache::NrUpdateGuard::kRegisters)) {
+          ++g_direct.rt_reg_ne[rt_reg & 15u];
+        }
+      }
       NrFastApplyOverlay(plan);  // Update reads the live file (a no-op when applied)
       uintptr_t ids0[1 + xenos::kMaxColorRenderTargets] = {};
       const bool ids0_valid = dcmp && render_target_cache_->NrBoundRenderTargetIdentities(ids0);
@@ -1446,6 +1592,21 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
         DirectCount(kFastDirectXfer, xfer_ok, rec, (uint64_t(used) << 8) | reads,
                     (uint64_t(sdk_used) << 8) | sdk_reads, (uint32_t(e->xfer_used) << 8) | e->xfer_reads);
       }
+      // The inputs this Update fingerprinted over the overlaid file are the
+      // entry's (keyed registers, the entry's depth control and color mask):
+      // compared with the bake in mode 2, then taken as the bake.
+      RenderTargetCache::NrUpdateInputs rt_in = {};
+      const bool rt_in_ok = FastReadUpdateInputs(*render_target_cache_, plan.ndc.value,
+                                                 plan.color_mask, &rt_in);
+      if (dcmp && e->rt_in_ok && rt_in_ok) {
+        const uint32_t d = FirstDiffDword(&rt_in, &e->rt_in, sizeof(rt_in));
+        const uint32_t* a = reinterpret_cast<const uint32_t*>(&e->rt_in);
+        const uint32_t* b = reinterpret_cast<const uint32_t*>(&rt_in);
+        DirectCount(kFastDirectRtk, d == UINT32_MAX, rec, d == UINT32_MAX ? 0 : a[d],
+                    d == UINT32_MAX ? 0 : b[d], d);
+      }
+      e->rt_in_ok = rt_in_ok ? 1 : 0;
+      if (rt_in_ok) e->rt_in = rt_in;
       e->rt_serial = render_target_cache_->nr_update_serial();
     }
     span.Lap(g_derive.rt);
@@ -1794,6 +1955,10 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
   if (render_target_cache_->nr_update_body_runs() == rt_runs0) {
     NrNativeBump(&NrNativeCounters::rt_update_skipped);
   }
+  // The inputs of this Update, for the entry's render target latch (rast is
+  // true here: the hit path calls Update(true, ...) with the same values).
+  plan.rt_in_ok = FastReadUpdateInputs(*render_target_cache_, plan.ndc.value, plan.color_mask,
+                                       &plan.rt_in);
   // Pipeline: the PSO table, else ConfigurePipeline.
   auto* vt = static_cast<D3D12Shader::D3D12Translation*>(vs->GetOrCreateTranslation(vmod.value));
   auto* pt = ps ? static_cast<D3D12Shader::D3D12Translation*>(ps->GetOrCreateTranslation(pmod.value))
@@ -2760,13 +2925,17 @@ void D3D12CommandProcessor::NrFastRecordEntry(NrFastPlan& plan, bool bindings_fr
                                 XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR, XE_GPU_REG_RB_SURFACE_INFO,
                                 XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_DEPTH_INFO};
     for (uint32_t i = 0; i < 6; ++i) e->dt_regs[i] = rf[dt_idx[i]];
-    // The latches of the miss derivation: its Update ran (or guard-hit) with
-    // these inputs, its index request succeeded (the miss path's Process).
+    // The render target latch of the miss derivation: the inputs its Update
+    // ran (or guard-hit) with, read back right after that call.
+    e->rt_in_ok = plan.rt_in_ok ? 1 : 0;
+    e->rt_in = plan.rt_in;
     e->rt_serial = render_target_cache_->nr_update_serial();
-    e->ib_latched = plan.prim.index_buffer_type ==
-                            PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA
-                        ? 1
-                        : 0;
+    // The index residency latch is taken by the first hit, whose request
+    // follows the generation read. The miss path's request ran inside
+    // Process, before any generation was read: latching it here under a
+    // generation read now would cover an invalidation that fell in between.
+    e->ib_latched = 0;
+    e->shm_range_gen = 0;
     e->shm_gen = g_shm_gen.load(std::memory_order_relaxed);
   }
   // The texture generation latch is taken on the first hit's restore.
@@ -3118,10 +3287,31 @@ void D3D12CommandProcessor::NrFastReport1Hz() {
     if (!g_stats.fb[i]) continue;
     fb += fmt::format(" {}={}", FastFallbackName(i), g_stats.fb[i]);
   }
+  // The render target and index residency latches in detail, spliced in
+  // after rt_skip: the hits the retired stamps would have refused, then every
+  // mode 1 hit that still ran Update (by the guard probe's verdict; reg: the
+  // first differing fingerprint register of the regs refusals, index:count)
+  // or still made the index request.
+  std::string latch;
+  {
+    using Guard = RenderTargetCache::NrUpdateGuard;
+    std::string reg;
+    for (uint32_t i = 0; i < 16; ++i) {
+      if (g_direct.rt_reg_ne[i]) reg += fmt::format(" {}:{}", i, g_direct.rt_reg_ne[i]);
+    }
+    latch = fmt::format(
+        " rt_skip_new={} rt_live off/reset/state/regs/own/nobake={}/{}/{}/{}/{}/{} rt_live_reg{} "
+        "ib_skip_new={} ib_live gen/first={}/{}",
+        g_direct.rt_skip_new, g_direct.rt_live[uint32_t(Guard::kOff)],
+        g_direct.rt_live[uint32_t(Guard::kReset)], g_direct.rt_live[uint32_t(Guard::kDrawState)],
+        g_direct.rt_live[uint32_t(Guard::kRegisters)], g_direct.rt_live[uint32_t(Guard::kOwnership)],
+        g_direct.rt_live[kFastRtNoBake], reg.empty() ? std::string(" none") : reg,
+        g_direct.ib_skip_new, g_direct.ib_live_gen, g_direct.ib_live_first);
+  }
   REXGPU_INFO(
       "[jade-native-fast] mode={} lean={} direct_mode={} entries={} evict={} delegate_hits={} "
       "nodraw={} async={} rt_rederive={} tex_restore_fail={} blob_refused={} pso_table_hit={} "
-      "shader_recheck={} recheck_ne={} direct={} refused env={} nodirect={} rt_skip={} "
+      "shader_recheck={} recheck_ne={} direct={} refused env={} nodirect={} rt_skip={}{} "
       "ib_skip={} ovl_skip={} ovl_live rt/blob/other={}/{}/{} tex_skip={} tex_live={} "
       "tex_gen_miss={} tex_outdated={} direct_di_skip={} direct_sys_skip={} direct_ia={} "
       "tex_own={} tex_own_no bind/dead/pending/stale={}/{}/{}/{} tex_own_unbound={} "
@@ -3132,7 +3322,7 @@ void D3D12CommandProcessor::NrFastReport1Hz() {
       g_stats.nodraw, g_stats.nodraw_async, g_stats.rt_rederive, g_stats.tex_restore_fail,
       g_stats.blob_refused, g_stats.pso_table_hit, g_stats.shader_recheck,
       g_stats.shader_recheck_ne, g_direct.draws, g_direct.refused_env, g_direct.nodirect,
-      g_direct.rt_skip, g_direct.ib_skip, g_direct.overlay_skip, g_direct.overlay_live_rt,
+      g_direct.rt_skip, latch, g_direct.ib_skip, g_direct.overlay_skip, g_direct.overlay_live_rt,
       g_direct.overlay_live_blob, g_direct.overlay_live_other, g_direct.tex_skip,
       g_direct.tex_live, g_direct.tex_gen_miss, g_direct.tex_outdated, g_direct.di_skip,
       g_direct.sys_skip, g_direct.ia_live, g_direct.tex_own, g_direct.tex_own_no[kFastOwnNoBind],

@@ -906,12 +906,14 @@ enum FastDirectClass : uint32_t {
   kFastDirectDiP,      // pixel descriptor-indices latch, the same
   kFastDirectEnv,      // environment fields: a matching stamp implies every field matches
   kFastDirectTxo,      // entry-owned texture skip: a fresh derivation of the slots equals the entry
+  kFastDirectRtk,      // render target inputs: the entry's bake vs the ones Update just fingerprinted
   kFastDirectClasses
 };
 inline const char* FastDirectName(uint32_t c) {
   static const char* const kNames[kFastDirectClasses] = {
       "vp",  "sc",  "stencil", "blend", "sys",  "hiz",  "pool", "rt",  "xfer", "tex",
-      "ib",  "ovl", "txl",     "ibv",   "args", "topo", "div",  "dip", "env",  "txo"};
+      "ib",  "ovl", "txl",     "ibv",   "args", "topo", "div",  "dip", "env",  "txo",
+      "rtk"};
   return c < kFastDirectClasses ? kNames[c] : "?";
 }
 

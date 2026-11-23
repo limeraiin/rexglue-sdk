@@ -724,6 +724,37 @@ bool SharedMemory::AuditPageValid(uint32_t page) {
   return ((bits >> (page & 63)) & 1) != 0;
 }
 
+bool SharedMemory::NrRangeFlaggedValid(uint32_t start, uint32_t length) const {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+  const uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
+  if (!valid_flags) {
+    return false;
+  }
+  // RequestRanges' all-valid check for one range.
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  uint32_t block_first = page_first >> 6;
+  uint32_t block_last = page_last >> 6;
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t block_valid = valid_flags[i];
+    if (i == block_first) {
+      block_valid |= (uint64_t(1) << (page_first & 63)) - 1;
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      block_valid |= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+    }
+    if (block_valid != UINT64_MAX) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void SharedMemory::PrepareForTraceDownload() {
   ReleaseTraceDownloadRanges();
   assert_true(trace_download_ranges_.empty());

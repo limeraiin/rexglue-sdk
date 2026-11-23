@@ -219,6 +219,37 @@ class RenderTargetCache {
   // mean the entry guard above would skip the body.
   uint64_t nr_update_serial() const { return nr_update_body_runs_ + ownership_generation_; }
 
+  // [NR-NATIVE-R2] direct submission: Update's entry guard asked as a
+  // question, so a caller that knows a draw's inputs without the live
+  // register file (the fast executor's entry) learns whether Update would
+  // return at the guard, and why not. NrUpdateInputs is the guard's
+  // fingerprint without the ownership generation, in the fingerprint's
+  // register order. No padding: compared with memcmp.
+  struct NrUpdateInputs {
+    uint32_t is_rasterization_done;
+    uint32_t normalized_depth_control;
+    uint32_t normalized_color_mask;
+    uint32_t path;
+    uint32_t regs[16];
+  };
+  enum class NrUpdateGuard : uint32_t {
+    kHolds = 0,   // Update would return at its entry guard: no body, empty transfers
+    kOff,         // the guard is not eligible (cvar, path, CPU vertex shader extents)
+    kReset,       // no fingerprint stands (a new frame, or nothing updated yet)
+    kDrawState,   // rasterization, depth control, color mask or path differ
+    kRegisters,   // one of the sixteen registers differs (the first in *reg_out)
+    kOwnership,   // equal inputs, but EDRAM ownership moved since (a resolve, a clear, a store)
+    kCount
+  };
+  // The inputs the guard holds after a successful Update (the call's own
+  // inputs: stored by the body, or equal to them on a guard hit). False when
+  // the guard is not eligible or holds nothing.
+  bool NrLastUpdateInputs(NrUpdateInputs* out) const;
+  // The guard's verdict for `inputs` against the current state. Reads no
+  // register and changes nothing; kHolds exactly when Update called now with
+  // these inputs would return true at the guard.
+  NrUpdateGuard NrProbeUpdateGuard(const NrUpdateInputs& inputs, uint32_t* reg_out = nullptr) const;
+
  protected:
 
   virtual bool IsGammaFormatHostStorageSeparate() const = 0;
