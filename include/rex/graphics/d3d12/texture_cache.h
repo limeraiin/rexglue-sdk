@@ -107,6 +107,8 @@ class D3D12TextureCache final : public TextureCache {
   void RequestTextures(uint32_t used_texture_mask) override;
   // [NR-TILTEX] N-4-2b piece 2.
   void NrTexBarriersOnly(uint32_t used_texture_mask) override;
+  // [NR-NATIVE-R2] the same over an entry's own snapshots.
+  void NrTexBarriersSnaps(const NrTexSnap* snaps, uint32_t count) override;
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and

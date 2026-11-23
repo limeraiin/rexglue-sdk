@@ -227,6 +227,16 @@ struct FastStats {
 };
 FastStats g_stats;
 
+// The entry-owned texture skip's verdict: taken, or the first reason it is not.
+enum : uint32_t {
+  kFastOwnOk = 0,
+  kFastOwnNoBind,   // no direct bind will follow (no bindings blob, or the retail comparator)
+  kFastOwnDead,     // the texture destroy generation moved since the entry's snapshots
+  kFastOwnPending,  // a texture memory watch is pending
+  kFastOwnStale,    // one of the entry's own textures has outdated data
+  kFastOwnReasons
+};
+
 // Direct submission (gpu_native_direct): counters and the mode 2 classes.
 struct FastDirectStats {
   uint64_t draws = 0;        // owned hits emitted through the direct head
@@ -249,6 +259,12 @@ struct FastDirectStats {
   uint64_t sys_skip = 0;       // system constants uploads skipped by the latch
   uint64_t ia_live = 0;        // direct draws whose index view is the live IA view
   uint64_t env_refresh = 0;    // entries dropped for re-bake on a stamp mismatch
+  // The entry-owned texture skip (ahead of the generation latch in the hit
+  // tail): the restore and the loads skipped on the proof that the entry's
+  // own textures are alive and current, whatever the fetch slots hold.
+  uint64_t tex_own = 0;                         // skips taken
+  uint64_t tex_own_no[kFastOwnReasons] = {};    // refusals by reason ([kFastOwnOk] unused)
+  uint64_t tex_own_unbound = 0;  // a skipped draw reached the bind without a direct bind: refused
   uint64_t eq[kFastDirectClasses] = {};
   uint64_t ne[kFastDirectClasses] = {};
   uint32_t logged[kFastDirectClasses] = {};
@@ -585,6 +601,9 @@ struct D3D12CommandProcessor::NrFastPlan {
   bool overlay_skip = false;  // (d) direct hit: the overlay was never applied
   bool direct_env_ok = false; // the entry's head is bakeable here (env stamp match)
   bool rt_skip = false, ib_skip = false;
+  // The hit skipped its texture restore on the entry's own proof: the fetch
+  // slots do not hold the entry's bindings, so only a direct bind may follow.
+  bool tex_own = false;
   uint64_t sys_hash_draw = 0; // the patched block's hash (the latch key)
   FastChanges dry;            // (d) the dirty set a skipped overlay owes, pre and post draw
 };
@@ -1440,6 +1459,70 @@ uint32_t D3D12CommandProcessor::NrFastDerive(NrFastPlan& plan) {
         if ((bits & (1u << i)) && formats[i] != e->rt_formats[i]) rt_same = false;
       }
     }
+    // (b0) The entry-owned texture skip, ahead of the generation latch (b)
+    // below. A direct bind (NrFastEmit: an owned hit with a bindings blob,
+    // the retail comparator off) uploads the entry's descriptor-indices
+    // packs and reads nothing from the fetch slots; the system constants are
+    // the entry's block and the sampler members and SRV keys are not
+    // restored. So the draw does not need the slots to hold its bindings. It
+    // needs the Texture objects its snapshots name to be alive (the destroy
+    // generation, re-read here: begin() above may have completed a
+    // submission whose fence destroyed textures after the lookup compared
+    // it) and to hold current data (no watch pending and no outdated bit on
+    // any of them: what NrTexRestore refuses on and what NrTexEnsureLoaded
+    // reloads by, so the full path would have written the same snapshots and
+    // loaded nothing). The slots and their in-sync bits are not touched:
+    // they stay what the last derivation or restore made them, and the next
+    // consumer needs no desync beyond the overlay's own dirty set. The
+    // generation latch cannot hold per object: every restore of another
+    // object's textures into the same slots moves the generation. The
+    // barriers stay live, over the snapshots' own textures.
+    // Mode 2 checks the claim against a fresh derivation: the used slots are
+    // desynced and requested from the overlaid file, and what the request
+    // resolves (texture objects, descriptor indices) must be the entry's
+    // snapshots (class txo). Where the generation latch claims too the check
+    // is left to class txl: re-deriving would rewrite the slots txl reads.
+    if (rt_same && plan.dmode != 0 && plan.direct_env_ok && plan.tex_count != 0) {
+      uint32_t own = kFastOwnOk;
+      if (!e->blob_ok || nr_retail_cmp_active_) {
+        own = kFastOwnNoBind;
+      } else if (e->tex_gen != texture_cache_->nr_texture_destroy_generation()) {
+        own = kFastOwnDead;
+      } else if (texture_cache_->NrTexOutdatedPending()) {
+        own = kFastOwnPending;
+      } else if (!texture_cache_->NrTexSnapsCurrent(plan.tex, plan.tex_count)) {
+        own = kFastOwnStale;
+      }
+      if (plan.dmode == 1) {
+        if (own == kFastOwnOk) {
+          ++g_direct.tex_own;
+          plan.tex_own = true;
+          NrNativeBump(&NrNativeCounters::entry_hit);
+          NrNativeBump(&NrNativeCounters::pso_hit);
+          span.Lap(g_derive.tex);
+          texture_cache_->NrTexBarriersSnaps(plan.tex, plan.tex_count);
+          NrNativeBump(&NrNativeCounters::tex_hit, uint32_t(__builtin_popcount(plan.tex_mask)));
+          span.Lap(g_derive.txb);
+          return 0;
+        }
+        ++g_direct.tex_own_no[own];
+      } else if (dcmp && own == kFastOwnOk &&
+                 !(e->tex_latched != 0 && e->tex_bgen == texture_cache_->nr_binding_generation())) {
+        texture_cache_->NrTexDesync(plan.tex_mask);
+        texture_cache_->RequestTextures(plan.tex_mask);
+        TextureCache::NrTexSnap derived[kFastTexMax];
+        const uint32_t n = texture_cache_->NrTexCapture(plan.tex_mask, derived, kFastTexMax);
+        bool teq = n == plan.tex_count;
+        uint32_t bad_slot = UINT32_MAX;
+        for (uint32_t i = 0; teq && i < n; ++i) {
+          if (!TexSnapEq(derived[i], plan.tex[i])) {
+            teq = false;
+            bad_slot = derived[i].slot;
+          }
+        }
+        DirectCount(kFastDirectTxo, teq, rec, n, plan.tex_count, bad_slot);
+      }
+    }
     // (d) NrTexRestore validates the snapshots against the live fetch
     // constants; with the overlay skipped, the record's used texture slots
     // whose fetch constants differ from the live file are overlaid sparsely
@@ -2284,6 +2367,15 @@ bool D3D12CommandProcessor::NrFastEmit(NrFastPlan& plan) {
   // packs by the latch in NrUpdateBindings and skips the member restore;
   // refused while the retail comparator captures the bound packs.
   plan.direct_bind = direct && blob != nullptr && !nr_retail_cmp_active_;
+  if (plan.tex_own && !plan.direct_bind) {
+    // The derivation skipped the texture restore on the promise of this
+    // direct bind (the same three conditions): the fetch slots do not hold
+    // the entry's bindings, and any other bind would read them. Unreachable
+    // by construction; a refused draw, never a draw with another object's
+    // textures.
+    ++g_direct.tex_own_unbound;
+    return false;
+  }
   const D3D12_GPU_VIRTUAL_ADDRESS di_addr0[2] = {
       cbuffer_binding_descriptor_indices_vertex_.address,
       cbuffer_binding_descriptor_indices_pixel_.address};
@@ -2999,7 +3091,9 @@ void D3D12CommandProcessor::NrFastReport1Hz() {
                  g_direct.refused_env + g_direct.nodirect + g_direct.rt_skip + g_direct.ib_skip +
                  g_direct.overlay_skip + g_direct.overlay_live_rt + g_direct.overlay_live_blob +
                  g_direct.overlay_live_other + g_direct.tex_skip + g_direct.tex_live +
-                 g_direct.di_skip + g_direct.sys_skip + g_direct.ia_live + g_direct.env_refresh;
+                 g_direct.di_skip + g_direct.sys_skip + g_direct.ia_live + g_direct.env_refresh +
+                 g_direct.tex_own + g_direct.tex_own_unbound;
+  for (uint32_t i = 0; i < kFastOwnReasons; ++i) sig += g_direct.tex_own_no[i];
   for (uint32_t i = 0; i < kFastFbReasons; ++i) sig += g_stats.fb[i];
   for (uint32_t i = 0; i < kFastCmpClasses; ++i) sig += g_cmp.eq[i] + g_cmp.ne[i];
   for (uint32_t i = 0; i < kFastDirectClasses; ++i) sig += g_direct.eq[i] + g_direct.ne[i];
@@ -3016,6 +3110,7 @@ void D3D12CommandProcessor::NrFastReport1Hz() {
       "shader_recheck={} recheck_ne={} direct={} refused env={} nodirect={} rt_skip={} "
       "ib_skip={} ovl_skip={} ovl_live rt/blob/other={}/{}/{} tex_skip={} tex_live={} "
       "tex_gen_miss={} tex_outdated={} direct_di_skip={} direct_sys_skip={} direct_ia={} "
+      "tex_own={} tex_own_no bind/dead/pending/stale={}/{}/{}/{} tex_own_unbound={} "
       "direct_env_refresh={} env_stamp={} | fallback{}",
       REXCVAR_GET(gpu_native_exec), REXCVAR_GET(gpu_native_fast_lean),
       REXCVAR_GET(gpu_native_direct), g_stats.entries, g_stats.evictions, g_stats.delegate_hits,
@@ -3025,8 +3120,10 @@ void D3D12CommandProcessor::NrFastReport1Hz() {
       g_direct.rt_skip, g_direct.ib_skip, g_direct.overlay_skip, g_direct.overlay_live_rt,
       g_direct.overlay_live_blob, g_direct.overlay_live_other, g_direct.tex_skip,
       g_direct.tex_live, g_direct.tex_gen_miss, g_direct.tex_outdated, g_direct.di_skip,
-      g_direct.sys_skip, g_direct.ia_live, g_direct.env_refresh, nr::NrDirectEnvStamp(),
-      fb.empty() ? std::string(" none") : fb);
+      g_direct.sys_skip, g_direct.ia_live, g_direct.tex_own, g_direct.tex_own_no[kFastOwnNoBind],
+      g_direct.tex_own_no[kFastOwnDead], g_direct.tex_own_no[kFastOwnPending],
+      g_direct.tex_own_no[kFastOwnStale], g_direct.tex_own_unbound, g_direct.env_refresh,
+      nr::NrDirectEnvStamp(), fb.empty() ? std::string(" none") : fb);
   bool any_direct = false;
   for (uint32_t i = 0; i < kFastDirectClasses; ++i) {
     any_direct |= (g_direct.eq[i] | g_direct.ne[i]) != 0;

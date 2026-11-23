@@ -572,6 +572,21 @@ class TextureCache {
   // The part of a texture request that is NOT derivation and still has to run
   // for a restored draw: usage marking and the resource transitions.
   virtual void NrTexBarriersOnly(uint32_t /*mask*/) {}
+  // [NR-NATIVE-R2] The entry-owned texture skip (nr_native_fast.cpp, the hit
+  // tail). A direct bind takes its SRV indices from the entry's recorded
+  // descriptor-indices packs and never reads the fetch slots, so what the
+  // slots hold between two draws of an object is immaterial to it. What the
+  // draw needs is that the Texture objects its snapshots name are alive and
+  // hold current data, which is a property of those objects, not of the
+  // slots. Both calls below dereference the snapshots' Texture pointers: the
+  // caller must first have proven them alive (nr_texture_destroy_generation
+  // equal to the value the snapshots were captured under, re-read after the
+  // last BeginSubmission).
+  // True when no texture a snapshot names has an outdated bit: the rule
+  // NrTexEnsureLoaded reloads by, read from the textures themselves.
+  bool NrTexSnapsCurrent(const NrTexSnap* snaps, uint32_t count) const;
+  // NrTexBarriersOnly over the snapshots' textures instead of the slots'.
+  virtual void NrTexBarriersSnaps(const NrTexSnap* /*snaps*/, uint32_t /*count*/) {}
 
  protected:
   // Backend hooks for the two halves of a snapshot that live below this class

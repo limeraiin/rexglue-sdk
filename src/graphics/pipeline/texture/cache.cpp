@@ -558,6 +558,15 @@ bool TextureCache::NrTexLatchCheck(const NrTexSnap* snaps, uint32_t count,
   return true;
 }
 
+bool TextureCache::NrTexSnapsCurrent(const NrTexSnap* snaps, uint32_t count) const {
+  for (uint32_t i = 0; i < count; ++i) {
+    const TextureBinding& b = snaps[i].binding;
+    if (b.texture && b.texture->outdated_mask()) return false;
+    if (b.texture_signed && b.texture_signed->outdated_mask()) return false;
+  }
+  return true;
+}
+
 // [dcache] The load half of a texture request over bindings that were
 // restored, not derived: the same PrepareTextureLoad / RequestRanges /
 // CommitPreparedTextureLoad sequence RequestTextures runs, over every bound

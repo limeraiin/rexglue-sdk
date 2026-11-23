@@ -807,6 +807,59 @@ void D3D12TextureCache::NrTexBarriersOnly(uint32_t used_texture_mask) {
   }
 }
 
+// [NR-NATIVE-R2] NrTexBarriersOnly for a direct hit that skipped its texture
+// restore: the same two passes (wrapper pre-creation, then usage marking and
+// transitions) over the textures the entry's snapshots name, because the
+// fetch slots hold whatever the previous draw left. Keep in step with
+// NrTexBarriersOnly. The caller has proven the pointers alive.
+void D3D12TextureCache::NrTexBarriersSnaps(const NrTexSnap* snaps, uint32_t count) {
+  if (REXCVAR_GET(gpu_3d_to_2d_texture)) {
+    for (uint32_t i = 0; i < count; ++i) {
+      const TextureBinding& binding = snaps[i].binding;
+      if (!binding.key.is_valid || binding.key.dimension != xenos::DataDimension::k3D) {
+        continue;
+      }
+      D3D12Texture* texture = static_cast<D3D12Texture*>(binding.texture);
+      if (texture) {
+        texture->GetOrCreate3DAs2DResource(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      }
+      D3D12Texture* texture_signed = static_cast<D3D12Texture*>(binding.texture_signed);
+      if (texture_signed) {
+        texture_signed->GetOrCreate3DAs2DResource(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      }
+    }
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    const TextureBinding& binding = snaps[i].binding;
+    if (!binding.key.is_valid) {
+      continue;
+    }
+    D3D12Texture* binding_texture = static_cast<D3D12Texture*>(binding.texture);
+    if (binding_texture != nullptr) {
+      // Will be referenced by the command list, so mark as used.
+      binding_texture->MarkAsUsed();
+      command_processor_.PushTransitionBarrier(
+          binding_texture->resource(),
+          binding_texture->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    D3D12Texture* binding_texture_signed = static_cast<D3D12Texture*>(binding.texture_signed);
+    if (binding_texture_signed != nullptr) {
+      binding_texture_signed->MarkAsUsed();
+      command_processor_.PushTransitionBarrier(
+          binding_texture_signed->resource(),
+          binding_texture_signed->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+  }
+}
+
 bool D3D12TextureCache::AreActiveTextureSRVKeysUpToDate(
     const TextureSRVKey* keys, const D3D12Shader::TextureBinding* host_shader_bindings,
     size_t host_shader_binding_count) const {
