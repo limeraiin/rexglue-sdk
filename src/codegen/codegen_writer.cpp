@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <fmt/format.h>
 #include <inja/inja.hpp>
@@ -23,12 +24,14 @@
 #include <rex/codegen/function_graph.h>
 #include <rex/codegen/template_registry.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
 
 #include "codegen_logging.h"
 #include "template_registry_internal.h"
 
+#include <ppc.h>
 #include <xxhash.h>
 
 namespace {
@@ -87,6 +90,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"cr_as_local", cfg.crRegistersAsLocalVariables},
       {"non_argument_as_local", cfg.nonArgumentRegistersAsLocalVariables},
       {"non_volatile_as_local", cfg.nonVolatileRegistersAsLocalVariables},
+      {"local_registers", cfg.anyLocalRegisters()},
   };
 
   return {
@@ -226,6 +230,36 @@ bool CodegenWriter::write(bool force) {
   if (runtime_)
     emitCtx.resolver = runtime_->export_resolver();
 
+  // With local registers, the functions that share registers outside the
+  // calling convention keep theirs in the context. The list is written next to
+  // the code for the checks that read the output.
+  const bool localRegisters = config().anyLocalRegisters();
+  std::unordered_set<uint32_t> contextRegisterFunctions;
+  const std::unordered_map<uint32_t, std::string> registerHelpers = findRegisterHelpers();
+  EmitContext sizingCtx = emitCtx;
+  sizingCtx.forceContextRegisters = true;
+  if (localRegisters) {
+    contextRegisterFunctions = findContextRegisterFunctions(functions, registerHelpers);
+    emitCtx.contextRegisterFunctions = &contextRegisterFunctions;
+    emitCtx.registerHelpers = &registerHelpers;
+    std::vector<uint32_t> sorted(contextRegisterFunctions.begin(), contextRegisterFunctions.end());
+    std::sort(sorted.begin(), sorted.end());
+    std::string list;
+    for (uint32_t address : sorted)
+      list += fmt::format("{:08X}\n", address);
+    pendingWrites.emplace_back("context_register_functions.txt", std::move(list));
+    sorted.clear();
+    for (const auto& [address, name] : registerHelpers)
+      sorted.push_back(address);
+    std::sort(sorted.begin(), sorted.end());
+    list.clear();
+    for (uint32_t address : sorted)
+      list += fmt::format("{:08X} {}\n", address, registerHelpers.at(address));
+    pendingWrites.emplace_back("register_helpers.txt", std::move(list));
+    REXCODEGEN_INFO("Local registers: {} of {} functions keep theirs in the context",
+                    contextRegisterFunctions.size(), functions.size());
+  }
+
   // Generate recomp files with size-based splitting
   REXCODEGEN_TRACE("Recompiling {} functions...", functions.size());
   size_t currentFileBytes = 0;
@@ -233,20 +267,25 @@ bool CodegenWriter::write(bool force) {
 
   for (size_t i = 0; i < functions.size(); i++) {
     std::string code = functions[i]->emitCpp(emitCtx);
+    // Files are cut by the size of the code with every register in the
+    // context, so a function stays in the same file whatever the *_as_local
+    // options are: source patches and build caches name those files.
+    const size_t codeBytes =
+        localRegisters ? functions[i]->emitCpp(sizingCtx).size() : code.size();
 
-    if (currentFileBytes > 0 && currentFileBytes + code.size() > REXCVAR_GET(max_file_size_bytes)) {
+    if (currentFileBytes > 0 && currentFileBytes + codeBytes > REXCVAR_GET(max_file_size_bytes)) {
       SaveCurrentOutData();
       println("#include \"{}_init.h\"\n", projectName);
       currentFileBytes = 0;
     }
 
-    if (code.size() > REXCVAR_GET(max_file_size_bytes)) {
+    if (codeBytes > REXCVAR_GET(max_file_size_bytes)) {
       REXCODEGEN_WARN("Function 0x{:08X} is {} bytes, exceeds max_file_size_bytes ({})",
-                      functions[i]->base(), code.size(), REXCVAR_GET(max_file_size_bytes));
+                      functions[i]->base(), codeBytes, REXCVAR_GET(max_file_size_bytes));
     }
 
     out += code;
-    currentFileBytes += code.size();
+    currentFileBytes += codeBytes;
   }
 
   SaveCurrentOutData();
@@ -267,6 +306,116 @@ bool CodegenWriter::write(bool force) {
   // Write all buffered files to disk
   FlushPendingWrites();
   return true;
+}
+
+// The *_as_local options keep a register in a local variable of each recompiled
+// function, which is only right while no register carries a value between
+// functions outside the calling convention. These functions break that, and
+// keep every register in the context, as without the options:
+// - The register save and restore helpers, which read or write their caller's
+//   non-volatile registers. Functions with local registers do not call them.
+// - A funclet (the body of a __finally block or of an __except filter) and the
+//   function that calls it. The funclet is part of its parent's body: it gets
+//   the parent's frame in r12 and uses the parent's non-volatile registers. The
+//   call is `addi r12, rN, frame` followed by `bl`.
+// - A function with exception data, and the handlers its tables name.
+// - A function that calls setjmp: longjmp brings the registers back to their
+//   values at the setjmp, which the recompiled code does by restoring a copy of
+//   the context.
+// Every other function follows the calling convention, so the two kinds can
+// call each other.
+std::unordered_map<uint32_t, std::string> CodegenWriter::findRegisterHelpers() const {
+  std::unordered_map<uint32_t, std::string> helpers;
+  auto add = [&](uint32_t base, const char* prefix, uint32_t stride, uint32_t first,
+                 uint32_t last) {
+    if (base == 0)
+      return;
+    for (uint32_t i = first; i <= last; i++)
+      helpers.emplace(base + (i - first) * stride, fmt::format("{}{}", prefix, i));
+  };
+  const auto& state = analysisState();
+  add(state.restGpr14Address, "__restgprlr_", 4, 14, 31);
+  add(state.saveGpr14Address, "__savegprlr_", 4, 14, 31);
+  add(state.restFpr14Address, "__restfpr_", 4, 14, 31);
+  add(state.saveFpr14Address, "__savefpr_", 4, 14, 31);
+  add(state.restVmx14Address, "__restvmx_", 8, 14, 31);
+  add(state.saveVmx14Address, "__savevmx_", 8, 14, 31);
+  add(state.restVmx64Address, "__restvmx_", 8, 64, 127);
+  add(state.saveVmx64Address, "__savevmx_", 8, 64, 127);
+  return helpers;
+}
+
+std::unordered_set<uint32_t> CodegenWriter::findContextRegisterFunctions(
+    const std::vector<const FunctionNode*>& functions,
+    const std::unordered_map<uint32_t, std::string>& registerHelpers) const {
+  using rex::memory::load_and_swap;
+  std::unordered_set<uint32_t> result = config().contextRegisterFunctions;
+  auto isRegisterHelper = [&](const FunctionNode& fn) {
+    return fn.isHelper() || registerHelpers.contains(fn.base()) ||
+           fn.name().starts_with("__rest") || fn.name().starts_with("__save");
+  };
+
+  for (const auto* fn : functions) {
+    if (isRegisterHelper(*fn)) {
+      result.insert(fn->base());
+      continue;
+    }
+    if (fn->hasExceptionInfo()) {
+      result.insert(fn->base());
+      if (const auto* seh = fn->exceptionInfo()->asSeh()) {
+        for (const auto& scope : seh->scopes) {
+          if (scope.handler > 1)
+            result.insert(scope.handler);
+          if (scope.filter > 1)
+            result.insert(scope.filter);
+        }
+      } else if (const auto* cxx = fn->exceptionInfo()->asCxx()) {
+        for (const auto& entry : cxx->unwindMap) {
+          if (entry.action)
+            result.insert(entry.action);
+        }
+        for (const auto& block : cxx->tryBlocks) {
+          for (const auto& handler : block.handlers) {
+            if (handler.handlerAddress)
+              result.insert(handler.handlerAddress);
+          }
+        }
+      }
+    }
+
+    for (const auto& block : fn->blocks()) {
+      const auto* data = static_cast<const uint8_t*>(binary().translate(block.base));
+      if (!data)
+        continue;
+      for (uint32_t address = block.base; address < block.end(); address += 4) {
+        const uint32_t insn = load_and_swap<uint32_t>(data + (address - block.base));
+        if (PPC_OP(insn) != PPC_OP_B || !PPC_BL(insn) || PPC_BA(insn))
+          continue;
+        const uint32_t target = address + PPC_BI(insn);
+        if (config().setJmpAddress != 0 && target == config().setJmpAddress) {
+          result.insert(fn->base());
+          continue;
+        }
+        // addi r12, rN, simm with N != 0 (N == 0 is li) right before the call.
+        if (address < fn->base() + 4)
+          continue;
+        const auto* previousData = static_cast<const uint8_t*>(binary().translate(address - 4));
+        if (!previousData)
+          continue;
+        const uint32_t previous = load_and_swap<uint32_t>(previousData);
+        if (PPC_OP(previous) != PPC_OP_ADDI || ((previous >> 21) & 0x1F) != 12 ||
+            ((previous >> 16) & 0x1F) == 0) {
+          continue;
+        }
+        const FunctionNode* callee = graph().getFunction(target);
+        if (!callee || callee->isImport() || isRegisterHelper(*callee))
+          continue;
+        result.insert(target);
+        result.insert(fn->base());
+      }
+    }
+  }
+  return result;
 }
 
 void CodegenWriter::SaveCurrentOutData(const std::string_view name) {

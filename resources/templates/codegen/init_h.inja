@@ -9,13 +9,13 @@
 #define REX_CONFIG_H_INCLUDED
 
 {% if config_flags.skip_lr %}#define REX_CONFIG_SKIP_LR
-{% endif %}{% if config_flags.ctr_as_local %}#define REX_CONFIG_CTR_AS_LOCAL
-{% endif %}{% if config_flags.xer_as_local %}#define REX_CONFIG_XER_AS_LOCAL
-{% endif %}{% if config_flags.reserved_as_local %}#define REX_CONFIG_RESERVED_AS_LOCAL
 {% endif %}{% if config_flags.skip_msr %}#define REX_CONFIG_SKIP_MSR
-{% endif %}{% if config_flags.cr_as_local %}#define REX_CONFIG_CR_AS_LOCAL
-{% endif %}{% if config_flags.non_argument_as_local %}#define REX_CONFIG_NON_ARGUMENT_AS_LOCAL
-{% endif %}{% if config_flags.non_volatile_as_local %}#define REX_CONFIG_NON_VOLATILE_AS_LOCAL
+{% endif %}{% if config_flags.local_registers %}// Most functions keep registers in local variables. PPCContext keeps every
+// register: the functions listed in context_register_functions.txt use them,
+// and the runtime library is built with the same layout. Host code must take
+// guest values from r1, r3-r10, r13, f1-f13 and lr only, unless the function it
+// hooks or its caller is listed.
+#define REX_CODEGEN_LOCAL_REGISTERS 1
 {% endif %}
 #define REX_IMAGE_BASE {{ image_base }}ull
 #define REX_IMAGE_SIZE {{ image_size }}ull

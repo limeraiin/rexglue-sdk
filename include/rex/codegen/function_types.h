@@ -51,6 +51,16 @@ struct EmitContext {
   const FunctionGraph& graph;
   uint32_t entryPoint = 0;                      ///< For "xstart" naming
   runtime::ExportResolver* resolver = nullptr;  ///< For import ordinal resolution (nullable)
+  /// Functions that keep every register in the context although the *_as_local
+  /// options are set (nullable: none).
+  const std::unordered_set<uint32_t>* contextRegisterFunctions = nullptr;
+  /// Entry points of the register save/restore helpers with their canonical
+  /// names (nullable). A helper is known by its address: an entry the project
+  /// also configures as a function carries the configured name.
+  const std::unordered_map<uint32_t, std::string>* registerHelpers = nullptr;
+  /// Emit every function with its registers in the context, as without the
+  /// *_as_local options. Used to size the output files independently of them.
+  bool forceContextRegisters = false;
 };
 
 //=============================================================================

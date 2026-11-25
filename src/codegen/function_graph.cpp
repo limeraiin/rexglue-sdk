@@ -482,6 +482,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
   emit_println(out, "\tREX_FUNC_PROLOGUE();");
 
+  // The registers of this function stay in the context when it is listed, and
+  // when a host SEH wrapper around it names them.
+  const bool contextRegisters =
+      ctx.forceContextRegisters ||
+      (ctx.contextRegisterFunctions && ctx.contextRegisterFunctions->contains(base())) ||
+      (sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers);
+
   // --- Second pass: emit instruction code ---
   const JumpTable* activeJt = nullptr;
   bool allRecompiled = true;
@@ -582,6 +589,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         int id = insn.opcode->id;
         BuilderContext builderCtx{body,           ctx,      *this,   insn, blockBase, data,
                                   localVariables, csrState, activeJt};
+        builderCtx.contextRegisters = contextRegisters;
 
         if (hasHookBefore) {
           builderCtx.emit_mid_asm_hook();

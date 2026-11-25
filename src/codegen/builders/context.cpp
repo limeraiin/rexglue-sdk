@@ -44,9 +44,10 @@ const FunctionGraph& BuilderContext::graph() const {
 
 std::string BuilderContext::r(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables &&
-       (index == 0 || index == 2 || index == 11 || index == 12)) ||
-      (cfg.nonVolatileRegistersAsLocalVariables && index >= 14)) {
+  if (!contextRegisters &&
+      ((cfg.nonArgumentRegistersAsLocalVariables &&
+        (index == 0 || index == 2 || index == 11 || index == 12)) ||
+       (cfg.nonVolatileRegistersAsLocalVariables && index >= 14))) {
     locals.r[index] = true;
     return fmt::format("r{}", index);
   }
@@ -55,8 +56,8 @@ std::string BuilderContext::r(size_t index) {
 
 std::string BuilderContext::f(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
-      (cfg.nonVolatileRegistersAsLocalVariables && index >= 14)) {
+  if (!contextRegisters && ((cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
+                            (cfg.nonVolatileRegistersAsLocalVariables && index >= 14))) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
   }
@@ -65,9 +66,10 @@ std::string BuilderContext::f(size_t index) {
 
 std::string BuilderContext::v(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
-      (cfg.nonVolatileRegistersAsLocalVariables &&
-       ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
+  if (!contextRegisters &&
+      ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+       (cfg.nonVolatileRegistersAsLocalVariables &&
+        ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
   }
@@ -75,7 +77,7 @@ std::string BuilderContext::v(size_t index) {
 }
 
 std::string BuilderContext::cr(size_t index) {
-  if (config().crRegistersAsLocalVariables) {
+  if (!contextRegisters && config().crRegistersAsLocalVariables) {
     locals.cr[index] = true;
     return fmt::format("cr{}", index);
   }
@@ -83,7 +85,7 @@ std::string BuilderContext::cr(size_t index) {
 }
 
 const char* BuilderContext::ctr() {
-  if (config().ctrAsLocalVariable) {
+  if (!contextRegisters && config().ctrAsLocalVariable) {
     locals.ctr = true;
     return "ctr";
   }
@@ -91,7 +93,7 @@ const char* BuilderContext::ctr() {
 }
 
 const char* BuilderContext::xer() {
-  if (config().xerAsLocalVariable) {
+  if (!contextRegisters && config().xerAsLocalVariable) {
     locals.xer = true;
     return "xer";
   }
@@ -99,7 +101,7 @@ const char* BuilderContext::xer() {
 }
 
 const char* BuilderContext::reserved() {
-  if (config().reservedRegisterAsLocalVariable) {
+  if (!contextRegisters && config().reservedRegisterAsLocalVariable) {
     locals.reserved = true;
     return "reserved";
   }
@@ -167,6 +169,12 @@ const CallTarget* BuilderContext::findCallTarget(uint32_t site) const {
   return nullptr;
 }
 
+bool BuilderContext::isRegisterHelper(uint32_t address, std::string_view name) const {
+  if (emitCtx.registerHelpers && emitCtx.registerHelpers->contains(address))
+    return true;
+  return name.starts_with("__rest") || name.starts_with("__save");
+}
+
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
 
@@ -193,10 +201,10 @@ void BuilderContext::emit_function_call(uint32_t address) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
 
-      // Handle save/restore helpers
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
-          (name.find("__rest") == 0 || name.find("__save") == 0)) {
-        // print nothing - these are handled by local variable tracking
+      // A function with local non-volatile registers has nothing to save for
+      // its caller. One that keeps them in the context still calls the helpers.
+      if (!contextRegisters && cfg.nonVolatileRegistersAsLocalVariables &&
+          isRegisterHelper(address, name)) {
         return;
       }
 
@@ -268,6 +276,12 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
       if (const auto* callTarget = findCallTarget(base)) {
         if (callTarget->isFunction()) {
           auto* targetFn = callTarget->asFunction();
+          if (!contextRegisters && config().nonVolatileRegistersAsLocalVariables &&
+              isRegisterHelper(target, targetFn->name())) {
+            // A conditional return through a restore helper: nothing to restore.
+            println("\tif ({}{}.{}) return;", not_ ? "!" : "", cr(insn.operands[0]), cond);
+            break;
+          }
           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
           println("\t\t{}(ctx, base);", targetFn->name());
           println("\t\treturn;");

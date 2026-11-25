@@ -93,6 +93,20 @@ struct RecompilerConfig {
   bool nonVolatileRegistersAsLocalVariables = false;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
+  /// Functions recompiled with every register in the context even when the
+  /// *_as_local options are set: targets of host hooks or source patches that
+  /// name a guest register, and guest code that shares registers with another
+  /// function outside the calling convention. Codegen adds the functions it can
+  /// identify itself (CodegenWriter::findContextRegisterFunctions).
+  std::unordered_set<uint32_t> contextRegisterFunctions;
+
+  /// Whether any register class is kept in local variables.
+  bool anyLocalRegisters() const {
+    return ctrAsLocalVariable || xerAsLocalVariable || reservedRegisterAsLocalVariable ||
+           crRegistersAsLocalVariables || nonArgumentRegistersAsLocalVariables ||
+           nonVolatileRegistersAsLocalVariables;
+  }
+
   // === Analysis tuning (optional) ===
   uint32_t maxJumpExtension = 65536;  ///< Max bytes to extend function for jump table targets
   uint32_t dataRegionThreshold = 16;  ///< Consecutive invalid instructions to mark as data region

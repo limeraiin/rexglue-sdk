@@ -98,6 +98,11 @@ struct BuilderContext {
   /// Pointer to active jump table for bctr dispatch, or nullptr
   const JumpTable* activeJumpTable = nullptr;
 
+  /// The function keeps every register in the context although the *_as_local
+  /// options are set: it shares registers with other code outside the calling
+  /// convention, or host code names its registers.
+  bool contextRegisters = false;
+
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;
 
@@ -224,6 +229,9 @@ struct BuilderContext {
    * Handles special cases like setjmp/longjmp and __restgprlr_N functions.
    */
   void emit_function_call(uint32_t address);
+
+  /// Whether a call target is a register save/restore helper.
+  bool isRegisterHelper(uint32_t address, std::string_view name) const;
 
   /**
    * @brief Emit C++ code for a conditional branch.

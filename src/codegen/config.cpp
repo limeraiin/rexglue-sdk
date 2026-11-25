@@ -126,6 +126,15 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
     cfg.isDll = toml["is_dll"].value_or(false);
   }
 
+  // context_register_functions -- additive set of function addresses
+  if (auto* list = toml["context_register_functions"].as_array()) {
+    for (const auto& elem : *list) {
+      if (auto addr = elem.value<int64_t>()) {
+        cfg.contextRegisterFunctions.insert(static_cast<uint32_t>(*addr));
+      }
+    }
+  }
+
   // Integer scalars (only override if present)
   if (auto v = toml["longjmp_address"].value<int64_t>()) {
     uint32_t addr = static_cast<uint32_t>(*v);

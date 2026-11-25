@@ -17,6 +17,10 @@
 
 #include <fmt/core.h>
 
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
 #include <rex/codegen/codegen_context.h>
 
 namespace rex {
@@ -64,6 +68,15 @@ class CodegenWriter {
     fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
     out += '\n';
   }
+
+  /// The entry points of the register save/restore helpers, with their names.
+  std::unordered_map<uint32_t, std::string> findRegisterHelpers() const;
+
+  /// The functions that keep every register in the context although the
+  /// *_as_local options are set: the configured ones and those found in the code.
+  std::unordered_set<uint32_t> findContextRegisterFunctions(
+      const std::vector<const FunctionNode*>& functions,
+      const std::unordered_map<uint32_t, std::string>& registerHelpers) const;
 
   void SaveCurrentOutData(std::string_view name = {});
   void FlushPendingWrites();
