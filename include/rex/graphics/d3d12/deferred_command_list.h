@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -33,6 +34,9 @@ class DeferredCommandList {
                       size_t initial_size_bytes = 1_MiB);
 
   void Reset();
+  void SetReplayBindingReuse(bool enabled) {
+    reuse_replay_bindings_.store(enabled, std::memory_order_relaxed);
+  }
   // What a replay carries from one range to the next when several ranges are
   // recorded into the same real command list: draws, dispatches and indirect
   // executions are dropped while no pipeline is bound, and a later range
@@ -910,6 +914,7 @@ class DeferredCommandList {
                     ID3D12GraphicsCommandList1* command_list_1, ReplayState* state = nullptr);
 
   const D3D12CommandProcessor& command_processor_;
+  std::atomic<bool> reuse_replay_bindings_{false};
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;

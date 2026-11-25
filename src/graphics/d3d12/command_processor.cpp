@@ -499,6 +499,15 @@ REXCVAR_DEFINE_UINT32(gpu_ia_mb, 512, "GPU/D3D12",
 // input-assembler vertex shader reads none of them. With this on, a stale
 // buffer is uploaded only when a pair of dwords the draw's shaders read
 // differs from the upload already bound (FetchCbLatch in the header).
+REXCVAR_DEFINE_UINT32(gpu_native_key_ranges, 0, "GPU/D3D12",
+                      "Compose contiguous register ranges together for native draw lookup: "
+                      "0 off, 1 on, 2 or more alternates on/off every N seconds.");
+REXCVAR_DEFINE_UINT32(gpu_replay_binding_reuse, 0, "GPU/D3D12",
+                      "Skip identical host bindings in a command list range. 0 off, 1 on, "
+                      "2 or more alternates on/off every N seconds.");
+REXCVAR_DEFINE_UINT32(gpu_descriptor_pack_reuse, 0, "GPU/D3D12",
+                      "Reuse immutable native descriptor pack uploads: 0 off, 1 on, "
+                      "2 or more alternates on/off every N seconds.");
 REXCVAR_DEFINE_INT32(gpu_fetch_need_cycle, 0, "GPU/D3D12",
                      "[fetch-need] A/B: seconds per phase, gpu_fetch_need as set / 0 in place "
                      "(0 = no cycling). Each switch logs '[fetch] cycle phase='.");
@@ -3215,6 +3224,10 @@ struct DcEntry {
   // [NR-NATIVE-R2] N4 step 2: XXH3 of di_v[0..di_n_v) / di_p[0..di_n_p),
   // the direct descriptor-indices latch key (NrDirectLatch::di_hash).
   uint64_t di_hash_v = 0, di_hash_p = 0;
+  // Cold records resolve immutable uploads by exact contents once per pool.
+  mutable uint64_t pack_epoch = 0;
+  mutable D3D12_GPU_VIRTUAL_ADDRESS pack_address[2] = {};
+
   TextureCache::NrTexSnap tex[kDcTexMax] = {};
 };
 struct DcSlot {
@@ -4470,6 +4483,44 @@ void GkAfter(uint64_t gk, uint64_t hkey, bool hit, const uint64_t r[4]) {
   }
 }
 }  // namespace
+
+// Native vertex and pixel descriptor index packs are immutable bytes. Keep
+// at most 4096 aligned uploads (1 MiB) until the queue is drained on cache
+// clear or shutdown. A live record then rebinds its address across frames.
+struct D3D12CommandProcessor::DescriptorPackCache {
+  explicit DescriptorPackCache(const ui::d3d12::D3D12Provider& provider) : pool(provider, 65536) {
+    static std::atomic<uint64_t> next_epoch{1};
+    epoch = next_epoch.fetch_add(1, std::memory_order_relaxed);
+  }
+  struct Pack {
+    uint32_t count;
+    uint32_t words[kDcDiMax];
+    D3D12_GPU_VIRTUAL_ADDRESS address;
+  };
+  uint64_t epoch;
+  ui::d3d12::D3D12UploadBufferPool pool;
+  std::unordered_map<uint64_t, Pack> packs;
+
+  D3D12_GPU_VIRTUAL_ADDRESS Resolve(uint64_t hash, const uint32_t* words, uint32_t count) {
+    const size_t bytes = count * sizeof(uint32_t);
+    auto it = packs.find(hash);
+    if (it != packs.end()) {
+      const Pack& pack = it->second;
+      return pack.count == count && !std::memcmp(pack.words, words, bytes) ? pack.address : 0;
+    }
+    if (packs.size() >= 4096) return 0;
+    D3D12_GPU_VIRTUAL_ADDRESS address;
+    auto* data = pool.Request(1, bytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+                              nullptr, nullptr, &address);
+    if (!data) return 0;
+    std::memcpy(data, words, bytes);
+    Pack& pack = packs[hash];
+    pack.count = count;
+    std::memcpy(pack.words, words, bytes);
+    pack.address = address;
+    return address;
+  }
+};
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -6449,6 +6500,7 @@ void D3D12CommandProcessor::ShutdownContext() {
     view_bindful_heap_pool_.reset();
   }
   constant_buffer_pool_.reset();
+  descriptor_packs_.reset();
 
   render_target_cache_.reset();
 
@@ -6923,6 +6975,36 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // `gpu_n7 3` owns it while it is cycling the three phases in place; otherwise
   // the old gpu_dedupe_constants cvar is the switch and means "census + act".
   g_dedupe_constants = REXCVAR_GET(gpu_dedupe_constants);
+  auto benchmark_phase = [](uint32_t mode) {
+    if (mode < 2) return mode == 1;
+    static const auto start = std::chrono::steady_clock::now();
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start).count();
+    return ((seconds / mode) & 1) == 0;
+  };
+  const uint32_t pack_mode = REXCVAR_GET(gpu_descriptor_pack_reuse);
+  profile_descriptor_packs_ = pack_mode >= 2;
+  const bool reuse_packs = benchmark_phase(pack_mode);
+  if (profile_descriptor_packs_ && reuse_packs != reuse_descriptor_packs_) {
+    REXGPU_INFO("[di-pack] cycle phase={} previous_rebinds={} previous_transient_uploads={}",
+                reuse_packs ? "on" : "off", descriptor_pack_reuses_,
+                descriptor_pack_upload_count_);
+    descriptor_pack_reuses_ = descriptor_pack_upload_count_ = 0;
+  }
+  reuse_descriptor_packs_ = reuse_packs;
+  const uint32_t key_mode = REXCVAR_GET(gpu_native_key_ranges);
+  const bool key_ranges = benchmark_phase(key_mode);
+  if (key_mode >= 2 && batch_key_ranges_ != key_ranges) {
+    REXGPU_INFO("[key-range] cycle phase={}", key_ranges ? "on" : "off");
+  }
+  batch_key_ranges_ = key_ranges;
+  const auto replay_mode = REXCVAR_GET(gpu_replay_binding_reuse);
+  const bool replay_reuse = benchmark_phase(replay_mode);
+  if (replay_mode >= 2 && replay_reuse != replay_binding_reuse_) {
+    REXGPU_INFO("[replay-bind] cycle phase={}", replay_reuse ? "on" : "off");
+  }
+  replay_binding_reuse_ = replay_reuse;
+  deferred_command_list_.SetReplayBindingReuse(replay_reuse);
   g_fetch_need = REXCVAR_GET(gpu_fetch_need);  // [fetch-need]
   if (const int32_t fetch_cycle = REXCVAR_GET(gpu_fetch_need_cycle); fetch_cycle > 0) {
     // A/B in place: the configured rule against the old one (0).
@@ -15378,6 +15460,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         view_bindful_heap_pool_->ClearCache();
       }
       constant_buffer_pool_->ClearCache();
+      descriptor_packs_.reset();
 
       texture_cache_->ClearCache();
 
@@ -17842,6 +17925,40 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
                              : std::chrono::steady_clock::time_point{};
   // Descriptor-indices constant buffers - ours, sized by the 1-BASED slot
   // rule (max_slot + 1, never tex+smp: [[descriptor-slots-one-based]]).
+  // The direct bind is admitted only after the entry's texture generation
+  // and descriptor heaps match. Other consumers retain the ordinary upload.
+  auto bind_pack = [&](uint32_t stage, const uint32_t* words, uint32_t count, uint64_t hash,
+                       ConstantBufferBinding& binding, uint32_t root_parameter,
+                       uint32_t* mirror, uint32_t& mirror_count, bool& uploaded) {
+    const size_t bytes = count * sizeof(uint32_t);
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+    if (g_dc_bind_direct && reuse_descriptor_packs_) {
+      if (!descriptor_packs_) descriptor_packs_ = std::make_unique<DescriptorPackCache>(provider);
+      if (dc_b->pack_epoch != descriptor_packs_->epoch) {
+        dc_b->pack_address[0] = dc_b->pack_address[1] = 0;
+        dc_b->pack_epoch = descriptor_packs_->epoch;
+      }
+      auto& cached = dc_b->pack_address[stage];
+      if (!cached) cached = descriptor_packs_->Resolve(hash, words, count);
+      address = cached;
+    }
+    if (address) {
+      binding.address = address;
+      if (profile_descriptor_packs_) ++descriptor_pack_reuses_;
+    } else {
+      auto* data = constant_buffer_pool_->Request(frame_current_, bytes,
+          D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr, &binding.address);
+      if (!data) return false;
+      std::memcpy(data, words, bytes);
+      uploaded = true;
+      if (profile_descriptor_packs_ && g_dc_bind_direct) ++descriptor_pack_upload_count_;
+    }
+    std::memcpy(mirror, words, bytes);
+    mirror_count = count;
+    binding.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << root_parameter);
+    return true;
+  };
   if (dc_b) {
     // [dcache] the entry's pack, uploaded only when the bound one differs;
     // an unbound stage is left alone (drive 858).
@@ -17863,18 +17980,10 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
         dl.di_skipped[0] = true;
       } else if (!(cbuffer_binding_descriptor_indices_vertex_.up_to_date && g_dc_di_cur_n_v == dc_n &&
                    std::memcmp(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t)) == 0)) {
-        uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
-            frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-            nullptr, nullptr, &cbuffer_binding_descriptor_indices_vertex_.address));
-        if (!descriptor_indices) {
-          return false;
-        }
-        std::memcpy(descriptor_indices, dc_b->di_v, dc_n * sizeof(uint32_t));
-        std::memcpy(g_dc_di_cur_v, dc_b->di_v, dc_n * sizeof(uint32_t));
-        g_dc_di_cur_n_v = dc_n;
-        cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
-        current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesVertex);
-        dl.di_uploaded[0] = true;
+        if (!bind_pack(0, dc_b->di_v, dc_n, dc_b->di_hash_v,
+                       cbuffer_binding_descriptor_indices_vertex_,
+                       kRootParameter_Bindless_DescriptorIndicesVertex, g_dc_di_cur_v,
+                       g_dc_di_cur_n_v, dl.di_uploaded[0])) return false;
       }
       dl.di_frame[0] = frame_current_;
       dl.di_hash[0] = dc_b->di_hash_v;
@@ -17957,18 +18066,10 @@ bool D3D12CommandProcessor::NrUpdateBindings(const D3D12Shader* vertex_shader,
         dl.di_skipped[1] = true;
       } else if (!(cbuffer_binding_descriptor_indices_pixel_.up_to_date && g_dc_di_cur_n_p == dc_n &&
                    std::memcmp(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t)) == 0)) {
-        uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
-            frame_current_, dc_n * sizeof(uint32_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-            nullptr, nullptr, &cbuffer_binding_descriptor_indices_pixel_.address));
-        if (!descriptor_indices) {
-          return false;
-        }
-        std::memcpy(descriptor_indices, dc_b->di_p, dc_n * sizeof(uint32_t));
-        std::memcpy(g_dc_di_cur_p, dc_b->di_p, dc_n * sizeof(uint32_t));
-        g_dc_di_cur_n_p = dc_n;
-        cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
-        current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
-        dl.di_uploaded[1] = true;
+        if (!bind_pack(1, dc_b->di_p, dc_n, dc_b->di_hash_p,
+                       cbuffer_binding_descriptor_indices_pixel_,
+                       kRootParameter_Bindless_DescriptorIndicesPixel, g_dc_di_cur_p,
+                       g_dc_di_cur_n_p, dl.di_uploaded[1])) return false;
       }
       dl.di_frame[1] = frame_current_;
       dl.di_hash[1] = dc_b->di_hash_p;

@@ -45,6 +45,21 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
   const uintmax_t* stream = stream_data;
   size_t stream_remaining = stream_size;
   ID3D12PipelineState* current_pipeline_state = state ? state->pipeline : nullptr;
+  // Keep this state local to the actual recording range. Another range or
+  // the caller may write to the real command list between calls.
+  const bool reuse = reuse_replay_bindings_.load(std::memory_order_relaxed);
+  ID3D12PipelineState* bound_pipeline = nullptr;
+  D3D12_GPU_VIRTUAL_ADDRESS graphics_cbvs[32];
+  uint32_t valid_cbvs = 0;
+  D3D12_INDEX_BUFFER_VIEW last_index{};
+  bool index_known = false;
+  auto bind_pipeline = [&](ID3D12PipelineState* pipeline) {
+    current_pipeline_state = pipeline;
+    if (pipeline && (!reuse || pipeline != bound_pipeline)) {
+      command_list->SetPipelineState(pipeline);
+      bound_pipeline = pipeline;
+    }
+  };
   uint64_t dropped = 0;
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
@@ -98,6 +113,9 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
         }
       } break;
       case Command::kD3DExecuteIndirect: {
+        // Indirect signatures can change root arguments and IA bindings.
+        valid_cbvs = 0;
+        index_known = false;
         if (current_pipeline_state != nullptr) {
           auto& args = *reinterpret_cast<const D3DExecuteIndirectArguments*>(stream);
           command_list->ExecuteIndirect(args.command_signature, args.max_command_count,
@@ -142,7 +160,16 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
       } break;
       case Command::kD3DIASetIndexBuffer: {
         auto view = reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(stream);
-        command_list->IASetIndexBuffer(view->Format != DXGI_FORMAT_UNKNOWN ? view : nullptr);
+        const bool unbind = view->Format == DXGI_FORMAT_UNKNOWN;
+        if (!reuse || !index_known || view->Format != last_index.Format ||
+            (!unbind && (view->BufferLocation != last_index.BufferLocation ||
+                         view->SizeInBytes != last_index.SizeInBytes))) {
+          command_list->IASetIndexBuffer(unbind ? nullptr : view);
+          if (reuse) {
+            last_index = unbind ? D3D12_INDEX_BUFFER_VIEW{} : *view;
+            index_known = true;
+          }
+        }
       } break;
       case Command::kD3DIASetPrimitiveTopology: {
         command_list->IASetPrimitiveTopology(
@@ -203,8 +230,14 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
       } break;
       case Command::kD3DSetGraphicsRootConstantBufferView: {
         auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
-        command_list->SetGraphicsRootConstantBufferView(args.root_parameter_index,
-                                                        args.buffer_location);
+        const UINT slot = args.root_parameter_index;
+        if (reuse && slot < 32) {
+          const uint32_t bit = uint32_t{1} << slot;
+          if ((valid_cbvs & bit) && graphics_cbvs[slot] == args.buffer_location) break;
+          valid_cbvs |= bit;
+          graphics_cbvs[slot] = args.buffer_location;
+        }
+        command_list->SetGraphicsRootConstantBufferView(slot, args.buffer_location);
       } break;
       case Command::kD3DSetComputeRootDescriptorTable: {
         auto& args = *reinterpret_cast<const SetRootDescriptorTableArguments*>(stream);
@@ -231,6 +264,8 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
             *reinterpret_cast<ID3D12RootSignature* const*>(stream));
       } break;
       case Command::kD3DSetGraphicsRootSignature: {
+        // A parameter has one type for the lifetime of a root signature.
+        valid_cbvs = 0;
         command_list->SetGraphicsRootSignature(
             *reinterpret_cast<ID3D12RootSignature* const*>(stream));
       } break;
@@ -257,17 +292,10 @@ void DeferredCommandList::ExecuteRange(const uintmax_t* stream_data, size_t stre
         command_list->SetDescriptorHeaps(num_descriptor_heaps, descriptor_heaps);
       } break;
       case Command::kD3DSetPipelineState: {
-        current_pipeline_state = *reinterpret_cast<ID3D12PipelineState* const*>(stream);
-        if (current_pipeline_state) {
-          command_list->SetPipelineState(current_pipeline_state);
-        }
+        bind_pipeline(*reinterpret_cast<ID3D12PipelineState* const*>(stream));
       } break;
       case Command::kSetPipelineStateHandle: {
-        current_pipeline_state =
-            command_processor_.GetD3D12PipelineByHandle(*reinterpret_cast<void* const*>(stream));
-        if (current_pipeline_state) {
-          command_list->SetPipelineState(current_pipeline_state);
-        }
+        bind_pipeline(command_processor_.GetD3D12PipelineByHandle(*reinterpret_cast<void* const*>(stream)));
       } break;
       case Command::kD3DSetSamplePositions: {
         if (command_list_1 != nullptr) {

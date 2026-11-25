@@ -1325,12 +1325,17 @@ void D3D12CommandProcessor::NrFastLookup(NrFastPlan& plan) {
   const bool mapped = plan.mapped;
   const uint32_t* rf = regs.values;
   auto hash_key = [&](const FastKeyInputs& in) {
-    const uint32_t n = std::min(
-        mapped ? FastComposeObjectKeyRead(
-                     in, [rf](uint32_t i) { return g_map.Read(rf, i); }, g_key_words,
-                     kFastKeyMaxWords)
-               : FastComposeObjectKey(in, g_key_words, kFastKeyMaxWords),
-        kFastKeyMaxWords);
+    uint32_t words;
+    if (!mapped) {
+      words = FastComposeObjectKey(in, g_key_words, kFastKeyMaxWords);
+    } else if (batch_key_ranges_) {
+      words = FastComposeObjectKeyRead(in, FastMappedKeyReader{g_map, rf}, g_key_words,
+                                       kFastKeyMaxWords);
+    } else {
+      words = FastComposeObjectKeyRead(in, [rf](uint32_t i) { return g_map.Read(rf, i); },
+                                       g_key_words, kFastKeyMaxWords);
+    }
+    const uint32_t n = std::min(words, kFastKeyMaxWords);
     const XXH128_hash_t h = XXH3_128bits(g_key_words, size_t(n) * sizeof(uint32_t));
     FastKey128 k;
     k.h1 = h.low64;

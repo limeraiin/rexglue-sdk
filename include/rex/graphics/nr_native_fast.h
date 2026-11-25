@@ -327,6 +327,14 @@ inline uint32_t FastComposeObjectKeyRead(const FastKeyInputs& in, Read read, uin
     if (n < cap) out[n] = v;
     ++n;
   };
+  auto range = [&](uint32_t first, uint32_t count) {
+    if constexpr (requires { read.Copy(first, out, count); }) {
+      if (n < cap) read.Copy(first, out + n, std::min(count, cap - n));
+      n += count;
+    } else {
+      for (uint32_t i = 0; i < count; ++i) put(read(first + i));
+    }
+  };
   put(0x4A4E4631u);  // format tag 'JNF1'
   put(in.prim_type);
   put(in.index_count);
@@ -345,14 +353,15 @@ inline uint32_t FastComposeObjectKeyRead(const FastKeyInputs& in, Read read, uin
   for (uint32_t i = 0; i < 4; ++i) put(read(kFastRegColorInfo[i]));
   put(read(kFastRegDepthInfo));
   for (uint32_t r = 0; r < in.range_count; ++r) {
-    for (uint32_t i = in.ranges[r][0]; i < in.ranges[r][1]; ++i) put(read(i));
+    const auto [first, end] = in.ranges[r];
+    if (first < end) range(first, end - first);
   }
-  for (uint32_t i = kFastRegBoolBase; i < kFastRegLoopEnd; ++i) put(read(i));
+  range(kFastRegBoolBase, kFastRegLoopEnd - kFastRegBoolBase);
   uint32_t tm = in.tex_mask;
   while (tm) {
     const uint32_t t = uint32_t(__builtin_ctz(tm));
     tm &= tm - 1;
-    for (uint32_t j = 0; j < 6; ++j) put(read(kFastRegFetchBase + 6 * t + j));
+    range(kFastRegFetchBase + 6 * t, 6);
   }
   put(read(kFastRegVgtDrawInitiator));
   put(read(kFastRegVgtDmaBase));
@@ -406,6 +415,23 @@ struct FastRegMap {
   bool Has(uint32_t index) const { return index < rf_count && stamp[index] == serial; }
   uint32_t Read(const uint32_t* rf, uint32_t index) const {
     return Has(index) ? value[index] : rf[index];
+  }
+};
+
+// For key composition, contiguous register ranges can select record or live
+// values in parallel. Use the scalar reader for the isolated pass/draw words.
+struct FastMappedKeyReader {
+  const FastRegMap& map;
+  const uint32_t* live;
+  uint32_t operator()(uint32_t index) const { return map.Read(live, index); }
+  void Copy(uint32_t first, uint32_t* out, uint32_t count) const {
+    const uint32_t mapped = first < map.rf_count ? std::min(count, map.rf_count - first) : 0;
+    for (uint32_t i = 0; i < mapped; ++i) {
+      const uint32_t r = first + i;
+      out[i] = map.stamp[r] == map.serial ? map.value[r] : live[r];
+    }
+    if (mapped < count) std::memcpy(out + mapped, live + first + mapped,
+                                    (count - mapped) * sizeof(uint32_t));
   }
 };
 

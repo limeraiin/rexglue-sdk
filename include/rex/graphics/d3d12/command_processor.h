@@ -1896,6 +1896,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_float_pixel_;
   ConstantBufferBinding cbuffer_binding_bool_loop_;
   ConstantBufferBinding cbuffer_binding_fetch_;
+  struct DescriptorPackCache;
+  std::unique_ptr<DescriptorPackCache> descriptor_packs_;
+  bool reuse_descriptor_packs_ = false;
+  bool profile_descriptor_packs_ = false;
+  bool batch_key_ranges_ = false;
+  bool replay_binding_reuse_ = false;
+  uint64_t descriptor_pack_reuses_ = 0, descriptor_pack_upload_count_ = 0;
+
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;
 
