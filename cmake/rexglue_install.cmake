@@ -8,6 +8,7 @@ set_target_properties(rexinput PROPERTIES EXPORT_NAME input)
 set_target_properties(rexaudio PROPERTIES EXPORT_NAME audio)
 set_target_properties(rexgraphics PROPERTIES EXPORT_NAME graphics)
 set_target_properties(rexruntime PROPERTIES EXPORT_NAME runtime)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/licenses/supporters.txt" DESTINATION licenses)
 set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
 
 set(REXGLUE_INSTALL_TARGETS

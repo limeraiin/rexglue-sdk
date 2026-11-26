@@ -175,6 +175,12 @@ configure_file(
 set(REXGLUE_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/output" CACHE PATH
     "SDK runtime, library and archive output directory")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(credits_output "${REXGLUE_OUTPUT_DIR}")
+if(CMAKE_CONFIGURATION_TYPES)
+    string(APPEND credits_output "/$<CONFIG>")
+endif()
+file(GENERATE OUTPUT "${credits_output}/licenses/supporters.txt"
+     INPUT "${CMAKE_CURRENT_SOURCE_DIR}/licenses/supporters.txt" NEWLINE_STYLE UNIX)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 

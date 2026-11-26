@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -656,6 +657,18 @@ void BuildOptions(HWND hwnd, DialogState* st) {
   UpdateLanguages(st);
 }
 
+std::wstring ReadCredits() {
+  const auto executable = rex::filesystem::GetExecutableFolder();
+  for (const auto& root : {executable, executable.parent_path()}) {
+    std::ifstream file(root / "licenses" / "supporters.txt", std::ios::binary);
+    if (file) {
+      std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+      return Widen(text);
+    }
+  }
+  return {};
+}
+
 void SelectTab(DialogState* st, int index) {
   for (int i = 0; i < kTabCount; ++i)
     ShowWindow(st->pages[i], i == index ? SW_SHOW : SW_HIDE);
@@ -702,17 +715,8 @@ void BuildControls(HWND hwnd, DialogState* st) {
   st->keyboard.canvas =
       CreateWindowExW(0, kCanvasClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, S(54),
                       pageW, pageH - S(54), p, nullptr, st->keyboard.hinst, &st->keyboard);
-  MakeControl(st->pages[kTabCredits], L"EDIT",
-              L"Special thanks to Jorge Luis, William Kitchen, luboo 24century, Ngoc Duy Anh Nguyen, "
-              L"lilfrosty, pecan_blandy, San Mitch, Einar Nesje, Eudy Mart\u00EDnez, Spartan Joe, "
-              L"SonOfFaith, Shadow Scornsear, Jeff Davis, YorSR, Derik.Digital, Gustavo Zuccon, "
-              L"Abraham ENQ, Michael Vermeeren, Rog\u00E9rio, N30NC0R3, Phreakyx, Xzavier pich, eze "
-              L"legui, Billy Midoriya, Jacob Krause, Rex, AngelKessie, Mashar, GoyaRice, Christian "
-              L"Mendez, StoneColdUFC, Josh, Kian Doherty, foltzyyy, Yuncle, SM47, zeb zeb, Noah, "
-              L"Khalid, M, Seath Scaleless, Rayane Mx2, Cyphr, Silver, ShinobiHunter93, Lemontine, "
-              L"ha ios, YueOrigin, Hollywood Akeem, pimp the heartless, eddie, Chris Parnell, Armin "
-              L"Suljovikj, Enel, P E L I O D A S, Austin_Toonz, Kalarot and Logan Lane for their "
-              L"Patreon support.",
+  const std::wstring credits = ReadCredits();
+  MakeControl(st->pages[kTabCredits], L"EDIT", credits.c_str(),
               ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, S(16), S(16), pageW - S(32),
               pageH - S(32), -1, st->font);
   int x = S(800) - margin - btnW;
@@ -770,7 +774,7 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
     rex::cvar::SetFlagByName("resolution_scale",
                              std::to_string(kInternalResOptions[internal_sel].scale));
 
-    // Vsync is always on (no dialog control) — force it true on every save.
+    // Vsync is always on (no dialog control) â€” force it true on every save.
     rex::cvar::SetFlagByName("vsync", "true");
 
     rex::cvar::SetFlagByName(
@@ -797,7 +801,7 @@ bool ApplyAndSave(HWND hwnd, DialogState* st, const std::filesystem::path& confi
 
   // NB: `install_content` is deliberately left alone here. DLC is installed and
   // removed directly by the panel on the right, so that cvar is now only the
-  // headless/CLI import path — the launcher must neither set nor wipe it.
+  // headless/CLI import path â€” the launcher must neither set nor wipe it.
 
   if (!st->standalone) {
     // Persist the "skip launcher next time" choice. If set, the next launch boots
@@ -1126,7 +1130,7 @@ static bool ShowConfigDialog(bool standalone, std::string_view app_name, const s
   SetFocus(GetDlgItem(hwnd, IDOK));
 
   // Local modal message loop until the user picks Play/Quit (state.done).
-  // Driven by the done flag — NOT by WM_QUIT — so we never post WM_QUIT into
+  // Driven by the done flag â€” NOT by WM_QUIT â€” so we never post WM_QUIT into
   // this thread's queue (which the app's main loop would later consume and quit
   // on). The `!state.done` short-circuit means once a choice is made we stop
   // before blocking in GetMessage again.
